@@ -1,0 +1,58 @@
+name: CI Test & Lint
+
+on:
+  push:
+    branches: [dev, qa, main]
+  pull_request:
+    branches: [dev, qa, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test & Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
+
+      - name: Run Ruff Linter
+        run: ruff check .
+
+      - name: Check Black Formatting
+        run: black --check .
+
+      - name: Check Import Order (isort)
+        run: isort --check-only .
+
+      - name: Run Mypy Type Checker
+        run: mypy --strict src/coach_web
+
+      - name: Run Pytest Test Suite
+        run: pytest -v --cov=src/coach_web tests/
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build OCI Docker Image (Validation)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          tags: coach-web:test
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
