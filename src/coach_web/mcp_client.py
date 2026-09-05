@@ -7,7 +7,12 @@ from typing import Any
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
-from coach_web.models import ReadinessMetrics
+from coach_web.models import (
+    AthleteProfile,
+    FitnessTrend,
+    FitnessTrendPoint,
+    ReadinessMetrics,
+)
 
 
 class MCPConnectionError(Exception):
@@ -57,6 +62,20 @@ class MCPClient:
         text = self._extract_text(result)
         data = json.loads(text)
         return ReadinessMetrics(**data)
+
+    async def get_fitness_summary(self) -> FitnessTrend:
+        """Fetch 42-day fitness trend summary from the MCP server."""
+        result = await self.call_tool("intervals_get_fitness_summary")
+        text = self._extract_text(result)
+        data = json.loads(text)
+        return FitnessTrend(points=[FitnessTrendPoint(**point) for point in data])
+
+    async def get_athlete_profile(self) -> AthleteProfile:
+        """Fetch athlete profile from the MCP server."""
+        result = await self.call_tool("intervals_get_athlete_profile")
+        text = self._extract_text(result)
+        data = json.loads(text)
+        return AthleteProfile(**data)
 
     @staticmethod
     def _extract_text(result: Any) -> str:
