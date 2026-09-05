@@ -34,7 +34,7 @@ class GitHubClient:
             f"/repos/{self.repo}/issues",
             params={
                 "labels": "agent::coach,type::task",
-                "state": "open",
+                "state": "all",
                 "sort": "created",
                 "direction": "desc",
                 "per_page": "100",
