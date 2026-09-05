@@ -53,6 +53,19 @@ class TestGitHubClient:
         assert plans[0].week_id == "2026-W37"
 
     @respx.mock
+    async def test_uses_state_all_param(self) -> None:
+        """fetch_training_plans uses state=all to fetch open and closed issues."""
+        route = respx.get("https://api.github.com/repos/fpittelo/coach/issues").mock(
+            return_value=Response(200, json=[])
+        )
+
+        async with GitHubClient("ghp_test", "fpittelo/coach") as client:
+            await client.fetch_training_plans()
+
+        request = route.calls[0].request
+        assert "state=all" in str(request.url)
+
+    @respx.mock
     async def test_filters_by_title_prefix(self) -> None:
         """Only issues with the 'Training Plan: ' prefix are returned."""
         respx.get("https://api.github.com/repos/fpittelo/coach/issues").mock(
