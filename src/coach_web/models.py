@@ -20,6 +20,32 @@ class ReadinessMetrics(BaseModel):
     tsb: float = Field(..., description="Training Stress Balance")
 
 
+class FitnessTrendPoint(BaseModel):
+    """A single point in a fitness trend history."""
+
+    date: str = Field(..., description="ISO 8601 date (YYYY-MM-DD)")
+    ctl: float = Field(..., description="Chronic Training Load on that date", ge=0)
+    atl: float = Field(..., description="Acute Training Load on that date", ge=0)
+    tsb: float = Field(..., description="Training Stress Balance on that date")
+
+
+class FitnessTrend(BaseModel):
+    """A series of fitness trend points."""
+
+    points: list[FitnessTrendPoint] = Field(
+        default_factory=list,
+        description="Chronological fitness trend data points",
+    )
+
+
+class AthleteProfile(BaseModel):
+    """Athlete profile data from Intervals.icu."""
+
+    weight_kg: float = Field(..., description="Athlete weight in kg", ge=0)
+    max_hr: int = Field(..., description="Maximum heart rate in bpm", ge=0)
+    resting_hr: int = Field(..., description="Resting heart rate in bpm", ge=0)
+
+
 class TrainingPlan(BaseModel):
     """A weekly training plan represented as a GitHub issue."""
 

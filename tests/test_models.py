@@ -3,7 +3,14 @@
 import pytest
 from pydantic import ValidationError
 
-from coach_web.models import ChatMessage, ReadinessMetrics, TrainingPlan
+from coach_web.models import (
+    AthleteProfile,
+    ChatMessage,
+    FitnessTrend,
+    FitnessTrendPoint,
+    ReadinessMetrics,
+    TrainingPlan,
+)
 
 
 class TestReadinessMetrics:
@@ -114,3 +121,78 @@ class TestChatMessage:
         """Roles other than user/assistant are rejected."""
         with pytest.raises(ValidationError):
             ChatMessage(role="system", content="Hello")
+
+
+class TestFitnessTrendPoint:
+    """FitnessTrendPoint schema validation."""
+
+    def test_valid_creation(self) -> None:
+        """A valid FitnessTrendPoint instance can be created."""
+        point = FitnessTrendPoint(
+            date="2026-09-01",
+            ctl=75.0,
+            atl=60.0,
+            tsb=15.0,
+        )
+
+        assert point.date == "2026-09-01"
+        assert point.ctl == 75.0
+        assert point.atl == 60.0
+        assert point.tsb == 15.0
+
+    def test_negative_ctl_raises(self) -> None:
+        """Negative CTL values are rejected."""
+        with pytest.raises(ValidationError):
+            FitnessTrendPoint(
+                date="2026-09-01",
+                ctl=-1.0,
+                atl=60.0,
+                tsb=15.0,
+            )
+
+
+class TestFitnessTrend:
+    """FitnessTrend schema validation."""
+
+    def test_valid_creation_with_points(self) -> None:
+        """A valid FitnessTrend instance can be created with points."""
+        points = [
+            FitnessTrendPoint(date="2026-09-01", ctl=75.0, atl=60.0, tsb=15.0),
+            FitnessTrendPoint(date="2026-09-02", ctl=76.0, atl=62.0, tsb=14.0),
+        ]
+        trend = FitnessTrend(points=points)
+
+        assert len(trend.points) == 2
+        assert trend.points[0].date == "2026-09-01"
+        assert trend.points[1].date == "2026-09-02"
+
+    def test_empty_points_default(self) -> None:
+        """FitnessTrend defaults to an empty points list."""
+        trend = FitnessTrend()
+
+        assert trend.points == []
+
+
+class TestAthleteProfile:
+    """AthleteProfile schema validation."""
+
+    def test_valid_creation(self) -> None:
+        """A valid AthleteProfile instance can be created."""
+        profile = AthleteProfile(
+            weight_kg=70.0,
+            max_hr=185,
+            resting_hr=48,
+        )
+
+        assert profile.weight_kg == 70.0
+        assert profile.max_hr == 185
+        assert profile.resting_hr == 48
+
+    def test_negative_weight_raises(self) -> None:
+        """Negative weight values are rejected."""
+        with pytest.raises(ValidationError):
+            AthleteProfile(
+                weight_kg=-1.0,
+                max_hr=185,
+                resting_hr=48,
+            )
