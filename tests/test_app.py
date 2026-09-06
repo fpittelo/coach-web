@@ -53,9 +53,7 @@ class TestMain:
 
         main()
 
-        mock_st.tabs.assert_called_once_with(
-            ["📊 Dashboard", "📋 Plans", "💬 Chat"]
-        )
+        mock_st.tabs.assert_called_once_with(["📊 Dashboard", "📋 Plans", "💬 Chat"])
 
     @patch("coach_web.app.render_chat")
     @patch("coach_web.app.render_plans")
