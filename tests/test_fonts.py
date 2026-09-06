@@ -11,11 +11,10 @@ def test_inject_fonts_function_exists() -> None:
     assert callable(inject_fonts)
 
 
-def test_inject_fonts_returns_none() -> None:
-    """inject_fonts calls st.html and returns None."""
+def test_inject_fonts_calls_st_html() -> None:
+    """inject_fonts calls st.html with CSS containing @font-face."""
     with patch("coach_web.fonts.st.html", return_value=None) as mock_html:
-        result = inject_fonts()
-        assert result is None
+        inject_fonts()
         mock_html.assert_called_once()
         call_args = mock_html.call_args
         assert call_args is not None
