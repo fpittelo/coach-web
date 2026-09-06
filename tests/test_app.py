@@ -29,7 +29,7 @@ class TestMain:
 
         mock_st.set_page_config.assert_called_once_with(
             page_title="Coach Web",
-            page_icon="🚴",
+            page_icon=None,
             layout="wide",
         )
         mock_inject_fonts.assert_called_once()
@@ -59,7 +59,7 @@ class TestMain:
         main()
 
         mock_inject_fonts.assert_called_once()
-        mock_st.tabs.assert_called_once_with(["📊 Dashboard", "📋 Plans", "💬 Chat"])
+        mock_st.tabs.assert_called_once_with(["Dashboard", "Plans", "Chat"])
 
     @patch("coach_web.app.inject_fonts")
     @patch("coach_web.app.render_chat")

@@ -13,14 +13,14 @@ def main() -> None:
     """Run the Coach Web Streamlit application."""
     st.set_page_config(
         page_title="Coach Web",
-        page_icon="🚴",
+        page_icon=None,
         layout="wide",
     )
 
     inject_fonts()
     inject_styles()
 
-    dashboard_tab, plans_tab, chat_tab = st.tabs(["📊 Dashboard", "📋 Plans", "💬 Chat"])
+    dashboard_tab, plans_tab, chat_tab = st.tabs(["Dashboard", "Plans", "Chat"])
 
     with dashboard_tab:
         render_dashboard()

@@ -12,16 +12,16 @@ from coach_web.models import FitnessTrend, ReadinessMetrics
 
 def render_dashboard() -> None:
     """Render the readiness dashboard tab with metric cards and trend charts."""
-    st.title("📊 Readiness Cockpit")
+    st.title("Readiness Cockpit")
     st.markdown("Daily readiness metrics from Intervals.icu via the Coach MCP server.")
 
     try:
         metrics = asyncio.run(get_readiness_metrics())
     except MCPConnectionError:
-        st.warning("⚠️ Connect your Coach MCP server to see your readiness data.")
+        st.warning("Connect your Coach MCP server to see your readiness data.")
         return
     except Exception:  # noqa: BLE001
-        st.error("⚠️ Unable to fetch readiness data. Check your MCP server configuration.")
+        st.error("Unable to fetch readiness data. Check your MCP server configuration.")
         return
 
     # --- Metric cards (7 metrics in a 4-column grid) ---
@@ -51,7 +51,7 @@ def render_dashboard() -> None:
     st.divider()
 
     # --- Trend charts ---
-    st.subheader("📈 Fitness Trends (42-day)")
+    st.subheader("Fitness Trends")
 
     try:
         trend = asyncio.run(get_fitness_trend())
