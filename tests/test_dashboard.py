@@ -181,7 +181,7 @@ class TestRenderTrendCharts:
 
     @patch("coach_web.dashboard.st")
     def test_chart_titles_and_templates(self, mock_st: MagicMock) -> None:
-        """Each chart has the correct title and template."""
+        """Each chart has the correct title, template, and line color."""
         points: list[FitnessTrendPoint] = [
             FitnessTrendPoint(date=f"2026-09-{day:02d}", ctl=70.0 + day, atl=50.0 + day, tsb=20.0)
             for day in range(1, 11)
@@ -194,14 +194,20 @@ class TestRenderTrendCharts:
         assert isinstance(ctl_fig, go.Figure)
         assert ctl_fig.layout.title.text == "Fitness (CTL) — 42 Day Trend"
         assert ctl_fig.layout.template is not None
+        assert ctl_fig.layout.template.layout.paper_bgcolor == "#FFFFFF"
+        assert ctl_fig.data[0].line.color == "#FF0000"
 
         atl_fig = mock_st.plotly_chart.call_args_list[1].args[0]
         assert isinstance(atl_fig, go.Figure)
         assert atl_fig.layout.title.text == "Fatigue (ATL) — 7 Day Trend"
+        assert atl_fig.layout.template.layout.paper_bgcolor == "#FFFFFF"
+        assert atl_fig.data[0].line.color == "#707070"
 
         tsb_fig = mock_st.plotly_chart.call_args_list[2].args[0]
         assert isinstance(tsb_fig, go.Figure)
         assert tsb_fig.layout.title.text == "Form (TSB) — Training Stress Balance"
+        assert tsb_fig.layout.template.layout.paper_bgcolor == "#FFFFFF"
+        assert tsb_fig.data[0].line.color == "#B51F1F"
 
 
 class TestRenderDashboardWithTrend:

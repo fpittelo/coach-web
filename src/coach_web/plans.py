@@ -26,19 +26,19 @@ def _get_current_week_id() -> str:
 
 def render_plans() -> None:
     """Render the weekly training plans tab with caching and current-week highlighting."""
-    st.title("📋 Weekly Training Plans")
+    st.title("Weekly Training Plans")
     st.markdown("Past 5 weeks + current week from the Coach GitHub repository.")
 
     try:
         plans = _get_cached_plans_sync()
     except httpx.HTTPStatusError:
-        st.warning("⚠️ Configure GITHUB_TOKEN to load training plans.")
+        st.warning("Configure GITHUB_TOKEN to load training plans.")
         return
     except httpx.ConnectError:
-        st.error("⚠️ Unable to connect to GitHub. Check your network connection.")
+        st.error("Unable to connect to GitHub. Check your network connection.")
         return
     except Exception:  # noqa: BLE001
-        st.error("⚠️ Unable to fetch training plans. Check your configuration.")
+        st.error("Unable to fetch training plans. Check your configuration.")
         return
 
     if not plans:
@@ -51,7 +51,7 @@ def render_plans() -> None:
 
     for plan in plans:
         is_current = plan.week_id == current_week
-        label = f"{'📌 ' if is_current else ''}{plan.title} ({plan.week_id})"
+        label = f"{plan.title} ({plan.week_id})"
 
         with st.expander(label, expanded=is_current):
             st.markdown(plan.body)
