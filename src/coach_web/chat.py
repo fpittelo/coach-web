@@ -34,13 +34,10 @@ def render_chat() -> None:
             response = asyncio.run(send_message(prompt))
         except MCPConnectionError:
             response = (
-                "Coach MCP server is not available. "
-                "Please start your MCP server and try again."
+                "Coach MCP server is not available. " "Please start your MCP server and try again."
             )
         except Exception:  # noqa: BLE001
-            response = (
-                "Unable to reach the Coach MCP server. Please check your configuration."
-            )
+            response = "Unable to reach the Coach MCP server. Please check your configuration."
 
         st.session_state.messages.append({"role": "assistant", "content": response})
         with st.chat_message("assistant"):
