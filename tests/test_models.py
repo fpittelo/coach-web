@@ -120,7 +120,7 @@ class TestChatMessage:
     def test_invalid_role_raises(self) -> None:
         """Roles other than user/assistant are rejected."""
         with pytest.raises(ValidationError):
-            ChatMessage(role="system", content="Hello")
+            ChatMessage(role="system", content="Hello")  # type: ignore[arg-type]
 
 
 class TestFitnessTrendPoint:

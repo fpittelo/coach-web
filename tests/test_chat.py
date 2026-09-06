@@ -1,5 +1,6 @@
 """Tests for coach_web.chat."""
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,7 +12,7 @@ from coach_web.mcp_client import MCPConnectionError
 class MockSessionState:
     """Mock Streamlit session_state with attribute and item access."""
 
-    def __init__(self, initial: dict | None = None) -> None:
+    def __init__(self, initial: dict[str, object] | None = None) -> None:
         self._data: dict[str, object] = initial or {}
 
     def __contains__(self, key: str) -> bool:
@@ -23,7 +24,7 @@ class MockSessionState:
     def __getitem__(self, key: str) -> object:
         return self._data[key]
 
-    def __iter__(self) -> iter:
+    def __iter__(self) -> Iterator[object]:
         return iter(self._data.values())
 
     def __getattr__(self, key: str) -> object:
