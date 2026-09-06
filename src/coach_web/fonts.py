@@ -40,4 +40,4 @@ def _build_font_css() -> str:
 def inject_fonts() -> None:
     """Inject Inter @font-face CSS via st.html() (sandboxed, no unsafe_allow_html)."""
     css = _build_font_css()
-    st.html(f"<style>{css}</style>")  # type: ignore[attr-defined]
+    st.html(f"<style>{css}</style>")
