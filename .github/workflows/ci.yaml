@@ -91,4 +91,4 @@ jobs:
           pip install pip-audit
 
       - name: Audit dependencies for known vulnerabilities
-        run: pip-audit --strict
+        run: pip-audit --strict .
