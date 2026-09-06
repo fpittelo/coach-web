@@ -4,18 +4,23 @@ import streamlit as st
 
 from coach_web.chat import render_chat
 from coach_web.dashboard import render_dashboard
+from coach_web.fonts import inject_fonts
 from coach_web.plans import render_plans
+from coach_web.styles import inject_styles
 
 
 def main() -> None:
     """Run the Coach Web Streamlit application."""
     st.set_page_config(
         page_title="Coach Web",
-        page_icon="🚴",
+        page_icon=None,
         layout="wide",
     )
 
-    dashboard_tab, plans_tab, chat_tab = st.tabs(["📊 Dashboard", "📋 Plans", "💬 Chat"])
+    inject_fonts()
+    inject_styles()
+
+    dashboard_tab, plans_tab, chat_tab = st.tabs(["Dashboard", "Plans", "Chat"])
 
     with dashboard_tab:
         render_dashboard()

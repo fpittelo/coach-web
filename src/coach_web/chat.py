@@ -10,7 +10,7 @@ from coach_web.mcp_client import MCPClient, MCPConnectionError
 
 def render_chat() -> None:
     """Render the chat interface tab with session state and error handling."""
-    st.title("💬 Chat with Your Coach")
+    st.title("Chat with Your Coach")
     st.markdown("Ask your coach about training, readiness, or today's workout.")
 
     # Initialize session state
@@ -34,20 +34,17 @@ def render_chat() -> None:
             response = asyncio.run(send_message(prompt))
         except MCPConnectionError:
             response = (
-                "⚠️ Coach MCP server is not available. "
-                "Please start your MCP server and try again."
+                "Coach MCP server is not available. " "Please start your MCP server and try again."
             )
         except Exception:  # noqa: BLE001
-            response = (
-                "⚠️ Unable to reach the Coach MCP server. " "Please check your configuration."
-            )
+            response = "Unable to reach the Coach MCP server. Please check your configuration."
 
         st.session_state.messages.append({"role": "assistant", "content": response})
         with st.chat_message("assistant"):
             st.write(response)
 
     # Clear chat button
-    if st.button("🗑️ Clear chat"):
+    if st.button("Clear chat"):
         st.session_state.messages = []
         st.rerun()
 
@@ -65,4 +62,4 @@ async def send_message(message: str) -> str:
             for item in result.content:
                 if getattr(item, "type", None) == "text":
                     return str(item.text)
-        return "🚴 I'm here! How can I help with your training today?"
+        return "I'm here! How can I help with your training today?"

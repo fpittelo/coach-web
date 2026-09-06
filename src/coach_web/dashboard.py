@@ -8,20 +8,27 @@ import streamlit as st
 from coach_web.config import get_settings
 from coach_web.mcp_client import MCPClient, MCPConnectionError
 from coach_web.models import FitnessTrend, ReadinessMetrics
+from coach_web.plotly_theme import (
+    SWISS_MINIMAL_TEMPLATE_NAME,
+    register_template,
+)
+from coach_web.theme import ACCENT, ACCENT_DARK, TEXT_SECONDARY
+
+register_template()
 
 
 def render_dashboard() -> None:
     """Render the readiness dashboard tab with metric cards and trend charts."""
-    st.title("📊 Readiness Cockpit")
+    st.title("Readiness Cockpit")
     st.markdown("Daily readiness metrics from Intervals.icu via the Coach MCP server.")
 
     try:
         metrics = asyncio.run(get_readiness_metrics())
     except MCPConnectionError:
-        st.warning("⚠️ Connect your Coach MCP server to see your readiness data.")
+        st.warning("Connect your Coach MCP server to see your readiness data.")
         return
     except Exception:  # noqa: BLE001
-        st.error("⚠️ Unable to fetch readiness data. Check your MCP server configuration.")
+        st.error("Unable to fetch readiness data. Check your MCP server configuration.")
         return
 
     # --- Metric cards (7 metrics in a 4-column grid) ---
@@ -51,7 +58,7 @@ def render_dashboard() -> None:
     st.divider()
 
     # --- Trend charts ---
-    st.subheader("📈 Fitness Trends (42-day)")
+    st.subheader("Fitness Trends")
 
     try:
         trend = asyncio.run(get_fitness_trend())
@@ -95,7 +102,7 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
                 y=ctl_values,
                 mode="lines+markers",
                 name="CTL",
-                line={"color": "blue"},
+                line={"color": ACCENT},
             ),
         ],
     )
@@ -103,7 +110,7 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
         title="Fitness (CTL) — 42 Day Trend",
         xaxis_title="Date",
         yaxis_title="CTL",
-        template="plotly_dark",
+        template=SWISS_MINIMAL_TEMPLATE_NAME,
     )
     st.plotly_chart(fig_ctl, use_container_width=True)
 
@@ -117,7 +124,7 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
                 y=last_7_atl,
                 mode="lines+markers",
                 name="ATL",
-                line={"color": "red"},
+                line={"color": TEXT_SECONDARY},
             ),
         ],
     )
@@ -125,7 +132,7 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
         title="Fatigue (ATL) — 7 Day Trend",
         xaxis_title="Date",
         yaxis_title="ATL",
-        template="plotly_dark",
+        template=SWISS_MINIMAL_TEMPLATE_NAME,
     )
     st.plotly_chart(fig_atl, use_container_width=True)
 
@@ -137,7 +144,7 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
                 y=tsb_values,
                 mode="lines+markers",
                 name="TSB",
-                line={"color": "green"},
+                line={"color": ACCENT_DARK},
             ),
         ],
     )
@@ -145,6 +152,6 @@ def _render_trend_charts(trend: FitnessTrend) -> None:
         title="Form (TSB) — Training Stress Balance",
         xaxis_title="Date",
         yaxis_title="TSB",
-        template="plotly_dark",
+        template=SWISS_MINIMAL_TEMPLATE_NAME,
     )
     st.plotly_chart(fig_tsb, use_container_width=True)

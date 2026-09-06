@@ -77,7 +77,7 @@ class TestRenderPlans:
 
         render_plans()
 
-        assert mock_st.title.call_args[0][0] == "📋 Weekly Training Plans"
+        assert mock_st.title.call_args[0][0] == "Weekly Training Plans"
         assert mock_st.expander.call_count == len(sample_training_plans)
         assert mock_st.markdown.called
         mock_week.assert_called_once()
