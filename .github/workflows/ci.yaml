@@ -40,10 +40,10 @@ jobs:
         run: isort --check-only .
 
       - name: Run Mypy Type Checker
-        run: mypy --strict src/coach_web
+        run: mypy --strict src/coach_web tests
 
       - name: Run Pytest Test Suite
-        run: pytest -v --cov=src/coach_web tests/
+        run: pytest -v -W error --cov=src/coach_web --cov-report=term-missing --cov-fail-under=80 tests/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
