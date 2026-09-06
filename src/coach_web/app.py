@@ -6,6 +6,7 @@ from coach_web.chat import render_chat
 from coach_web.dashboard import render_dashboard
 from coach_web.fonts import inject_fonts
 from coach_web.plans import render_plans
+from coach_web.styles import inject_styles
 
 
 def main() -> None:
@@ -17,6 +18,7 @@ def main() -> None:
     )
 
     inject_fonts()
+    inject_styles()
 
     dashboard_tab, plans_tab, chat_tab = st.tabs(["📊 Dashboard", "📋 Plans", "💬 Chat"])
 
