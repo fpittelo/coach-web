@@ -69,3 +69,6 @@ Thumbs.db
 
 # Docker
 *.pid
+
+# Local vendored packages artifact
+.venv-packages/
