@@ -19,7 +19,7 @@ def test_inject_fonts_returns_none() -> None:
         mock_html.assert_called_once()
         call_args = mock_html.call_args
         assert call_args is not None
-        call_str = call_args[0][0]  # type: ignore[union-attr]
+        call_str = call_args[0][0]
         assert "<style>" in call_str
         assert "</style>" in call_str
 
