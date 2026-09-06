@@ -28,7 +28,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .[dev]
+          pip install -e .[dev]
 
       - name: Run Ruff Linter
         run: ruff check .
@@ -40,10 +40,10 @@ jobs:
         run: isort --check-only .
 
       - name: Run Mypy Type Checker
-        run: mypy --strict src/coach_web
+        run: mypy --strict src/coach_web tests
 
       - name: Run Pytest Test Suite
-        run: pytest -v --cov=src/coach_web tests/
+        run: pytest -v -W error --cov=src/coach_web --cov-report=term-missing --cov-fail-under=80 tests/
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -56,3 +56,39 @@ jobs:
           tags: coach-web:test
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  secret-scan:
+    name: Secret Scanning (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan for leaked secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency Vulnerability Scanning (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
+          pip install pip-audit
+
+      - name: Audit dependencies for known vulnerabilities
+        run: pip-audit --strict .
