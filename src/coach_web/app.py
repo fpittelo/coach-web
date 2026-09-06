@@ -4,6 +4,7 @@ import streamlit as st
 
 from coach_web.chat import render_chat
 from coach_web.dashboard import render_dashboard
+from coach_web.fonts import inject_fonts
 from coach_web.plans import render_plans
 
 
@@ -14,6 +15,8 @@ def main() -> None:
         page_icon="🚴",
         layout="wide",
     )
+
+    inject_fonts()
 
     dashboard_tab, plans_tab, chat_tab = st.tabs(["📊 Dashboard", "📋 Plans", "💬 Chat"])
 
