@@ -14,10 +14,11 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("COACH_MCP_URL", "http://test-mcp.local/mcp")
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setenv("GITHUB_REPO", "fpittelo/coach")
-    monkeypatch.setenv("STREAMLIT_SERVER_PORT", "8501")
-    monkeypatch.setenv("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
     monkeypatch.setenv("CACHE_TTL_SECONDS", "30")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("APP_HOST", "127.0.0.1")
+    monkeypatch.setenv("APP_PORT", "8080")
+    monkeypatch.setenv("CORS_ORIGINS", '["http://test.local"]')
     get_settings.cache_clear()
     return get_settings()
 

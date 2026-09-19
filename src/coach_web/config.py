@@ -2,6 +2,7 @@
 
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,17 +24,25 @@ class Settings(BaseSettings):
     GITHUB_REPO: str = "fpittelo/coach"
     """Repository containing training plan issues."""
 
-    STREAMLIT_SERVER_PORT: int = 8501
-    """Port the Streamlit server binds to."""
-
-    STREAMLIT_SERVER_ADDRESS: str = "0.0.0.0"
-    """Address the Streamlit server binds to."""
-
     CACHE_TTL_SECONDS: int = 60
     """Default cache TTL for fetched data."""
 
     LOG_LEVEL: str = "INFO"
     """Logging level."""
+
+    APP_HOST: str = "0.0.0.0"
+    """Host the ASGI server binds to."""
+
+    APP_PORT: int = 8080
+    """Port the ASGI server binds to."""
+
+    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:8080"])
+    """Allowed browser origins for cross-origin requests."""
+
+    @property
+    def service_name(self) -> str:
+        """Canonical service identifier reported by the healthcheck."""
+        return "coach-web"
 
 
 @lru_cache(maxsize=1)
