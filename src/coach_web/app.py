@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +17,9 @@ from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from coach_web.agent import AgentEvent, CoachAgent, create_agent
 from coach_web.config import Settings, get_settings
+from coach_web.mcp_hub import MCPClientHub, MCPHubError
+from coach_web.models import PlanApprovalRequest, PlanApprovalResponse
+from coach_web.plan_approval import approve_plan
 
 logger = logging.getLogger("coach_web")
 
@@ -71,6 +74,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.settings = resolved
     application.state.started_at = time.monotonic()
     application.state.agent_factory = create_agent
+    application.state.hub_factory = MCPClientHub.from_settings
 
     application.add_middleware(
         CORSMiddleware,
@@ -125,6 +129,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 yield ServerSentEvent(event=failure.type, data=failure.model_dump_json())
 
         return EventSourceResponse(event_generator())
+
+    @application.post("/api/plan/approve", response_model=PlanApprovalResponse, tags=["plan"])
+    async def approve_plan_endpoint(
+        request: Request,
+        payload: PlanApprovalRequest,
+    ) -> PlanApprovalResponse:
+        """Approve a plan proposal and execute its scheduling side effects.
+
+        Schedules the workout on Intervals.icu through ``coach-mcp`` and commits
+        the Markdown plan to the training repository through ``github-mcp``.
+        """
+        settings: Settings = request.app.state.settings
+        factory = getattr(request.app.state, "hub_factory", MCPClientHub.from_settings)
+        hub = factory(settings)
+        try:
+            async with hub:
+                return await approve_plan(
+                    hub,
+                    payload.plan,
+                    repo=settings.GITHUB_REPO,
+                    branch=settings.GITHUB_PLAN_BRANCH,
+                    directory=settings.GITHUB_PLAN_DIR,
+                )
+        except MCPHubError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     return application
 

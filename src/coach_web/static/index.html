@@ -5,98 +5,159 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="color-scheme" content="light" />
     <title>Coach Web</title>
-    <style>
-      :root {
-        --ink: #111111;
-        --muted: #6b6b6b;
-        --paper: #ffffff;
-        --line: #e2e2e2;
-        --accent: #ff0000;
-      }
-
-      * {
-        box-sizing: border-box;
-      }
-
-      html,
-      body {
-        margin: 0;
-        padding: 0;
-      }
-
-      body {
-        min-height: 100vh;
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        background: var(--paper);
-        color: var(--ink);
-        font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
-        font-weight: 400;
-        line-height: 1.4;
-        -webkit-font-smoothing: antialiased;
-      }
-
-      main {
-        width: min(760px, 90vw);
-        padding: 4rem 0;
-      }
-
-      .rule {
-        height: 2px;
-        background: var(--accent);
-        margin-bottom: 2.5rem;
-      }
-
-      .kicker {
-        font-size: 0.75rem;
-        letter-spacing: 0.18em;
-        text-transform: uppercase;
-        color: var(--muted);
-        margin: 0 0 1rem;
-      }
-
-      h1 {
-        font-size: clamp(2.5rem, 7vw, 4.5rem);
-        font-weight: 700;
-        letter-spacing: -0.03em;
-        margin: 0 0 1.5rem;
-      }
-
-      p {
-        font-size: 1.05rem;
-        max-width: 52ch;
-        color: var(--ink);
-        margin: 0 0 2.5rem;
-      }
-
-      footer {
-        display: flex;
-        flex-wrap: wrap;
-        gap: 2rem;
-        border-top: 1px solid var(--line);
-        padding-top: 1.5rem;
-        font-size: 0.8rem;
-        letter-spacing: 0.06em;
-        text-transform: uppercase;
-        color: var(--muted);
-      }
-    </style>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/vendor/alpine.min.js"></script>
+    <script defer src="/static/app.js"></script>
   </head>
   <body>
-    <main>
-      <div class="rule"></div>
-      <p class="kicker">Endurance Cockpit · Local VIDAR</p>
-      <h1>Coach Web</h1>
-      <p>
-        The FastAPI core is online. The Swiss minimalist interface, agent chat console and
-        weekly training plans will be mounted here in the upcoming Phase&nbsp;1 iterations.
-      </p>
-      <footer>
-        <span>Status: scaffold</span>
+    <div x-data="coachApp()" x-init="init()" x-cloak>
+      <header class="masthead">
+        <div class="rule"></div>
+        <p class="kicker">Endurance Cockpit · Local VIDAR</p>
+        <h1>Coach Web</h1>
+        <p class="lede">
+          Ask your coach about readiness, fitness and the week ahead. Every answer is
+          grounded in your Intervals.icu data, and every proposed workout waits for your
+          approval before it is scheduled.
+        </p>
+      </header>
+
+      <main class="layout">
+        <section class="panel chat" aria-label="Coach chat console">
+          <h2 class="panel-title">Chat console</h2>
+
+          <div class="chat-log" x-ref="log" aria-live="polite">
+            <p class="empty-state" x-show="messages.length === 0">
+              Start the conversation with a question about your training.
+            </p>
+
+            <template x-for="(message, index) in messages" :key="index">
+              <article class="message" :class="{ 'message--user': message.role === 'user' }">
+                <span class="message-role" x-text="message.role"></span>
+                <p class="message-body" x-text="message.content"></p>
+              </article>
+            </template>
+          </div>
+
+          <div class="activity" x-show="streaming || thoughts.length > 0 || tools.length > 0">
+            <div class="status-line" x-show="streaming">
+              <span class="pulse" aria-hidden="true"></span>
+              <span x-text="statusText || 'Working'"></span>
+            </div>
+
+            <template x-for="(thought, index) in thoughts" :key="'thought-' + index">
+              <p class="thought" x-text="thought"></p>
+            </template>
+
+            <ul class="tool-list" x-show="tools.length > 0">
+              <template x-for="tool in tools" :key="tool.id">
+                <li class="tool" :class="{ 'tool--done': tool.state === 'done' }">
+                  <span class="tool-name" x-text="tool.name"></span>
+                  <span class="tool-state" x-text="tool.state"></span>
+                </li>
+              </template>
+            </ul>
+          </div>
+
+          <form class="composer" @submit.prevent="send()">
+            <input
+              type="text"
+              name="message"
+              autocomplete="off"
+              placeholder="Ask your coach…"
+              aria-label="Message for the coach"
+              x-model="input"
+              :disabled="streaming"
+            />
+            <button class="button" type="submit" :disabled="streaming || input.trim() === ''">
+              Send
+            </button>
+          </form>
+        </section>
+
+        <aside class="panel plan" aria-label="Plan approval">
+          <h2 class="panel-title">Plan approval</h2>
+
+          <p class="plan-placeholder" x-show="!plan">
+            Proposed workouts appear here for review before anything is scheduled.
+          </p>
+
+          <template x-if="plan">
+            <div>
+              <dl class="plan-meta">
+                <div class="plan-field">
+                  <dt>Date</dt>
+                  <dd x-text="plan.date || '—'"></dd>
+                </div>
+                <div class="plan-field">
+                  <dt>Duration</dt>
+                  <dd x-text="planDuration + ' min'"></dd>
+                </div>
+              </dl>
+
+              <h3 class="plan-title" x-text="plan.title"></h3>
+              <p class="plan-summary" x-text="plan.summary"></p>
+              <p class="plan-rationale" x-show="plan.rationale" x-text="plan.rationale"></p>
+
+              <table class="interval-table" x-show="plan.steps && plan.steps.length > 0">
+                <thead>
+                  <tr>
+                    <th scope="col">Interval</th>
+                    <th scope="col">Duration</th>
+                    <th scope="col">Target</th>
+                    <th scope="col">Cadence</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <template x-for="(step, index) in plan.steps" :key="index">
+                    <tr>
+                      <td x-text="step.label"></td>
+                      <td x-text="step.duration_minutes + ' min'"></td>
+                      <td
+                        x-text="
+                          step.target_power_watts
+                            ? step.target_power_watts + ' W'
+                            : step.target_power_pct
+                              ? step.target_power_pct + ' %'
+                              : '—'
+                        "
+                      ></td>
+                      <td x-text="step.cadence_rpm ? step.cadence_rpm + ' rpm' : '—'"></td>
+                    </tr>
+                  </template>
+                </tbody>
+              </table>
+
+              <div class="plan-actions">
+                <button
+                  class="button"
+                  type="button"
+                  @click="approvePlan()"
+                  :disabled="approval.state === 'submitting' || approval.state === 'approved'"
+                >
+                  Approve &amp; Push
+                </button>
+                <button class="button button--ghost" type="button" @click="rejectPlan()">
+                  Reject
+                </button>
+              </div>
+
+              <p
+                class="approval-note"
+                :class="{ 'approval-note--error': approval.state === 'error' }"
+                x-show="approval.message"
+                x-text="approval.message"
+              ></p>
+            </div>
+          </template>
+        </aside>
+      </main>
+
+      <footer class="footer">
         <span>FastAPI · Python 3.12</span>
+        <span>Alpine.js · self-hosted</span>
         <span>Data stays on VIDAR</span>
       </footer>
-    </main>
+    </div>
   </body>
 </html>

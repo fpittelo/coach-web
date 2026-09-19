@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     GITHUB_REPO: str = "fpittelo/coach"
     """Repository containing training plan issues."""
 
+    GITHUB_PLAN_BRANCH: str = "main"
+    """Branch receiving approved Markdown training plans."""
+
+    GITHUB_PLAN_DIR: str = "plans"
+    """Directory inside the repository holding approved Markdown plans."""
+
     OPENROUTER_API_KEY: str = ""
     """OpenRouter API key (env var only; never logged or persisted)."""
 
