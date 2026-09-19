@@ -4,19 +4,16 @@ from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic_settings import SettingsConfigDict
 
 from coach_web.config import Settings, get_settings
 from coach_web.models import ReadinessMetrics, TrainingPlan
 
 
 @pytest.fixture(autouse=True)
-def _isolate_settings_cache() -> Iterator[None]:
-    """Clear the ``get_settings`` singleton around every test.
-
-    ``get_settings`` is ``lru_cache``d, so settings built by one test (for
-    example via the ``settings`` fixture) would otherwise leak into unrelated
-    tests that call ``create_app()`` without explicit settings.
-    """
+def _isolate_settings_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Clear the ``get_settings`` singleton and disable .env loading during tests."""
+    monkeypatch.setattr(Settings, "model_config", SettingsConfigDict(extra="ignore"))
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

@@ -45,19 +45,24 @@ class MCPClient:
         """Establish an MCP connection using the transport implied by the URL."""
         try:
             if self._use_sse():
-                headers = (
-                    {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else None
-                )
-                self._transport = sse_client(self.url, headers=headers)
+                if self.auth_token:
+                    self._transport = sse_client(
+                        self.url,
+                        headers={"Authorization": f"Bearer {self.auth_token}"},
+                    )
+                else:
+                    self._transport = sse_client(self.url)
             else:
-                headers = (
-                    {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else None
-                )
-                self._http_client = httpx.AsyncClient(headers=headers)
-                self._transport = streamable_http_client(
-                    self.url,
-                    http_client=self._http_client,  # type: ignore[arg-type]
-                )
+                if self.auth_token:
+                    self._http_client = httpx.AsyncClient(
+                        headers={"Authorization": f"Bearer {self.auth_token}"}
+                    )
+                    self._transport = streamable_http_client(
+                        self.url,
+                        http_client=self._http_client,  # type: ignore[arg-type]
+                    )
+                else:
+                    self._transport = streamable_http_client(self.url)
             read_stream, write_stream = await self._transport.__aenter__()
             self._session = ClientSession(read_stream, write_stream)
             await self._session.__aenter__()
