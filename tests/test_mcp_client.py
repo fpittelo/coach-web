@@ -3,6 +3,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from mcp.types import Tool
 
 from coach_web.mcp_client import MCPClient, MCPConnectionError
 from coach_web.models import AthleteProfile, FitnessTrend, ReadinessMetrics
@@ -114,6 +115,44 @@ class TestMCPClient:
 
             with pytest.raises(MCPConnectionError):
                 await client.connect()
+
+
+class TestListTools:
+    """MCP client list_tools behaviour."""
+
+    async def test_list_tools_returns_tools(self) -> None:
+        """list_tools returns the tools advertised by the session."""
+        tool = Tool(
+            name="intervals_get_readiness_dashboard",
+            description="Readiness",
+            input_schema={"type": "object", "properties": {}},
+        )
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(return_value=MagicMock(tools=[tool]))
+        mock_streams = (MagicMock(), MagicMock())
+
+        with patch(
+            "coach_web.mcp_client.streamable_http_client",
+            return_value=_mock_transport(mock_streams),
+        ):
+            with patch(
+                "coach_web.mcp_client.ClientSession",
+                return_value=mock_session,
+            ):
+                client = MCPClient("http://mcp.local/mcp")
+                await client.connect()
+                tools = await client.list_tools()
+
+        assert len(tools) == 1
+        assert tools[0].name == "intervals_get_readiness_dashboard"
+
+    async def test_list_tools_requires_connection(self) -> None:
+        """list_tools raises MCPConnectionError when not connected."""
+        client = MCPClient("http://mcp.local/mcp")
+
+        with pytest.raises(MCPConnectionError):
+            await client.list_tools()
 
 
 class TestGetFitnessSummary:
