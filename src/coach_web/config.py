@@ -27,6 +27,27 @@ class Settings(BaseSettings):
     GITHUB_REPO: str = "fpittelo/coach"
     """Repository containing training plan issues."""
 
+    OPENROUTER_API_KEY: str = ""
+    """OpenRouter API key (env var only; never logged or persisted)."""
+
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    """OpenRouter API base URL."""
+
+    OPENROUTER_MODEL: str = "anthropic/claude-3.5-sonnet"
+    """Default model routed through OpenRouter for the coach agent."""
+
+    OPENROUTER_TIMEOUT_SECONDS: float = 60.0
+    """Timeout for a single OpenRouter completion request."""
+
+    OPENROUTER_APP_TITLE: str = "Coach Web"
+    """X-Title attribution header sent to OpenRouter."""
+
+    OPENROUTER_REFERER: str = "https://github.com/fpittelo/coach-web"
+    """HTTP-Referer attribution header sent to OpenRouter."""
+
+    AGENT_MAX_TOOL_ITERATIONS: int = 8
+    """Hard cap on agent tool-calling iterations per user turn."""
+
     CACHE_TTL_SECONDS: int = 60
     """Default cache TTL for fetched data."""
 
