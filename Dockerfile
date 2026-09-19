@@ -1,4 +1,4 @@
-# Multi-stage build for Coach Web — Streamlit dashboard
+# Multi-stage build for Coach Web — FastAPI application
 # Non-root execution (UID 10001), same hardening as Coach MCP server
 
 FROM python:3.12-slim AS builder
@@ -6,9 +6,6 @@ FROM python:3.12-slim AS builder
 WORKDIR /app
 
 COPY pyproject.toml README.md ./
-
-RUN pip install --no-cache-dir .
-
 COPY src/ ./src/
 
 RUN pip install --no-cache-dir .
@@ -31,9 +28,9 @@ RUN chown -R coach-web:coach-web /app
 
 USER coach-web
 
-EXPOSE 8501
+EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:8501/_stcore/health || exit 1
+    CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8080/health', timeout=5).status == 200 else 1)"
 
-ENTRYPOINT ["streamlit", "run", "src/coach_web/app.py", "--server.port", "8501", "--server.address", "0.0.0.0"]
+ENTRYPOINT ["uvicorn", "coach_web.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]

@@ -1,36 +1,111 @@
-"""Streamlit entry point for Coach Web."""
+"""FastAPI application factory for Coach Web."""
 
-import streamlit as st
+import logging
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 
-from coach_web.chat import render_chat
-from coach_web.dashboard import render_dashboard
-from coach_web.fonts import inject_fonts
-from coach_web.plans import render_plans
-from coach_web.styles import inject_styles
+import uvicorn
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from coach_web.config import Settings, get_settings
+
+logger = logging.getLogger("coach_web")
+
+STATIC_DIR = Path(__file__).parent / "static"
+SERVICE_NAME = "coach-web"
+PACKAGE_NAME = "coach-web"
+FALLBACK_VERSION = "0.0.0"
 
 
-def main() -> None:
-    """Run the Coach Web Streamlit application."""
-    st.set_page_config(
-        page_title="Coach Web",
-        page_icon=None,
-        layout="wide",
+def resolve_version() -> str:
+    """Return the installed package version, falling back for bare source checkouts."""
+    try:
+        return version(PACKAGE_NAME)
+    except PackageNotFoundError:
+        return FALLBACK_VERSION
+
+
+class HealthResponse(BaseModel):
+    """Healthcheck payload returned by ``/health`` and ``/healthz``."""
+
+    status: str
+    service: str
+    version: str
+    uptime_seconds: float
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Manage application startup and shutdown."""
+    settings: Settings = app.state.settings
+    app.state.started_at = time.monotonic()
+    logger.info(
+        "Starting %s v%s on %s:%s",
+        SERVICE_NAME,
+        app.version,
+        settings.APP_HOST,
+        settings.APP_PORT,
+    )
+    yield
+    logger.info("Stopping %s", SERVICE_NAME)
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    """Create and configure the Coach Web FastAPI application."""
+    resolved = settings or get_settings()
+
+    application = FastAPI(
+        title="Coach Web",
+        version=resolve_version(),
+        lifespan=lifespan,
+    )
+    application.state.settings = resolved
+    application.state.started_at = time.monotonic()
+
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=resolved.CORS_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
-    inject_fonts()
-    inject_styles()
+    application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-    dashboard_tab, plans_tab, chat_tab = st.tabs(["Dashboard", "Plans", "Chat"])
+    @application.get("/", include_in_schema=False)
+    async def index() -> FileResponse:
+        """Serve the single-page interface."""
+        return FileResponse(STATIC_DIR / "index.html")
 
-    with dashboard_tab:
-        render_dashboard()
+    @application.get("/health", response_model=HealthResponse, tags=["ops"])
+    @application.get("/healthz", response_model=HealthResponse, include_in_schema=False)
+    async def health(request: Request) -> HealthResponse:
+        """Report service liveness and uptime."""
+        started_at: float = getattr(request.app.state, "started_at", time.monotonic())
+        return HealthResponse(
+            status="healthy",
+            service=SERVICE_NAME,
+            version=request.app.version,
+            uptime_seconds=round(time.monotonic() - started_at, 3),
+        )
 
-    with plans_tab:
-        render_plans()
-
-    with chat_tab:
-        render_chat()
+    return application
 
 
-if __name__ == "__main__":
-    main()
+def run() -> None:
+    """Run the Coach Web ASGI application with uvicorn."""
+    settings = get_settings()
+    uvicorn.run(
+        "coach_web.app:create_app",
+        factory=True,
+        host=settings.APP_HOST,
+        port=settings.APP_PORT,
+        log_level=settings.LOG_LEVEL.lower(),
+    )

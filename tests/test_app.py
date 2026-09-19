@@ -1,96 +1,147 @@
-"""Smoke tests for coach_web.app."""
+"""Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
 from unittest.mock import MagicMock, patch
 
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-class TestMain:
-    """Smoke tests for the Streamlit app entry point."""
+from coach_web.app import STATIC_DIR, create_app
 
-    @patch("coach_web.app.inject_fonts")
-    @patch("coach_web.app.render_chat")
-    @patch("coach_web.app.render_plans")
-    @patch("coach_web.app.render_dashboard")
-    @patch("coach_web.app.st")
-    def test_main_initializes_page_config(
-        self,
-        mock_st: MagicMock,
-        mock_render_dashboard: MagicMock,
-        mock_render_plans: MagicMock,
-        mock_render_chat: MagicMock,
-        mock_inject_fonts: MagicMock,
-    ) -> None:
-        """main() calls st.set_page_config with correct title, icon, and layout."""
-        mock_tabs: list[MagicMock] = [MagicMock(), MagicMock(), MagicMock()]
-        mock_st.tabs.return_value = mock_tabs
 
-        from coach_web.app import main
+class TestCreateApp:
+    """Application factory behaviour."""
 
-        main()
+    def test_returns_fastapi_instance(self) -> None:
+        """create_app() returns a configured FastAPI application."""
+        app = create_app()
 
-        mock_st.set_page_config.assert_called_once_with(
-            page_title="Coach Web",
-            page_icon=None,
-            layout="wide",
-        )
-        mock_inject_fonts.assert_called_once()
-        mock_render_dashboard.assert_called_once()
-        mock_render_plans.assert_called_once()
-        mock_render_chat.assert_called_once()
+        assert isinstance(app, FastAPI)
 
-    @patch("coach_web.app.inject_fonts")
-    @patch("coach_web.app.render_chat")
-    @patch("coach_web.app.render_plans")
-    @patch("coach_web.app.render_dashboard")
-    @patch("coach_web.app.st")
-    def test_main_creates_three_tabs(
-        self,
-        mock_st: MagicMock,
-        mock_render_dashboard: MagicMock,
-        mock_render_plans: MagicMock,
-        mock_render_chat: MagicMock,
-        mock_inject_fonts: MagicMock,
-    ) -> None:
-        """main() calls st.tabs with the three expected tab labels."""
-        mock_tabs: list[MagicMock] = [MagicMock(), MagicMock(), MagicMock()]
-        mock_st.tabs.return_value = mock_tabs
+    def test_sets_application_metadata(self) -> None:
+        """The application exposes the Coach Web title and a resolved version."""
+        app = create_app()
 
-        from coach_web.app import main
+        assert app.title == "Coach Web"
+        assert app.version
+        assert app.version != "0.0.0"
 
-        main()
+    def test_mounts_static_directory(self) -> None:
+        """Static assets are mounted under /static."""
+        app = create_app()
 
-        mock_inject_fonts.assert_called_once()
-        mock_st.tabs.assert_called_once_with(["Dashboard", "Plans", "Chat"])
+        mounted_paths = {getattr(route, "path", None) for route in app.routes}
 
-    @patch("coach_web.app.inject_fonts")
-    @patch("coach_web.app.render_chat")
-    @patch("coach_web.app.render_plans")
-    @patch("coach_web.app.render_dashboard")
-    @patch("coach_web.app.st")
-    def test_main_renders_each_tab_in_context(
-        self,
-        mock_st: MagicMock,
-        mock_render_dashboard: MagicMock,
-        mock_render_plans: MagicMock,
-        mock_render_chat: MagicMock,
-        mock_inject_fonts: MagicMock,
-    ) -> None:
-        """main() renders dashboard, plans, and chat inside their tab contexts."""
-        dashboard_tab = MagicMock()
-        plans_tab = MagicMock()
-        chat_tab = MagicMock()
-        mock_st.tabs.return_value = [dashboard_tab, plans_tab, chat_tab]
+        assert "/static" in mounted_paths
 
-        from coach_web.app import main
+    def test_registers_health_routes(self) -> None:
+        """Both /health and the /healthz alias are registered."""
+        app = create_app()
 
-        main()
+        registered_paths = {getattr(route, "path", None) for route in app.routes}
 
-        mock_inject_fonts.assert_called_once()
-        dashboard_tab.__enter__.assert_called_once()
-        plans_tab.__enter__.assert_called_once()
-        chat_tab.__enter__.assert_called_once()
-        dashboard_tab.__exit__.assert_called_once()
-        plans_tab.__exit__.assert_called_once()
-        chat_tab.__exit__.assert_called_once()
-        mock_render_dashboard.assert_called_once()
-        mock_render_plans.assert_called_once()
-        mock_render_chat.assert_called_once()
+        assert "/health" in registered_paths
+        assert "/healthz" in registered_paths
+
+    def test_index_html_is_present_in_static_dir(self) -> None:
+        """The Swiss minimalist placeholder index.html ships with the package."""
+        index = STATIC_DIR / "index.html"
+
+        assert index.is_file()
+        assert "Coach Web" in index.read_text(encoding="utf-8")
+
+    def test_cors_middleware_allows_configured_origin(self) -> None:
+        """CORS middleware echoes the configured origin."""
+        with TestClient(create_app()) as client:
+            response = client.get("/health", headers={"Origin": "http://localhost:8080"})
+
+        assert response.headers.get("access-control-allow-origin") == "http://localhost:8080"
+
+
+class TestHealthEndpoint:
+    """Healthcheck contract."""
+
+    def test_health_returns_healthy_payload(self) -> None:
+        """GET /health returns the canonical status payload."""
+        with TestClient(create_app()) as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["status"] == "healthy"
+        assert payload["service"] == "coach-web"
+        assert payload["version"]
+        assert payload["uptime_seconds"] >= 0
+
+    def test_healthz_alias_matches_health(self) -> None:
+        """GET /healthz is an alias of GET /health."""
+        with TestClient(create_app()) as client:
+            health = client.get("/health")
+            healthz = client.get("/healthz")
+
+        assert healthz.status_code == 200
+        health_payload = health.json()
+        healthz_payload = healthz.json()
+        assert healthz_payload["status"] == health_payload["status"]
+        assert healthz_payload["service"] == health_payload["service"]
+        assert healthz_payload["version"] == health_payload["version"]
+
+
+class TestStaticServing:
+    """Static asset serving."""
+
+    def test_root_serves_index_html(self) -> None:
+        """GET / serves the single-page interface."""
+        with TestClient(create_app()) as client:
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+        assert "Coach Web" in response.text
+
+    def test_static_mount_serves_index_html(self) -> None:
+        """GET /static/index.html serves the same placeholder."""
+        with TestClient(create_app()) as client:
+            response = client.get("/static/index.html")
+
+        assert response.status_code == 200
+        assert "Coach Web" in response.text
+
+
+class TestLifespan:
+    """Lifespan startup/shutdown handling."""
+
+    def test_lifespan_populates_application_state(self) -> None:
+        """Startup exposes resolved settings and a monotonic start timestamp."""
+        app = create_app()
+
+        with TestClient(app):
+            assert app.state.settings is not None
+            assert app.state.settings.service_name == "coach-web"
+            assert app.state.started_at > 0
+
+    def test_lifespan_shutdown_is_clean(self) -> None:
+        """The context manager exits without raising."""
+        app = create_app()
+
+        with TestClient(app) as client:
+            assert client.get("/health").status_code == 200
+
+
+class TestRun:
+    """CLI entrypoint."""
+
+    @patch("coach_web.app.uvicorn")
+    def test_run_invokes_uvicorn_factory(self, mock_uvicorn: MagicMock) -> None:
+        """run() boots uvicorn against the application factory."""
+        from coach_web.app import run
+        from coach_web.config import get_settings
+
+        get_settings.cache_clear()
+        run()
+
+        mock_uvicorn.run.assert_called_once()
+        args, kwargs = mock_uvicorn.run.call_args
+        assert args[0] == "coach_web.app:create_app"
+        assert kwargs["factory"] is True
+        assert kwargs["host"] == "0.0.0.0"  # noqa: S104
+        assert kwargs["port"] == 8080

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>Coach Web</title>
+    <style>
+      :root {
+        --ink: #111111;
+        --muted: #6b6b6b;
+        --paper: #ffffff;
+        --line: #e2e2e2;
+        --accent: #ff0000;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: var(--paper);
+        color: var(--ink);
+        font-family: "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-weight: 400;
+        line-height: 1.4;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      main {
+        width: min(760px, 90vw);
+        padding: 4rem 0;
+      }
+
+      .rule {
+        height: 2px;
+        background: var(--accent);
+        margin-bottom: 2.5rem;
+      }
+
+      .kicker {
+        font-size: 0.75rem;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+        color: var(--muted);
+        margin: 0 0 1rem;
+      }
+
+      h1 {
+        font-size: clamp(2.5rem, 7vw, 4.5rem);
+        font-weight: 700;
+        letter-spacing: -0.03em;
+        margin: 0 0 1.5rem;
+      }
+
+      p {
+        font-size: 1.05rem;
+        max-width: 52ch;
+        color: var(--ink);
+        margin: 0 0 2.5rem;
+      }
+
+      footer {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 2rem;
+        border-top: 1px solid var(--line);
+        padding-top: 1.5rem;
+        font-size: 0.8rem;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <div class="rule"></div>
+      <p class="kicker">Endurance Cockpit · Local VIDAR</p>
+      <h1>Coach Web</h1>
+      <p>
+        The FastAPI core is online. The Swiss minimalist interface, agent chat console and
+        weekly training plans will be mounted here in the upcoming Phase&nbsp;1 iterations.
+      </p>
+      <footer>
+        <span>Status: scaffold</span>
+        <span>FastAPI · Python 3.12</span>
+        <span>Data stays on VIDAR</span>
+      </footer>
+    </main>
+  </body>
+</html>
