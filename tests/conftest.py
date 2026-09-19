@@ -1,11 +1,25 @@
 """Shared pytest fixtures for coach-web tests."""
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from coach_web.config import Settings, get_settings
 from coach_web.models import ReadinessMetrics, TrainingPlan
+
+
+@pytest.fixture(autouse=True)
+def _isolate_settings_cache() -> Iterator[None]:
+    """Clear the ``get_settings`` singleton around every test.
+
+    ``get_settings`` is ``lru_cache``d, so settings built by one test (for
+    example via the ``settings`` fixture) would otherwise leak into unrelated
+    tests that call ``create_app()`` without explicit settings.
+    """
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture

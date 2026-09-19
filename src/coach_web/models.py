@@ -68,3 +68,55 @@ class ChatMessage(BaseModel):
 
     role: Literal["user", "assistant"] = Field(..., description="Message role: user or assistant")
     content: str = Field(..., description="Message content")
+
+
+class WorkoutStep(BaseModel):
+    """A single structured workout step within a plan proposal."""
+
+    label: str = Field(..., description="Human-readable step label (e.g. 'Threshold')")
+    duration_minutes: float = Field(..., gt=0, description="Step duration in minutes")
+    target_power_pct: float | None = Field(
+        default=None,
+        ge=0,
+        le=250,
+        description="Target power as a percentage of FTP",
+    )
+    target_power_watts: int | None = Field(
+        default=None,
+        ge=0,
+        description="Explicit target power in watts",
+    )
+    cadence_rpm: int | None = Field(
+        default=None,
+        ge=0,
+        le=200,
+        description="Target cadence in revolutions per minute",
+    )
+    description: str | None = Field(default=None, description="Free-form step instructions")
+
+
+class PlanProposal(BaseModel):
+    """A structured workout plan awaiting athlete approval.
+
+    Emitted by the agent as a JSON SSE event so the UI can render an approval
+    card. Every proposal is validated before it leaves the agent loop.
+    """
+
+    title: str = Field(..., description="Plan title")
+    week_id: str = Field(..., description="ISO week identifier (YYYY-WNN)")
+    summary: str = Field(..., description="One-paragraph plan summary")
+    rationale: str | None = Field(
+        default=None,
+        description="Why this plan is proposed, based on athlete data",
+    )
+    steps: list[WorkoutStep] = Field(
+        default_factory=list,
+        description="Ordered workout steps",
+    )
+
+    @field_validator("week_id")
+    @classmethod
+    def _validate_week_id(cls, value: str) -> str:
+        if not re.match(_WEEK_ID_PATTERN, value):
+            raise ValueError(f"week_id must match ISO week pattern {_WEEK_ID_PATTERN!r}")
+        return value

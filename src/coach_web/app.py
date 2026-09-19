@@ -8,12 +8,14 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from sse_starlette import EventSourceResponse, ServerSentEvent
 
+from coach_web.agent import AgentEvent, CoachAgent, create_agent
 from coach_web.config import Settings, get_settings
 
 logger = logging.getLogger("coach_web")
@@ -68,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     application.state.settings = resolved
     application.state.started_at = time.monotonic()
+    application.state.agent_factory = create_agent
 
     application.add_middleware(
         CORSMiddleware,
@@ -95,6 +98,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             version=request.app.version,
             uptime_seconds=round(time.monotonic() - started_at, 3),
         )
+
+    @application.get("/api/agent/stream", tags=["agent"])
+    @application.get("/api/chat/stream", include_in_schema=False)
+    async def agent_stream(
+        request: Request,
+        message: str = Query(..., min_length=1, description="User message for the coach agent"),
+    ) -> EventSourceResponse:
+        """Stream the coach agent's reasoning, tool calls and plan over SSE.
+
+        Native ``EventSource`` clients consume the typed events emitted by
+        :meth:`coach_web.agent.CoachAgent.run`.
+        """
+        settings: Settings = request.app.state.settings
+        factory = getattr(request.app.state, "agent_factory", create_agent)
+        agent: CoachAgent = factory(settings)
+
+        async def event_generator() -> AsyncIterator[ServerSentEvent]:
+            try:
+                async with agent:
+                    async for event in agent.run(message):
+                        yield ServerSentEvent(event=event.type, data=event.model_dump_json())
+            except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
+                logger.warning("Agent stream failed: %s", exc)
+                failure = AgentEvent(type="error", data={"message": str(exc)})
+                yield ServerSentEvent(event=failure.type, data=failure.model_dump_json())
+
+        return EventSourceResponse(event_generator())
 
     return application
 
