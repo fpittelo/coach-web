@@ -52,9 +52,9 @@ class TestCreateApp:
     def test_cors_middleware_allows_configured_origin(self) -> None:
         """CORS middleware echoes the configured origin."""
         with TestClient(create_app()) as client:
-            response = client.get("/health", headers={"Origin": "http://localhost:8080"})
+            response = client.get("/health", headers={"Origin": "http://localhost:8000"})
 
-        assert response.headers.get("access-control-allow-origin") == "http://localhost:8080"
+        assert response.headers.get("access-control-allow-origin") == "http://localhost:8000"
 
 
 class TestHealthEndpoint:
@@ -144,4 +144,4 @@ class TestRun:
         assert args[0] == "coach_web.app:create_app"
         assert kwargs["factory"] is True
         assert kwargs["host"] == "0.0.0.0"  # noqa: S104
-        assert kwargs["port"] == 8080
+        assert kwargs["port"] == 8000
