@@ -5,6 +5,18 @@
  * User data is only ever bound with x-text; no raw HTML is injected.
  */
 
+function parsePayload(event) {
+  try {
+    const raw = typeof event === "string" ? JSON.parse(event) : JSON.parse(event.data);
+    if (raw && typeof raw.data === "object" && raw.data !== null) {
+      return raw.data;
+    }
+    return raw || {};
+  } catch (err) {
+    return {};
+  }
+}
+
 function coachApp() {
   return {
     messages: [],
@@ -57,21 +69,27 @@ function coachApp() {
       this.source = source;
 
       source.addEventListener("status", (event) => {
-        const data = JSON.parse(event.data);
-        this.statusText = data.phase === "thinking" ? "Thinking" : data.phase;
+        const data = parsePayload(event);
+        this.statusText = data.phase === "thinking" ? "Thinking" : (data.phase || "");
       });
 
       source.addEventListener("thought", (event) => {
-        this.thoughts.push(JSON.parse(event.data).text);
+        const data = parsePayload(event);
+        if (data.text) {
+          this.thoughts.push(data.text);
+        }
       });
 
       source.addEventListener("token", (event) => {
-        this.messages[index].content += JSON.parse(event.data).text;
-        this.scrollToBottom();
+        const data = parsePayload(event);
+        if (data.text) {
+          this.messages[index].content += data.text;
+          this.scrollToBottom();
+        }
       });
 
       source.addEventListener("tool_call", (event) => {
-        const data = JSON.parse(event.data);
+        const data = parsePayload(event);
         this.tools.push({
           id: data.id,
           name: data.name,
@@ -80,7 +98,7 @@ function coachApp() {
       });
 
       source.addEventListener("tool_start", (event) => {
-        const data = JSON.parse(event.data);
+        const data = parsePayload(event);
         const tool = this.tools.find((item) => item.id === data.id);
         if (tool) {
           tool.state = "running";
@@ -88,7 +106,7 @@ function coachApp() {
       });
 
       source.addEventListener("tool_result", (event) => {
-        const data = JSON.parse(event.data);
+        const data = parsePayload(event);
         const tool = this.tools.find((item) => item.id === data.id);
         if (tool) {
           tool.state = "done";
@@ -96,28 +114,28 @@ function coachApp() {
       });
 
       source.addEventListener("plan_proposal", (event) => {
-        this.plan = JSON.parse(event.data).plan;
+        const data = parsePayload(event);
+        this.plan = data.plan || data;
       });
 
       source.addEventListener("plan", (event) => {
-        this.plan = JSON.parse(event.data).plan;
+        const data = parsePayload(event);
+        this.plan = data.plan || data;
       });
 
       source.addEventListener("error", (event) => {
-        if (event.data) {
-          try {
-            const err = JSON.parse(event.data);
-            this.statusText = err.message || "Error";
-            if (!this.messages[index].content) {
-              this.messages[index].content = "⚠️ " + this.statusText;
-            }
-          } catch (error) {
-            this.statusText = "Error";
-          }
+        const data = parsePayload(event);
+        this.statusText = data.message || "Error";
+        if (!this.messages[index].content) {
+          this.messages[index].content = "⚠️ " + this.statusText;
         }
       });
 
-      source.addEventListener("done", () => {
+      source.addEventListener("done", (event) => {
+        const data = parsePayload(event);
+        if (!this.messages[index].content && data.message) {
+          this.messages[index].content = data.message;
+        }
         this.finishStream();
       });
 
