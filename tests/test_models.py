@@ -8,6 +8,7 @@ from coach_web.models import (
     ChatMessage,
     FitnessTrend,
     FitnessTrendPoint,
+    PlanProposal,
     ReadinessMetrics,
     TrainingPlan,
 )
@@ -196,3 +197,44 @@ class TestAthleteProfile:
                 max_hr=185,
                 resting_hr=48,
             )
+
+
+class TestPlanProposalDate:
+    """PlanProposal scheduled-date validation."""
+
+    def _payload(self, **overrides: object) -> dict[str, object]:
+        """Build a minimal valid plan payload with optional overrides."""
+        payload: dict[str, object] = {
+            "title": "Threshold Builder",
+            "week_id": "2026-W38",
+            "summary": "Three by twelve minutes at threshold.",
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_date_defaults_to_none(self) -> None:
+        """A proposal without a date leaves the field unset."""
+        plan = PlanProposal.model_validate(self._payload())
+
+        assert plan.date is None
+
+    def test_accepts_iso_date(self) -> None:
+        """A well-formed ISO date is accepted."""
+        plan = PlanProposal.model_validate(self._payload(date="2026-09-21"))
+
+        assert plan.date == "2026-09-21"
+
+    def test_rejects_malformed_date(self) -> None:
+        """A non-ISO date string is rejected."""
+        with pytest.raises(ValidationError):
+            PlanProposal.model_validate(self._payload(date="21-09-2026"))
+
+    def test_rejects_impossible_calendar_date(self) -> None:
+        """A syntactically valid but impossible date is rejected."""
+        with pytest.raises(ValidationError):
+            PlanProposal.model_validate(self._payload(date="2026-02-30"))
+
+    def test_rejects_impossible_iso_week(self) -> None:
+        """An out-of-range ISO week number is rejected."""
+        with pytest.raises(ValidationError):
+            PlanProposal.model_validate(self._payload(week_id="2026-W99"))

@@ -4,8 +4,11 @@ import json
 from types import TracebackType
 from typing import Any
 
+import httpx
 from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import Tool
 
 from coach_web.models import (
     AthleteProfile,
@@ -20,24 +23,60 @@ class MCPConnectionError(Exception):
 
 
 class MCPClient:
-    """Async client for interacting with a Coach MCP server."""
+    """Async client for interacting with an MCP server.
 
-    def __init__(self, url: str) -> None:
-        """Store the MCP server URL."""
+    Chooses between the legacy SSE transport (URLs ending in ``/sse``) and the
+    streamable HTTP transport based on the provided URL.
+    """
+
+    def __init__(self, url: str, auth_token: str | None = None) -> None:
+        """Store the MCP server URL and optional auth token."""
         self.url = url
+        self.auth_token = auth_token
         self._session: ClientSession | None = None
         self._transport: Any | None = None
+        self._http_client: httpx.AsyncClient | None = None
+
+    def _use_sse(self) -> bool:
+        """Return True when the URL targets a legacy SSE endpoint."""
+        return self.url.rstrip("/").endswith("/sse")
 
     async def connect(self) -> None:
-        """Establish a streamable_http connection to the MCP server."""
+        """Establish an MCP connection using the transport implied by the URL."""
         try:
-            self._transport = streamable_http_client(self.url)
+            if self._use_sse():
+                if self.auth_token:
+                    self._transport = sse_client(
+                        self.url,
+                        headers={"Authorization": f"Bearer {self.auth_token}"},
+                    )
+                else:
+                    self._transport = sse_client(self.url)
+            else:
+                if self.auth_token:
+                    self._http_client = httpx.AsyncClient(
+                        headers={"Authorization": f"Bearer {self.auth_token}"}
+                    )
+                    self._transport = streamable_http_client(
+                        self.url,
+                        http_client=self._http_client,  # type: ignore[arg-type]
+                    )
+                else:
+                    self._transport = streamable_http_client(self.url)
             read_stream, write_stream = await self._transport.__aenter__()
             self._session = ClientSession(read_stream, write_stream)
+            await self._session.__aenter__()
             await self._session.initialize()
         except Exception as exc:
             await self.close()
             raise MCPConnectionError(f"Failed to connect to MCP server at {self.url}") from exc
+
+    async def list_tools(self) -> list[Tool]:
+        """List the tools exposed by the MCP server."""
+        if self._session is None:
+            raise MCPConnectionError("MCP client is not connected")
+        result = await self._session.list_tools()
+        return list(result.tools)
 
     async def call_tool(
         self,
@@ -50,11 +89,16 @@ class MCPClient:
         return await self._session.call_tool(tool_name, arguments)
 
     async def close(self) -> None:
-        """Close the MCP transport."""
+        """Close the MCP session and transport."""
+        if self._session is not None:
+            await self._session.__aexit__(None, None, None)
+            self._session = None
         if self._transport is not None:
             await self._transport.__aexit__(None, None, None)
             self._transport = None
-        self._session = None
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     async def get_readiness_dashboard(self) -> ReadinessMetrics:
         """Fetch readiness metrics from the MCP server."""
