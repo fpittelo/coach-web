@@ -6,6 +6,7 @@ from typing import Any
 
 from mcp.client.session import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.types import Tool
 
 from coach_web.models import (
     AthleteProfile,
@@ -38,6 +39,13 @@ class MCPClient:
         except Exception as exc:
             await self.close()
             raise MCPConnectionError(f"Failed to connect to MCP server at {self.url}") from exc
+
+    async def list_tools(self) -> list[Tool]:
+        """List the tools exposed by the MCP server."""
+        if self._session is None:
+            raise MCPConnectionError("MCP client is not connected")
+        result = await self._session.list_tools()
+        return list(result.tools)
 
     async def call_tool(
         self,

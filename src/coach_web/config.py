@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     COACH_MCP_URL: str = "http://localhost:8000/mcp"
     """Coach MCP server endpoint."""
 
+    GITHUB_MCP_URL: str = "http://localhost:8001/mcp"
+    """GitHub MCP server endpoint."""
+
     GITHUB_TOKEN: str = ""
     """GitHub PAT for training plan issues (empty default for local dev)."""
 
