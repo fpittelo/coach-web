@@ -4,6 +4,7 @@ import json
 from types import TracebackType
 from typing import Any
 
+import httpx
 from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
@@ -28,11 +29,13 @@ class MCPClient:
     streamable HTTP transport based on the provided URL.
     """
 
-    def __init__(self, url: str) -> None:
-        """Store the MCP server URL."""
+    def __init__(self, url: str, auth_token: str | None = None) -> None:
+        """Store the MCP server URL and optional auth token."""
         self.url = url
+        self.auth_token = auth_token
         self._session: ClientSession | None = None
         self._transport: Any | None = None
+        self._http_client: httpx.AsyncClient | None = None
 
     def _use_sse(self) -> bool:
         """Return True when the URL targets a legacy SSE endpoint."""
@@ -42,11 +45,22 @@ class MCPClient:
         """Establish an MCP connection using the transport implied by the URL."""
         try:
             if self._use_sse():
-                self._transport = sse_client(self.url)
+                headers = (
+                    {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else None
+                )
+                self._transport = sse_client(self.url, headers=headers)
             else:
-                self._transport = streamable_http_client(self.url)
+                headers = (
+                    {"Authorization": f"Bearer {self.auth_token}"} if self.auth_token else None
+                )
+                self._http_client = httpx.AsyncClient(headers=headers)
+                self._transport = streamable_http_client(
+                    self.url,
+                    http_client=self._http_client,  # type: ignore[arg-type]
+                )
             read_stream, write_stream = await self._transport.__aenter__()
             self._session = ClientSession(read_stream, write_stream)
+            await self._session.__aenter__()
             await self._session.initialize()
         except Exception as exc:
             await self.close()
@@ -70,11 +84,16 @@ class MCPClient:
         return await self._session.call_tool(tool_name, arguments)
 
     async def close(self) -> None:
-        """Close the MCP transport."""
+        """Close the MCP session and transport."""
+        if self._session is not None:
+            await self._session.__aexit__(None, None, None)
+            self._session = None
         if self._transport is not None:
             await self._transport.__aexit__(None, None, None)
             self._transport = None
-        self._session = None
+        if self._http_client is not None:
+            await self._http_client.aclose()
+            self._http_client = None
 
     async def get_readiness_dashboard(self) -> ReadinessMetrics:
         """Fetch readiness metrics from the MCP server."""

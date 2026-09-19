@@ -45,6 +45,7 @@ class MCPClientHub:
         coach_url: str,
         github_url: str,
         *,
+        github_token: str | None = None,
         call_timeout: float = 30.0,
     ) -> None:
         """Create the hub and its per-server clients."""
@@ -53,7 +54,7 @@ class MCPClientHub:
         self.call_timeout = call_timeout
         self._clients: dict[str, MCPClient] = {
             COACH_SERVER: MCPClient(coach_url),
-            GITHUB_SERVER: MCPClient(github_url),
+            GITHUB_SERVER: MCPClient(github_url, auth_token=github_token),
         }
         self._connected: set[str] = set()
         self._connection_errors: dict[str, str] = {}
@@ -64,7 +65,11 @@ class MCPClientHub:
     @classmethod
     def from_settings(cls, settings: Settings) -> "MCPClientHub":
         """Build a hub from application settings."""
-        return cls(settings.COACH_MCP_URL, settings.GITHUB_MCP_URL)
+        return cls(
+            settings.COACH_MCP_URL,
+            settings.GITHUB_MCP_URL,
+            github_token=settings.GITHUB_TOKEN,
+        )
 
     @property
     def connected_servers(self) -> set[str]:
@@ -105,7 +110,7 @@ class MCPClientHub:
 
     async def close(self) -> None:
         """Close every client session and clear the tool registry."""
-        for name, client in self._clients.items():
+        for name, client in reversed(list(self._clients.items())):
             try:
                 await client.close()
             except Exception as exc:  # noqa: BLE001 - shutdown must never raise

@@ -106,7 +106,11 @@ function coachApp() {
       source.addEventListener("error", (event) => {
         if (event.data) {
           try {
-            this.statusText = JSON.parse(event.data).message;
+            const err = JSON.parse(event.data);
+            this.statusText = err.message || "Error";
+            if (!this.messages[index].content) {
+              this.messages[index].content = "⚠️ " + this.statusText;
+            }
           } catch (error) {
             this.statusText = "Error";
           }
@@ -181,4 +185,13 @@ function coachApp() {
       );
     },
   };
+}
+
+if (typeof document !== "undefined") {
+  document.addEventListener("alpine:init", () => {
+    if (window.Alpine) {
+      window.Alpine.data("coachApp", coachApp);
+    }
+  });
+  window.coachApp = coachApp;
 }

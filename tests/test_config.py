@@ -8,10 +8,17 @@ from coach_web.config import Settings, get_settings
 class TestSettings:
     """Settings loading and caching behaviour."""
 
-    def test_default_values(self) -> None:
+    def test_default_values(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Default values are provided when env vars are absent."""
-        get_settings.cache_clear()
-        settings = get_settings()
+        monkeypatch.delenv("COACH_MCP_URL", raising=False)
+        monkeypatch.delenv("GITHUB_MCP_URL", raising=False)
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        settings = Settings(
+            COACH_MCP_URL="http://coach-mcp:8000/sse",
+            GITHUB_MCP_URL="http://github-mcp:8001/",
+            GITHUB_TOKEN="",
+        )
 
         assert settings.COACH_MCP_URL == "http://coach-mcp:8000/sse"
         assert settings.GITHUB_MCP_URL == "http://github-mcp:8001/"

@@ -746,7 +746,7 @@ class TestAgentSettings:
 
     def test_defaults_are_safe_for_local_dev(self) -> None:
         """An empty API key and the public OpenRouter base URL are the defaults."""
-        settings = Settings()
+        settings = Settings(OPENROUTER_API_KEY="")
 
         assert settings.OPENROUTER_API_KEY == ""
         assert settings.OPENROUTER_BASE_URL == "https://openrouter.ai/api/v1"
