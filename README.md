@@ -19,8 +19,8 @@
 Coach Web is the **interactive frontend** for the [Coach MCP server](https://github.com/fpittelo/coach) — a FastMCP server that exposes the Intervals.icu REST API to LLMs via the Model Context Protocol.
 
 Phase 1 (Local VIDAR Evolution) replaces the legacy Streamlit scaffold with an asynchronous
-FastAPI core that serves a Swiss minimalist single-page interface (Alpine.js + Tailwind CSS)
-and streams the agent pipeline over native Server-Sent Events.
+FastAPI core that serves a Swiss minimalist single-page interface (Alpine.js + self-hosted
+Inter, zero CDN dependencies) and streams the agent pipeline over native Server-Sent Events.
 
 The Phase 1 core delivers:
 
@@ -28,7 +28,9 @@ The Phase 1 core delivers:
 - **`GET /health` / `GET /healthz`** healthchecks (status, service, version, uptime)
 - **Static asset serving** for the Swiss minimalist UI at `/static/`
 - **Pydantic v2 settings** with `.env` loading
-- **Dual MCP client hub**, OpenRouter agent loop and SSE streaming (upcoming issues)
+- **Dual MCP client hub** and OpenRouter agent loop streaming typed SSE events
+- **Chat console** consuming `GET /api/agent/stream` via native `EventSource`
+- **Plan approval card** posting to `POST /api/plan/approve` (Intervals.icu event + GitHub Markdown commit)
 
 ---
 
