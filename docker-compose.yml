@@ -77,7 +77,7 @@ services:
     tmpfs:
       - /tmp:noexec,nosuid,size=64m
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/sse', timeout=5).status == 200 else 1)"]
       interval: 15s
       timeout: 10s
       retries: 5
