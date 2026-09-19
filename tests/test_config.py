@@ -13,14 +13,15 @@ class TestSettings:
         get_settings.cache_clear()
         settings = get_settings()
 
-        assert settings.COACH_MCP_URL == "http://localhost:8000/mcp"
+        assert settings.COACH_MCP_URL == "http://coach-mcp:8000/sse"
+        assert settings.GITHUB_MCP_URL == "http://github-mcp:8001/"
         assert settings.GITHUB_TOKEN == ""
         assert settings.GITHUB_REPO == "fpittelo/coach"
         assert settings.CACHE_TTL_SECONDS == 60
         assert settings.LOG_LEVEL == "INFO"
         assert settings.APP_HOST == "0.0.0.0"  # noqa: S104
-        assert settings.APP_PORT == 8080
-        assert settings.CORS_ORIGINS == ["http://localhost:8080"]
+        assert settings.APP_PORT == 8000
+        assert settings.CORS_ORIGINS == ["http://localhost:8000"]
 
     def test_service_name_is_constant(self) -> None:
         """The service name identifies coach-web in the health payload."""

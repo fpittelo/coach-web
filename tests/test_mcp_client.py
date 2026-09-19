@@ -26,6 +26,43 @@ class TestMCPClient:
 
         assert client.url == "http://mcp.local/mcp"
 
+    def test_sse_url_uses_sse_transport(self) -> None:
+        """URLs ending in /sse select the legacy SSE transport."""
+        client = MCPClient("http://coach-mcp:8000/sse")
+
+        assert client._use_sse() is True
+
+    def test_non_sse_url_uses_streamable_http(self) -> None:
+        """Non-/sse URLs select the streamable HTTP transport."""
+        client = MCPClient("http://github-mcp:8001/")
+
+        assert client._use_sse() is False
+
+    async def test_connect_uses_sse_client_for_sse_url(self) -> None:
+        """connect uses sse_client when the URL ends in /sse."""
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_streams = (MagicMock(), MagicMock())
+        mock_transport = _mock_transport(mock_streams)
+
+        with patch(
+            "coach_web.mcp_client.sse_client",
+            return_value=mock_transport,
+        ) as mock_sse:
+            with patch(
+                "coach_web.mcp_client.streamable_http_client",
+            ) as mock_http:
+                with patch(
+                    "coach_web.mcp_client.ClientSession",
+                    return_value=mock_session,
+                ):
+                    client = MCPClient("http://coach-mcp:8000/sse")
+                    await client.connect()
+
+        mock_sse.assert_called_once_with("http://coach-mcp:8000/sse")
+        mock_http.assert_not_called()
+        mock_session.initialize.assert_awaited_once()
+
     async def test_connect_and_call_tool(self) -> None:
         """connect establishes a session and call_tool invokes it."""
         mock_session = MagicMock()

@@ -15,11 +15,11 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    COACH_MCP_URL: str = "http://localhost:8000/mcp"
-    """Coach MCP server endpoint."""
+    COACH_MCP_URL: str = "http://coach-mcp:8000/sse"
+    """Coach MCP server endpoint (Docker service discovery on coach-net)."""
 
-    GITHUB_MCP_URL: str = "http://localhost:8001/mcp"
-    """GitHub MCP server endpoint."""
+    GITHUB_MCP_URL: str = "http://github-mcp:8001/"
+    """GitHub MCP server endpoint (streamable HTTP on coach-net)."""
 
     GITHUB_TOKEN: str = ""
     """GitHub PAT for training plan issues (empty default for local dev)."""
@@ -63,10 +63,10 @@ class Settings(BaseSettings):
     APP_HOST: str = "0.0.0.0"
     """Host the ASGI server binds to."""
 
-    APP_PORT: int = 8080
+    APP_PORT: int = 8000
     """Port the ASGI server binds to."""
 
-    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:8080"])
+    CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     """Allowed browser origins for cross-origin requests."""
 
     @property

@@ -5,6 +5,7 @@ from types import TracebackType
 from typing import Any
 
 from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.types import Tool
 
@@ -21,7 +22,11 @@ class MCPConnectionError(Exception):
 
 
 class MCPClient:
-    """Async client for interacting with a Coach MCP server."""
+    """Async client for interacting with an MCP server.
+
+    Chooses between the legacy SSE transport (URLs ending in ``/sse``) and the
+    streamable HTTP transport based on the provided URL.
+    """
 
     def __init__(self, url: str) -> None:
         """Store the MCP server URL."""
@@ -29,10 +34,17 @@ class MCPClient:
         self._session: ClientSession | None = None
         self._transport: Any | None = None
 
+    def _use_sse(self) -> bool:
+        """Return True when the URL targets a legacy SSE endpoint."""
+        return self.url.rstrip("/").endswith("/sse")
+
     async def connect(self) -> None:
-        """Establish a streamable_http connection to the MCP server."""
+        """Establish an MCP connection using the transport implied by the URL."""
         try:
-            self._transport = streamable_http_client(self.url)
+            if self._use_sse():
+                self._transport = sse_client(self.url)
+            else:
+                self._transport = streamable_http_client(self.url)
             read_stream, write_stream = await self._transport.__aenter__()
             self._session = ClientSession(read_stream, write_stream)
             await self._session.initialize()
