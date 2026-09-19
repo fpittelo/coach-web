@@ -1,11 +1,22 @@
 """Shared pytest fixtures for coach-web tests."""
 
+from collections.abc import Iterator
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from pydantic_settings import SettingsConfigDict
 
 from coach_web.config import Settings, get_settings
 from coach_web.models import ReadinessMetrics, TrainingPlan
+
+
+@pytest.fixture(autouse=True)
+def _isolate_settings_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Clear the ``get_settings`` singleton and disable .env loading during tests."""
+    monkeypatch.setattr(Settings, "model_config", SettingsConfigDict(extra="ignore"))
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
 
 
 @pytest.fixture
@@ -14,10 +25,11 @@ def settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
     monkeypatch.setenv("COACH_MCP_URL", "http://test-mcp.local/mcp")
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setenv("GITHUB_REPO", "fpittelo/coach")
-    monkeypatch.setenv("STREAMLIT_SERVER_PORT", "8501")
-    monkeypatch.setenv("STREAMLIT_SERVER_ADDRESS", "127.0.0.1")
     monkeypatch.setenv("CACHE_TTL_SECONDS", "30")
     monkeypatch.setenv("LOG_LEVEL", "DEBUG")
+    monkeypatch.setenv("APP_HOST", "127.0.0.1")
+    monkeypatch.setenv("APP_PORT", "8080")
+    monkeypatch.setenv("CORS_ORIGINS", '["http://test.local"]')
     get_settings.cache_clear()
     return get_settings()
 

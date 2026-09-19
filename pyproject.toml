@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "coach-web"
 version = "0.1.0"
-description = "Streamlit web app for interactive Intervals.icu endurance coaching dashboard & weekly training plan visualization"
+description = "FastAPI web application for interactive Intervals.icu endurance coaching, agent pipeline & weekly training plan visualization"
 readme = "README.md"
 requires-python = ">=3.12"
 license = "GPL-3.0-or-later"
@@ -13,13 +13,17 @@ authors = [
     { name = "Frederic Pitteloud", email = "fpittelo@users.noreply.github.com" },
 ]
 dependencies = [
-    "streamlit>=1.39.0",
+    "fastapi>=0.115.0",
+    # anyio 4.15 deprecates the anyio.abc.BlockingPortal alias still referenced by
+    # starlette 1.6.0, which breaks the `pytest -W error` zero-warning gate at import time.
+    "anyio>=4.0,<4.15",
+    "uvicorn[standard]>=0.32.0",
     "mcp[cli]>=2.0.0",
     "httpx>=0.27.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",
-    "plotly>=5.0.0",
+    "sse-starlette>=2.1.0",
 ]
 
 [project.optional-dependencies]
@@ -32,10 +36,11 @@ dev = [
     "mypy>=1.10.0",
     "black>=24.0.0",
     "isort>=5.13.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]
-coach-web = "coach_web.app:main"
+coach-web = "coach_web.app:run"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/coach_web"]
@@ -55,6 +60,7 @@ ignore = []
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101"]
 "src/coach_web/config.py" = ["S104"]
+"tests/integration/test_compose_topology.py" = ["S104", "S108"]
 
 [tool.isort]
 profile = "black"
