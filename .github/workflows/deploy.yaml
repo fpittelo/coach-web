@@ -7,6 +7,13 @@ name: Deploy Coach Web Image
 #   prod/latest/vX.Y.Z images  → push of v* tag
 # Main promotions are tag-driven; the PR-closed trigger intentionally
 # excludes main to prevent duplicate concurrent builds racing the GHA cache.
+#
+# Issue #67 adds the GCP deploy stage: after build/push, the workflow
+# authenticates to GCP via Workload Identity Federation (keyless, ADR-06 —
+# no service account keys anywhere) and runs `tofu apply` to roll the
+# digest-pinned images out to the Cloud Run service. Production deploys run
+# under the protected `production` GitHub environment (required reviewer:
+# @fpittelo — one-time manual setup documented in infra/README.md).
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -39,6 +46,11 @@ jobs:
     name: Build and Push OCI Container
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
+    outputs:
+      deploy_env: ${{ steps.env.outputs.deploy_env }}
+      coach_web_image: ${{ steps.images.outputs.coach_web_image }}
+      coach_mcp_image: ${{ steps.images.outputs.coach_mcp_image }}
+      github_mcp_image: ${{ steps.images.outputs.github_mcp_image }}
 
     steps:
       - name: Checkout repository
@@ -61,7 +73,17 @@ jobs:
           else
             ENV_TAG="latest"
           fi
+          # Deploy lane (issue #67): dev and qa push their own lane; prod (the
+          # manual-dispatch choice), v* tag pushes and the (unreachable)
+          # latest fallback are the prod lane.
+          case "${ENV_TAG}" in
+            dev)             DEPLOY_ENV="dev" ;;
+            qa)              DEPLOY_ENV="qa" ;;
+            latest|prod|v*)  DEPLOY_ENV="prod" ;;
+            *)               DEPLOY_ENV="prod" ;;
+          esac
           echo "tag=${ENV_TAG}" >> "$GITHUB_OUTPUT"
+          echo "deploy_env=${DEPLOY_ENV}" >> "$GITHUB_OUTPUT"
 
       - name: Generate OCI image metadata
         id: meta
@@ -82,6 +104,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and Push OCI Image
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -100,3 +123,119 @@ jobs:
             echo "Verifying registry presence of ${image}"
             docker buildx imagetools inspect "${image}" > /dev/null
           done <<< "${TAGS}"
+
+      # ---------------------------------------------------------------------
+      # Deploy-time image pinning (issue #67): `tofu apply` receives
+      # digest-pinned image refs (repo@sha256:...), never mutable :dev/:qa/
+      # :latest tags. The coach-web digest comes straight from the
+      # build-push-action output; the sidecar digests are resolved from the
+      # registry (the coach repo publishes matching dev/qa/prod lane tags;
+      # github-mcp is the pinned upstream release tag).
+      # ---------------------------------------------------------------------
+      - name: Resolve digest-pinned image references
+        id: images
+        env:
+          COACH_WEB_REPO: ghcr.io/${{ github.repository }}
+          COACH_MCP_REF: ghcr.io/fpittelo/coach:${{ steps.env.outputs.deploy_env }}
+          GITHUB_MCP_REF: ghcr.io/github/github-mcp-server:v1.12.2
+          WEB_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+
+          resolve_digest() {
+            local ref="$1" digest
+            digest="$(docker buildx imagetools inspect "${ref}" | sed -n 's/^Digest:[[:space:]]*//p')"
+            if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Failed to resolve a valid digest for ${ref} (got: '${digest}'). Check that the image/tag exists and that this repository has read access to the GHCR package."
+              exit 1
+            fi
+            echo "${digest}"
+          }
+
+          if ! [[ "${WEB_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build-push-action returned an invalid digest: '${WEB_DIGEST}'"
+            exit 1
+          fi
+
+          coach_mcp_digest="$(resolve_digest "${COACH_MCP_REF}")"
+          github_mcp_digest="$(resolve_digest "${GITHUB_MCP_REF}")"
+
+          echo "coach_web_image=${COACH_WEB_REPO}@${WEB_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "coach_mcp_image=ghcr.io/fpittelo/coach@${coach_mcp_digest}" >> "$GITHUB_OUTPUT"
+          echo "github_mcp_image=ghcr.io/github/github-mcp-server@${github_mcp_digest}" >> "$GITHUB_OUTPUT"
+
+  deploy-gcp:
+    name: Deploy to Cloud Run (OpenTofu via WIF)
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    # Skip-guard (PR #95 review): the federation repo variables only exist
+    # after the gated first apply (#64/#67 — they are populated from real
+    # `tofu outputs`). Until then, skip the deploy silently instead of
+    # failing at auth/init on every push; builds/pushes still run.
+    if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != ''
+    # AC4: the production lane runs under the `production` GitHub environment;
+    # required-reviewer protection on that environment is the @fpittelo
+    # approval gate (one-time manual setup — see infra/README.md). dev/qa run
+    # under their own (unprotected by default) environments for auditability.
+    environment: ${{ needs.build-and-push.outputs.deploy_env == 'prod' && 'production' || needs.build-and-push.outputs.deploy_env }}
+    # Lane-scoped serialization (PR #95 review): a pending production
+    # approval must not stall dev/qa deploys. Cross-lane collisions are
+    # backstopped by the GCS state lock (-lock-timeout makes a rare
+    # simultaneous apply wait, not fail).
+    concurrency:
+      group: gcp-deploy-${{ needs.build-and-push.outputs.deploy_env }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # OIDC token for Workload Identity Federation (AC2, keyless)
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Authenticate to GCP via Workload Identity Federation (keyless, ADR-06)
+        # SHA-pinned to google-github-actions/auth@v3.0.0.
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SA }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          # Carried review item #1 (from #64): the action's default audience is
+          # the provider resource name; pin it to the GitHub owner URL that the
+          # WIF provider's allowed_audiences expects (infra/modules/wif/main.tf).
+          audience: https://github.com/${{ github.repository_owner }}
+
+      - name: Set up OpenTofu
+        # SHA-pinned to opentofu/setup-opentofu@v2.0.2 (carried review item #3).
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4
+        with:
+          tofu_version: "1.12.6"
+
+      - name: OpenTofu Init (GCS remote state)
+        working-directory: infra
+        run: tofu init -input=false
+
+      - name: OpenTofu Apply (Cloud Run deploy, digest-pinned images)
+        working-directory: infra
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          COACH_WEB_IMAGE: ${{ needs.build-and-push.outputs.coach_web_image }}
+          COACH_MCP_IMAGE: ${{ needs.build-and-push.outputs.coach_mcp_image }}
+          GITHUB_MCP_IMAGE: ${{ needs.build-and-push.outputs.github_mcp_image }}
+        run: |
+          tofu apply -auto-approve -input=false -lock-timeout=300s \
+            -var="project_id=${GCP_PROJECT_ID}" \
+            -var="coach_web_image=${COACH_WEB_IMAGE}" \
+            -var="coach_mcp_image=${COACH_MCP_IMAGE}" \
+            -var="github_mcp_image=${GITHUB_MCP_IMAGE}"
+
+      - name: Deployment summary
+        working-directory: infra
+        run: |
+          {
+            echo "## Cloud Run deployment (deploy_env: ${{ needs.build-and-push.outputs.deploy_env }})"
+            echo ""
+            echo "- Service URL: $(tofu output -raw cloud_run_service_url)"
+            echo "- coach-web image: \`${{ needs.build-and-push.outputs.coach_web_image }}\`"
+            echo "- coach-mcp image: \`${{ needs.build-and-push.outputs.coach_mcp_image }}\`"
+            echo "- github-mcp image: \`${{ needs.build-and-push.outputs.github_mcp_image }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -153,6 +153,25 @@ variable "cors_origins" {
   description = "CORS_ORIGINS env for the app — a JSON array string of allowed browser origins. Empty default: the UI is served same-origin by the FastAPI app, so the cloud deployment needs no CORS. Local dev overrides via compose/.env; set here only for a cross-origin consumer."
   type        = string
   default     = ""
+
+  # Carried review item #4 (from #66): fail malformed CORS JSON at `tofu
+  # plan`/`apply` time, not at container startup (the app parses CORS_ORIGINS
+  # as JSON — a malformed value would crash the container). OpenTofu 1.12
+  # `tofu validate` does not evaluate variable validation blocks.
+  validation {
+    condition     = var.cors_origins == "" || can(jsondecode(var.cors_origins))
+    error_message = "cors_origins must be empty or valid JSON (e.g. a JSON array of origin strings, see Settings.CORS_ORIGINS)."
+  }
+}
+
+# ---------------------------------------------------------------------------
+# Remote state (issue #67 — CI deployer state access)
+# ---------------------------------------------------------------------------
+
+variable "state_bucket_name" {
+  description = "Name of the GCS state bucket. MUST match backend.tf and infra/bootstrap (backend blocks cannot use variables); used here only to scope the CI deployer's state access to the bucket (least privilege, issue #67)."
+  type        = string
+  default     = "fpittelo-coach-web-tofu-state-europe-west6"
 }
 
 # ---------------------------------------------------------------------------

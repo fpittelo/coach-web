@@ -163,8 +163,10 @@ gate below) and will be audited in issue #68:
   (e.g. `gcloud run services describe` + request-timing a scale-from-zero
   request) and record the result in #68.
 - **AC6 (`tofu plan` / `tofu apply` deploys the service):** no plan/apply has
-  run against real GCP yet — this issue deliberately performs no `gcloud auth`
-  and no live plan/apply. Exercise at the gated apply moment.
+  run against real GCP yet — #64/#66 deliberately performed no `gcloud auth`
+  and no live plan/apply, and #67 authors the CI apply path (deploy.yaml)
+  without exercising it live. Exercise at the gated apply moment; the first
+  live run of the #67 deploy workflow is audited in #68.
 
 ## Remote state & bootstrap (AC3)
 
@@ -207,13 +209,142 @@ tofu show tfplan                                   # human-readable review
 `tofu plan` performs no writes and is safe to run at any time. The resulting
 plan diff is attached to the corresponding issue/PR as the audit record.
 
-## Apply policy (AC5 — procedural gate)
+## Apply policy (AC5 — procedural gate, updated by #67)
 
-**`tofu apply` is never wired into CI.** Applies are executed manually by
-@devops **only after an explicit approval comment from @fpittelo** on the
-corresponding issue or promotion PR. This gate is procedural by design: the
-audit trail lives in GitHub (approval comment → apply → plan diff attached to
-the issue), not in pipeline YAML.
+**Local applies** remain manual: @devops executes `tofu apply` locally only
+after an explicit approval comment from @fpittelo on the corresponding issue
+or promotion PR (audit trail: approval comment → apply → plan diff attached
+to the issue).
+
+**CI applies** (issue #67): the `deploy-gcp` job in `.github/workflows/
+deploy.yaml` runs `tofu apply -auto-approve` as part of the deploy pipeline:
+
+- **dev lane** (push to `dev`) and **qa lane** (PR merged into `qa`) apply
+  automatically — this is the point of the pipeline; the promotion PRs
+  (`dev` → `qa` → `main`) remain the human gates in the Git lifecycle.
+- **prod lane** (push of a `v*` tag, or manual dispatch with `prod`) runs
+  under the protected **`production` GitHub environment** — the required
+  reviewer on that environment is the @fpittelo approval gate (setup below).
+
+## Deploy pipeline (issue #67 — keyless CI/CD via WIF)
+
+`.github/workflows/deploy.yaml` extends the #90/#91 image pipeline with a GCP
+deploy stage. No service account keys exist anywhere — authentication is
+Workload Identity Federation only (ADR-06).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub Actions
+    participant Reg as GHCR
+    participant STS as GCP STS (WIF)
+    participant CR as Cloud Run (europe-west6)
+
+    GH->>Reg: build & push image (dev/qa/prod lane tags)
+    GH->>Reg: resolve digests (coach-web from build output; sidecars via imagetools inspect)
+    GH->>STS: OIDC token (aud=https://github.com/fpittelo, sub=repo:fpittelo/coach-web:...)
+    STS-->>GH: exchange against WIF pool/provider (repo attribute condition)
+    GH->>STS: impersonate gha-coach-web-deployer (repo-scoped principalSet)
+    GH->>CR: tofu init (GCS state) + tofu apply -auto-approve (digest-pinned -var images)
+```
+
+### Keyless authentication (AC1, AC2)
+
+- `google-github-actions/auth` (SHA-pinned to `v3.0.0`) exchanges the job's
+  OIDC token against the WIF provider and impersonates the deployer SA —
+  `workload_identity_provider` + `service_account` inputs, **no
+  `credentials_json`, no keys**.
+- The requested audience is pinned to `https://github.com/<owner>` to pair
+  with the provider's `allowed_audiences` (see the WIF section above —
+  carried review item #1).
+- The deploy job holds `id-token: write` (job-scoped permissions); nothing
+  else is elevated.
+
+### Deploy-time image pinning (carried review item #5 from #66)
+
+`tofu apply` receives **digest-pinned** image refs (`repo@sha256:...`), never
+mutable `:dev`/`:qa`/`:latest` tags:
+
+- **coach-web**: digest taken directly from the `docker/build-push-action`
+  `digest` output of the build step.
+- **coach-mcp**: digest resolved from the registry for the matching lane tag
+  (`ghcr.io/fpittelo/coach:dev|qa|prod` — the coach repo publishes the same
+  lane scheme).
+- **github-mcp**: digest resolved from the pinned upstream tag
+  (`ghcr.io/github/github-mcp-server:v1.12.2`).
+
+Digest refs pass the `coach_*_image` variable validations unchanged (a
+`@sha256:` suffix satisfies the "explicit tag or digest" rule). A failed
+digest resolution (missing tag, no package access) fails the build job before
+any deploy is attempted.
+
+### Production approval gate (AC4)
+
+The `deploy-gcp` job declares
+`environment: ${{ ... == 'prod' && 'production' || <deploy_env> }}`:
+
+| Lane | Trigger | GitHub environment | Protection |
+| --- | --- | --- | --- |
+| dev | push to `dev` | `dev` | none (auto-apply) |
+| qa | PR merged into `qa` | `qa` | none by default (add reviewers anytime) |
+| prod | push of `v*` tag / manual dispatch `prod` | `production` | **required reviewer: @fpittelo** |
+
+Concurrency is **lane-scoped** (`gcp-deploy-<deploy_env>`): a pending
+production approval never stalls dev/qa deploys; cross-lane collisions fall
+through to the GCS state lock (`-lock-timeout=300s` makes a rare
+simultaneous apply wait, not fail).
+
+> **Skip-guard:** the `deploy-gcp` job carries
+> `if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != ''`.
+> Until the three repo variables below are set, every lane **silently skips**
+> the deploy (build/push still runs) instead of failing at auth/init.
+
+> **One-time manual step for @fpittelo (required before the first prod
+> deploy):** repo **Settings → Environments → New environment → `production`**
+> → under *Deployment protection rules* enable **Required reviewers** and add
+> **@fpittelo**. GitHub cannot create protected environments via API/workflow
+> tooling, and an unprotected `production` environment is created implicitly
+> on first use — so this step MUST be done before the first `v*` tag push.
+> (Optionally repeat for `qa` when a staging gate is wanted.)
+
+### Required repository configuration (repo → Settings → Secrets and variables → Actions → Variables)
+
+CI cannot read `tofu outputs` before the first apply, so the workflow takes
+the federation coordinates from **repo variables** (none of these are secret
+material — they are identifiers, surfaced by `infra/outputs.tf` for exactly
+this purpose):
+
+| Repo variable | Value | Source |
+| --- | --- | --- |
+| `GCP_WIF_PROVIDER` | Full provider resource name: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider` | `tofu output wif_provider_name` |
+| `GCP_DEPLOY_SA` | Deployer SA email: `gha-coach-web-deployer@<PROJECT_ID>.iam.gserviceaccount.com` | `tofu output deployer_sa_email` |
+| `GCP_PROJECT_ID` | The GCP project ID hosting the stack | `terraform.tfvars` / `gcloud config get-value project` |
+
+Notes:
+
+- `GCS_STATE_BUCKET` is deliberately **not** a repo variable: the bucket name
+  is pinned in `infra/backend.tf` (backend blocks cannot use variables), and
+  letting CI override it via `-backend-config` would risk CI and local runs
+  writing state to different buckets. `backend.tf` is the single source of
+  truth.
+- **GHCR package access prerequisite:** resolving the coach-mcp digest
+  requires read access to the private `ghcr.io/fpittelo/coach` package. Grant
+  it once: package **Settings → Manage access → add `coach-web` repository
+  (read)** — or make the package public if it contains no sensitive material
+  (same triage as the Cloud Run pull prerequisite above).
+
+### Live exercise deferred (AC2/AC3 — audited in #68)
+
+Authoring the workflow is complete, but **no live WIF authentication or live
+`tofu apply` has been exercised yet**: the GCP resources (pool, provider,
+deployer SA, state bucket, service) are created at the gated apply moment
+(#64 AC5), and the repo variables above can only be populated from real
+`tofu outputs` afterwards. Because of the deploy job's skip-guard, pushes in
+that window still build and push images but **silently skip the deploy**
+instead of failing at auth/init. The first live run — WIF token exchange,
+state lock, Cloud Run rollout — happens at the gated deployment moment once
+the variables are populated, and is audited in issue #68, together with the
+deferred cold-start measurement.
 
 ## Ingress posture (carried review item #2 from #64)
 
@@ -232,20 +363,33 @@ be revisited in the same change.
 - Pool `github-actions-pool` + provider `github-actions-provider` trust
   `https://token.actions.githubusercontent.com`.
 - The **attribute condition** restricts federation to
-  `assertion.repository == "fpittelo/coach-web"` — tokens from any other
-  repository are rejected outright.
+  `assertion.repository == "fpittelo/coach-web"` **and** to the refs that
+  legitimately deploy — `refs/heads/dev`, `refs/heads/qa`, `refs/heads/main`
+  (workflow_dispatch runs on the default branch) and `refs/tags/v*` (CEL
+  `startsWith`). Tokens from any other repository or ref (PR refs, feature
+  branches, non-`v` tags) are rejected outright at the STS token exchange.
+- **Audience pairing** (carried review item #1 from #64, resolved in #67):
+  `google-github-actions/auth` defaults its requested OIDC audience to the
+  *provider resource name* (which embeds the GCP project number). The deploy
+  workflow instead sets `audience: https://github.com/<owner>` explicitly,
+  pairing exactly with the provider's
+  `allowed_audiences = ["https://github.com/fpittelo"]`. This avoids a
+  project-number data lookup in IaC; the per-repo attribute condition remains
+  the actual trust boundary.
 - The deployer service account is impersonated via a **repo-scoped
   `principalSet`** bound on the SA itself (not project-wide).
 - **No service account keys exist anywhere** — not in code, not in state.
-  GitHub Actions consumes this in issue #67 (`deploy.yaml`), using the
-  outputs `wif_provider_name` and `deployer_sa_email`.
+  GitHub Actions consumes this in `deploy.yaml` (#67), using the repo
+  variables `GCP_WIF_PROVIDER` (← output `wif_provider_name`) and
+  `GCP_DEPLOY_SA` (← output `deployer_sa_email`).
 
 ## IAM — least-privilege justifications
 
 | Principal | Role | Scope | Why |
 | --- | --- | --- | --- |
 | `gha-coach-web-deployer` (CI) | `roles/run.admin` | project | Create/update the Cloud Run service during deploys (#67) |
-| `gha-coach-web-deployer` (CI) | `roles/iam.serviceAccountUser` | project | Set the runtime SA on the service it deploys |
+| `gha-coach-web-deployer` (CI) | `roles/iam.serviceAccountUser` | **runtime SA only** | Set the runtime SA on the service it deploys (carried review item #2 from #64: was project-wide, now SA-scoped in #67) |
+| `gha-coach-web-deployer` (CI) | `roles/storage.objectAdmin` | **state bucket only** | `tofu init`/`apply` in CI read/write remote state + locks (#67; no project-level storage roles) |
 | `coach-web-runtime` | `roles/logging.logWriter` | project | Write application logs |
 | `coach-web-runtime` | `roles/monitoring.metricWriter` | project | Report container metrics |
 | `coach-web-runtime` | `roles/cloudtrace.agent` | project | Export traces |
@@ -254,9 +398,12 @@ be revisited in the same change.
 
 Deliberately **not** granted: `roles/owner`, any `roles/*` wildcard,
 project-level `secretmanager.secretAccessor` (replaced by per-secret bindings
-in #66), `secretmanager.secretAccessor` on the CI deployer (it never reads
-secret values), Artifact Registry roles (images ship from ghcr.io; an AR
-mirror would add `artifactregistry.reader` for the runtime SA only).
+in #66), project-level `iam.serviceAccountUser` on the CI deployer (replaced
+by the runtime-SA-scoped binding in #67), project-level storage roles on the
+CI deployer (replaced by the bucket-scoped binding in #67),
+`secretmanager.secretAccessor` on the CI deployer (it never reads secret
+values), Artifact Registry roles (images ship from ghcr.io; an AR mirror
+would add `artifactregistry.reader` for the runtime SA only).
 
 ## CI gates (AC4, AC7)
 
@@ -266,16 +413,22 @@ mirror would add `artifactregistry.reader` for the runtime SA only).
 2. `tofu init -backend=false` + `tofu validate` in `infra/`
 3. `tofu init -backend=false` + `tofu validate` in `infra/bootstrap/`
 
-`-backend=false` because CI holds no GCP credentials in this issue; WIF-based
-CI authentication (and any plan/apply automation) is issue #67. No CI changes
-were needed for #66: the existing `opentofu` job validates `infra/`
-recursively and picks up the extended module automatically.
+`-backend=false` because the *validate* job holds no GCP credentials — the
+keyless WIF deploy path (init against the real backend + apply) lives in
+`deploy.yaml` (#67). Issue #67 also SHA-pinned `opentofu/setup-opentofu`
+(carried review item #3 from #64) and upgraded it from the stale `@v1` major
+tag to `v2.0.2`.
+
+Note on variable validations: OpenTofu 1.12's `tofu validate` does **not**
+evaluate `validation` blocks on variables (verified empirically — e.g. the
+`region == "europe-west6"` pin passes `validate` with a wrong region). The
+CORS JSON gate (carried review item #4 from #66) therefore fires at
+`tofu plan`/`apply` time — still long before any container starts.
 
 ## Intentionally out of scope (tracked elsewhere)
 
 | Concern | Issue |
 | --- | --- |
 | Application-level Google OIDC whitelist | #65 |
-| GitHub Actions WIF authentication in `deploy.yaml` | #67 |
-| Cold-start measurement + live apply audit | #68 |
+| Cold-start measurement + live apply/WIF audit (first live deploy run) | #68 |
 | `deletion_protection` (requires google provider 6.x upgrade — unsupported by 5.45.2, re-verified in #66) | tracked for a provider-upgrade change |
