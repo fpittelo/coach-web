@@ -1,0 +1,19 @@
+# coach-web GCP foundation — example variable values (issue #64).
+#
+# Copy to terraform.tfvars and fill in real values. NEVER commit
+# terraform.tfvars (gitignored). No secrets belong here — authentication uses
+# Application Default Credentials / Workload Identity Federation, not keys (AC6).
+
+# GCP project hosting the stack (required — no default on purpose).
+project_id = "your-gcp-project-id"
+
+# region is pinned to europe-west6 (Zürich) by validation in variables.tf;
+# Swiss data residency (nLPD) is non-negotiable (AC2).
+
+# GitHub repository scope for the WIF attribute condition (defaults shown).
+# github_org  = "fpittelo"
+# github_repo = "coach-web"
+
+# Google OAuth web client ID (created once in the Google Cloud Console;
+# consumed by the app-level whitelist in issue #65). Leave empty until created.
+# oidc_client_id = "1234567890-abcdefg.apps.googleusercontent.com"
