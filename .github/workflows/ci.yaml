@@ -92,3 +92,38 @@ jobs:
 
       - name: Audit dependencies for known vulnerabilities
         run: pip-audit --strict .
+
+  opentofu:
+    name: OpenTofu Format & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up OpenTofu
+        # SHA-pinned to opentofu/setup-opentofu@v2.0.2 (carried review item #3
+        # from #64, executed in #67). The previously used @v1 major tag is
+        # stale — v2 is the current major.
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
+        with:
+          tofu_version: "1.12.6"
+
+      - name: OpenTofu Format Check (infra, recursive)
+        run: tofu fmt -check -recursive infra/
+
+      - name: OpenTofu Init (infra, no backend — this validate job holds no GCP
+          credentials; the keyless WIF deploy path lives in deploy.yaml, #67)
+        working-directory: infra
+        run: tofu init -backend=false
+
+      - name: OpenTofu Validate (infra)
+        working-directory: infra
+        run: tofu validate
+
+      - name: OpenTofu Init (bootstrap, no backend — local backend by design)
+        working-directory: infra/bootstrap
+        run: tofu init -backend=false
+
+      - name: OpenTofu Validate (bootstrap)
+        working-directory: infra/bootstrap
+        run: tofu validate

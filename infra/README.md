@@ -1,0 +1,521 @@
+# coach-web — OpenTofu GCP Foundation (europe-west6)
+
+Infrastructure-as-Code for the Phase 2 Serverless Cloud Migration (Sprint 08,
+issues #64 + #66). Provisions the Swiss regional foundation: the full
+multi-container Cloud Run service (coach-web + coach-mcp + github-mcp
+sidecars), the networking foundation, the Google Identity OIDC configuration
+surface, keyless CI federation (Workload Identity Federation) and versioned,
+locked remote state.
+
+## Data residency (Swiss nLPD)
+
+- Every regional resource is pinned to **`europe-west6` (Zürich)**. The region
+  variable is guarded by a validation rule — a different region requires a
+  conscious edit of `variables.tf`, never a silent override.
+- Secret Manager secrets use **user-managed replication pinned to
+  `europe-west6`** — automatic replication would distribute secret material
+  across Google-managed regions, which is unacceptable for nLPD-scoped
+  credentials.
+- The Workload Identity **pool and provider are global Google resources by
+  design**; they hold no personal data (issue #64, AC2). All data-bearing
+  resources (Cloud Run service, secrets, VPC/subnet, state bucket) live in
+  `europe-west6`.
+- Biometric/health data (Intervals.icu) never leaves `europe-west6`.
+
+## Module layout
+
+```
+infra/
+├── main.tf                  # Root: API enablement + module wiring
+├── variables.tf             # Strongly typed inputs (region pinned to europe-west6)
+├── outputs.tf               # Auditable outputs (URLs, identities, secret names, WIF principals)
+├── versions.tf              # OpenTofu >= 1.6, google provider ~> 5.30
+├── providers.tf             # google provider (ADC locally / WIF in CI from #67)
+├── backend.tf               # GCS remote state (europe-west6, versioned + locked)
+├── terraform.tfvars.example # Placeholder values — never commit terraform.tfvars
+├── bootstrap/               # One-shot config that creates the state bucket
+│   ├── main.tf              #   GCS bucket: versioning, UBLA, PAP enforced
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── providers.tf
+│   ├── versions.tf
+│   └── terraform.tfvars.example
+└── modules/
+    ├── cloud-run/           # Multi-container service (issue #66): coach-web +
+    │                        # coach-mcp + github-mcp, Secret Manager secrets with
+    │                        # per-secret IAM, Startup CPU Boost, scale-to-zero,
+    │                        # startup probes, invocation IAM
+    ├── networking/          # Custom-mode VPC + europe-west6 subnet (Private
+    │                        # Google Access) — optional direct VPC egress
+    ├── oidc/                # Google Identity OIDC config surface (client ID,
+    │                        # issuer) — whitelist enforcement is #65
+    └── wif/                 # WIF pool + GitHub OIDC provider (repo-scoped
+                             # attribute condition) + least-privilege deployer SA
+```
+
+## Multi-container topology (issue #66, AC1)
+
+One Cloud Run service, three containers. Cloud Run's sidecar pattern gives all
+containers of an instance a **shared network namespace**: the Docker DNS names
+of the local compose topology (`docker-compose.yml`, issue #63) become
+`localhost` URLs. Only the **first** container (`coach-web`) terminates
+ingress; sidecar ports are internal-only (AC5).
+
+```mermaid
+flowchart LR
+    U["Browser / client"] -- "HTTPS (ingress port 8080)" --> W
+
+    subgraph CR["Cloud Run service: coach-web (europe-west6)"]
+        subgraph I["One service instance — shared localhost"]
+            W["coach-web (main)<br/>FastAPI · port 8080<br/>Startup CPU Boost"]
+            M["coach-mcp (sidecar)<br/>SSE · port 8000<br/>internal-only"]
+            G["github-mcp (sidecar)<br/>streamable HTTP · port 8001<br/>internal-only"]
+            W -- "http://localhost:8000/sse" --> M
+            W -- "http://localhost:8001/" --> G
+        end
+    end
+
+    W -- "HTTPS" --> OR["OpenRouter API"]
+    M -- "HTTPS" --> IN["Intervals.icu API"]
+    G -- "HTTPS" --> GH["GitHub API"]
+    W & M & G -. "secret_key_ref (version=latest)" .-> SM["Secret Manager<br/>(europe-west6, user-managed replication)"]
+```
+
+| Container | Image (variable, pinned tag) | Port | Role |
+| --- | --- | --- | --- |
+| `coach-web` (main) | `coach_web_image` → `ghcr.io/fpittelo/coach-web:dev` | 8080 (service port) | FastAPI app, agent loop, plan visualization |
+| `coach-mcp` (sidecar) | `coach_mcp_image` → `ghcr.io/fpittelo/coach:dev` | 8000 (internal) | Intervals.icu MCP gateway (SSE) |
+| `github-mcp` (sidecar) | `github_mcp_image` → `ghcr.io/github/github-mcp-server:v1.12.2` | 8001 (internal) | GitHub MCP server (streamable HTTP) |
+
+- **Startup CPU Boost** is enabled on the main container (ADR-05) to keep
+  cold starts inside the <3.5s budget even from scale-to-zero.
+- **Startup probes** mirror the compose healthchecks: `GET /health` (coach-web),
+  `GET /sse` (coach-mcp), TCP socket (github-mcp — the official image has no
+  plain HTTP health endpoint; compose used a binary `--version` check).
+- **Resources** (defaults, tunable via variables): coach-web 1 vCPU / 512Mi,
+  coach-mcp 0.5 vCPU / 256Mi, github-mcp 0.25 vCPU / 256Mi — ~1.75 vCPU and
+  1 GiB per instance, keeping scale-to-zero at $0 fixed cost (ADR-04).
+- **Scaling**: `min_instance_count = 0`, `max_instance_count = 2`.
+- **Images** (AC3): every image variable must carry an explicit tag or digest;
+  floating `:latest` is rejected by variable validation. The deploy workflow
+  (#67) wires environment-specific tags (`dev` / `qa` / `prod` / sha) and will
+  pin deploy-time images by digest/sha tag.
+
+### Private GHCR images — deployment prerequisite
+
+The `ghcr.io/fpittelo/*` packages are **private** (architect triage on #66:
+anonymous pull returns `UNAUTHORIZED`). Cloud Run can pull **only** from
+Google-hosted registries (Artifact Registry) or public registries — it has no
+`imagePullSecrets` mechanism for external private registries. At the gated
+apply moment, resolve via one of:
+
+1. **Mirror to Artifact Registry `europe-west6`** (preferred — keeps image
+   distribution in-region and uses the runtime SA's `artifactregistry.reader`),
+   then set `coach_web_image` / `coach_mcp_image` to the AR URIs; or
+2. Make the GHCR packages public (acceptable only if the images contain no
+   sensitive material) and keep the GHCR references.
+
+`github-mcp-server` is pulled from the public `ghcr.io/github/` registry and
+is unaffected. Coordination with #67 (keyless CI/CD) is required either way.
+
+## Secret Manager (issue #66, AC4)
+
+IaC manages **secret metadata, replication and IAM only** — secret **versions
+are populated out-of-band**, so no secret material ever reaches IaC or state.
+
+| Secret (default ID) | Purpose | Consumed by (env name) |
+| --- | --- | --- |
+| `openrouter-api-key` | OpenRouter API key (coach agent LLM) | coach-web → `OPENROUTER_API_KEY` |
+| `intervals-api-key` | Intervals.icu API key | coach-mcp → `INTERVALS_API_KEY` |
+| `github-token` | GitHub PAT (training plan issues + MCP) | coach-web → `GITHUB_TOKEN`; github-mcp → `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| `auth-session-secret` | HS256 signing key for stateless auth session cookies (auth boundary, #68) | coach-web → `AUTH_SESSION_SECRET` |
+| `google-oauth-client-secret` | Google OAuth client secret for the OIDC code exchange (auth boundary, #68) | coach-web → `GOOGLE_OIDC_CLIENT_SECRET` |
+
+### Population procedure (out-of-band, after the first `tofu apply`)
+
+```bash
+# 1. Create the secret resources + per-secret IAM (metadata only — no values):
+cd infra && tofu apply
+
+# 2. Populate versions (values never pass through IaC or state):
+gcloud secrets versions add openrouter-api-key --data-file=- <<< "sk-or-..."     # project: <your-project>
+gcloud secrets versions add intervals-api-key --data-file=- <<< "your-intervals-key"
+gcloud secrets versions add github-token      --data-file=- <<< "ghp_..."
+
+# 2b. Auth boundary secrets (issue #68) — see "Auth boundary (ADR-04)" below:
+openssl rand -base64 48 | gcloud secrets versions add auth-session-secret --data-file=- --project=<your-project>
+printf '%s' 'GOCSPX-your-client-secret' | gcloud secrets versions add google-oauth-client-secret --data-file=- --project=<your-project>
+
+# 3. Deploy / redeploy the service so revisions resolve the secrets:
+tofu apply   # or the #67 deploy workflow
+```
+
+- Cloud Run resolves `version = "latest"` at instance start; pin an integer
+  version in `modules/cloud-run/main.tf` for strict deploy reproducibility
+  once a rotation cadence is established.
+- Rotation = step 2 + a service redeploy; the secret resource itself never
+  changes.
+- The first deployment **requires** each secret to already carry a version —
+  run step 2 before the first service-creating apply (or apply twice).
+
+## Auth boundary (ADR-04, issue #68)
+
+The application-level Google OIDC whitelist (issue #65) **is** the
+access-control boundary that justifies the unauthenticated edge (see
+"Ingress posture" below). Issue #68 wires the #65 auth settings into the
+Cloud Run service spec: `AUTH_ENABLED` is fixed to `true` for the cloud
+posture (local compose stays env-driven off), and every setting the auth
+middleware needs is provisioned by IaC. The app **fails closed** at startup
+(`AuthConfigError`) if `AUTH_ENABLED=true` without its required settings —
+the IaC variable validations make that state a `tofu plan` failure instead.
+
+### coach-web container env (auth)
+
+| Env var | Source | Notes |
+| --- | --- | --- |
+| `AUTH_ENABLED` | fixed `"true"` | Cloud posture; local compose stays env-driven off (app default `false`). |
+| `AUTH_WHITELIST_EMAILS` | variable `auth_whitelist_emails` (default `["frederic.pitteloud@gmail.com"]`) | JSON array string — pydantic-settings parses `list[str]` as JSON (the CORS lesson from #93). Single-user personal app: the default is the owner's own address, a real value **by design** — it is public config, not a credential (access requires a Google-verified ID token for that address, not knowledge of it). |
+| `GOOGLE_OIDC_CLIENT_ID` | variable `oidc_client_id` (required) | Emitted only when non-empty (same dynamic-env pattern as `CORS_ORIGINS`); validation makes empty a plan-time failure. |
+| `GOOGLE_OIDC_CLIENT_SECRET` | Secret Manager `google-oauth-client-secret` (`secret_key_ref`, version `latest`) | Never a plain env value. |
+| `AUTH_SESSION_SECRET` | Secret Manager `auth-session-secret` (`secret_key_ref`, version `latest`) | HS256 session-cookie signing key; the app enforces ≥ 32 bytes at startup. |
+| `GOOGLE_OIDC_ISSUER` | fixed `https://accounts.google.com` | Google's public issuer (modules/oidc). |
+
+Deliberately **not** set (KIS — app defaults are the source of truth,
+`src/coach_web/config.py`): `AUTH_REDIRECT_URI` (the router derives it from
+the request base URL behind Cloud Run HTTPS —
+`src/coach_web/auth/router.py`, `_resolve_redirect_uri`) and
+`AUTH_SESSION_TTL_SECONDS` (app default `3600`).
+
+### Required configuration (one-time)
+
+1. **Google OAuth web client** (Google Cloud Console → APIs & Services →
+   Credentials → OAuth client ID, type *Web application*). The authorized
+   redirect URI must be exactly:
+
+   ```
+   https://<service-url>/auth/callback
+   ```
+
+   where `<service-url>` is the Cloud Run service URL (`tofu output
+   cloud_run_service_url`). The client **ID** is a public identifier (it is
+   sent in every browser redirect to Google) — set it as the repo **variable**
+   `OIDC_CLIENT_ID` (Settings → Secrets and variables → Actions → Variables);
+   the deploy workflow passes it to `tofu apply` via
+   `-var="oidc_client_id=..."` and **skips the deploy while it is empty**
+   (extended skip-guard). For local applies, set `oidc_client_id` in
+   `terraform.tfvars`. Variable validation enforces the client-ID shape
+   (`<number>-<lowercase-alphanumeric>.apps.googleusercontent.com`) at plan
+   time — a missing or malformed value fails `tofu plan`, never container boot.
+
+2. **Auth secrets** (Secret Manager versions, populated out-of-band — values
+   never pass through IaC or state):
+
+   ```bash
+   # Session-cookie signing key (random, >= 32 bytes for HS256):
+   openssl rand -base64 48 | gcloud secrets versions add auth-session-secret --data-file=- --project=<your-project>
+
+   # OAuth client secret (from the Console client created in step 1):
+   printf '%s' 'GOCSPX-your-client-secret' | gcloud secrets versions add google-oauth-client-secret --data-file=- --project=<your-project>
+   ```
+
+Both secrets are created by IaC with user-managed replication pinned to
+`europe-west6` and **per-secret** `roles/secretmanager.secretAccessor` for
+the runtime SA (same pattern as the three #66 secrets). Until the repo
+variable and both secret versions exist, the deploy lane silently skips
+(skip-guard) — the service keeps running its last revision until the first
+protected deploy rolls out.
+
+## Pending-deployment validation (AC2 / AC6)
+
+`tofu validate` proves the spec is syntactically and type correct, but two
+acceptance criteria are **deferred to the gated apply moment** (procedural
+gate below) and will be audited in issue #68:
+
+- **AC2 (cold start < 3.5s, measured):** Startup CPU Boost is enabled in the
+  spec, but the measurement requires a live service. Measure at first deploy
+  (e.g. `gcloud run services describe` + request-timing a scale-from-zero
+  request) and record the result in #68.
+- **AC6 (`tofu plan` / `tofu apply` deploys the service):** no plan/apply has
+  run against real GCP yet — #64/#66 deliberately performed no `gcloud auth`
+  and no live plan/apply, and #67 authors the CI apply path (deploy.yaml)
+  without exercising it live. Exercise at the gated apply moment; the first
+  live run of the #67 deploy workflow is audited in #68.
+
+## Remote state & bootstrap (AC3)
+
+State lives in a GCS bucket in `europe-west6` with object **versioning**
+(state history) and the GCS backend's native **state locking**. The bucket
+cannot create itself, so a tiny separate configuration with a **local backend**
+bootstraps it once:
+
+```bash
+# 1. Authenticate as yourself (no service account keys — AC6)
+gcloud auth application-default login
+
+# 2. Create the state bucket (one-time)
+cd infra/bootstrap
+cp terraform.tfvars.example terraform.tfvars   # set project_id
+tofu init
+tofu plan          # review: one regional bucket
+tofu apply         # procedural gate: see "Apply policy" below
+
+# 3. Switch the root module to remote state
+cd ..
+tofu init          # configures the GCS backend from backend.tf
+```
+
+The bucket name in `backend.tf` must match `state_bucket_name` in
+`infra/bootstrap/variables.tf` (backend blocks cannot use variables). Defaults
+are kept in sync: `fpittelo-coach-web-tofu-state-europe-west6`.
+
+## Running `tofu plan` locally
+
+```bash
+cd infra
+gcloud auth application-default login              # if not already authenticated
+tofu init                                          # remote backend + providers
+cp terraform.tfvars.example terraform.tfvars       # set project_id (once)
+tofu plan -out=tfplan                              # auditable diff (AC5)
+tofu show tfplan                                   # human-readable review
+```
+
+`tofu plan` performs no writes and is safe to run at any time. The resulting
+plan diff is attached to the corresponding issue/PR as the audit record.
+
+## Apply policy (AC5 — procedural gate, updated by #67)
+
+**Local applies** remain manual: @devops executes `tofu apply` locally only
+after an explicit approval comment from @fpittelo on the corresponding issue
+or promotion PR (audit trail: approval comment → apply → plan diff attached
+to the issue).
+
+**CI applies** (issue #67): the `deploy-gcp` job in `.github/workflows/
+deploy.yaml` runs `tofu apply -auto-approve` as part of the deploy pipeline:
+
+- **dev lane** (push to `dev`) and **qa lane** (PR merged into `qa`) apply
+  automatically — this is the point of the pipeline; the promotion PRs
+  (`dev` → `qa` → `main`) remain the human gates in the Git lifecycle.
+- **prod lane** (push of a `v*` tag, or manual dispatch with `prod`) runs
+  under the protected **`production` GitHub environment** — the required
+  reviewer on that environment is the @fpittelo approval gate (setup below).
+
+## Deploy pipeline (issue #67 — keyless CI/CD via WIF)
+
+`.github/workflows/deploy.yaml` extends the #90/#91 image pipeline with a GCP
+deploy stage. No service account keys exist anywhere — authentication is
+Workload Identity Federation only (ADR-06).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant GH as GitHub Actions
+    participant Reg as GHCR
+    participant STS as GCP STS (WIF)
+    participant CR as Cloud Run (europe-west6)
+
+    GH->>Reg: build & push image (dev/qa/prod lane tags)
+    GH->>Reg: resolve digests (coach-web from build output; sidecars via imagetools inspect)
+    GH->>STS: OIDC token (aud=https://github.com/fpittelo, sub=repo:fpittelo/coach-web:...)
+    STS-->>GH: exchange against WIF pool/provider (repo attribute condition)
+    GH->>STS: impersonate gha-coach-web-deployer (repo-scoped principalSet)
+    GH->>CR: tofu init (GCS state) + tofu apply -auto-approve (digest-pinned -var images)
+```
+
+### Keyless authentication (AC1, AC2)
+
+- `google-github-actions/auth` (SHA-pinned to `v3.0.0`) exchanges the job's
+  OIDC token against the WIF provider and impersonates the deployer SA —
+  `workload_identity_provider` + `service_account` inputs, **no
+  `credentials_json`, no keys**.
+- The requested audience is pinned to `https://github.com/<owner>` to pair
+  with the provider's `allowed_audiences` (see the WIF section above —
+  carried review item #1).
+- The deploy job holds `id-token: write` (job-scoped permissions); nothing
+  else is elevated.
+
+### Deploy-time image pinning (carried review item #5 from #66)
+
+`tofu apply` receives **digest-pinned** image refs (`repo@sha256:...`), never
+mutable `:dev`/`:qa`/`:latest` tags:
+
+- **coach-web**: digest taken directly from the `docker/build-push-action`
+  `digest` output of the build step.
+- **coach-mcp**: digest resolved from the registry for the matching lane tag
+  (`ghcr.io/fpittelo/coach:dev|qa|prod` — the coach repo publishes the same
+  lane scheme).
+- **github-mcp**: digest resolved from the pinned upstream tag
+  (`ghcr.io/github/github-mcp-server:v1.12.2`).
+
+Digest refs pass the `coach_*_image` variable validations unchanged (a
+`@sha256:` suffix satisfies the "explicit tag or digest" rule). A failed
+digest resolution (missing tag, no package access) fails the build job before
+any deploy is attempted.
+
+### Production approval gate (AC4)
+
+The `deploy-gcp` job declares
+`environment: ${{ ... == 'prod' && 'production' || <deploy_env> }}`:
+
+| Lane | Trigger | GitHub environment | Protection |
+| --- | --- | --- | --- |
+| dev | push to `dev` | `dev` | none (auto-apply) |
+| qa | PR merged into `qa` | `qa` | none by default (add reviewers anytime) |
+| prod | push of `v*` tag / manual dispatch `prod` | `production` | **required reviewer: @fpittelo** |
+
+Concurrency is **lane-scoped** (`gcp-deploy-<deploy_env>`): a pending
+production approval never stalls dev/qa deploys; cross-lane collisions fall
+through to the GCS state lock (`-lock-timeout=300s` makes a rare
+simultaneous apply wait, not fail).
+
+> **Skip-guard:** the `deploy-gcp` job carries
+> `if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != '' && vars.OIDC_CLIENT_ID != ''`.
+> Until the repo variables below are set, every lane **silently skips**
+> the deploy (build/push still runs) instead of failing at auth/init.
+> `OIDC_CLIENT_ID` was added by #68: the Cloud Run spec requires the OAuth
+> client ID (ADR-04 auth boundary, enforced by variable validation at plan
+> time), so a deploy without it would fail `tofu apply` anyway.
+
+> **One-time manual step for @fpittelo (required before the first prod
+> deploy):** repo **Settings → Environments → New environment → `production`**
+> → under *Deployment protection rules* enable **Required reviewers** and add
+> **@fpittelo**. GitHub cannot create protected environments via API/workflow
+> tooling, and an unprotected `production` environment is created implicitly
+> on first use — so this step MUST be done before the first `v*` tag push.
+> (Optionally repeat for `qa` when a staging gate is wanted.)
+
+### Required repository configuration (repo → Settings → Secrets and variables → Actions → Variables)
+
+CI cannot read `tofu outputs` before the first apply, so the workflow takes
+the federation coordinates from **repo variables** (none of these are secret
+material — they are identifiers, surfaced by `infra/outputs.tf` for exactly
+this purpose):
+
+| Repo variable | Value | Source |
+| --- | --- | --- |
+| `GCP_WIF_PROVIDER` | Full provider resource name: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider` | `tofu output wif_provider_name` |
+| `GCP_DEPLOY_SA` | Deployer SA email: `gha-coach-web-deployer@<PROJECT_ID>.iam.gserviceaccount.com` | `tofu output deployer_sa_email` |
+| `GCP_PROJECT_ID` | The GCP project ID hosting the stack | `terraform.tfvars` / `gcloud config get-value project` |
+| `OIDC_CLIENT_ID` | Google OAuth web client ID: `<number>-<lowercase-alphanumeric>.apps.googleusercontent.com` | Google Cloud Console (OAuth web client, created once — see "Auth boundary (ADR-04)"). Public identifier → repo **variable**, not a secret (#68) |
+
+Notes:
+
+- `GCS_STATE_BUCKET` is deliberately **not** a repo variable: the bucket name
+  is pinned in `infra/backend.tf` (backend blocks cannot use variables), and
+  letting CI override it via `-backend-config` would risk CI and local runs
+  writing state to different buckets. `backend.tf` is the single source of
+  truth.
+- **GHCR package access prerequisite:** resolving the coach-mcp digest
+  requires read access to the private `ghcr.io/fpittelo/coach` package. Grant
+  it once: package **Settings → Manage access → add `coach-web` repository
+  (read)** — or make the package public if it contains no sensitive material
+  (same triage as the Cloud Run pull prerequisite above).
+
+### Live exercise deferred (AC2/AC3 — audited in #68)
+
+Authoring the workflow is complete, but **no live WIF authentication or live
+`tofu apply` has been exercised yet**: the GCP resources (pool, provider,
+deployer SA, state bucket, service) are created at the gated apply moment
+(#64 AC5), and the repo variables above can only be populated from real
+`tofu outputs` afterwards. Because of the deploy job's skip-guard, pushes in
+that window still build and push images but **silently skip the deploy**
+instead of failing at auth/init. The first live run — WIF token exchange,
+state lock, Cloud Run rollout — happens at the gated deployment moment once
+the variables are populated, and is audited in issue #68, together with the
+deferred cold-start measurement.
+
+## Ingress posture (carried review item #2 from #64)
+
+The service uses `INGRESS_TRAFFIC_ALL` plus a `roles/run.invoker` binding for
+`allUsers` on this single service. This open edge posture is **only acceptable
+because ADR-04 makes the application-level Google OIDC whitelist (issue #65)
+the access-control boundary**: the edge passes traffic through, the app
+validates Google ID tokens against the configured client ID
+(`GOOGLE_OIDC_CLIENT_ID` / `GOOGLE_OIDC_ISSUER` env) and enforces the
+whitelist. This assumption is documented inline in
+`modules/cloud-run/main.tf`; if #65's posture changes, the edge posture must
+be revisited in the same change.
+
+## Workload Identity Federation (AC6 — keyless, ADR-06)
+
+- Pool `github-actions-pool` + provider `github-actions-provider` trust
+  `https://token.actions.githubusercontent.com`.
+- The **attribute condition** restricts federation to
+  `assertion.repository == "fpittelo/coach-web"` **and** to the refs that
+  legitimately deploy — `refs/heads/dev`, `refs/heads/qa`, `refs/heads/main`
+  (workflow_dispatch runs on the default branch) and `refs/tags/v*` (CEL
+  `startsWith`). Tokens from any other repository or ref (PR refs, feature
+  branches, non-`v` tags) are rejected outright at the STS token exchange.
+- **Audience pairing** (carried review item #1 from #64, resolved in #67):
+  `google-github-actions/auth` defaults its requested OIDC audience to the
+  *provider resource name* (which embeds the GCP project number). The deploy
+  workflow instead sets `audience: https://github.com/<owner>` explicitly,
+  pairing exactly with the provider's
+  `allowed_audiences = ["https://github.com/fpittelo"]`. This avoids a
+  project-number data lookup in IaC; the per-repo attribute condition remains
+  the actual trust boundary.
+- The deployer service account is impersonated via a **repo-scoped
+  `principalSet`** bound on the SA itself (not project-wide).
+- **No service account keys exist anywhere** — not in code, not in state.
+  GitHub Actions consumes this in `deploy.yaml` (#67), using the repo
+  variables `GCP_WIF_PROVIDER` (← output `wif_provider_name`) and
+  `GCP_DEPLOY_SA` (← output `deployer_sa_email`).
+
+## IAM — least-privilege justifications
+
+| Principal | Role | Scope | Why |
+| --- | --- | --- | --- |
+| `gha-coach-web-deployer` (CI) | `roles/run.admin` | project | Create/update the Cloud Run service during deploys (#67) |
+| `gha-coach-web-deployer` (CI) | `roles/iam.serviceAccountUser` | **runtime SA only** | Set the runtime SA on the service it deploys (carried review item #2 from #64: was project-wide, now SA-scoped in #67) |
+| `gha-coach-web-deployer` (CI) | `roles/storage.objectAdmin` | **state bucket only** | `tofu init`/`apply` in CI read/write remote state + locks (#67; no project-level storage roles) |
+| `gha-coach-web-deployer` (CI) | `roles/viewer` | project | READ-only get/list on all resources — `tofu apply` REFRESHES every resource in state before planning (compute/VPC, Cloud Run, secret metadata, serviceusage, WIF pool); the first live CI deploy (run 35509409312) 403'd in this refresh phase (#67 hot-fix) |
+| `gha-coach-web-deployer` (CI) | `roles/iam.securityReviewer` | project | READ-only getIamPolicy on project/service accounts/WIF/secrets — the `*_iam_member` resources in state refresh via getIamPolicy; zero write (#67 hot-fix) |
+| `coach-web-runtime` | `roles/logging.logWriter` | project | Write application logs |
+| `coach-web-runtime` | `roles/monitoring.metricWriter` | project | Report container metrics |
+| `coach-web-runtime` | `roles/cloudtrace.agent` | project | Export traces |
+| `coach-web-runtime` | `roles/secretmanager.secretAccessor` | **per secret** (5 bindings) | Read exactly the stack's secrets (carried review item #1: no project-level secret access; the 2 auth secrets added by #68) |
+| `allUsers` | `roles/run.invoker` | single service | ADR-04: edge accepts traffic, app enforces the Google OIDC whitelist (#65) |
+
+Deliberately **not** granted: `roles/owner`, any `roles/*` wildcard,
+project-level `secretmanager.secretAccessor` (replaced by per-secret bindings
+in #66), project-level `iam.serviceAccountUser` on the CI deployer (replaced
+by the runtime-SA-scoped binding in #67), project-level storage roles on the
+CI deployer (replaced by the bucket-scoped binding in #67),
+`secretmanager.secretAccessor` on the CI deployer (it never reads secret
+values), Artifact Registry roles (images ship from ghcr.io; an AR mirror
+would add `artifactregistry.reader` for the runtime SA only).
+
+One deliberate exception to the narrow-scope rule: the deployer holds
+project-wide `roles/viewer` + `roles/iam.securityReviewer` (#67 hot-fix).
+These are READ-only — `tofu apply` refreshes every resource in state, so a
+full-stack deployer needs project-wide read, while all WRITE stays narrow
+(`run.admin`, SA-scoped `serviceAccountUser`, bucket-scoped `objectAdmin`):
+a read-broad / write-narrow pattern, consciously resolving the
+least-privilege follow-up predicted in #67.
+
+## CI gates (AC4, AC7)
+
+`.github/workflows/ci.yaml` runs, with zero-warning tolerance:
+
+1. `tofu fmt -check -recursive infra/`
+2. `tofu init -backend=false` + `tofu validate` in `infra/`
+3. `tofu init -backend=false` + `tofu validate` in `infra/bootstrap/`
+
+`-backend=false` because the *validate* job holds no GCP credentials — the
+keyless WIF deploy path (init against the real backend + apply) lives in
+`deploy.yaml` (#67). Issue #67 also SHA-pinned `opentofu/setup-opentofu`
+(carried review item #3 from #64) and upgraded it from the stale `@v1` major
+tag to `v2.0.2`.
+
+Note on variable validations: OpenTofu 1.12's `tofu validate` does **not**
+evaluate `validation` blocks on variables (verified empirically — e.g. the
+`region == "europe-west6"` pin passes `validate` with a wrong region). The
+CORS JSON gate (carried review item #4 from #66) therefore fires at
+`tofu plan`/`apply` time — still long before any container starts.
+
+## Intentionally out of scope (tracked elsewhere)
+
+| Concern | Issue |
+| --- | --- |
+| Application-level Google OIDC whitelist | #65 |
+| Cold-start measurement + live apply/WIF audit (first live deploy run) | #68 |
+| `deletion_protection` (requires google provider 6.x upgrade — unsupported by 5.45.2, re-verified in #66) | tracked for a provider-upgrade change |

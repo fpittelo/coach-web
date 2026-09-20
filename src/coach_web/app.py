@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
 
 from coach_web.agent import AgentEvent, CoachAgent, create_agent
+from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
+from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.models import PlanApprovalRequest, PlanApprovalResponse
@@ -66,6 +68,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Create and configure the Coach Web FastAPI application."""
     resolved = settings or get_settings()
 
+    # Fail closed: refuse to boot with auth enabled but incomplete credentials.
+    if resolved.AUTH_ENABLED:
+        validate_auth_config(resolved)
+
     application = FastAPI(
         title="Coach Web",
         version=resolve_version(),
@@ -83,6 +89,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    if resolved.AUTH_ENABLED:
+        # Auth middleware is added last => outermost: the whitelist boundary
+        # is enforced before any route, mount or CORS logic runs.
+        application.include_router(auth_router)
+        application.add_middleware(AuthMiddleware)
 
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
