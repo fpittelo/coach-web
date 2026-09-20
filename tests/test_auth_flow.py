@@ -49,6 +49,11 @@ def _login_state(client: TestClient) -> str:
     return parse_qs(urlparse(login.headers["location"]).query)["state"][0]
 
 
+def _state_cookie_cleared(response: Any) -> bool:
+    """Return True when the response clears the single-use state cookie."""
+    return any('cw_oidc_state=""' in cookie for cookie in response.headers.get_list("set-cookie"))
+
+
 def _mock_google_token_exchange(
     google_test_keys: Any, id_token: str, status_code: int = 200
 ) -> None:
@@ -130,6 +135,7 @@ class TestCallback:
         session = response.cookies["cw_session"]
         claims = verify_session_token(session, SESSION_SECRET)
         assert claims["email"] == OWNER_EMAIL
+        assert _state_cookie_cleared(response)
 
     @respx.mock
     async def test_non_whitelisted_email_rejected_with_403(
@@ -148,6 +154,7 @@ class TestCallback:
 
         assert response.status_code == 403
         assert "cw_session" not in response.cookies
+        assert _state_cookie_cleared(response)
 
     async def test_state_mismatch_rejected_with_400(self, auth_client: TestClient) -> None:
         """A state param not matching the state cookie is rejected (CSRF)."""
@@ -158,6 +165,7 @@ class TestCallback:
         )
 
         assert response.status_code == 400
+        assert _state_cookie_cleared(response)
 
     async def test_missing_state_cookie_rejected_with_400(self, auth_client: TestClient) -> None:
         """A callback without a prior /auth/login (no state cookie) is rejected."""
@@ -189,6 +197,7 @@ class TestCallback:
         )
 
         assert response.status_code == 401
+        assert _state_cookie_cleared(response)
 
     @respx.mock
     async def test_nonce_mismatch_rejected_with_401(
@@ -226,6 +235,23 @@ class TestCallback:
         """A token response lacking id_token surfaces as 502."""
         state = _login_state(auth_client)
         respx.post(GOOGLE_TOKEN_URL).mock(return_value=Response(200, json={"x": "y"}))
+        respx.get(GOOGLE_JWKS_URL).mock(return_value=Response(200, json=google_test_keys.jwks))
+
+        response = auth_client.get(
+            f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+        )
+
+        assert response.status_code == 502
+
+    @respx.mock
+    async def test_token_exchange_invalid_json_returns_502(
+        self, auth_client: TestClient, google_test_keys: Any
+    ) -> None:
+        """A non-JSON token response surfaces as 502."""
+        state = _login_state(auth_client)
+        respx.post(GOOGLE_TOKEN_URL).mock(
+            return_value=Response(200, text="not-json", headers={"content-type": "text/plain"})
+        )
         respx.get(GOOGLE_JWKS_URL).mock(return_value=Response(200, json=google_test_keys.jwks))
 
         response = auth_client.get(
@@ -280,11 +306,21 @@ class TestCallback:
 
 
 class TestLogout:
-    """Session termination stays stateless: the cookie is simply cleared."""
+    """Session termination stays stateless: the cookie is simply cleared.
+
+    Logout is POST-only: a GET must return 405 so third-party pages cannot
+    force-logout the owner cross-site (logout CSRF).
+    """
+
+    def test_logout_get_returns_405(self, auth_client: TestClient) -> None:
+        """GET /auth/logout is rejected (no cross-site forced logout)."""
+        response = auth_client.get("/auth/logout", follow_redirects=False)
+
+        assert response.status_code == 405
 
     def test_logout_clears_cookie_and_redirects(self, auth_client: TestClient) -> None:
-        """GET /auth/logout redirects home with a cleared session cookie."""
-        response = auth_client.get("/auth/logout", follow_redirects=False)
+        """POST /auth/logout redirects home with a cleared session cookie."""
+        response = auth_client.post("/auth/logout", follow_redirects=False)
 
         assert response.status_code == 302
         assert response.headers["location"] == "/"
@@ -300,7 +336,7 @@ class TestLogout:
         )
         assert auth_client.get("/api/nonexistent").status_code == 404
 
-        response = auth_client.get("/auth/logout", follow_redirects=False)
+        response = auth_client.post("/auth/logout", follow_redirects=False)
         assert response.status_code == 302
         assert 'cw_session=""' in response.headers["set-cookie"]
 

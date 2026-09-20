@@ -4,8 +4,9 @@
 doubles as the ID-token nonce and is bound to a short-lived HttpOnly cookie
 (stateless CSRF protection — no server-side store). ``/auth/callback``
 exchanges the code, verifies the ID token against the Google JWKS, enforces
-the whitelist and issues the stateless session cookie. ``/auth/logout``
-clears the session cookie.
+the whitelist and issues the stateless session cookie; the state cookie is
+cleared on every callback exit. ``/auth/logout`` is POST-only (logout-CSRF
+safe) and clears the session cookie.
 
 Secrets (client secret, session secret) are read from settings only, are
 never logged and never appear in responses (Swiss nLPD).
@@ -17,7 +18,8 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
+from starlette.responses import Response
 
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import (
@@ -44,6 +46,17 @@ def _resolve_redirect_uri(request: Request, settings: Settings) -> str:
     if settings.AUTH_REDIRECT_URI:
         return settings.AUTH_REDIRECT_URI
     return str(request.base_url).rstrip("/") + "/auth/callback"
+
+
+def _state_cleared(status_code: int, detail: str) -> Response:
+    """Build a callback response that also clears the single-use state cookie.
+
+    The state value doubles as the ID-token nonce, so it is deleted on every
+    callback exit — success and failure — to keep the single-use guarantee.
+    """
+    response: Response = JSONResponse(status_code=status_code, content={"detail": detail})
+    response.delete_cookie(STATE_COOKIE, path="/", secure=True, httponly=True)
+    return response
 
 
 @router.get("/login")
@@ -81,15 +94,19 @@ async def callback(
     request: Request,
     code: str | None = Query(default=None),
     state: str | None = Query(default=None),
-) -> RedirectResponse:
+) -> Response:
     """Finish the OIDC flow: exchange, verify, whitelist and issue a session."""
     settings: Settings = request.app.state.settings
     cookie_state = request.cookies.get(STATE_COOKIE)
     if not code or not state or not cookie_state or not secrets.compare_digest(state, cookie_state):
-        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+        return _state_cleared(400, "Invalid OAuth state")
 
-    id_token = await _exchange_code(request, settings, code)
-    jwks = await _fetch_jwks()
+    try:
+        id_token = await _exchange_code(request, settings, code)
+        jwks = await _fetch_jwks()
+    except HTTPException as exc:
+        return _state_cleared(exc.status_code, str(exc.detail))
+
     try:
         claims = verify_google_id_token(
             id_token,
@@ -98,12 +115,12 @@ async def callback(
             issuer=settings.GOOGLE_OIDC_ISSUER,
             nonce=state,
         )
-    except TokenError as exc:
-        raise HTTPException(status_code=401, detail="Invalid Google ID token") from exc
+    except TokenError:
+        return _state_cleared(401, "Invalid Google ID token")
 
     email: str = claims["email"]
     if not is_whitelisted(email, settings.AUTH_WHITELIST_EMAILS):
-        raise HTTPException(status_code=403, detail="Email not whitelisted")
+        return _state_cleared(403, "Email not whitelisted")
 
     session = create_session_token(
         email,
@@ -120,12 +137,17 @@ async def callback(
         secure=True,
         path="/",
     )
+    response.delete_cookie(STATE_COOKIE, path="/", secure=True, httponly=True)
     return response
 
 
-@router.get("/logout")
+@router.post("/logout")
 async def logout() -> RedirectResponse:
-    """Clear the session cookie and return to the public landing page."""
+    """Clear the session cookie and return to the public landing page.
+
+    POST-only: a state-changing action must not be reachable via GET, or any
+    third-party page could force-logout the owner cross-site (logout CSRF).
+    """
     response = RedirectResponse("/", status_code=302)
     response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True)
     return response

@@ -10,6 +10,7 @@ Implemented as a pure-ASGI middleware (not BaseHTTPMiddleware) so the SSE
 agent stream passes through untouched.
 """
 
+import posixpath
 from typing import Any
 
 from starlette.requests import Request
@@ -31,8 +32,16 @@ class AuthConfigError(RuntimeError):
 
 
 def is_public_path(path: str) -> bool:
-    """Return True for paths reachable without authentication (AC4)."""
-    return path in PUBLIC_PATHS or path.startswith(PUBLIC_PREFIXES)
+    """Return True for paths reachable without authentication (AC4).
+
+    The raw ASGI path is normalized first (dot-segment traversal, redundant
+    separators, trailing slashes) so e.g. ``/static/../api/...`` cannot be
+    classified public; any residual ``..`` segment fails closed.
+    """
+    normalized = posixpath.normpath(path)
+    if ".." in normalized.split("/"):
+        return False
+    return normalized in PUBLIC_PATHS or normalized.startswith(PUBLIC_PREFIXES)
 
 
 def validate_auth_config(settings: Settings) -> None:
@@ -45,7 +54,7 @@ def validate_auth_config(settings: Settings) -> None:
     missing = [name for name, value in required if not value]
     if missing:
         raise AuthConfigError("AUTH_ENABLED=true requires non-empty " + ", ".join(missing))
-    if len(settings.AUTH_SESSION_SECRET) < 32:
+    if len(settings.AUTH_SESSION_SECRET.encode("utf-8")) < 32:
         raise AuthConfigError("AUTH_SESSION_SECRET must be at least 32 bytes for HS256 (RFC 7518)")
 
 

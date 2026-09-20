@@ -110,6 +110,11 @@ class TestFailClosedValidation:
         with pytest.raises(AuthConfigError, match="at least 32 bytes"):
             validate_auth_config(self._settings(AUTH_SESSION_SECRET="too-short"))  # noqa: S106
 
+    def test_multibyte_secret_measured_in_bytes(self) -> None:
+        """The key-length check counts bytes, matching the error message."""
+        # 20 characters but 40 UTF-8 bytes: valid under byte counting.
+        validate_auth_config(self._settings(AUTH_SESSION_SECRET="é" * 20))
+
     def test_all_missing_reports_every_name(self) -> None:
         """The error lists every missing setting at once."""
         with pytest.raises(AuthConfigError) as excinfo:

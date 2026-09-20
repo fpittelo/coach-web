@@ -17,8 +17,12 @@ import jwt
 
 GOOGLE_JWKS_URI = "https://www.googleapis.com/oauth2/v3/certs"
 SESSION_ISSUER = "coach-web"
+SESSION_AUDIENCE = "coach-web"
 _SESSION_ALGORITHM = "HS256"
 _ID_TOKEN_ALGORITHM = "RS256"  # noqa: S105 - algorithm name, not a secret
+# Google documents the ID-token iss claim in two forms; some flows still
+# emit the bare host. Accepting both prevents a fail-closed login outage.
+_GOOGLE_ISSUER_FORMS = frozenset({"https://accounts.google.com", "accounts.google.com"})
 
 
 class TokenError(Exception):
@@ -30,6 +34,7 @@ def create_session_token(email: str, secret: str, ttl_seconds: int) -> str:
     now = int(time.time())
     payload = {
         "iss": SESSION_ISSUER,
+        "aud": SESSION_AUDIENCE,
         "sub": email,
         "email": email,
         "iat": now,
@@ -47,7 +52,8 @@ def verify_session_token(token: str, secret: str) -> dict[str, Any]:
             secret,
             algorithms=[_SESSION_ALGORITHM],
             issuer=SESSION_ISSUER,
-            options={"require": ["exp", "iat", "sub", "email"]},
+            audience=SESSION_AUDIENCE,
+            options={"require": ["exp", "iat", "sub", "aud", "email"]},
         )
     except jwt.PyJWTError as exc:
         raise TokenError(f"Invalid session token: {exc}") from exc
@@ -91,11 +97,12 @@ def verify_google_id_token(
             key,
             algorithms=[_ID_TOKEN_ALGORITHM],
             audience=client_id,
-            issuer=issuer,
             options={"require": ["exp", "iat", "iss", "aud"]},
         )
     except jwt.PyJWTError as exc:
         raise TokenError(f"Invalid ID token: {exc}") from exc
+    if claims.get("iss") not in _accepted_issuers(issuer):
+        raise TokenError("Invalid ID token issuer")
     if nonce is not None and claims.get("nonce") != nonce:
         raise TokenError("Nonce mismatch")
     if not claims.get("email"):
@@ -103,6 +110,19 @@ def verify_google_id_token(
     if claims.get("email_verified") is not True:
         raise TokenError("Email not verified")
     return claims
+
+
+def _accepted_issuers(configured: str) -> frozenset[str] | set[str]:
+    """Return the ID-token issuer values accepted for *configured*.
+
+    Google emits ``iss`` in two documented forms (with and without the
+    https scheme); when either Google form is configured, both are accepted
+    so a token variant cannot fail the login closed. Any other configured
+    issuer must match exactly.
+    """
+    if configured in _GOOGLE_ISSUER_FORMS:
+        return _GOOGLE_ISSUER_FORMS
+    return {configured}
 
 
 def _find_jwk(jwks: dict[str, Any], kid: Any) -> dict[str, Any] | None:

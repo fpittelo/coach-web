@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coach_web.app import create_app
-from coach_web.auth.middleware import AuthConfigError
+from coach_web.auth.middleware import AuthConfigError, is_public_path
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
 
@@ -117,6 +117,39 @@ class TestPublicPaths:
         response = auth_client.get("/docs")
 
         assert response.status_code == 401
+
+
+class TestPathNormalization:
+    """Defense-in-depth: the public-path check normalizes the raw path first."""
+
+    def test_traversal_from_static_to_api_is_not_public(self) -> None:
+        """Dot-segments cannot reclassify a protected path as public."""
+        assert is_public_path("/static/../api/agent/stream") is False
+
+    def test_traversal_from_auth_to_api_is_not_public(self) -> None:
+        """Traversal via the auth prefix cannot reach protected paths."""
+        assert is_public_path("/auth/../api/plan/approve") is False
+
+    def test_trailing_slash_is_tolerated(self) -> None:
+        """Trailing slashes do not change the public classification."""
+        assert is_public_path("/health/") is True
+        assert is_public_path("/static/styles.css/") is True
+
+    def test_redundant_separators_are_collapsed(self) -> None:
+        """Double slashes do not change the public classification."""
+        assert is_public_path("/static//styles.css") is True
+
+    def test_protocol_relative_root_fails_closed(self) -> None:
+        """'//' is preserved by POSIX normalization and fails closed."""
+        assert is_public_path("//health") is False
+
+    def test_root_relative_traversal_fails_closed(self) -> None:
+        """Root-relative dot-segments resolve to protected paths."""
+        assert is_public_path("/../api/x") is False
+
+    def test_relative_path_with_dotdot_fails_closed(self) -> None:
+        """Paths that survive normalization with '..' segments fail closed."""
+        assert is_public_path("../../../etc/passwd") is False
 
 
 class TestAuthDisabled:

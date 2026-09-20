@@ -16,6 +16,7 @@ from httpx import Response
 
 from coach_web.auth.tokens import (
     GOOGLE_JWKS_URI,
+    SESSION_AUDIENCE,
     SESSION_ISSUER,
     TokenError,
     create_session_token,
@@ -47,6 +48,13 @@ class TestCreateSessionToken:
         token = create_session_token(OWNER_EMAIL, SECRET, ttl_seconds=600)
 
         assert token.count(".") == 2
+
+    def test_token_carries_audience_claim(self) -> None:
+        """Session JWTs are audience-pinned (key reuse elsewhere cannot mint them)."""
+        token = create_session_token(OWNER_EMAIL, SECRET, ttl_seconds=600)
+        claims = verify_session_token(token, SECRET)
+
+        assert claims["aud"] == SESSION_AUDIENCE
 
     def test_expiry_is_iat_plus_ttl(self) -> None:
         """The token is short-lived: exp = iat + ttl."""
@@ -118,6 +126,43 @@ class TestVerifySessionToken:
         with pytest.raises(TokenError):
             verify_session_token(token, SECRET)
 
+    def test_wrong_audience_is_rejected(self) -> None:
+        """A session token minted for another service audience is invalid."""
+        now = int(time.time())
+        token = jwt.encode(
+            {
+                "iss": SESSION_ISSUER,
+                "aud": "other-service",
+                "sub": OWNER_EMAIL,
+                "email": OWNER_EMAIL,
+                "iat": now,
+                "exp": now + 600,
+            },
+            SECRET,
+            algorithm="HS256",
+        )
+
+        with pytest.raises(TokenError):
+            verify_session_token(token, SECRET)
+
+    def test_missing_audience_is_rejected(self) -> None:
+        """A session token without the aud claim is invalid."""
+        now = int(time.time())
+        token = jwt.encode(
+            {
+                "iss": SESSION_ISSUER,
+                "sub": OWNER_EMAIL,
+                "email": OWNER_EMAIL,
+                "iat": now,
+                "exp": now + 600,
+            },
+            SECRET,
+            algorithm="HS256",
+        )
+
+        with pytest.raises(TokenError):
+            verify_session_token(token, SECRET)
+
     def test_unexpected_algorithm_is_rejected(self) -> None:
         """Algorithm pinning: HS512-signed tokens are invalid."""
         now = int(time.time())
@@ -177,6 +222,48 @@ class TestVerifyGoogleIdToken:
 
         with pytest.raises(TokenError):
             verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
+
+    def test_bare_issuer_variant_is_accepted(self, google_test_keys: Any) -> None:
+        """Google's bare 'accounts.google.com' iss form is accepted."""
+        token = google_test_keys.sign(_id_token_claims(iss="accounts.google.com"))
+
+        claims = verify_google_id_token(
+            token,
+            google_test_keys.jwks,
+            client_id=CLIENT_ID,
+            issuer="https://accounts.google.com",
+            nonce="nonce-123",
+        )
+
+        assert claims["email"] == OWNER_EMAIL
+
+    def test_https_issuer_variant_is_accepted(self, google_test_keys: Any) -> None:
+        """The https iss form is accepted when the bare form is configured."""
+        token = google_test_keys.sign(_id_token_claims())
+
+        claims = verify_google_id_token(
+            token,
+            google_test_keys.jwks,
+            client_id=CLIENT_ID,
+            issuer="accounts.google.com",
+            nonce="nonce-123",
+        )
+
+        assert claims["email"] == OWNER_EMAIL
+
+    def test_non_google_issuer_requires_exact_match(self, google_test_keys: Any) -> None:
+        """A custom configured issuer accepts only its exact value."""
+        token = google_test_keys.sign(_id_token_claims(iss="https://custom.example"))
+
+        claims = verify_google_id_token(
+            token,
+            google_test_keys.jwks,
+            client_id=CLIENT_ID,
+            issuer="https://custom.example",
+            nonce="nonce-123",
+        )
+
+        assert claims["email"] == OWNER_EMAIL
 
     def test_wrong_issuer_is_rejected(self, google_test_keys: Any) -> None:
         """Tokens from another issuer are rejected."""
