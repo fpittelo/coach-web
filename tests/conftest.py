@@ -1,11 +1,18 @@
 """Shared pytest fixtures for coach-web tests."""
 
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
 from pydantic_settings import SettingsConfigDict
 
+from coach_web.app import create_app
 from coach_web.config import Settings, get_settings
 from coach_web.models import ReadinessMetrics, TrainingPlan
 
@@ -97,3 +104,63 @@ def sample_training_plans() -> list[TrainingPlan]:
         )
         for idx, i in enumerate(range(1, 7), start=0)
     ]
+
+
+# ---------------------------------------------------------------------------
+# Google OIDC authentication fixtures (issue #65)
+# ---------------------------------------------------------------------------
+
+AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key"
+"""HS256 signing key used by auth tests (mirrors AUTH_SESSION_SECRET env)."""
+
+AUTH_TEST_OWNER_EMAIL = "frederic.pitteloud@gmail.com"
+"""The whitelisted owner email (mirrors the AUTH_WHITELIST_EMAILS default)."""
+
+
+@dataclass
+class GoogleTestKeys:
+    """RSA test keypair mimicking the Google JWKS for ID-token signing."""
+
+    private_pem: str
+    jwks: dict[str, Any]
+
+    def sign(self, claims: dict[str, Any], kid: str = "test-google-key") -> str:
+        """Sign claims as a Google-style RS256 ID token with the test key."""
+        return str(
+            jwt.encode(claims, self.private_pem, algorithm="RS256", headers={"kid": kid})
+        )
+
+
+@pytest.fixture(scope="session")
+def google_test_keys() -> GoogleTestKeys:
+    """Generate an RSA keypair once per session to mock Google ID-token signing."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    jwk: dict[str, Any] = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+    jwk["kid"] = "test-google-key"
+    jwk["alg"] = "RS256"
+    jwk["use"] = "sig"
+    return GoogleTestKeys(private_pem=pem, jwks={"keys": [jwk]})
+
+
+@pytest.fixture
+def auth_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Settings with auth enabled and deterministic test credentials (#65)."""
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    monkeypatch.setenv("GOOGLE_OIDC_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("GOOGLE_OIDC_CLIENT_SECRET", "test-client-secret")
+    monkeypatch.setenv("AUTH_SESSION_SECRET", AUTH_TEST_SESSION_SECRET)
+    monkeypatch.setenv("GOOGLE_OIDC_ISSUER", "https://accounts.google.com")
+    get_settings.cache_clear()
+    return get_settings()
+
+
+@pytest.fixture
+def auth_client(auth_settings: Settings) -> Iterator[TestClient]:
+    """Test client against an auth-enabled app (https base for Secure cookies)."""
+    with TestClient(create_app(auth_settings), base_url="https://testserver") as client:
+        yield client
