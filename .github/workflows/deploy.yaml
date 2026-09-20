@@ -1,5 +1,13 @@
 name: Deploy Coach Web Image
 
+# ---------------------------------------------------------------------------
+# Trigger → image tag mapping (issue #90):
+#   dev images                 → push to dev
+#   qa images                  → PR closed into qa
+#   prod/latest/vX.Y.Z images  → push of v* tag
+# Main promotions are tag-driven; the PR-closed trigger intentionally
+# excludes main to prevent duplicate concurrent builds racing the GHA cache.
+# ---------------------------------------------------------------------------
 on:
   push:
     branches:
@@ -10,7 +18,6 @@ on:
     types: [closed]
     branches:
       - qa
-      - main
   workflow_dispatch:
     inputs:
       environment:
@@ -51,8 +58,6 @@ jobs:
             ENV_TAG="dev"
           elif [ "${{ github.base_ref }}" == "qa" ]; then
             ENV_TAG="qa"
-          elif [ "${{ github.base_ref }}" == "main" ]; then
-            ENV_TAG="prod"
           else
             ENV_TAG="latest"
           fi
@@ -85,3 +90,13 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify pushed images
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          while IFS= read -r image; do
+            [ -n "$image" ] || continue
+            echo "Verifying registry presence of ${image}"
+            docker buildx imagetools inspect "${image}" > /dev/null
+          done <<< "${TAGS}"
