@@ -1,0 +1,8 @@
+# Bootstrap example values. Copy to terraform.tfvars and set your real project
+# ID. NEVER commit terraform.tfvars (gitignored).
+
+project_id = "your-gcp-project-id"
+
+# region and state_bucket_name have safe defaults (europe-west6 /
+# fpittelo-coach-web-tofu-state-europe-west6); override only if the bucket
+# name is taken — and then update ../backend.tf to match.

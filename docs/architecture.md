@@ -1,7 +1,7 @@
 # 📕 Architecture — Coach Web
 
 **Audience:** @architect, @devops  
-**Last updated:** 2026-09-05
+**Last updated:** 2026-09-19
 
 ---
 
@@ -124,7 +124,7 @@ graph TD
 
     subgraph "External"
         GITHUB["GitHub REST API"]
-        INTERVALS["Intervals.icu REST API"]
+        INTERVALS["Intervals.icu<br/>REST API"]
     end
 
     APP --> CACHE
@@ -209,8 +209,7 @@ The product owner (@fpittelo) requested a modern web application to interactivel
 
 | Field | Value |
 |:---|:---|
-|:---|:---|
-| **Status** | Accepted |
+| **Status** | Accepted (superseded in practice by the v0.5 FastAPI migration — see ADR-006 note) |
 | **Date** | 2026-09-05 |
 | **Deciders** | @architect, @developer, @fpittelo |
 
@@ -313,4 +312,58 @@ graph LR
 
 ---
 
-_Last updated: 2026-09-05_
+## 9. ADR-006: v0.7 Visual Contract Supersession
+
+| Field | Value |
+|:---|:---|
+| **Status** | Accepted |
+| **Date** | 2026-09-19 |
+| **Deciders** | @architect, @developer, @scrum-master, @cyber-security |
+| **Reviewed by** | @fpittelo |
+| **Supersedes** | Sprint 03 Swiss minimalist visual contract (test-enforced, undocumented) |
+| **Tracked in** | Epic #88 — Sprint 09 (v0.7.0), Milestone 9 |
+
+### Context
+
+Sprint 03 (v0.3.0) established a Swiss minimalist visual contract: a strict token set (`#111` ink, `#fff` paper, `#ff0000` accent, `--radius: 2px`, 1px hairline borders, no shadows, emoji-free Inter typography), enforced by contract tests in `tests/test_static_assets.py` (`test_stylesheet_uses_swiss_tokens` asserts the absence of shadows and large radii; `test_index_uses_text_interpolation_only` forbids `x-html` entirely).
+
+The v0.7 UI/UX Overhaul epic (Sprint 09, #88 — groomed 2026-09-19 through a code-grounded technical grilling by @developer, 12 product decisions signed off by @fpittelo, and a KIS/YAGNI scope pass) requires a client-ready conversational experience that is incompatible with several clauses of that contract: softer radii and shadows, a slate/teal palette, a centered 760px single column, and sanitized markdown rendering of assistant messages (an intentional, gated reversal of the x-text-only posture).
+
+### Decision
+
+**Supersede the Sprint 03 visual contract with the v0.7 conversational design contract:**
+
+1. **Design tokens:** off-white surfaces (`#F8FAFC`/`#FFFFFF`), ink `#1E293B`, muted ink `#475569`, hairline `#E2E8F0`, accent deep teal `#0F766E`, accent ink `#FFFFFF`; `--radius: 10px` (band 8–12px); soft shadow tokens replace harsh black hairline borders. Single centered column, `max-width: 760px`. Inter remains the sole typeface (self-hosted WOFF2, unchanged since Sprint 03).
+2. **Deliberate test supersession:** `test_stylesheet_uses_swiss_tokens` is rewritten to assert the v0.7 token contract instead of forbidding shadows/radii. No test is deleted without a replacement assertion (zero-warning gate unchanged).
+3. **Rendering posture (assistant-only):** assistant messages render `DOMPurify.sanitize(marked.parse(text))` via `x-html` — vendored, self-hosted, zero CDN. User messages remain `x-text` forever. `test_index_uses_text_interpolation_only` is rewritten to allow `x-html` only on assistant messages via the sanitizer helper. **This reversal is security-gated:** STRIDE review #87 (@cyber-security) must sign off before #81 merges.
+4. **Transport & conversation:** `GET /api/agent/stream` is replaced by `POST /api/agent/stream` (Pydantic v2 body `{message, history}`; history capped at 10 entries; roles `user`/`assistant` only) — client-owned history, no server session store (nLPD ephemeral posture), and message content no longer leaks into access-log query strings (#79).
+5. **Styling strategy:** hand-written CSS + design tokens. No Tailwind, no Node toolchain, no icon library (single inline SVG monogram). The KIS/YAGNI cut list and locked product decisions are recorded in epic #88.
+
+### Rationale
+
+1. **Client-ready quality bar (PO Q1):** the v0.3 contract reads as an internal prototype; the epic's conversational ergonomics (bubbles, inline plan cards, pinned composer, onboarding chips) require softer geometry and a focused reading column.
+2. **Accessibility:** slate-on-off-white with a deep teal accent meets WCAG AA contrast; the 8–12px radius band + soft shadows is the epic's explicit visual direction (PO Q5).
+3. **Security by gate, not by avoidance:** forbidding `x-html` entirely was the simplest v0.5 posture; the proportionate v0.7 posture is sanitization + STRIDE review + contract tests — enabling markdown value without exposing the browser to untrusted HTML (user input never renders as HTML; the plan card stays structured Pydantic→HTML).
+4. **Privacy by design (Swiss nLPD):** POST transport removes message text from URLs; client-owned history keeps the server stateless and the browser session ephemeral.
+5. **KIS/YAGNI:** only two new vendored assets (marked, DOMPurify); no frameworks, no build toolchain, no icon set; deliberate non-goals are recorded in epic #88.
+
+### Alternatives Considered
+
+| Alternative | Pros | Cons | Verdict |
+|:---|:---|:---|:---|
+| **Keep v0.3 contract, style around it** | Zero test churn | Blocks the epic's core visual goals; compliance theatre | ❌ Rejected |
+| **Adopt Tailwind (vendored/CDN)** | Utility speed | Requires Node build or multi-KB CDN payload; contradicts zero-CDN and hand-written CSS; README claim already wrong | ❌ Rejected |
+| **Server-side markdown rendering** | One render path | Template pipeline rework; plan approval needs raw JSON anyway; client-side sanitization is proportionate | ❌ Rejected |
+| **v0.7 tokens + gated x-html (chosen)** | Epic goals met; security-gated; minimal asset footprint | Requires deliberate test rewrites (this ADR) and STRIDE review | ✅ Accepted |
+
+### Consequences
+
+- `tests/test_static_assets.py` contract tests are rewritten per this ADR in #78 and #81 — test supersession is explicit, reviewed, and logged; never silent deletion.
+- #81 is merge-blocked on STRIDE sign-off (#87): sanitizer configuration, mid-stream partial renders, CSP posture (including the Alpine `unsafe-eval` question), and replayed-history prompt injection.
+- `README.md` tech-stack table is corrected in #78: the repo uses hand-written CSS, not Tailwind.
+- Sections 1–8 of this document still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh; **ADR-006 is authoritative for the visual/rendering contract going forward.**
+- The v0.3 Inter typography decision (self-hosted WOFF2, zero CDN) carries forward unchanged.
+
+---
+
+_Last updated: 2026-09-19_

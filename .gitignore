@@ -69,3 +69,27 @@ Thumbs.db
 
 # Local vendored packages artifact
 .venv-packages/
+
+# ---------------------------------------------------------------------------
+# OpenTofu / Terraform (infra/)
+# ---------------------------------------------------------------------------
+# Provider plugins & downloaded modules are never committed
+.terraform/
+.terraform.tfstate.lock.info
+# State files never leave remote storage (GCS: versioned + locked, AC3)
+*.tfstate
+*.tfstate.*
+# Plan files
+*.tfplan
+*.tfplan.txt
+# Real variable values are never committed (only *.tfvars.example lives in git)
+*.tfvars
+# Crash logs
+crash.log
+crash.*.log
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+# NOTE: .terraform.lock.hcl IS committed (pinned provider hashes).
