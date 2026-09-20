@@ -31,14 +31,14 @@ project_id = "your-gcp-project-id"
 # github_token_secret_id       = "github-token"
 
 # ---------------------------------------------------------------------------
-# Application configuration (mirrors .env.example) — defaults shown.
+# Application configuration (cloud-specific only — review PR #93). Env entries
+# duplicating the app's built-in defaults (src/coach_web/config.py) are
+# intentionally NOT set in the spec; the app defaults are the single source
+# of truth.
 # ---------------------------------------------------------------------------
-# github_plan_repo   = "fpittelo/coach"
-# github_plan_branch = "main"
-# github_plan_dir    = "plans"
-# openrouter_model   = "anthropic/claude-3.5-sonnet"
-# cors_origins       = ["http://localhost:8000"]
-# log_level          = "INFO"
+# cors_origins = "" # empty default (same-origin UI); JSON array string if a
+#                     # cross-origin consumer is ever added, e.g.
+#                     # cors_origins = "[\"https://coach.example.com\"]"
 
 # ---------------------------------------------------------------------------
 # WIF & OIDC

@@ -146,49 +146,13 @@ variable "github_token_secret_id" {
 }
 
 # ---------------------------------------------------------------------------
-# Non-secret application configuration (mirrors .env.example)
+# Non-secret application configuration (cloud-specific only — review PR #93)
 # ---------------------------------------------------------------------------
 
-variable "github_plan_repo" {
-  description = "GitHub repository holding training plan issues (owner/name). Distinct from the WIF-scope github_repo (the IaC repository itself)."
-  type        = string
-  default     = "fpittelo/coach"
-}
-
-variable "github_plan_branch" {
-  description = "Branch receiving approved Markdown training plans."
-  type        = string
-  default     = "main"
-}
-
-variable "github_plan_dir" {
-  description = "Directory inside the repository holding approved Markdown plans."
-  type        = string
-  default     = "plans"
-}
-
-variable "openrouter_base_url" {
-  description = "OpenRouter API base URL."
-  type        = string
-  default     = "https://openrouter.ai/api/v1"
-}
-
-variable "openrouter_model" {
-  description = "Default model routed through OpenRouter for the coach agent."
-  type        = string
-  default     = "anthropic/claude-3.5-sonnet"
-}
-
 variable "cors_origins" {
-  description = "Allowed browser origins for cross-origin requests (serialized to the CORS_ORIGINS env as a JSON array). Same-origin serving from Cloud Run makes this mostly relevant for local development."
-  type        = list(string)
-  default     = ["http://localhost:8000"]
-}
-
-variable "log_level" {
-  description = "Application log level (DEBUG, INFO, WARNING, ERROR)."
+  description = "CORS_ORIGINS env for the app — a JSON array string of allowed browser origins. Empty default: the UI is served same-origin by the FastAPI app, so the cloud deployment needs no CORS. Local dev overrides via compose/.env; set here only for a cross-origin consumer."
   type        = string
-  default     = "INFO"
+  default     = ""
 }
 
 # ---------------------------------------------------------------------------

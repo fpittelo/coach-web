@@ -210,13 +210,15 @@ resource "google_cloud_run_v2_service" "main" {
 
       # Non-secret configuration as plain env (AC4: secrets only via
       # value_source below — no plaintext credentials anywhere in this spec).
+      # KIS (review PR #93): env entries that exactly duplicate the app's
+      # built-in defaults (src/coach_web/config.py) are omitted — the app
+      # defaults are the single source of truth. Only cloud-required
+      # overrides and cloud-specific config are set here.
       env {
-        name  = "APP_HOST"
-        value = "0.0.0.0"
-      }
-      env {
+        # Cloud override: the app default is 8000 (local compose topology);
+        # the Cloud Run ingress port is 8080 (issue #66).
         name  = "APP_PORT"
-        value = tostring(local.coach_web_port) # 8080 on Cloud Run (issue #66)
+        value = tostring(local.coach_web_port)
       }
       env {
         # Cloud Run sidecar networking: containers share localhost, replacing
@@ -229,54 +231,18 @@ resource "google_cloud_run_v2_service" "main" {
         name  = "GITHUB_MCP_URL"
         value = "http://localhost:${local.github_mcp_port}/"
       }
-      env {
-        name  = "GITHUB_REPO"
-        value = var.github_plan_repo
-      }
-      env {
-        name  = "GITHUB_PLAN_BRANCH"
-        value = var.github_plan_branch
-      }
-      env {
-        name  = "GITHUB_PLAN_DIR"
-        value = var.github_plan_dir
-      }
-      env {
-        name  = "OPENROUTER_BASE_URL"
-        value = var.openrouter_base_url
-      }
-      env {
-        name  = "OPENROUTER_MODEL"
-        value = var.openrouter_model
-      }
-      env {
-        name  = "OPENROUTER_TIMEOUT_SECONDS"
-        value = "60" # .env.example default
-      }
-      env {
-        name  = "OPENROUTER_APP_TITLE"
-        value = "Coach Web"
-      }
-      env {
-        name  = "OPENROUTER_REFERER"
-        value = "https://github.com/fpittelo/coach-web"
-      }
-      env {
-        name  = "AGENT_MAX_TOOL_ITERATIONS"
-        value = "8" # .env.example default
-      }
-      env {
-        name  = "CACHE_TTL_SECONDS"
-        value = "60" # coach-web app default (.env.example)
-      }
-      env {
-        name  = "LOG_LEVEL"
-        value = var.log_level
-      }
-      env {
-        # JSON array of allowed browser origins (Settings.CORS_ORIGINS).
-        name  = "CORS_ORIGINS"
-        value = jsonencode(var.cors_origins)
+      dynamic "env" {
+        # CORS: the UI is served same-origin by the FastAPI app, so the cloud
+        # deployment needs no CORS configuration (empty default). Set
+        # cors_origins in tfvars only for a cross-origin consumer; the value
+        # must be a JSON array string (Settings.CORS_ORIGINS). Emitted only
+        # when non-empty — an empty CORS_ORIGINS env would fail the app's
+        # JSON parsing at startup.
+        for_each = var.cors_origins != "" ? [1] : []
+        content {
+          name  = "CORS_ORIGINS"
+          value = var.cors_origins
+        }
       }
 
       # OIDC config surface (issue #64): the client ID is injected as env so
@@ -395,13 +361,17 @@ resource "google_cloud_run_v2_service" "main" {
     }
 
     # --- Container 3 (SIDECAR): github-mcp -------------------------------------
-    # Official github-mcp-server in streamable-HTTP mode, same command as the
-    # compose topology.
+    # Official github-mcp-server in streamable-HTTP mode, same invocation as
+    # the compose topology.
     containers {
       name  = "github-mcp"
       image = var.github_mcp_image
 
-      command = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
+      # `args` (NOT `command`): a Cloud Run v2 `command` would REPLACE the
+      # image ENTRYPOINT (/server/github-mcp-server) and exec a non-existent
+      # `http` binary. Compose `command` maps to CMD (entrypoint args); the
+      # Cloud Run equivalent is `args` (review PR #93, blocking).
+      args = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
 
       # Internal-only (AC5).
       ports {

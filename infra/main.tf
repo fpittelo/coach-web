@@ -80,14 +80,8 @@ module "cloud_run" {
   intervals_api_key_secret_id  = var.intervals_api_key_secret_id
   github_token_secret_id       = var.github_token_secret_id
 
-  # Non-secret application configuration (mirrors .env.example)
-  github_plan_repo    = var.github_plan_repo
-  github_plan_branch  = var.github_plan_branch
-  github_plan_dir     = var.github_plan_dir
-  openrouter_base_url = var.openrouter_base_url
-  openrouter_model    = var.openrouter_model
-  cors_origins        = var.cors_origins
-  log_level           = var.log_level
+  # Non-secret application configuration (cloud-specific only — review PR #93)
+  cors_origins = var.cors_origins
 
   # Networking (optional direct VPC egress)
   enable_vpc_egress = var.enable_vpc_egress

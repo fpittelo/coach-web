@@ -98,7 +98,8 @@ flowchart LR
 - **Scaling**: `min_instance_count = 0`, `max_instance_count = 2`.
 - **Images** (AC3): every image variable must carry an explicit tag or digest;
   floating `:latest` is rejected by variable validation. The deploy workflow
-  (#67) wires environment-specific tags (`dev` / `qa` / `prod` / sha).
+  (#67) wires environment-specific tags (`dev` / `qa` / `prod` / sha) and will
+  pin deploy-time images by digest/sha tag.
 
 ### Private GHCR images — deployment prerequisite
 
