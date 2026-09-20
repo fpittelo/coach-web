@@ -119,8 +119,20 @@ variable "runtime_sa_id" {
 }
 
 variable "oidc_client_id" {
-  description = "Google OAuth web client ID injected as GOOGLE_OIDC_CLIENT_ID (config surface, issue #65)."
+  # ADR-04 (issue #68): the app-level Google OIDC whitelist IS the
+  # access-control boundary, and AUTH_ENABLED is fixed to "true" for this
+  # service — so a missing client ID must fail at `tofu plan`/`apply` time,
+  # never at container boot (the app's middleware fails closed with
+  # AuthConfigError at startup instead). The full-shape regex (numeric prefix,
+  # lowercase alphanumeric suffix) rejects placeholder values that would pass
+  # a bare ".apps.googleusercontent.com" suffix check.
+  description = "Google OAuth web client ID injected as GOOGLE_OIDC_CLIENT_ID (issue #65/#68). Required — obtain it once from the Google Cloud Console and set repo variable OIDC_CLIENT_ID (CI) or oidc_client_id in terraform.tfvars (local applies)."
   type        = string
+
+  validation {
+    condition     = can(regex("^[0-9]+-[a-z0-9]+\\.apps\\.googleusercontent\\.com$", var.oidc_client_id))
+    error_message = "oidc_client_id must be a Google OAuth web client ID of the form <number>-<lowercase-alphanumeric>.apps.googleusercontent.com. Set repo variable OIDC_CLIENT_ID (CI deploys) or oidc_client_id in terraform.tfvars (local applies); the client is created once in the Google Cloud Console."
+  }
 }
 
 variable "oidc_issuer_uri" {
@@ -150,6 +162,18 @@ variable "github_token_secret_id" {
   default     = "github-token"
 }
 
+variable "auth_session_secret_id" {
+  description = "Secret Manager secret ID holding the HS256 session-token signing key (coach-web auth, issue #68)."
+  type        = string
+  default     = "auth-session-secret"
+}
+
+variable "google_oauth_client_secret_id" {
+  description = "Secret Manager secret ID holding the Google OAuth client secret for the OIDC code exchange (coach-web auth, issue #68)."
+  type        = string
+  default     = "google-oauth-client-secret"
+}
+
 # ---------------------------------------------------------------------------
 # Non-secret application configuration (cloud-specific only — review PR #93)
 # ---------------------------------------------------------------------------
@@ -166,6 +190,29 @@ variable "cors_origins" {
   validation {
     condition     = var.cors_origins == "" || can(jsondecode(var.cors_origins))
     error_message = "cors_origins must be empty or valid JSON (e.g. a JSON array of origin strings, see Settings.CORS_ORIGINS)."
+  }
+}
+
+variable "auth_whitelist_emails" {
+  # ADR-04 (issue #68): the email whitelist IS the access-control boundary, so
+  # it is wired explicitly into the service spec rather than left to the app
+  # default — the deployed posture must be visible in IaC and the Cloud Run
+  # console, not implied. The default value is a REAL email by design: it is
+  # the owner's public identity as the single user of a single-user personal
+  # app, it is not a credential (access requires a Google-verified ID token
+  # for that address, not knowledge of it), and it is by nature public config
+  # — acceptable to commit, unlike secret material.
+  description = "AUTH_WHITELIST_EMAILS env for the app — a JSON array string of Google account emails allowed past the auth boundary (ADR-04, issue #65/#68). Single-user personal app: the default is the owner's own address."
+  type        = string
+  default     = "[\"frederic.pitteloud@gmail.com\"]"
+
+  # Same plan-time JSON gate as cors_origins (carried review item #4 from
+  # #66): pydantic-settings parses list[str] fields as JSON, so a malformed
+  # value would crash the container at startup — fail at plan instead.
+  # OpenTofu 1.12 `tofu validate` does not evaluate validation blocks.
+  validation {
+    condition     = can(jsondecode(var.auth_whitelist_emails))
+    error_message = "auth_whitelist_emails must be a valid JSON array string of email addresses (e.g. [\"you@example.com\"]) — pydantic-settings parses it as JSON (same contract as CORS_ORIGINS, issue #93)."
   }
 }
 
