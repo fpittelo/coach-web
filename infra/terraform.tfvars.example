@@ -1,14 +1,48 @@
-# coach-web GCP foundation — example variable values (issue #64).
+# coach-web GCP foundation — example variable values (issues #64, #66).
 #
 # Copy to terraform.tfvars and fill in real values. NEVER commit
 # terraform.tfvars (gitignored). No secrets belong here — authentication uses
-# Application Default Credentials / Workload Identity Federation, not keys (AC6).
+# Application Default Credentials / Workload Identity Federation, not keys
+# (AC6), and API keys live in Secret Manager (AC4), populated out-of-band
+# (see infra/README.md).
 
 # GCP project hosting the stack (required — no default on purpose).
 project_id = "your-gcp-project-id"
 
 # region is pinned to europe-west6 (Zürich) by validation in variables.tf;
 # Swiss data residency (nLPD) is non-negotiable (AC2).
+
+# ---------------------------------------------------------------------------
+# Container images (issue #66, AC3) — defaults shown; the deploy workflow #67
+# wires environment-specific tags (dev/qa/prod/sha). Floating ':latest' is
+# rejected by validation.
+# ---------------------------------------------------------------------------
+# coach_web_image  = "ghcr.io/fpittelo/coach-web:dev"
+# coach_mcp_image  = "ghcr.io/fpittelo/coach:dev"
+# github_mcp_image = "ghcr.io/github/github-mcp-server:v1.12.2"
+
+# ---------------------------------------------------------------------------
+# Secret Manager secret names (issue #66, AC4) — defaults shown. Secret
+# VERSIONS are populated out-of-band with `gcloud secrets versions add`
+# (procedure in infra/README.md); never place secret values in this file.
+# ---------------------------------------------------------------------------
+# openrouter_api_key_secret_id = "openrouter-api-key"
+# intervals_api_key_secret_id  = "intervals-api-key"
+# github_token_secret_id       = "github-token"
+
+# ---------------------------------------------------------------------------
+# Application configuration (mirrors .env.example) — defaults shown.
+# ---------------------------------------------------------------------------
+# github_plan_repo   = "fpittelo/coach"
+# github_plan_branch = "main"
+# github_plan_dir    = "plans"
+# openrouter_model   = "anthropic/claude-3.5-sonnet"
+# cors_origins       = ["http://localhost:8000"]
+# log_level          = "INFO"
+
+# ---------------------------------------------------------------------------
+# WIF & OIDC
+# ---------------------------------------------------------------------------
 
 # GitHub repository scope for the WIF attribute condition (defaults shown).
 # github_org  = "fpittelo"
