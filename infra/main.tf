@@ -133,3 +133,30 @@ resource "google_storage_bucket_iam_member" "deployer_state_access" {
   role   = "roles/storage.objectAdmin"
   member = "serviceAccount:${module.wif.deployer_sa_email}"
 }
+
+# 3. Project-wide READ for the REFRESH phase of `tofu apply` (first live CI
+# deploy, workflow_dispatch run 35509409312, 403'd here: the deployer
+# authenticated via WIF fine but the plan's refresh phase was denied
+# `serviceusage.services.list` and could not read the project services, WIF
+# pool, VPC, secrets and IAM bindings already in state). `tofu apply`
+# REFRESHES every resource in state before planning, so a full-stack deployer
+# needs project-wide READ: `roles/viewer` grants get/list on all resources
+# (compute, run, secretmanager metadata, serviceusage).
+resource "google_project_iam_member" "deployer_read_viewer" {
+  project = var.project_id
+  role    = "roles/viewer"
+  member  = "serviceAccount:${module.wif.deployer_sa_email}"
+}
+
+# 4. Project-wide READ for IAM metadata: `roles/iam.securityReviewer` grants
+# getIamPolicy on the project, service accounts, the WIF pool/provider and
+# secrets — the `google_*_iam_member` resources in state refresh via
+# getIamPolicy. Both roles grant ZERO write: writes remain governed by the
+# narrow grants above (run.admin, SA-scoped serviceAccountUser, bucket-scoped
+# objectAdmin). This consciously resolves the least-privilege follow-up
+# predicted in #67: a read-broad / write-narrow pattern.
+resource "google_project_iam_member" "deployer_read_security_reviewer" {
+  project = var.project_id
+  role    = "roles/iam.securityReviewer"
+  member  = "serviceAccount:${module.wif.deployer_sa_email}"
+}
