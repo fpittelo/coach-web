@@ -69,6 +69,32 @@ class Settings(BaseSettings):
     CORS_ORIGINS: list[str] = Field(default_factory=lambda: ["http://localhost:8000"])
     """Allowed browser origins for cross-origin requests."""
 
+    AUTH_ENABLED: bool = False
+    """Enable Google OIDC authentication & whitelist middleware (opt-in, #65)."""
+
+    GOOGLE_OIDC_CLIENT_ID: str = ""
+    """Google OAuth web client ID (Cloud Run injects GOOGLE_OIDC_CLIENT_ID, #66)."""
+
+    GOOGLE_OIDC_CLIENT_SECRET: str = ""
+    """Google OAuth client secret (env var only; never logged or persisted)."""
+
+    GOOGLE_OIDC_ISSUER: str = "https://accounts.google.com"
+    """Expected issuer of Google ID tokens (aligns with the Cloud Run spec, #66)."""
+
+    AUTH_WHITELIST_EMAILS: list[str] = Field(
+        default_factory=lambda: ["frederic.pitteloud@gmail.com"]
+    )
+    """Application-level access-control whitelist — THE security boundary (#65)."""
+
+    AUTH_SESSION_SECRET: str = ""
+    """HS256 signing key for stateless session tokens (env var only; never logged)."""
+
+    AUTH_SESSION_TTL_SECONDS: int = 3600
+    """Stateless session token lifetime in seconds (short-lived by design)."""
+
+    AUTH_REDIRECT_URI: str = ""
+    """Explicit OAuth redirect URI; derived from the request base URL when empty."""
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""
