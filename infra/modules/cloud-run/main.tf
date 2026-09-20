@@ -300,10 +300,13 @@ resource "google_cloud_run_v2_service" "main" {
         }
       }
 
-      # Mirrors the compose healthcheck: GET /sse must return 2xx.
+      # TCP socket probe: proves the SSE listener is up. HTTP probes MUST NOT
+      # target /sse — Server-Sent Events streams never complete, so an HTTP
+      # probe always hits its timeout (Cloud Run ERROR_TIMEOUT; each aborted
+      # probe also tears the instance down — live incident #66). Compose only
+      # appeared to work due to curl header behaviour.
       startup_probe {
-        http_get {
-          path = "/sse"
+        tcp_socket {
           port = local.coach_mcp_port
         }
         period_seconds    = 5
