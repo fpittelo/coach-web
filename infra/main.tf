@@ -76,12 +76,18 @@ module "cloud_run" {
   oidc_issuer_uri       = module.oidc.issuer_uri
 
   # Secret Manager secret names (AC4 — versions populated out-of-band)
-  openrouter_api_key_secret_id = var.openrouter_api_key_secret_id
-  intervals_api_key_secret_id  = var.intervals_api_key_secret_id
-  github_token_secret_id       = var.github_token_secret_id
+  openrouter_api_key_secret_id  = var.openrouter_api_key_secret_id
+  intervals_api_key_secret_id   = var.intervals_api_key_secret_id
+  github_token_secret_id        = var.github_token_secret_id
+  auth_session_secret_id        = var.auth_session_secret_id
+  google_oauth_client_secret_id = var.google_oauth_client_secret_id
 
   # Non-secret application configuration (cloud-specific only — review PR #93)
   cors_origins = var.cors_origins
+
+  # Auth boundary (ADR-04, issue #68): AUTH_ENABLED is fixed "true" inside the
+  # module; the whitelist is the access-control boundary and is wired here.
+  auth_whitelist_emails = var.auth_whitelist_emails
 
   # Networking (optional direct VPC egress)
   enable_vpc_egress = var.enable_vpc_egress

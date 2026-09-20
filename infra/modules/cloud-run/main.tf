@@ -11,11 +11,18 @@
 # the local compose topology (docker-compose.yml, issue #63) therefore become
 # localhost URLs (COACH_MCP_URL / GITHUB_MCP_URL below).
 #
-# Secrets: three Secret Manager secrets (OpenRouter, Intervals.icu, GitHub
-# PAT) with user-managed replication pinned to europe-west6 and PER-SECRET
-# IAM bindings for the runtime SA (carried review item #1 from #64). Secret
-# VERSIONS are populated out-of-band (see infra/README.md) — no secret
-# material is ever managed by, or stored in, IaC or state (AC4).
+# Secrets: five Secret Manager secrets (OpenRouter, Intervals.icu, GitHub
+# PAT, auth session key, Google OAuth client secret — the latter two added by
+# issue #68) with user-managed replication pinned to europe-west6 and
+# PER-SECRET IAM bindings for the runtime SA (carried review item #1 from
+# #64). Secret VERSIONS are populated out-of-band (see infra/README.md) — no
+# secret material is ever managed by, or stored in, IaC or state (AC4).
+#
+# Auth boundary (ADR-04, issue #68): AUTH_ENABLED is fixed to "true" for the
+# cloud posture and the email whitelist is wired explicitly — the application
+# level Google OIDC whitelist (issue #65) IS the access-control boundary that
+# justifies the unauthenticated edge (INGRESS_TRAFFIC_ALL + allUsers invoker
+# below). Local compose stays env-driven off (app default AUTH_ENABLED=false).
 
 # --- Runtime identity ---------------------------------------------------------
 # Dedicated least-privilege runtime service account. The service never runs on
@@ -81,6 +88,17 @@ locals {
     github_token = {
       secret_id   = var.github_token_secret_id
       description = "GitHub PAT for coach-web (training plan issues) and the github-mcp sidecar."
+    }
+    # Auth boundary secrets (issue #68, ADR-04). The session key signs the
+    # stateless HS256 session cookies; the OAuth client secret authenticates
+    # the /auth/callback code exchange against Google's token endpoint.
+    auth_session_secret = {
+      secret_id   = var.auth_session_secret_id
+      description = "HS256 signing key for stateless auth session tokens (coach-web, issue #65/#68)."
+    }
+    google_oauth_client_secret = {
+      secret_id   = var.google_oauth_client_secret_id
+      description = "Google OAuth client secret for the OIDC authorization-code exchange (coach-web, issue #68)."
     }
   }
 }
@@ -245,13 +263,44 @@ resource "google_cloud_run_v2_service" "main" {
         }
       }
 
-      # OIDC config surface (issue #64): the client ID is injected as env so
-      # the app can validate Google ID tokens. Whitelist enforcement is #65.
+      # --- Auth boundary (ADR-04, issue #68) -------------------------------------
+      # The application-level Google OIDC whitelist (issue #65) IS the
+      # access-control boundary that justifies the unauthenticated edge, so
+      # auth is unconditionally ON for the cloud posture. Local compose stays
+      # env-driven off (app default AUTH_ENABLED=false,
+      # src/coach_web/config.py). Deliberately NOT set (KIS, app defaults are
+      # the source of truth): AUTH_REDIRECT_URI (the router derives it from
+      # the request base URL behind Cloud Run HTTPS —
+      # src/coach_web/auth/router.py _resolve_redirect_uri) and
+      # AUTH_SESSION_TTL_SECONDS (app default 3600).
       env {
-        name  = "GOOGLE_OIDC_CLIENT_ID"
-        value = var.oidc_client_id
+        name  = "AUTH_ENABLED"
+        value = "true"
       }
       env {
+        # JSON array string — pydantic-settings parses list[str] fields as
+        # JSON (the CORS lesson from issue #93). Wired explicitly rather than
+        # left to the app default: the deployed whitelist is the security
+        # boundary and must be visible in IaC / the Cloud Run console, not
+        # implied (see the variable comment in variables.tf).
+        name  = "AUTH_WHITELIST_EMAILS"
+        value = var.auth_whitelist_emails
+      }
+      dynamic "env" {
+        # Same emit-only-when-non-empty pattern as CORS_ORIGINS above. The
+        # oidc_client_id validation makes empty a plan-time failure, so this
+        # always emits in practice; the dynamic block keeps the env spec
+        # honest if that validation is ever consciously relaxed (an omitted
+        # GOOGLE_OIDC_CLIENT_ID fails the app closed at boot —
+        # AuthConfigError — which is the desired posture, never a silent "").
+        for_each = var.oidc_client_id != "" ? [1] : []
+        content {
+          name  = "GOOGLE_OIDC_CLIENT_ID"
+          value = var.oidc_client_id
+        }
+      }
+      env {
+        # Google's public OIDC issuer — fixed by Google (modules/oidc).
         name  = "GOOGLE_OIDC_ISSUER"
         value = var.oidc_issuer_uri
       }
@@ -273,6 +322,27 @@ resource "google_cloud_run_v2_service" "main" {
         value_source {
           secret_key_ref {
             secret  = google_secret_manager_secret.app_secrets["github_token"].secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        # OAuth client secret for the /auth/callback code exchange (issue #68).
+        name = "GOOGLE_OIDC_CLIENT_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.app_secrets["google_oauth_client_secret"].secret_id
+            version = "latest"
+          }
+        }
+      }
+      env {
+        # HS256 signing key for the stateless session cookies (issue #68); the
+        # app enforces >= 32 bytes at startup and fails closed otherwise.
+        name = "AUTH_SESSION_SECRET"
+        value_source {
+          secret_key_ref {
+            secret  = google_secret_manager_secret.app_secrets["auth_session_secret"].secret_id
             version = "latest"
           }
         }

@@ -168,11 +168,16 @@ jobs:
     name: Deploy to Cloud Run (OpenTofu via WIF)
     runs-on: ubuntu-latest
     needs: build-and-push
-    # Skip-guard (PR #95 review): the federation repo variables only exist
-    # after the gated first apply (#64/#67 — they are populated from real
-    # `tofu outputs`). Until then, skip the deploy silently instead of
-    # failing at auth/init on every push; builds/pushes still run.
-    if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != ''
+    # Skip-guard (PR #95 review; extended by #68): the federation repo
+    # variables only exist after the gated first apply (#64/#67 — they are
+    # populated from real `tofu outputs`). Until then, skip the deploy
+    # silently instead of failing at auth/init on every push; builds/pushes
+    # still run. #68 adds vars.OIDC_CLIENT_ID to the guard: the Cloud Run
+    # spec now REQUIRES a Google OAuth client ID (ADR-04 — the app-level
+    # whitelist is the access-control boundary, enforced by variable
+    # validation at plan time), so a deploy without it would fail `tofu
+    # apply` anyway; skipping keeps the pre-configuration window green.
+    if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != '' && vars.OIDC_CLIENT_ID != ''
     # AC4: the production lane runs under the `production` GitHub environment;
     # required-reviewer protection on that environment is the @fpittelo
     # approval gate (one-time manual setup — see infra/README.md). dev/qa run
@@ -218,12 +223,17 @@ jobs:
         working-directory: infra
         env:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          # Public identifier (sent in every browser redirect to Google) — a
+          # repo VARIABLE, not a secret (#68). The OAuth client secret is a
+          # Secret Manager secret, populated out-of-band, never via CI.
+          OIDC_CLIENT_ID: ${{ vars.OIDC_CLIENT_ID }}
           COACH_WEB_IMAGE: ${{ needs.build-and-push.outputs.coach_web_image }}
           COACH_MCP_IMAGE: ${{ needs.build-and-push.outputs.coach_mcp_image }}
           GITHUB_MCP_IMAGE: ${{ needs.build-and-push.outputs.github_mcp_image }}
         run: |
           tofu apply -auto-approve -input=false -lock-timeout=300s \
             -var="project_id=${GCP_PROJECT_ID}" \
+            -var="oidc_client_id=${OIDC_CLIENT_ID}" \
             -var="coach_web_image=${COACH_WEB_IMAGE}" \
             -var="coach_mcp_image=${COACH_MCP_IMAGE}" \
             -var="github_mcp_image=${GITHUB_MCP_IMAGE}"
