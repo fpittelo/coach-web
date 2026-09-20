@@ -110,7 +110,7 @@ def sample_training_plans() -> list[TrainingPlan]:
 # Google OIDC authentication fixtures (issue #65)
 # ---------------------------------------------------------------------------
 
-AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"
+AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 """HS256 signing key used by auth tests (mirrors AUTH_SESSION_SECRET env)."""
 
 AUTH_TEST_OWNER_EMAIL = "frederic.pitteloud@gmail.com"
@@ -126,9 +126,7 @@ class GoogleTestKeys:
 
     def sign(self, claims: dict[str, Any], kid: str = "test-google-key") -> str:
         """Sign claims as a Google-style RS256 ID token with the test key."""
-        return str(
-            jwt.encode(claims, self.private_pem, algorithm="RS256", headers={"kid": kid})
-        )
+        return str(jwt.encode(claims, self.private_pem, algorithm="RS256", headers={"kid": kid}))
 
 
 @pytest.fixture(scope="session")

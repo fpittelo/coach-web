@@ -46,9 +46,7 @@ def validate_auth_config(settings: Settings) -> None:
     if missing:
         raise AuthConfigError("AUTH_ENABLED=true requires non-empty " + ", ".join(missing))
     if len(settings.AUTH_SESSION_SECRET) < 32:
-        raise AuthConfigError(
-            "AUTH_SESSION_SECRET must be at least 32 bytes for HS256 (RFC 7518)"
-        )
+        raise AuthConfigError("AUTH_SESSION_SECRET must be at least 32 bytes for HS256 (RFC 7518)")
 
 
 class AuthMiddleware:
@@ -68,10 +66,14 @@ class AuthMiddleware:
             return
         claims = self._session_claims(scope, settings)
         if claims is None:
-            await self._reject(scope, receive, send, status_code=401, detail="Authentication required")
+            await self._reject(
+                scope, receive, send, status_code=401, detail="Authentication required"
+            )
             return
         if not is_whitelisted(claims.get("email"), settings.AUTH_WHITELIST_EMAILS):
-            await self._reject(scope, receive, send, status_code=403, detail="Email not whitelisted")
+            await self._reject(
+                scope, receive, send, status_code=403, detail="Email not whitelisted"
+            )
             return
         await self.app(scope, receive, send)
 

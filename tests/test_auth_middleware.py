@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from coach_web.app import create_app
-from coach_web.auth.middleware import AuthConfigError, AuthMiddleware
+from coach_web.auth.middleware import AuthConfigError
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
 
@@ -61,9 +61,7 @@ class TestRouteProtection:
 
     def test_non_whitelisted_email_is_forbidden(self, auth_client: TestClient) -> None:
         """AC2: a valid session for a non-whitelisted email returns 403."""
-        auth_client.cookies.set(
-            "cw_session", _session_cookie(email="attacker@example.com")
-        )
+        auth_client.cookies.set("cw_session", _session_cookie(email="attacker@example.com"))
 
         response = auth_client.get("/api/nonexistent")
 
@@ -72,9 +70,7 @@ class TestRouteProtection:
 
     def test_expired_session_is_unauthorized(self, auth_client: TestClient) -> None:
         """An expired session token returns 401."""
-        auth_client.cookies.set(
-            "cw_session", _session_cookie(ttl_seconds=-10)
-        )
+        auth_client.cookies.set("cw_session", _session_cookie(ttl_seconds=-10))
 
         response = auth_client.get("/api/nonexistent")
 
@@ -137,8 +133,10 @@ class TestAuthDisabled:
         """The middleware is absent from the stack when auth is disabled."""
         app = create_app()
 
-        registered = [middleware.cls for middleware in app.user_middleware]
-        assert AuthMiddleware not in registered
+        registered_names = [
+            getattr(middleware.cls, "__name__", "") for middleware in app.user_middleware
+        ]
+        assert "AuthMiddleware" not in registered_names
 
 
 class TestFailClosedConfiguration:
@@ -161,9 +159,7 @@ class TestFailClosedConfiguration:
         with pytest.raises(AuthConfigError, match="GOOGLE_OIDC_CLIENT_ID"):
             create_app()
 
-    def test_missing_client_secret_refuses_to_boot(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_client_secret_refuses_to_boot(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing GOOGLE_OIDC_CLIENT_SECRET raises AuthConfigError."""
         self._enabled_env(monkeypatch)
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_SECRET", "")
@@ -172,9 +168,7 @@ class TestFailClosedConfiguration:
         with pytest.raises(AuthConfigError, match="GOOGLE_OIDC_CLIENT_SECRET"):
             create_app()
 
-    def test_missing_session_secret_refuses_to_boot(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_session_secret_refuses_to_boot(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Missing AUTH_SESSION_SECRET raises AuthConfigError."""
         self._enabled_env(monkeypatch)
         monkeypatch.setenv("AUTH_SESSION_SECRET", "")

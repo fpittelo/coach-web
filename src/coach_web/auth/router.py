@@ -32,7 +32,7 @@ from coach_web.config import Settings
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"  # noqa: S105 - public URL
 STATE_COOKIE = "cw_oidc_state"
 STATE_COOKIE_TTL_SECONDS = 600
 GOOGLE_TIMEOUT_SECONDS = 10.0
@@ -85,12 +85,7 @@ async def callback(
     """Finish the OIDC flow: exchange, verify, whitelist and issue a session."""
     settings: Settings = request.app.state.settings
     cookie_state = request.cookies.get(STATE_COOKIE)
-    if (
-        not code
-        or not state
-        or not cookie_state
-        or not secrets.compare_digest(state, cookie_state)
-    ):
+    if not code or not state or not cookie_state or not secrets.compare_digest(state, cookie_state):
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     id_token = await _exchange_code(request, settings, code)
@@ -151,9 +146,7 @@ async def _exchange_code(request: Request, settings: Settings, code: str) -> str
                 },
             )
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502, detail="Google token endpoint unreachable"
-        ) from exc
+        raise HTTPException(status_code=502, detail="Google token endpoint unreachable") from exc
     if response.status_code != 200:
         raise HTTPException(status_code=502, detail="Google token exchange failed")
     try:
@@ -164,9 +157,7 @@ async def _exchange_code(request: Request, settings: Settings, code: str) -> str
         ) from exc
     id_token = payload.get("id_token")
     if not id_token:
-        raise HTTPException(
-            status_code=502, detail="Google token exchange returned no ID token"
-        )
+        raise HTTPException(status_code=502, detail="Google token exchange returned no ID token")
     return str(id_token)
 
 

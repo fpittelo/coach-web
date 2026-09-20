@@ -176,36 +176,28 @@ class TestVerifyGoogleIdToken:
         token = google_test_keys.sign(_id_token_claims(aud="other-client"))
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_wrong_issuer_is_rejected(self, google_test_keys: Any) -> None:
         """Tokens from another issuer are rejected."""
         token = google_test_keys.sign(_id_token_claims(iss="https://evil.example"))
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_expired_token_is_rejected(self, google_test_keys: Any) -> None:
         """Expired ID tokens are rejected."""
         token = google_test_keys.sign(_id_token_claims(exp=int(time.time()) - 10))
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_unknown_kid_is_rejected(self, google_test_keys: Any) -> None:
         """Tokens signed by an unknown key (kid) are rejected."""
         token = google_test_keys.sign(_id_token_claims(), kid="rotated-away-key")
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_nonce_mismatch_is_rejected(self, google_test_keys: Any) -> None:
         """Nonce binding: replayed tokens with a foreign nonce are rejected."""
@@ -225,23 +217,21 @@ class TestVerifyGoogleIdToken:
         token = google_test_keys.sign(_id_token_claims(email=None))
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_unverified_email_is_rejected(self, google_test_keys: Any) -> None:
         """ID tokens with an unverified email are rejected (identity boundary)."""
         token = google_test_keys.sign(_id_token_claims(email_verified=False))
 
         with pytest.raises(TokenError):
-            verify_google_id_token(
-                token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER
-            )
+            verify_google_id_token(token, google_test_keys.jwks, client_id=CLIENT_ID, issuer=ISSUER)
 
     def test_algorithm_confusion_is_rejected(self, google_test_keys: Any) -> None:
         """HS256 alg-confusion tokens are rejected (RS256 pinned)."""
         token = jwt.encode(
-            _id_token_claims(), "attacker-hmac-secret-0123456789abcdef", algorithm="HS256"  # noqa: S106
+            _id_token_claims(),
+            "attacker-hmac-secret-0123456789abcdef",
+            algorithm="HS256",  # noqa: S106
         )
 
         with pytest.raises(TokenError):

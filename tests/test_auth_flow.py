@@ -8,6 +8,7 @@ rejection at callback time (AC2).
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import httpx
 import pytest
 import respx
 from fastapi.testclient import TestClient
@@ -20,7 +21,7 @@ SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 CLIENT_ID = "test-client-id"
 ISSUER = "https://accounts.google.com"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"  # noqa: S105 - public URL
 GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
 
 
@@ -53,9 +54,11 @@ def _mock_google_token_exchange(
 ) -> None:
     """Mock the Google token endpoint and JWKS endpoint."""
     respx.post(GOOGLE_TOKEN_URL).mock(
-        return_value=Response(status_code, json={"id_token": id_token})
-        if status_code == 200
-        else Response(status_code, text="upstream error")
+        return_value=(
+            Response(status_code, json={"id_token": id_token})
+            if status_code == 200
+            else Response(status_code, text="upstream error")
+        )
     )
     respx.get(GOOGLE_JWKS_URL).mock(return_value=Response(200, json=google_test_keys.jwks))
 
@@ -156,9 +159,7 @@ class TestCallback:
 
         assert response.status_code == 400
 
-    async def test_missing_state_cookie_rejected_with_400(
-        self, auth_client: TestClient
-    ) -> None:
+    async def test_missing_state_cookie_rejected_with_400(self, auth_client: TestClient) -> None:
         """A callback without a prior /auth/login (no state cookie) is rejected."""
         response = auth_client.get(
             "/auth/callback?code=good-code&state=any-state", follow_redirects=False
@@ -240,10 +241,36 @@ class TestCallback:
         """A JWKS outage surfaces as 502 (upstream, not a bad credential)."""
         state = _login_state(auth_client)
         id_token = google_test_keys.sign(_id_token_claims(nonce=state))
-        respx.post(GOOGLE_TOKEN_URL).mock(
-            return_value=Response(200, json={"id_token": id_token})
-        )
+        respx.post(GOOGLE_TOKEN_URL).mock(return_value=Response(200, json={"id_token": id_token}))
         respx.get(GOOGLE_JWKS_URL).mock(return_value=Response(500))
+
+        response = auth_client.get(
+            f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+        )
+
+        assert response.status_code == 502
+
+    @respx.mock
+    async def test_token_endpoint_unreachable_returns_502(self, auth_client: TestClient) -> None:
+        """A transport-level failure against Google surfaces as 502."""
+        state = _login_state(auth_client)
+        respx.post(GOOGLE_TOKEN_URL).mock(side_effect=httpx.ConnectError("unreachable"))
+
+        response = auth_client.get(
+            f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+        )
+
+        assert response.status_code == 502
+
+    @respx.mock
+    async def test_jwks_endpoint_unreachable_returns_502(
+        self, auth_client: TestClient, google_test_keys: Any
+    ) -> None:
+        """A transport-level failure against the JWKS surfaces as 502."""
+        state = _login_state(auth_client)
+        id_token = google_test_keys.sign(_id_token_claims(nonce=state))
+        respx.post(GOOGLE_TOKEN_URL).mock(return_value=Response(200, json={"id_token": id_token}))
+        respx.get(GOOGLE_JWKS_URL).mock(side_effect=httpx.ConnectError("unreachable"))
 
         response = auth_client.get(
             f"/auth/callback?code=good-code&state={state}", follow_redirects=False

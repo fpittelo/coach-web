@@ -108,7 +108,7 @@ class TestFailClosedValidation:
     def test_short_session_secret_raises(self) -> None:
         """An HS256 key below 32 bytes (RFC 7518) is rejected."""
         with pytest.raises(AuthConfigError, match="at least 32 bytes"):
-            validate_auth_config(self._settings(AUTH_SESSION_SECRET="too-short"))
+            validate_auth_config(self._settings(AUTH_SESSION_SECRET="too-short"))  # noqa: S106
 
     def test_all_missing_reports_every_name(self) -> None:
         """The error lists every missing setting at once."""

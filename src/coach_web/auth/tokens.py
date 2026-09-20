@@ -18,7 +18,7 @@ import jwt
 GOOGLE_JWKS_URI = "https://www.googleapis.com/oauth2/v3/certs"
 SESSION_ISSUER = "coach-web"
 _SESSION_ALGORITHM = "HS256"
-_ID_TOKEN_ALGORITHM = "RS256"
+_ID_TOKEN_ALGORITHM = "RS256"  # noqa: S105 - algorithm name, not a secret
 
 
 class TokenError(Exception):
@@ -107,7 +107,8 @@ def verify_google_id_token(
 
 def _find_jwk(jwks: dict[str, Any], kid: Any) -> dict[str, Any] | None:
     """Return the JWKS entry matching *kid*, or None."""
-    for jwk in jwks.get("keys", []):
+    for entry in jwks.get("keys", []):
+        jwk: dict[str, Any] = entry
         if jwk.get("kid") == kid:
             return jwk
     return None
