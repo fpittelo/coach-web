@@ -286,13 +286,12 @@ resource "google_cloud_run_v2_service" "main" {
       name  = "coach-mcp"
       image = var.coach_mcp_image
 
-      # Internal-only (AC5): reachable over localhost within the instance;
-      # Cloud Run never exposes sidecar ports as service ports. No port
-      # `name`: Cloud Run v2 accepts only empty/'http1'/'h2c' (API-level
-      # validation, invisible to `tofu validate` — live-apply failure #66).
-      ports {
-        container_port = local.coach_mcp_port
-      }
+      # Internal-only (AC5): reachable over localhost within the instance.
+      # Sidecars must NOT declare a ports block: Cloud Run v2 permits exactly
+      # ONE container with an exposed port (the main ingress container) and
+      # counts any ports block as an exposed port (API-level validation,
+      # invisible to `tofu validate` — live-apply failures #66/#96). The
+      # startup probe below references the port number directly.
 
       resources {
         limits = {
@@ -374,12 +373,12 @@ resource "google_cloud_run_v2_service" "main" {
       # Cloud Run equivalent is `args` (review PR #93, blocking).
       args = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
 
-      # Internal-only (AC5). No port `name`: Cloud Run v2 accepts only
-      # empty/'http1'/'h2c' (API-level validation, invisible to `tofu
-      # validate` — live-apply failure #66).
-      ports {
-        container_port = local.github_mcp_port
-      }
+      # Internal-only (AC5). Sidecars must NOT declare a ports block: Cloud
+      # Run v2 permits exactly ONE container with an exposed port (the main
+      # ingress container) and counts any ports block as an exposed port
+      # (API-level validation, invisible to `tofu validate` — live-apply
+      # failures #66/#96). The TCP startup probe below references the port
+      # number directly.
 
       resources {
         limits = {
