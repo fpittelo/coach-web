@@ -22,12 +22,16 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   workload_identity_pool_id          = google_iam_workload_identity_pool.github.workload_identity_pool_id
   workload_identity_pool_provider_id = var.wif_provider_id
   display_name                       = "GitHub Actions OIDC provider"
-  description                        = "GitHub Actions OIDC tokens, restricted to repository ${var.github_org}/${var.github_repo}."
+  description                        = "GitHub Actions OIDC tokens, restricted to repository ${var.github_org}/${var.github_repo} deploy refs (dev/qa/main branches, v* tags)."
 
-  # Per-repo attribute condition (least privilege): only tokens issued to
-  # fpittelo/coach-web can ever authenticate. Issue #67 may tighten this
-  # further to specific refs (e.g. refs/heads/dev).
-  attribute_condition = "assertion.repository == \"${var.github_org}/${var.github_repo}\""
+  # Ref-scoped attribute condition (PR #95 review, issue #67): only tokens
+  # from ${var.github_org}/${var.github_repo} AND from refs that legitimately
+  # deploy may ever authenticate — the dev/qa/main branches (main covers
+  # workflow_dispatch, which runs on the default branch) and version tags
+  # (CEL startsWith covers the v* family). PR refs (refs/pull/*), feature
+  # branches and other tags are rejected at the STS token exchange, before
+  # any IAM evaluation.
+  attribute_condition = "assertion.repository == \"${var.github_org}/${var.github_repo}\" && (assertion.ref == \"refs/heads/dev\" || assertion.ref == \"refs/heads/qa\" || assertion.ref == \"refs/heads/main\" || assertion.ref.startsWith(\"refs/tags/v\"))"
 
   attribute_mapping = {
     "google.subject"       = "assertion.sub"

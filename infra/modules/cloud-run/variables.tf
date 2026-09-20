@@ -160,8 +160,9 @@ variable "cors_origins" {
   default     = ""
 
   # Carried review item #4 (from #66): fail malformed CORS JSON at `tofu
-  # validate` time, not at container startup (the app parses CORS_ORIGINS as
-  # JSON — a malformed value would crash the container).
+  # plan`/`apply` time, not at container startup (the app parses CORS_ORIGINS
+  # as JSON — a malformed value would crash the container). OpenTofu 1.12
+  # `tofu validate` does not evaluate variable validation blocks.
   validation {
     condition     = var.cors_origins == "" || can(jsondecode(var.cors_origins))
     error_message = "cors_origins must be empty or valid JSON (e.g. a JSON array of origin strings, see Settings.CORS_ORIGINS)."

@@ -289,6 +289,16 @@ The `deploy-gcp` job declares
 | qa | PR merged into `qa` | `qa` | none by default (add reviewers anytime) |
 | prod | push of `v*` tag / manual dispatch `prod` | `production` | **required reviewer: @fpittelo** |
 
+Concurrency is **lane-scoped** (`gcp-deploy-<deploy_env>`): a pending
+production approval never stalls dev/qa deploys; cross-lane collisions fall
+through to the GCS state lock (`-lock-timeout=300s` makes a rare
+simultaneous apply wait, not fail).
+
+> **Skip-guard:** the `deploy-gcp` job carries
+> `if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != ''`.
+> Until the three repo variables below are set, every lane **silently skips**
+> the deploy (build/push still runs) instead of failing at auth/init.
+
 > **One-time manual step for @fpittelo (required before the first prod
 > deploy):** repo **Settings → Environments → New environment → `production`**
 > → under *Deployment protection rules* enable **Required reviewers** and add
@@ -329,9 +339,12 @@ Authoring the workflow is complete, but **no live WIF authentication or live
 `tofu apply` has been exercised yet**: the GCP resources (pool, provider,
 deployer SA, state bucket, service) are created at the gated apply moment
 (#64 AC5), and the repo variables above can only be populated from real
-`tofu outputs` afterwards. The first live run — WIF token exchange, state
-lock, Cloud Run rollout — is exercised at that gated deployment moment and
-audited in issue #68, together with the deferred cold-start measurement.
+`tofu outputs` afterwards. Because of the deploy job's skip-guard, pushes in
+that window still build and push images but **silently skip the deploy**
+instead of failing at auth/init. The first live run — WIF token exchange,
+state lock, Cloud Run rollout — happens at the gated deployment moment once
+the variables are populated, and is audited in issue #68, together with the
+deferred cold-start measurement.
 
 ## Ingress posture (carried review item #2 from #64)
 
@@ -350,8 +363,11 @@ be revisited in the same change.
 - Pool `github-actions-pool` + provider `github-actions-provider` trust
   `https://token.actions.githubusercontent.com`.
 - The **attribute condition** restricts federation to
-  `assertion.repository == "fpittelo/coach-web"` — tokens from any other
-  repository are rejected outright.
+  `assertion.repository == "fpittelo/coach-web"` **and** to the refs that
+  legitimately deploy — `refs/heads/dev`, `refs/heads/qa`, `refs/heads/main`
+  (workflow_dispatch runs on the default branch) and `refs/tags/v*` (CEL
+  `startsWith`). Tokens from any other repository or ref (PR refs, feature
+  branches, non-`v` tags) are rejected outright at the STS token exchange.
 - **Audience pairing** (carried review item #1 from #64, resolved in #67):
   `google-github-actions/auth` defaults its requested OIDC audience to the
   *provider resource name* (which embeds the GCP project number). The deploy
