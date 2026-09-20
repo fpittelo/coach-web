@@ -50,9 +50,16 @@ ENV PATH="/app/site-packages/bin:${PATH}" \
 
 USER coach-web:coach-web
 
+# Local/compose topology default is 8000 (docker-compose.yml, issue #63).
+# Cloud Run (issue #66) overrides APP_PORT=8080 via the service spec; the
+# ENTRYPOINT below resolves both APP_HOST and APP_PORT at runtime.
+# EXPOSE and HEALTHCHECK document the local default only — Cloud Run ignores
+# them and uses the probes declared in infra/modules/cloud-run/main.tf.
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
     CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"
 
-ENTRYPOINT ["uvicorn", "coach_web.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+# exec keeps uvicorn as PID 1 so SIGTERM (Cloud Run shutdown signal) is
+# delivered directly to the ASGI server.
+ENTRYPOINT ["sh", "-c", "exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\""]
