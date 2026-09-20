@@ -20,7 +20,7 @@ from coach_web.config import Settings
 from coach_web.mcp_hub import MCPClientHub
 from coach_web.models import ChatMessage, PlanProposal
 
-DEFAULT_OPENROUTER_MODEL = "anthropic/claude-3.5-sonnet"
+DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.5"
 """Model routed through OpenRouter when no override is configured."""
 
 OPENROUTER_CHAT_COMPLETIONS_PATH = "/chat/completions"

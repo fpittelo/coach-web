@@ -315,14 +315,14 @@ class TestOpenRouterClient:
 
         client = OpenRouterClient(
             "sk-test",
-            model="anthropic/claude-3.5-sonnet",
+            model="anthropic/claude-sonnet-4.5",
             transport=httpx.MockTransport(handler),
         )
         tools = [{"type": "function", "function": {"name": "noop"}}]
 
         _ = [chunk async for chunk in client.stream_chat_completion([], tools=tools)]
 
-        assert captured["body"]["model"] == "anthropic/claude-3.5-sonnet"
+        assert captured["body"]["model"] == "anthropic/claude-sonnet-4.5"
         assert captured["body"]["tools"] == tools
         await client.close()
 
@@ -750,6 +750,10 @@ class TestAgentSettings:
 
         assert settings.OPENROUTER_API_KEY == ""
         assert settings.OPENROUTER_BASE_URL == "https://openrouter.ai/api/v1"
+        # Pinned literal: the default must be a CURRENT OpenRouter model.
+        # anthropic/claude-3.5-sonnet was retired upstream and made live chat
+        # fail with HTTP 404 "No endpoints found".
+        assert settings.OPENROUTER_MODEL == "anthropic/claude-sonnet-4.5"
         assert settings.OPENROUTER_MODEL == DEFAULT_OPENROUTER_MODEL
         assert settings.AGENT_MAX_TOOL_ITERATIONS >= 1
 
