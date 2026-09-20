@@ -92,3 +92,34 @@ jobs:
 
       - name: Audit dependencies for known vulnerabilities
         run: pip-audit --strict .
+
+  opentofu:
+    name: OpenTofu Format & Validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: "1.12.6"
+
+      - name: OpenTofu Format Check (infra, recursive)
+        run: tofu fmt -check -recursive infra/
+
+      - name: OpenTofu Init (infra, no backend — CI holds no GCP credentials; WIF auth is issue #67)
+        working-directory: infra
+        run: tofu init -backend=false
+
+      - name: OpenTofu Validate (infra)
+        working-directory: infra
+        run: tofu validate
+
+      - name: OpenTofu Init (bootstrap, no backend — local backend by design)
+        working-directory: infra/bootstrap
+        run: tofu init -backend=false
+
+      - name: OpenTofu Validate (bootstrap)
+        working-directory: infra/bootstrap
+        run: tofu validate
