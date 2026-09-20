@@ -467,6 +467,8 @@ be revisited in the same change.
 | `gha-coach-web-deployer` (CI) | `roles/run.admin` | project | Create/update the Cloud Run service during deploys (#67) |
 | `gha-coach-web-deployer` (CI) | `roles/iam.serviceAccountUser` | **runtime SA only** | Set the runtime SA on the service it deploys (carried review item #2 from #64: was project-wide, now SA-scoped in #67) |
 | `gha-coach-web-deployer` (CI) | `roles/storage.objectAdmin` | **state bucket only** | `tofu init`/`apply` in CI read/write remote state + locks (#67; no project-level storage roles) |
+| `gha-coach-web-deployer` (CI) | `roles/viewer` | project | READ-only get/list on all resources — `tofu apply` REFRESHES every resource in state before planning (compute/VPC, Cloud Run, secret metadata, serviceusage, WIF pool); the first live CI deploy (run 35509409312) 403'd in this refresh phase (#67 hot-fix) |
+| `gha-coach-web-deployer` (CI) | `roles/iam.securityReviewer` | project | READ-only getIamPolicy on project/service accounts/WIF/secrets — the `*_iam_member` resources in state refresh via getIamPolicy; zero write (#67 hot-fix) |
 | `coach-web-runtime` | `roles/logging.logWriter` | project | Write application logs |
 | `coach-web-runtime` | `roles/monitoring.metricWriter` | project | Report container metrics |
 | `coach-web-runtime` | `roles/cloudtrace.agent` | project | Export traces |
@@ -481,6 +483,14 @@ CI deployer (replaced by the bucket-scoped binding in #67),
 `secretmanager.secretAccessor` on the CI deployer (it never reads secret
 values), Artifact Registry roles (images ship from ghcr.io; an AR mirror
 would add `artifactregistry.reader` for the runtime SA only).
+
+One deliberate exception to the narrow-scope rule: the deployer holds
+project-wide `roles/viewer` + `roles/iam.securityReviewer` (#67 hot-fix).
+These are READ-only — `tofu apply` refreshes every resource in state, so a
+full-stack deployer needs project-wide read, while all WRITE stays narrow
+(`run.admin`, SA-scoped `serviceAccountUser`, bucket-scoped `objectAdmin`):
+a read-broad / write-narrow pattern, consciously resolving the
+least-privilege follow-up predicted in #67.
 
 ## CI gates (AC4, AC7)
 
