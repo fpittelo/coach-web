@@ -81,7 +81,7 @@ class TestFailClosedValidation:
             "AUTH_ENABLED": True,
             "GOOGLE_OIDC_CLIENT_ID": "cid",
             "GOOGLE_OIDC_CLIENT_SECRET": "sec",
-            "AUTH_SESSION_SECRET": "key",
+            "AUTH_SESSION_SECRET": "unit-test-session-signing-key-0123456789abcdef",
         }
         values.update(overrides)
         return Settings(**values)
@@ -104,6 +104,11 @@ class TestFailClosedValidation:
         """Empty AUTH_SESSION_SECRET is rejected."""
         with pytest.raises(AuthConfigError, match="AUTH_SESSION_SECRET"):
             validate_auth_config(self._settings(AUTH_SESSION_SECRET=""))
+
+    def test_short_session_secret_raises(self) -> None:
+        """An HS256 key below 32 bytes (RFC 7518) is rejected."""
+        with pytest.raises(AuthConfigError, match="at least 32 bytes"):
+            validate_auth_config(self._settings(AUTH_SESSION_SECRET="too-short"))
 
     def test_all_missing_reports_every_name(self) -> None:
         """The error lists every missing setting at once."""

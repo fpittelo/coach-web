@@ -110,7 +110,7 @@ def sample_training_plans() -> list[TrainingPlan]:
 # Google OIDC authentication fixtures (issue #65)
 # ---------------------------------------------------------------------------
 
-AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key"
+AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"
 """HS256 signing key used by auth tests (mirrors AUTH_SESSION_SECRET env)."""
 
 AUTH_TEST_OWNER_EMAIL = "frederic.pitteloud@gmail.com"

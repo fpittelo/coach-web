@@ -16,7 +16,7 @@ from httpx import Response
 from coach_web.auth.tokens import verify_session_token
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
-SESSION_SECRET = "unit-test-session-signing-key"  # noqa: S105
+SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 CLIENT_ID = "test-client-id"
 ISSUER = "https://accounts.google.com"
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -270,10 +270,13 @@ class TestLogout:
         auth_client.cookies.set(
             "cw_session",
             create_session_token(OWNER_EMAIL, SESSION_SECRET, ttl_seconds=600),
-            domain="testserver",
         )
         assert auth_client.get("/api/nonexistent").status_code == 404
 
-        auth_client.get("/auth/logout")
+        response = auth_client.get("/auth/logout", follow_redirects=False)
+        assert response.status_code == 302
+        assert 'cw_session=""' in response.headers["set-cookie"]
 
+        # The browser applies the clearing Set-Cookie: the jar drops the session.
+        auth_client.cookies.clear()
         assert auth_client.get("/api/nonexistent").status_code == 401

@@ -20,6 +20,9 @@ dependencies = [
     "uvicorn[standard]>=0.32.0",
     "mcp[cli]>=2.0.0",
     "httpx>=0.27.0",
+    # Google OIDC auth (#65): RS256 ID-token verification via Google JWKS and
+    # HS256 stateless session tokens. Already resolved transitively via mcp.
+    "pyjwt[crypto]>=2.8.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",

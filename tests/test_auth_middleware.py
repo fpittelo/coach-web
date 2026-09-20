@@ -14,7 +14,7 @@ from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
-SESSION_SECRET = "unit-test-session-signing-key"  # noqa: S105
+SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 
 
 def _session_cookie(email: str = OWNER_EMAIL, ttl_seconds: int = 600) -> str:
@@ -45,7 +45,7 @@ class TestRouteProtection:
 
     def test_valid_session_reaches_router(self, auth_client: TestClient) -> None:
         """A whitelisted session passes the middleware through to the router."""
-        auth_client.cookies.set("cw_session", _session_cookie(), domain="testserver")
+        auth_client.cookies.set("cw_session", _session_cookie())
 
         response = auth_client.get("/api/nonexistent")
 
@@ -53,7 +53,7 @@ class TestRouteProtection:
 
     def test_valid_session_reaches_request_validation(self, auth_client: TestClient) -> None:
         """A whitelisted session reaches FastAPI validation (422, not 401)."""
-        auth_client.cookies.set("cw_session", _session_cookie(), domain="testserver")
+        auth_client.cookies.set("cw_session", _session_cookie())
 
         response = auth_client.post("/api/plan/approve", json={})
 
@@ -62,7 +62,7 @@ class TestRouteProtection:
     def test_non_whitelisted_email_is_forbidden(self, auth_client: TestClient) -> None:
         """AC2: a valid session for a non-whitelisted email returns 403."""
         auth_client.cookies.set(
-            "cw_session", _session_cookie(email="attacker@example.com"), domain="testserver"
+            "cw_session", _session_cookie(email="attacker@example.com")
         )
 
         response = auth_client.get("/api/nonexistent")
@@ -73,7 +73,7 @@ class TestRouteProtection:
     def test_expired_session_is_unauthorized(self, auth_client: TestClient) -> None:
         """An expired session token returns 401."""
         auth_client.cookies.set(
-            "cw_session", _session_cookie(ttl_seconds=-10), domain="testserver"
+            "cw_session", _session_cookie(ttl_seconds=-10)
         )
 
         response = auth_client.get("/api/nonexistent")
@@ -82,7 +82,7 @@ class TestRouteProtection:
 
     def test_tampered_session_is_unauthorized(self, auth_client: TestClient) -> None:
         """A mutated session token returns 401."""
-        auth_client.cookies.set("cw_session", _session_cookie() + "x", domain="testserver")
+        auth_client.cookies.set("cw_session", _session_cookie() + "x")
 
         response = auth_client.get("/api/nonexistent")
 

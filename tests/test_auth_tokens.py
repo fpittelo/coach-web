@@ -25,7 +25,7 @@ from coach_web.auth.tokens import (
 )
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
-SECRET = "unit-test-session-signing-key"  # noqa: S105
+SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 CLIENT_ID = "test-client-id"
 ISSUER = "https://accounts.google.com"
 
@@ -74,7 +74,7 @@ class TestVerifySessionToken:
         token = create_session_token(OWNER_EMAIL, SECRET, ttl_seconds=600)
 
         with pytest.raises(TokenError):
-            verify_session_token(token, "another-signing-key-0123456789")
+            verify_session_token(token, "another-signing-key-0123456789abcdef")
 
     def test_tampered_signature_is_rejected(self) -> None:
         """A mutated token fails signature verification."""
@@ -129,7 +129,7 @@ class TestVerifySessionToken:
                 "iat": now,
                 "exp": now + 600,
             },
-            SECRET,
+            "x" * 64,
             algorithm="HS512",
         )
 
@@ -241,7 +241,7 @@ class TestVerifyGoogleIdToken:
     def test_algorithm_confusion_is_rejected(self, google_test_keys: Any) -> None:
         """HS256 alg-confusion tokens are rejected (RS256 pinned)."""
         token = jwt.encode(
-            _id_token_claims(), "attacker-secret", algorithm="HS256"  # noqa: S106
+            _id_token_claims(), "attacker-hmac-secret-0123456789abcdef", algorithm="HS256"  # noqa: S106
         )
 
         with pytest.raises(TokenError):
