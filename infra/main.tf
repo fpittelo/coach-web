@@ -1,13 +1,13 @@
-# coach-web — OpenTofu root module (issue #64).
+# coach-web — OpenTofu root module (issues #64, #66).
 #
 # Swiss regional GCP foundation (europe-west6, Zürich) for the Phase 2 Cloud
-# Run deployment: service skeleton, networking foundation, Google OIDC config
-# surface, keyless CI federation (WIF) and remote state (see backend.tf).
+# Run deployment: multi-container Cloud Run service (coach-web + coach-mcp +
+# github-mcp sidecars), networking foundation, Google OIDC config surface,
+# keyless CI federation (WIF) and remote state (see backend.tf).
 #
 # ADRs: 03 (sidecar topology), 04 (Google OIDC + app whitelist),
 #       05 (Cloud Run + Startup CPU Boost), 06 (keyless WIF deploys).
-# Scope boundaries: full multi-container spec -> #66; CI WIF auth -> #67;
-#                   app-level whitelist -> #65.
+# Scope boundaries: app-level whitelist -> #65; CI WIF auth -> #67.
 
 # --- Required Google APIs ----------------------------------------------------
 # Each API is enabled explicitly (no implicit enablement at apply time);
@@ -20,7 +20,7 @@ resource "google_project_service" "required" {
     "iam.googleapis.com",                  # service accounts
     "iamcredentials.googleapis.com",       # SA token exchange (WIF impersonation)
     "sts.googleapis.com",                  # Security Token Service (WIF, ADR-06)
-    "secretmanager.googleapis.com",        # app secrets (consumed by #66)
+    "secretmanager.googleapis.com",        # app secrets (AC4, issue #66)
     "compute.googleapis.com",              # VPC networking foundation
     "cloudresourcemanager.googleapis.com", # project/IAM metadata
     "serviceusage.googleapis.com",         # API enablement itself
@@ -49,21 +49,43 @@ module "oidc" {
 }
 
 module "cloud_run" {
-  source                = "./modules/cloud-run"
-  project_id            = var.project_id
-  region                = var.region
-  service_name          = var.service_name
-  container_image       = var.container_image
-  container_cpu         = var.container_cpu
-  container_memory      = var.container_memory
-  min_instance_count    = var.min_instance_count
-  max_instance_count    = var.max_instance_count
+  source       = "./modules/cloud-run"
+  project_id   = var.project_id
+  region       = var.region
+  service_name = var.service_name
+
+  # Multi-container topology (issue #66, AC1/AC3)
+  coach_web_image   = var.coach_web_image
+  coach_mcp_image   = var.coach_mcp_image
+  github_mcp_image  = var.github_mcp_image
+  coach_web_cpu     = var.coach_web_cpu
+  coach_web_memory  = var.coach_web_memory
+  coach_mcp_cpu     = var.coach_mcp_cpu
+  coach_mcp_memory  = var.coach_mcp_memory
+  github_mcp_cpu    = var.github_mcp_cpu
+  github_mcp_memory = var.github_mcp_memory
+
+  # Scaling (ADR-04: scale-to-zero)
+  min_instance_count = var.min_instance_count
+  max_instance_count = var.max_instance_count
+
+  # Invocation & identity (ADR-04)
   allow_unauthenticated = var.allow_unauthenticated
   runtime_sa_id         = var.runtime_sa_id
   oidc_client_id        = module.oidc.client_id
   oidc_issuer_uri       = module.oidc.issuer_uri
-  enable_vpc_egress     = var.enable_vpc_egress
-  subnet_self_link      = module.networking.subnet_self_link
+
+  # Secret Manager secret names (AC4 — versions populated out-of-band)
+  openrouter_api_key_secret_id = var.openrouter_api_key_secret_id
+  intervals_api_key_secret_id  = var.intervals_api_key_secret_id
+  github_token_secret_id       = var.github_token_secret_id
+
+  # Non-secret application configuration (cloud-specific only — review PR #93)
+  cors_origins = var.cors_origins
+
+  # Networking (optional direct VPC egress)
+  enable_vpc_egress = var.enable_vpc_egress
+  subnet_self_link  = module.networking.subnet_self_link
 
   depends_on = [google_project_service.required]
 }

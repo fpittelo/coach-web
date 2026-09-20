@@ -19,7 +19,7 @@ variable "region" {
 }
 
 # ---------------------------------------------------------------------------
-# Cloud Run service skeleton (full multi-container spec lands with issue #66)
+# Cloud Run multi-container service (issue #66, ADR-03/ADR-05)
 # ---------------------------------------------------------------------------
 
 variable "service_name" {
@@ -28,22 +28,75 @@ variable "service_name" {
   default     = "coach-web"
 }
 
-variable "container_image" {
-  description = "Placeholder main-container image. The full 3-container topology (coach-web + coach-mcp + github-mcp sidecars) is issue #66."
+variable "coach_web_image" {
+  description = "coach-web main-container image (FastAPI). Pinned tag or digest; the deploy workflow (#67) wires environment-specific tags (dev/qa/prod/sha)."
   type        = string
   default     = "ghcr.io/fpittelo/coach-web:dev"
+
+  validation {
+    condition     = can(regex(":[^/@]+$", var.coach_web_image)) && !can(regex(":latest$", var.coach_web_image))
+    error_message = "coach_web_image must pin an explicit tag or digest (AC3); floating ':latest' is rejected."
+  }
 }
 
-variable "container_cpu" {
-  description = "CPU limit for the placeholder container."
+variable "coach_mcp_image" {
+  description = "coach-mcp sidecar image (Intervals.icu MCP gateway, SSE)."
+  type        = string
+  default     = "ghcr.io/fpittelo/coach:dev"
+
+  validation {
+    condition     = can(regex(":[^/@]+$", var.coach_mcp_image)) && !can(regex(":latest$", var.coach_mcp_image))
+    error_message = "coach_mcp_image must pin an explicit tag or digest (AC3); floating ':latest' is rejected."
+  }
+}
+
+variable "github_mcp_image" {
+  description = "github-mcp sidecar image (official github-mcp-server, streamable HTTP)."
+  type        = string
+  default     = "ghcr.io/github/github-mcp-server:v1.12.2"
+
+  validation {
+    condition     = can(regex(":[^/@]+$", var.github_mcp_image)) && !can(regex(":latest$", var.github_mcp_image))
+    error_message = "github_mcp_image must pin an explicit tag or digest (AC3); floating ':latest' is rejected."
+  }
+}
+
+# Per-container resources — sized for scale-to-zero ($0 at idle, ADR-04).
+
+variable "coach_web_cpu" {
+  description = "CPU limit for the coach-web main container."
   type        = string
   default     = "1"
 }
 
-variable "container_memory" {
-  description = "Memory limit for the placeholder container."
+variable "coach_web_memory" {
+  description = "Memory limit for the coach-web main container."
   type        = string
   default     = "512Mi"
+}
+
+variable "coach_mcp_cpu" {
+  description = "CPU limit for the coach-mcp sidecar."
+  type        = string
+  default     = "0.5"
+}
+
+variable "coach_mcp_memory" {
+  description = "Memory limit for the coach-mcp sidecar."
+  type        = string
+  default     = "256Mi"
+}
+
+variable "github_mcp_cpu" {
+  description = "CPU limit for the github-mcp sidecar."
+  type        = string
+  default     = "0.25"
+}
+
+variable "github_mcp_memory" {
+  description = "Memory limit for the github-mcp sidecar."
+  type        = string
+  default     = "256Mi"
 }
 
 variable "min_instance_count" {
@@ -71,7 +124,39 @@ variable "runtime_sa_id" {
 }
 
 # ---------------------------------------------------------------------------
-# Networking foundation (direct VPC egress reserved for issue #66)
+# Secret Manager secret names (AC4 — versions populated out-of-band)
+# ---------------------------------------------------------------------------
+
+variable "openrouter_api_key_secret_id" {
+  description = "Secret Manager secret ID holding the OpenRouter API key (coach-web)."
+  type        = string
+  default     = "openrouter-api-key"
+}
+
+variable "intervals_api_key_secret_id" {
+  description = "Secret Manager secret ID holding the Intervals.icu API key (coach-mcp sidecar)."
+  type        = string
+  default     = "intervals-api-key"
+}
+
+variable "github_token_secret_id" {
+  description = "Secret Manager secret ID holding the GitHub PAT (coach-web + github-mcp sidecar)."
+  type        = string
+  default     = "github-token"
+}
+
+# ---------------------------------------------------------------------------
+# Non-secret application configuration (cloud-specific only — review PR #93)
+# ---------------------------------------------------------------------------
+
+variable "cors_origins" {
+  description = "CORS_ORIGINS env for the app — a JSON array string of allowed browser origins. Empty default: the UI is served same-origin by the FastAPI app, so the cloud deployment needs no CORS. Local dev overrides via compose/.env; set here only for a cross-origin consumer."
+  type        = string
+  default     = ""
+}
+
+# ---------------------------------------------------------------------------
+# Networking foundation (direct VPC egress — optional)
 # ---------------------------------------------------------------------------
 
 variable "vpc_name" {
@@ -93,7 +178,7 @@ variable "subnet_cidr" {
 }
 
 variable "enable_vpc_egress" {
-  description = "Attach direct VPC egress to the Cloud Run service. Default false — the skeleton needs no private routes; issue #66 may enable it."
+  description = "Attach direct VPC egress to the Cloud Run service. Default false — the stack calls public endpoints only (OpenRouter, Intervals.icu, GitHub)."
   type        = bool
   default     = false
 }
@@ -124,7 +209,7 @@ variable "github_org" {
 }
 
 variable "github_repo" {
-  description = "GitHub repository allowed to deploy (per-repo WIF attribute condition, least privilege)."
+  description = "GitHub repository allowed to deploy (per-repo WIF attribute condition, least privilege). This is the IaC repository itself — NOT the training-plan repo (github_plan_repo)."
   type        = string
   default     = "coach-web"
 }

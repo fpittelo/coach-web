@@ -12,8 +12,13 @@ output "cloud_run_service_name" {
 }
 
 output "runtime_sa_email" {
-  description = "Runtime service account email (least-privilege telemetry/secret roles bound)."
+  description = "Runtime service account email (least-privilege telemetry roles bound; secret access is per-secret)."
   value       = module.cloud_run.runtime_sa_email
+}
+
+output "cloud_run_secret_ids" {
+  description = "Map of purpose -> Secret Manager secret name (issue #66). Values are populated out-of-band; names only — never secret material."
+  value       = module.cloud_run.secret_ids
 }
 
 output "deployer_sa_email" {
