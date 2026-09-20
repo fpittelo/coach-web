@@ -287,9 +287,10 @@ resource "google_cloud_run_v2_service" "main" {
       image = var.coach_mcp_image
 
       # Internal-only (AC5): reachable over localhost within the instance;
-      # Cloud Run never exposes sidecar ports as service ports.
+      # Cloud Run never exposes sidecar ports as service ports. No port
+      # `name`: Cloud Run v2 accepts only empty/'http1'/'h2c' (API-level
+      # validation, invisible to `tofu validate` — live-apply failure #66).
       ports {
-        name           = "sse"
         container_port = local.coach_mcp_port
       }
 
@@ -373,9 +374,10 @@ resource "google_cloud_run_v2_service" "main" {
       # Cloud Run equivalent is `args` (review PR #93, blocking).
       args = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
 
-      # Internal-only (AC5).
+      # Internal-only (AC5). No port `name`: Cloud Run v2 accepts only
+      # empty/'http1'/'h2c' (API-level validation, invisible to `tofu
+      # validate` — live-apply failure #66).
       ports {
-        name           = "http"
         container_port = local.github_mcp_port
       }
 
