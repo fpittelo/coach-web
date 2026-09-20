@@ -101,14 +101,18 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up OpenTofu
-        uses: opentofu/setup-opentofu@v1
+        # SHA-pinned to opentofu/setup-opentofu@v2.0.2 (carried review item #3
+        # from #64, executed in #67). The previously used @v1 major tag is
+        # stale — v2 is the current major.
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2.0.2
         with:
           tofu_version: "1.12.6"
 
       - name: OpenTofu Format Check (infra, recursive)
         run: tofu fmt -check -recursive infra/
 
-      - name: OpenTofu Init (infra, no backend — CI holds no GCP credentials; WIF auth is issue #67)
+      - name: OpenTofu Init (infra, no backend — this validate job holds no GCP
+          credentials; the keyless WIF deploy path lives in deploy.yaml, #67)
         working-directory: infra
         run: tofu init -backend=false
 
