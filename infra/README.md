@@ -128,6 +128,8 @@ are populated out-of-band**, so no secret material ever reaches IaC or state.
 | `openrouter-api-key` | OpenRouter API key (coach agent LLM) | coach-web → `OPENROUTER_API_KEY` |
 | `intervals-api-key` | Intervals.icu API key | coach-mcp → `INTERVALS_API_KEY` |
 | `github-token` | GitHub PAT (training plan issues + MCP) | coach-web → `GITHUB_TOKEN`; github-mcp → `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| `auth-session-secret` | HS256 signing key for stateless auth session cookies (auth boundary, #68) | coach-web → `AUTH_SESSION_SECRET` |
+| `google-oauth-client-secret` | Google OAuth client secret for the OIDC code exchange (auth boundary, #68) | coach-web → `GOOGLE_OIDC_CLIENT_SECRET` |
 
 ### Population procedure (out-of-band, after the first `tofu apply`)
 
@@ -140,6 +142,10 @@ gcloud secrets versions add openrouter-api-key --data-file=- <<< "sk-or-..."    
 gcloud secrets versions add intervals-api-key --data-file=- <<< "your-intervals-key"
 gcloud secrets versions add github-token      --data-file=- <<< "ghp_..."
 
+# 2b. Auth boundary secrets (issue #68) — see "Auth boundary (ADR-04)" below:
+openssl rand -base64 48 | gcloud secrets versions add auth-session-secret --data-file=- --project=<your-project>
+printf '%s' 'GOCSPX-your-client-secret' | gcloud secrets versions add google-oauth-client-secret --data-file=- --project=<your-project>
+
 # 3. Deploy / redeploy the service so revisions resolve the secrets:
 tofu apply   # or the #67 deploy workflow
 ```
@@ -151,6 +157,73 @@ tofu apply   # or the #67 deploy workflow
   changes.
 - The first deployment **requires** each secret to already carry a version —
   run step 2 before the first service-creating apply (or apply twice).
+
+## Auth boundary (ADR-04, issue #68)
+
+The application-level Google OIDC whitelist (issue #65) **is** the
+access-control boundary that justifies the unauthenticated edge (see
+"Ingress posture" below). Issue #68 wires the #65 auth settings into the
+Cloud Run service spec: `AUTH_ENABLED` is fixed to `true` for the cloud
+posture (local compose stays env-driven off), and every setting the auth
+middleware needs is provisioned by IaC. The app **fails closed** at startup
+(`AuthConfigError`) if `AUTH_ENABLED=true` without its required settings —
+the IaC variable validations make that state a `tofu plan` failure instead.
+
+### coach-web container env (auth)
+
+| Env var | Source | Notes |
+| --- | --- | --- |
+| `AUTH_ENABLED` | fixed `"true"` | Cloud posture; local compose stays env-driven off (app default `false`). |
+| `AUTH_WHITELIST_EMAILS` | variable `auth_whitelist_emails` (default `["frederic.pitteloud@gmail.com"]`) | JSON array string — pydantic-settings parses `list[str]` as JSON (the CORS lesson from #93). Single-user personal app: the default is the owner's own address, a real value **by design** — it is public config, not a credential (access requires a Google-verified ID token for that address, not knowledge of it). |
+| `GOOGLE_OIDC_CLIENT_ID` | variable `oidc_client_id` (required) | Emitted only when non-empty (same dynamic-env pattern as `CORS_ORIGINS`); validation makes empty a plan-time failure. |
+| `GOOGLE_OIDC_CLIENT_SECRET` | Secret Manager `google-oauth-client-secret` (`secret_key_ref`, version `latest`) | Never a plain env value. |
+| `AUTH_SESSION_SECRET` | Secret Manager `auth-session-secret` (`secret_key_ref`, version `latest`) | HS256 session-cookie signing key; the app enforces ≥ 32 bytes at startup. |
+| `GOOGLE_OIDC_ISSUER` | fixed `https://accounts.google.com` | Google's public issuer (modules/oidc). |
+
+Deliberately **not** set (KIS — app defaults are the source of truth,
+`src/coach_web/config.py`): `AUTH_REDIRECT_URI` (the router derives it from
+the request base URL behind Cloud Run HTTPS —
+`src/coach_web/auth/router.py`, `_resolve_redirect_uri`) and
+`AUTH_SESSION_TTL_SECONDS` (app default `3600`).
+
+### Required configuration (one-time)
+
+1. **Google OAuth web client** (Google Cloud Console → APIs & Services →
+   Credentials → OAuth client ID, type *Web application*). The authorized
+   redirect URI must be exactly:
+
+   ```
+   https://<service-url>/auth/callback
+   ```
+
+   where `<service-url>` is the Cloud Run service URL (`tofu output
+   cloud_run_service_url`). The client **ID** is a public identifier (it is
+   sent in every browser redirect to Google) — set it as the repo **variable**
+   `OIDC_CLIENT_ID` (Settings → Secrets and variables → Actions → Variables);
+   the deploy workflow passes it to `tofu apply` via
+   `-var="oidc_client_id=..."` and **skips the deploy while it is empty**
+   (extended skip-guard). For local applies, set `oidc_client_id` in
+   `terraform.tfvars`. Variable validation enforces the client-ID shape
+   (`<number>-<lowercase-alphanumeric>.apps.googleusercontent.com`) at plan
+   time — a missing or malformed value fails `tofu plan`, never container boot.
+
+2. **Auth secrets** (Secret Manager versions, populated out-of-band — values
+   never pass through IaC or state):
+
+   ```bash
+   # Session-cookie signing key (random, >= 32 bytes for HS256):
+   openssl rand -base64 48 | gcloud secrets versions add auth-session-secret --data-file=- --project=<your-project>
+
+   # OAuth client secret (from the Console client created in step 1):
+   printf '%s' 'GOCSPX-your-client-secret' | gcloud secrets versions add google-oauth-client-secret --data-file=- --project=<your-project>
+   ```
+
+Both secrets are created by IaC with user-managed replication pinned to
+`europe-west6` and **per-secret** `roles/secretmanager.secretAccessor` for
+the runtime SA (same pattern as the three #66 secrets). Until the repo
+variable and both secret versions exist, the deploy lane silently skips
+(skip-guard) — the service keeps running its last revision until the first
+protected deploy rolls out.
 
 ## Pending-deployment validation (AC2 / AC6)
 
@@ -295,9 +368,12 @@ through to the GCS state lock (`-lock-timeout=300s` makes a rare
 simultaneous apply wait, not fail).
 
 > **Skip-guard:** the `deploy-gcp` job carries
-> `if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != ''`.
-> Until the three repo variables below are set, every lane **silently skips**
+> `if: vars.GCP_WIF_PROVIDER != '' && vars.GCP_DEPLOY_SA != '' && vars.GCP_PROJECT_ID != '' && vars.OIDC_CLIENT_ID != ''`.
+> Until the repo variables below are set, every lane **silently skips**
 > the deploy (build/push still runs) instead of failing at auth/init.
+> `OIDC_CLIENT_ID` was added by #68: the Cloud Run spec requires the OAuth
+> client ID (ADR-04 auth boundary, enforced by variable validation at plan
+> time), so a deploy without it would fail `tofu apply` anyway.
 
 > **One-time manual step for @fpittelo (required before the first prod
 > deploy):** repo **Settings → Environments → New environment → `production`**
@@ -319,6 +395,7 @@ this purpose):
 | `GCP_WIF_PROVIDER` | Full provider resource name: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider` | `tofu output wif_provider_name` |
 | `GCP_DEPLOY_SA` | Deployer SA email: `gha-coach-web-deployer@<PROJECT_ID>.iam.gserviceaccount.com` | `tofu output deployer_sa_email` |
 | `GCP_PROJECT_ID` | The GCP project ID hosting the stack | `terraform.tfvars` / `gcloud config get-value project` |
+| `OIDC_CLIENT_ID` | Google OAuth web client ID: `<number>-<lowercase-alphanumeric>.apps.googleusercontent.com` | Google Cloud Console (OAuth web client, created once — see "Auth boundary (ADR-04)"). Public identifier → repo **variable**, not a secret (#68) |
 
 Notes:
 
@@ -393,7 +470,7 @@ be revisited in the same change.
 | `coach-web-runtime` | `roles/logging.logWriter` | project | Write application logs |
 | `coach-web-runtime` | `roles/monitoring.metricWriter` | project | Report container metrics |
 | `coach-web-runtime` | `roles/cloudtrace.agent` | project | Export traces |
-| `coach-web-runtime` | `roles/secretmanager.secretAccessor` | **per secret** (3 bindings) | Read exactly the stack's secrets (carried review item #1: no project-level secret access) |
+| `coach-web-runtime` | `roles/secretmanager.secretAccessor` | **per secret** (5 bindings) | Read exactly the stack's secrets (carried review item #1: no project-level secret access; the 2 auth secrets added by #68) |
 | `allUsers` | `roles/run.invoker` | single service | ADR-04: edge accepts traffic, app enforces the Google OIDC whitelist (#65) |
 
 Deliberately **not** granted: `roles/owner`, any `roles/*` wildcard,

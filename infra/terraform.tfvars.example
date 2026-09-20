@@ -48,6 +48,30 @@ project_id = "your-gcp-project-id"
 # github_org  = "fpittelo"
 # github_repo = "coach-web"
 
-# Google OAuth web client ID (created once in the Google Cloud Console;
-# consumed by the app-level whitelist in issue #65). Leave empty until created.
+# ---------------------------------------------------------------------------
+# Auth boundary (ADR-04, issue #68) — REQUIRED for every plan/apply
+# ---------------------------------------------------------------------------
+# The Cloud Run service runs with AUTH_ENABLED=true and the app-level email
+# whitelist as the access-control boundary, so a Google OAuth web client ID
+# is mandatory: variable validation fails `tofu plan` otherwise (fail at
+# plan, not at container boot).
+#
+# Create the OAuth web client ONCE in the Google Cloud Console (APIs &
+# Services -> Credentials -> OAuth client ID, type "Web application",
+# authorized redirect URI: https://<service-url>/auth/callback), then:
+#   - CI deploys: set the repo VARIABLE OIDC_CLIENT_ID (public identifier —
+#     it is sent in every browser redirect to Google; not a secret) — the
+#     deploy workflow passes it via -var and skips the deploy while empty.
+#   - Local applies: set it here (copy this file to terraform.tfvars).
 # oidc_client_id = "1234567890-abcdefg.apps.googleusercontent.com"
+
+# Whitelist env (defaults shown — single-user personal app, the owner's own
+# Google address; JSON array string, pydantic-settings parses it as JSON).
+# Override only if additional Google accounts must ever gain access.
+# auth_whitelist_emails = "[\"frederic.pitteloud@gmail.com\"]"
+
+# Secret Manager secret names for the auth boundary (defaults shown). Secret
+# VERSIONS are populated out-of-band with `gcloud secrets versions add`
+# (one-liners in infra/README.md); never place secret values in this file.
+# auth_session_secret_id        = "auth-session-secret"
+# google_oauth_client_secret_id = "google-oauth-client-secret"
