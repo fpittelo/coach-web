@@ -39,6 +39,15 @@ resource "google_iam_workload_identity_pool_provider" "github" {
   oidc {
     issuer_uri = "https://token.actions.githubusercontent.com"
     # GitHub Actions OIDC tokens carry aud = "https://github.com/<owner>".
+    #
+    # Carried review item #1 (from #64, resolved in #67): google-github-actions/
+    # auth defaults its requested audience to the PROVIDER RESOURCE NAME (which
+    # embeds the GCP project number — unknowable in this module without a
+    # project-number data lookup, and impossible to reference from this
+    # resource's own arguments). The deploy workflow therefore sets
+    # `audience: https://github.com/<org>` explicitly (deploy.yaml), pairing
+    # exactly with allowed_audiences below. The per-repo attribute_condition
+    # above remains the actual trust boundary.
     allowed_audiences = ["https://github.com/${var.github_org}"]
   }
 }
@@ -60,22 +69,23 @@ resource "google_service_account_iam_member" "deployer_wif" {
   member             = "principalSet://iam.googleapis.com/${google_iam_workload_identity_pool.github.name}/attribute.repository/${var.github_org}/${var.github_repo}"
 }
 
-# Least-privilege project roles for the deployer SA — each justified:
-#   roles/run.admin              -> create/update the Cloud Run service (deploys, #67)
-#   roles/iam.serviceAccountUser -> act as the runtime SA when setting it on the service
+# Least-privilege project role for the deployer SA:
+#   roles/run.admin -> create/update the Cloud Run service (deploys, #67)
+#
+# Carried review item #2 (from #64, resolved in #67): roles/iam.serviceAccountUser
+# was removed from this PROJECT-WIDE grant. `tofu apply` only needs act-as on
+# the single Cloud Run runtime SA it sets on the service; that binding is now
+# scoped to the runtime SA itself (google_service_account_iam_member in the
+# root main.tf).
 #
 # Deliberately NOT granted (least privilege):
 #   roles/secretmanager.secretAccessor -> the deployer never reads secret values;
 #     runtime secret access is bound to the runtime SA (modules/cloud-run).
 #   roles/artifactregistry.reader      -> images ship from public ghcr.io, no AR pull.
-#   state-bucket access                -> CI does not manage remote state in this
-#     issue; if #67 needs it, grant roles/storage.objectAdmin on the bucket only.
+#   project-level storage roles        -> remote-state access is bound to the
+#     state bucket ONLY (google_storage_bucket_iam_member in root main.tf, #67).
 resource "google_project_iam_member" "deployer" {
-  for_each = toset([
-    "roles/run.admin",
-    "roles/iam.serviceAccountUser",
-  ])
   project = var.project_id
-  role    = each.value
+  role    = "roles/run.admin"
   member  = "serviceAccount:${google_service_account.deployer.email}"
 }

@@ -101,3 +101,29 @@ module "wif" {
 
   depends_on = [google_project_service.required]
 }
+
+# --- CI deployer grants (issue #67) ---------------------------------------------
+# Two least-privilege bindings complete the keyless deploy path; both resolve
+# carried review items from #64/#66.
+
+# 1. Act-as the Cloud Run runtime SA (carried review item #2 from #64).
+# `tofu apply` sets `service_account` on the Cloud Run service, which requires
+# roles/iam.serviceAccountUser on THAT service account. The former PROJECT-WIDE
+# grant on the deployer (modules/wif) is replaced by this SA-scoped binding.
+resource "google_service_account_iam_member" "deployer_runtime_sa_user" {
+  service_account_id = "projects/${var.project_id}/serviceAccounts/${module.cloud_run.runtime_sa_email}"
+  role               = "roles/iam.serviceAccountUser"
+  member             = "serviceAccount:${module.wif.deployer_sa_email}"
+}
+
+# 2. Remote-state access for CI (the deploy workflow runs `tofu init` against
+# the GCS backend, which reads/writes state objects and lock files). Scoped to
+# the state bucket ONLY — no project-level storage roles. The bucket is created
+# by infra/bootstrap (chicken-and-egg: it cannot create itself); this binding
+# is created by the first apply, which always runs locally with human ADC (see
+# README "Apply policy"), so CI never bootstraps its own state access.
+resource "google_storage_bucket_iam_member" "deployer_state_access" {
+  bucket = var.state_bucket_name
+  role   = "roles/storage.objectAdmin"
+  member = "serviceAccount:${module.wif.deployer_sa_email}"
+}

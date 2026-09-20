@@ -158,6 +158,14 @@ variable "cors_origins" {
   description = "CORS_ORIGINS env for the app — a JSON array string of allowed browser origins. Empty default: the UI is served same-origin by the FastAPI app, so the cloud deployment needs no CORS. Local dev overrides via compose/.env; set here only for a cross-origin consumer."
   type        = string
   default     = ""
+
+  # Carried review item #4 (from #66): fail malformed CORS JSON at `tofu
+  # validate` time, not at container startup (the app parses CORS_ORIGINS as
+  # JSON — a malformed value would crash the container).
+  validation {
+    condition     = var.cors_origins == "" || can(jsondecode(var.cors_origins))
+    error_message = "cors_origins must be empty or valid JSON (e.g. a JSON array of origin strings, see Settings.CORS_ORIGINS)."
+  }
 }
 
 # ---------------------------------------------------------------------------
