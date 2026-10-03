@@ -73,13 +73,13 @@ class Settings(BaseSettings):
     """Enable Google OIDC authentication & whitelist middleware (opt-in, #65)."""
 
     GOOGLE_OIDC_CLIENT_ID: str = ""
-    """Google OAuth web client ID (Cloud Run injects GOOGLE_OIDC_CLIENT_ID, #66)."""
+    """Google OAuth web client ID (lane env files wire GOOGLE_OIDC_CLIENT_ID, #66)."""
 
     GOOGLE_OIDC_CLIENT_SECRET: str = ""
     """Google OAuth client secret (env var only; never logged or persisted)."""
 
     GOOGLE_OIDC_ISSUER: str = "https://accounts.google.com"
-    """Expected issuer of Google ID tokens (aligns with the Cloud Run spec, #66)."""
+    """Expected issuer of Google ID tokens (Google accounts issuer, #66)."""
 
     AUTH_WHITELIST_EMAILS: list[str] = Field(
         default_factory=lambda: ["frederic.pitteloud@gmail.com"]
