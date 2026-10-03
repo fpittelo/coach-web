@@ -6,7 +6,7 @@ Coach Web processes **biometric and health-related personal data** (resting hear
 
 This data is subject to the **Swiss Federal Act on Data Protection (nLPD / FADP)** and the **Cantonal (CH-VD)** data protection regulations.
 
-**Local-first posture (ADR-007, 2026-10-03):** dev, qa, and prod run on the local workstation in loopback-only Docker lanes — biometric data storage and processing never leave the host. The former `europe-west6` cloud residency argument is retired with the GCP topology; the residual cross-border consideration is the OpenRouter LLM call (assessed in #112). The cloud-era checklists below are retained as the v0.6.0 historical record until the local-topology rewrite lands (#113).
+**Local-first posture (ADR-007, 2026-10-03):** dev, qa, and prod run on the local workstation in loopback-only Docker lanes — biometric data storage and processing never leave the host. The former `europe-west6` cloud residency argument is retired with the GCP topology; the residual cross-border consideration is the OpenRouter LLM call (assessed in #112). The authoritative threat model for this topology is the **Local STRIDE model** below; the retired v0.6.0 cloud model is retained as a clearly-delimited historical appendix.
 
 ---
 
@@ -169,9 +169,130 @@ terms in the project's compliance notes. Until then, treat the transfer as an
 
 ---
 
-## STRIDE Threat Model — Cloud Topology (v0.6.0, issue #68)
+## STRIDE Threat Model — Local Topology (ADR-007, v0.8.0)
 
-> **⚠️ Topology transition (ADR-007):** the model below is the authoritative STRIDE analysis of the **retired v0.6.0 Cloud Run topology**, retained as the historical record of that release. The GCP platform is decommissioned (#111); the local-topology STRIDE rewrite (loopback reachability by local processes, DNS rebinding, Docker socket / `docker` group, sidecar bridge exposure, plaintext env secrets, LAN exposure if binding changes) lands in #113. Interim local posture: **loopback binding primary, OIDC whitelist defense-in-depth** — see the Access-Control Boundary section above.
+> **Authoritative model.** This replaces the v0.6.0 Cloud Run STRIDE analysis as the current threat model. The cloud model is retained as a clearly-delimited historical appendix at the end of this document (it records the retired release's analysis and must not be silently deleted).
+
+### Trust Boundaries
+
+```mermaid
+graph TD
+    subgraph "Workstation (single user, LUKS full-disk encryption)"
+        subgraph "Untrusted local actors"
+            LOCAL["Any local process / user"]
+            SITE["Malicious website (DNS rebinding)"]
+            BROWSER["Owner browser"]
+        end
+        subgraph "Docker host"
+            DOCKERD["dockerd / docker group<br/>root-equivalent"]
+            subgraph "Lane bridge network (coach-net)"
+                WEB["coach-web :8000<br/>published 127.0.0.1 only"]
+                MCP["coach-mcp :8000<br/>no published ports"]
+                GHMCP["github-mcp :8001<br/>no published ports"]
+            end
+        end
+        ENVFILES["Per-lane env files<br/>chmod 600 · gitignored"]
+    end
+    subgraph "External services"
+        GOOGLE["Google OIDC"]
+        OPENROUTER["OpenRouter (US routing)"]
+        INTERVALS["Intervals.icu"]
+        GITHUB["GitHub API"]
+    end
+    LOCAL -->|"loopback TCP"| WEB
+    SITE -->|"DNS rebinding → 127.0.0.1"| WEB
+    BROWSER -->|"http loopback + session cookie"| WEB
+    DOCKERD -->|"root-equivalent"| WEB
+    WEB -->|"bridge DNS"| MCP
+    WEB -->|"bridge DNS"| GHMCP
+    WEB -->|"HTTPS"| GOOGLE
+    WEB -->|"HTTPS"| OPENROUTER
+    MCP -->|"HTTPS"| INTERVALS
+    GHMCP -->|"HTTPS"| GITHUB
+    ENVFILES -->|"env injection"| WEB
+```
+
+### Boundary B1 — Local processes/users → loopback service
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Spoofing** | Any local process or user reaches `127.0.0.1:<port>` and impersonates the owner | Loopback binding is the primary control; on prod, Google OIDC + `AUTH_WHITELIST_EMAILS` re-checked on every request (403). Single-user workstation is the trust assumption. |
+| **Elevation of Privilege** | A local unprivileged process uses the app as a confused deputy to reach sidecars/secrets | Sidecars publish no host ports; secrets are scoped per service; the app never exposes secret material. |
+| **Information Disclosure** | A local process reads biometric data from the API | Accepted local trust assumption (single user); OIDC on prod; no multi-user model. |
+
+### Boundary B2 — DNS rebinding → loopback
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Spoofing** | A malicious website resolves a hostname to `127.0.0.1` and reaches the service same-origin (critical while dev/qa run `AUTH_ENABLED=false`) | `TrustedHostMiddleware` rejects any `Host` not in `TRUSTED_HOSTS` (default `localhost`, `127.0.0.1`) with **400** (implemented #118). |
+| **Tampering** | Cross-origin request mutates state | `SameSite=Lax` session cookie; CORS restricted to the lane's loopback origin. |
+
+### Boundary B3 — Docker socket / `docker` group = root-equivalent
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Elevation of Privilege** | Membership in the `docker` group (or access to `/var/run/docker.sock`) is root-equivalent: a member can mount the host filesystem into a container | **Accepted local trust assumption**, documented. The workstation is single-user; the owner is the only `docker` group member. Containers run non-root, read-only rootfs, `cap_drop: ALL`, `no-new-privileges`. |
+| **Tampering** | A compromised container escapes to the host | Hardened runtime (non-root, read-only, dropped caps); no privileged containers; no host mounts. |
+
+### Boundary B4 — coach-web → sidecars on the lane bridge network
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Spoofing** | Any container on the lane bridge can reach `github-mcp`/`coach-mcp` by DNS name | Sidecars publish nothing to the host; the lane network is per-project (`<project>_coach-net`), so only containers of the same lane share it. Accepted: any container on the lane net can reach the sidecars. |
+| **Information Disclosure** | A sidecar leaks its secret to another container | Per-service secret scoping: `coach-mcp` holds only `INTERVALS_API_KEY`; `github-mcp` only the GitHub PAT; `coach-web` never receives the Intervals key. |
+| **Denial of Service** | A sidecar crash silently passes the gate | Pre-flight asserts the exact service set via `docker compose ps -a` (exited containers included) and all healthchecks healthy (#113). |
+
+### Boundary B5 — Browser → app session
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Tampering** | Forged/edited session cookie | HS256 JWT, ≥32-byte secret, pinned `algorithms=["HS256"]`, `iss`/`aud`/`exp`/`iat`/`sub`/`email` required, per-token `jti`. `HttpOnly; Secure; SameSite=Lax`. |
+| **Spoofing (CSRF/state)** | Login-CSRF / replayed OIDC state | `state` doubles as nonce, bound to a single-use `cw_oidc_state` cookie, `compare_digest`, deleted on every callback exit. |
+| **Information Disclosure** | Session/biometric data leaking to the client | No `localStorage`/`IndexedDB`; cookies carry identity only; sanitized JSON errors. |
+| **Spoofing (cookie over loopback)** | `Secure` cookie dropped over plain HTTP | Chromium/Firefox treat loopback as trustworthy and send it; **Safari does not** — Safari users need a TLS front-end. `AUTH_COOKIE_SECURE` must stay `true`. |
+
+### Boundary B6 — Plan approval: repudiation
+
+`POST /api/plan/approve` is state-changing (schedules workouts on Intervals.icu, commits plan Markdown to GitHub). Repudiation is mitigated by a three-way external audit trail:
+
+1. **GitHub commit history** — every approved plan is an attributed commit in `fpittelo/coach`.
+2. **Intervals.icu workout records** — scheduled workouts are queryable in the athlete's calendar.
+3. **Local structured application logs** — container stdout captured by the Docker host; secrets never logged. **Cloud Logging is gone** (retired with the GCP topology, #111); the local log retention policy is documented in the admin guide (bounded Docker log rotation, secret redaction).
+
+Because a single whitelisted identity is admitted, any approval is attributable to the owner by construction. **Residual:** an unattended unlocked browser could approve on the owner's behalf — accepted for a single-tenant personal app; session TTL bounded (`AUTH_SESSION_TTL_SECONDS=3600`).
+
+### Boundary B7 — Plaintext env secrets on disk
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Information Disclosure** | A local process/user reads `.env.<lane>` and exfiltrates API keys | Per-lane env files are `chmod 600` and gitignored; **LUKS full-disk encryption** is the at-rest expectation; secrets are never committed (gitleaks full-history scan). |
+| **Elevation of Privilege** | A leaked lane file grants more than its scope | Per-service secret scoping: a leaked lane file can do no more than the declared `${...}` scope allows. |
+
+### Boundary B8 — OpenRouter cross-border processing
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Information Disclosure** | Biometric context is sent to a US-routed LLM provider | Local-first fixes **storage** residency, not **processing** residency. The transfer inventory, legal-basis approach, minimization options and DPA requirement are assessed in the **OpenRouter Cross-Border Assessment (#112)** section above. Accepted residual risk for a single self-controller; minimization tracked as follow-up. |
+
+### Local STRIDE Summary Table
+
+| STRIDE | Primary vector (local topology) | Mitigation (anchor) |
+|:---|:---|:---|
+| **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce |
+| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS |
+| **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + local structured logs (secret-redacted); single whitelisted identity |
+| **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112) |
+| **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap |
+| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers |
+
+---
+
+## Historical Appendix — v0.6.0 Cloud Run STRIDE Model (retired)
+
+> **⚠️ Historical record only.** The model below is the authoritative STRIDE analysis of the **retired v0.6.0 Cloud Run topology**. The GCP platform is decommissioned (#111); it is retained here so the release's analysis is not lost. Do not use it as the current threat model — see the Local Topology model above.
+
+<details>
+<summary>Click to expand the retired v0.6.0 Cloud Run STRIDE analysis (issue #68)</summary>
 
 The v0.6.0 release moved the application from a single-container local compose topology to a **serverless multi-container Cloud Run service in `europe-west6`** fronted by an unauthenticated edge, with keyless CI federation and Secret Manager. This section is the authoritative STRIDE analysis of that cloud topology; the table below is the per-boundary summary.
 
@@ -279,9 +400,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 |:---|:---|:---|
 | **Denial of Service** | Request floods / upstream stalls / instance teardown | `minScale=0`, `maxScale=2` bounds blast radius and cost; upstream timeouts (OpenRouter, MCP sidecars, Google endpoints, `HTTP_TIMEOUT_SECONDS=30`); agent tool-iteration cap (`AGENT_MAX_TOOL_ITERATIONS`); graceful exception handling. Scale-to-zero also caps the *cost* of a flood to the request-driven price only. |
 
----
-
-## Cloud STRIDE Summary Table
+### Cloud STRIDE Summary Table
 
 | STRIDE | Primary vector (cloud topology) | Mitigation (anchor) |
 |:---|:---|:---|
@@ -292,19 +411,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 | **Denial of Service** | Floods, upstream stalls, SSE probe teardown | `minScale=0`/`maxScale=2`; timeouts; tool-iteration cap; TCP (not HTTP) sidecar probes |
 | **Elevation of Privilege** | Secret extraction; path traversal; over-broad CI identity | Per-secret `secretAccessor` (no project-level grant); default-deny path normalization; read-broad/write-narrow deployer with no secret access; non-root container |
 
----
-
-## Dependency Vulnerability Scanning
-
-- **Python**: `pip-audit --strict` runs in CI (`ci.yaml`) — verified green on `main` (run 35512358319 / jobs 106082347692)
-- **Docker**: Image built & validated in CI; scan via `trivy` or GitHub Security tab (planned)
-- **Secrets**: `gitleaks` scans all commits for leaked credentials (`ci.yaml`) — verified green on `main` (job 106082347801)
-
----
-
-## nLPD Compliance Checklist
-
-> **⚠️ Historical (v0.6.0 cloud topology):** this checklist records the retired Cloud Run posture. Under ADR-007 the primary access control is **loopback binding**; OIDC is defense-in-depth. The local-first checklist lands with the #113 rewrite.
+### Historical nLPD Compliance Checklist (v0.6.0 cloud topology)
 
 | # | Requirement | Status | Evidence |
 |:---|:---|:---|:---|
@@ -317,11 +424,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 | 7 | Encryption at rest | ✅ | Google-managed encryption for Secret Manager, GCS, Cloud Run |
 | 8 | No persistent browser storage of personal data | ✅ | No `localStorage`/`IndexedDB`; identity-only cookies |
 
----
-
-## Compliance Checklist
-
-> ℹ️ v0.6.0 cloud-era items below (WIF keyless CI, `europe-west6` pinning) are retained as the historical record of that release; they are retired by ADR-007 (#110/#111), and the local-first checklist lands with the #113 rewrite.
+### Historical Compliance Checklist (v0.6.0 cloud topology)
 
 - [x] No biometric data stored persistently in the browser
 - [x] No API key exposed to the client side
@@ -334,6 +437,53 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 - [x] Per-secret Secret Manager IAM (no project-level `secretAccessor`)
 - [x] All data-bearing resources pinned to `europe-west6` (nLPD)
 
+</details>
+
+---
+
+## Dependency Vulnerability Scanning
+
+- **Python**: `pip-audit --strict` runs in CI (`ci.yaml`, `dependency-scan` job) — zero known CVEs.
+- **Docker**: `trivy` image scan runs in CI (`ci.yaml`, `image-scan` job) — fails on **HIGH/CRITICAL** OS/library CVEs (`--exit-code 1 --severity HIGH,CRITICAL`); LOW/MEDIUM are reported but non-failing.
+- **Secrets**: `gitleaks` scans the **full commit history** (`fetch-depth: 0`) in CI (`ci.yaml`, `secret-scan` job) — zero leaked credentials.
+
+---
+
+## nLPD Compliance Checklist (local-first, v0.8.0)
+
+> **Authoritative checklist for the local-first topology.** The retired v0.6.0 cloud checklist is preserved in the historical appendix above.
+
+| # | Requirement | Status | Evidence |
+|:---|:---|:---|:---|
+| 1 | Loopback-only binding as the primary access control | ✅ | All lanes publish `127.0.0.1` only; sidecars publish no host ports; pre-flight asserts it (`scripts/e2e-preflight.sh`) |
+| 2 | Local encryption at rest | ✅ | LUKS full-disk encryption on the workstation (expectation); per-lane env files `chmod 600` and gitignored |
+| 3 | Backup policy for persisted biometric data | ✅ (N/A) | The app persists **no** biometric data server-side (ephemeral posture); no backup of personal data exists. Any future persistence must add an encrypted-backup policy before shipping |
+| 4 | Workstation access control | ✅ | Single-user workstation; OS screen lock; `docker` group membership is the documented root-equivalent trust assumption (B3) |
+| 5 | Local log retention with secret redaction | ✅ | Container stdout captured by the Docker host with bounded log rotation; secrets never logged; Cloud Logging retired (#111) |
+| 6 | OpenRouter cross-border assessment | ✅ | Documented in the OpenRouter Cross-Border Assessment (#112) — accepted residual risk for a single self-controller |
+| 7 | Data minimization | ✅ | Pertinent metrics only; no client-side persistence; secrets never logged |
+| 8 | No persistent browser storage of personal data | ✅ | No `localStorage`/`IndexedDB`; identity-only cookies |
+| 9 | Encryption in transit | ✅ | HTTPS/TLS to Google, OpenRouter, Intervals.icu, GitHub; loopback plain HTTP accepted (local, single-user) |
+| 10 | Audit trail | ✅ | GitHub commit history + Intervals.icu records + local structured logs (secret-redacted) |
+
+---
+
+## Compliance Checklist (local-first, v0.8.0)
+
+- [x] No biometric data stored persistently in the browser
+- [x] No API key exposed to the client side
+- [x] Non-root container execution (UID:GID 10001:10001)
+- [x] Minimal data fetching (pertinent metrics only)
+- [x] Loopback-only binding as the primary access control (ADR-007)
+- [x] Google OIDC whitelist authentication enforced on the prod lane (defense-in-depth)
+- [x] `TrustedHostMiddleware` Host allowlist (DNS-rebinding mitigation, #118)
+- [x] Stateless sessions — no server-side session store
+- [x] Fail-closed auth configuration (refuses to boot misconfigured)
+- [x] Per-lane, per-service secret scoping (`chmod 600`, gitignored env files)
+- [x] Local encryption at rest (LUKS full-disk; `chmod 600` env files)
+- [x] Full-history secret scanning (gitleaks) + dependency scanning (`pip-audit --strict`) + image scanning (trivy HIGH/CRITICAL)
+- [x] OpenRouter cross-border transfer assessed and documented (#112)
+
 ---
 
 ## Related Documents
@@ -341,8 +491,9 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 | Document | Owner | Content |
 |:---|:---|:---|
 | [Architecture](architecture.md) | @architect | ArchiMate model, C4 diagrams, ADRs |
-| [Admin Guide](admin_guide.md) | @fpittelo | Operations & configuration |
+| [Admin Guide](admin_guide.md) | @fpittelo | Operations, configuration & release gate |
+| [E2E Checklist](e2e-checklist.md) | @fpittelo | Manual prod-lane E2E verification (v0.8.0) |
 
 ---
 
-_Last updated: 2026-10-03 (issue #112 — local auth & secrets posture: TrustedHostMiddleware, AUTH_COOKIE_SECURE, per-lane secrets, OpenRouter cross-border assessment; #113 STRIDE rewrite still pending)_
+_Last updated: 2026-10-03 (issue #113 — local-topology STRIDE rewrite, nLPD local-first checklist, trivy image scan, preflight service-set assertion, github-mcp prod digest pin)_
