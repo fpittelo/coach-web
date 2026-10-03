@@ -81,15 +81,15 @@ uv sync
 cp .env.example .env
 # Edit .env with your COACH_MCP_URL and GITHUB_TOKEN
 
-# Run (FastAPI + uvicorn)
+# Run (FastAPI + uvicorn — binds APP_PORT, default 8000)
 uv run coach-web
-# or with autoreload
+# or with autoreload on an explicit port override
 uv run uvicorn coach_web.app:create_app --factory --reload --port 8080
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) — the Swiss minimalist shell is served from `/`.
+Then open [http://localhost:8000](http://localhost:8000) (or `:8080` with the override above) — the Swiss minimalist shell is served from `/`.
 
-Healthcheck: [http://localhost:8080/health](http://localhost:8080/health)
+Healthcheck: [http://localhost:8000/health](http://localhost:8000/health)
 
 ### Option 2: Docker (local lanes — ADR-007)
 

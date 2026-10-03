@@ -3,7 +3,7 @@
 **Audience:** @architect, @devops  
 **Last updated:** 2026-10-03
 
-> **Authority note:** Sections 1–3 and 7 still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh. **ADR-006 (§9)** is authoritative for the visual/rendering contract; **ADR-007 (§10)** is authoritative for the deployment topology (§4).
+> **Authority note:** Sections 1–3 and 7–8 still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh. **ADR-006 (§9)** is authoritative for the visual/rendering contract; **ADR-007 (§10)** is authoritative for the deployment topology (§4).
 
 ---
 
@@ -158,7 +158,7 @@ graph TD
         GITHUB["GitHub"]
     end
 
-    OWNER(["@fpittelo<br/>browser, loopback only"]) -->|"127.0.0.1:<lane-port>"| WEB
+    OWNER(["@fpittelo<br/>browser, loopback only"]) -->|"127.0.0.1:{lane-port}"| WEB
     WEB -->|"http://coach-mcp:8000/sse"| MCP
     WEB -->|"http://github-mcp:8001/"| GHMCP
     MCP -->|"HTTPS"| INTERVALS
@@ -380,7 +380,7 @@ The v0.7 UI/UX Overhaul epic (Sprint 09, #88 — groomed 2026-09-19 through a co
 - `tests/test_static_assets.py` contract tests are rewritten per this ADR in #78 and #81 — test supersession is explicit, reviewed, and logged; never silent deletion.
 - #81 is merge-blocked on STRIDE sign-off (#87): sanitizer configuration, mid-stream partial renders, CSP posture (including the Alpine `unsafe-eval` question), and replayed-history prompt injection.
 - `README.md` tech-stack table is corrected in #78: the repo uses hand-written CSS, not Tailwind.
-- Sections 1–8 of this document still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh; **ADR-006 is authoritative for the visual/rendering contract going forward.**
+- Sections 1–3 and 7–8 of this document still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh (§4 was refreshed by ADR-007, 2026-10); **ADR-006 is authoritative for the visual/rendering contract going forward.**
 - The v0.3 Inter typography decision (self-hosted WOFF2, zero CDN) carries forward unchanged.
 
 ---

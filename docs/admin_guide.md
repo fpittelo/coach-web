@@ -79,6 +79,8 @@ docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml down
 
 The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have no published ports, all healthchecks healthy, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
 
+> ℹ️ Lane-aware pre-flight (lane argument, per-lane compose files, loopback assertions) lands with #109; the current `scripts/e2e-preflight.sh` targets the legacy single-stack topology.
+
 > **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
 ---

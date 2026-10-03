@@ -147,7 +147,7 @@ graph TD
 
 | STRIDE | Threat | Mitigation |
 |:---|:---|:---|
-| **Spoofing** | Anonymous access to dashboard/API | `INGRESS_TRAFFIC_ALL` + `allUsers` invoker is **only** acceptable because ADR-04 makes the **application-level Google OIDC email whitelist the access-control boundary** (`infra/modules/cloud-run/main.tf`, carried review item #2 from #64). The edge is a transport door, not an authorization decision. Default-deny middleware protects every path except `PUBLIC_PATHS = {/ , /health, /healthz}` and `PUBLIC_PREFIXES = (/static/, /auth/)`; `/api/*` returns **401** without a valid session, and a non-whitelisted identity gets **403** on every request. |
+| **Spoofing** | Anonymous access to dashboard/API | `INGRESS_TRAFFIC_ALL` + `allUsers` invoker is **only** acceptable because ADR-04 makes the **application-level Google OIDC email whitelist the access-control boundary** (ADR-04, superseded by ADR-007 — loopback binding is primary in the local topology) (`infra/modules/cloud-run/main.tf`, carried review item #2 from #64). The edge is a transport door, not an authorization decision. Default-deny middleware protects every path except `PUBLIC_PATHS = {/ , /health, /healthz}` and `PUBLIC_PREFIXES = (/static/, /auth/)`; `/api/*` returns **401** without a valid session, and a non-whitelisted identity gets **403** on every request. |
 | **Elevation of Privilege** | Path traversal to reach a public path | `is_public_path()` normalizes the raw ASGI path with `posixpath.normpath` and fails closed on any residual `..` segment, so `/static/../api/...` cannot be classified public. |
 
 ### Boundary 3 — GFE → uvicorn: proxy-header trust
@@ -202,7 +202,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 | STRIDE | Primary vector (cloud topology) | Mitigation (anchor) |
 |:---|:---|:---|
-| **Spoofing** | Foreign repo/ref federating into GCP; anonymous edge access; forged session | WIF `attribute_condition` (repo + ref) + pinned `allowed_audiences`; app-level OIDC whitelist **is** the boundary (ADR-04); HS256 session with pinned iss/aud and required claims; OIDC state/nonce single-use |
+| **Spoofing** | Foreign repo/ref federating into GCP; anonymous edge access; forged session | WIF `attribute_condition` (repo + ref) + pinned `allowed_audiences`; app-level OIDC whitelist **is** the boundary (ADR-04, superseded by ADR-007); HS256 session with pinned iss/aud and required claims; OIDC state/nonce single-use |
 | **Tampering** | Cookie/API tampering; arbitrary CI image; spoofed `X-Forwarded-*` | HS256 signature + `algorithms=[...]` pinning; digest-pinned images + gated prod deploy; GFE sole-ingress proxy-header trust (topology-dependent, caveat recorded) |
 | **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + structured logs; single whitelisted identity |
 | **Information Disclosure** | Biometric data / credential leakage | Data rendered only inside a whitelisted session; secrets env-only via Secret Manager; sanitized errors; no client persistence; per-secret IAM; europe-west6 replication |
@@ -242,7 +242,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 - [x] No API key exposed to the client side
 - [x] Non-root container execution
 - [x] Minimal data fetching (pertinent metrics only)
-- [x] Google OIDC whitelist authentication enforced at application level (ADR-04, #65)
+- [x] Google OIDC whitelist authentication enforced at application level (ADR-04, #65; superseded by ADR-007 — loopback primary, OIDC defense-in-depth)
 - [x] Stateless sessions — no server-side session store (scale-to-zero compatible)
 - [x] Fail-closed auth configuration (refuses to boot misconfigured)
 - [x] Keyless CI (WIF, no service-account keys) with repo+ref-scoped trust (ADR-06)
