@@ -1,6 +1,7 @@
-/* Coach Web — Swiss minimalist interface (EPFL Elements inspired).
-   Pure white surfaces, hairline borders, 2px radii, Inter typography,
-   no elevation. All assets are self-hosted; no external requests. */
+/* Coach Web — v0.7 conversational interface (ADR-006 visual contract).
+   Off-white surfaces, slate ink, deep-teal accent, 10px radii, soft
+   elevation, and a single centered reading column. All assets are
+   self-hosted; no external requests. */
 
 @font-face {
   font-family: "Inter";
@@ -27,12 +28,19 @@
 }
 
 :root {
-  --ink: #111111;
-  --muted: #6b6b6b;
+  /* v0.7 palette (ADR-006): slate-on-off-white with a deep teal accent. */
+  --surface: #f8fafc;
   --paper: #ffffff;
-  --line: #d5d5d5;
-  --accent: #ff0000;
-  --radius: 2px;
+  --ink: #1e293b;
+  --muted: #475569;
+  --line: #e2e8f0;
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --error: #b91c1c;
+  /* Soft geometry: 10px radius band, elevation replaces harsh borders. */
+  --radius: 10px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08);
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -56,7 +64,7 @@ body {
 
 body {
   min-height: 100vh;
-  background: var(--paper);
+  background: var(--surface);
   color: var(--ink);
   font-family: var(--font-sans);
   font-weight: 400;
@@ -72,7 +80,7 @@ body {
 /* --- Masthead ---------------------------------------------------------- */
 
 .masthead {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: var(--space-6) var(--space-5) var(--space-5);
 }
@@ -109,25 +117,18 @@ body {
 /* --- Layout ------------------------------------------------------------ */
 
 .layout {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: 0 var(--space-5) var(--space-7);
-  display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: var(--space-5);
-  align-items: start;
-}
-
-@media (max-width: 900px) {
-  .layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 .panel {
   background: var(--paper);
-  border: 1px solid var(--line);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
   padding: var(--space-5);
 }
 
@@ -181,6 +182,7 @@ body {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.6;
 }
 
 .empty-state {
@@ -306,10 +308,10 @@ body {
 /* --- Buttons ----------------------------------------------------------- */
 
 .button {
-  border: 1px solid var(--ink);
+  border: none;
   border-radius: var(--radius);
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--accent);
+  color: var(--accent-ink);
   padding: var(--space-3) var(--space-5);
   font-family: inherit;
   font-size: 0.8rem;
@@ -320,8 +322,8 @@ body {
 }
 
 .button:hover:not(:disabled) {
-  background: var(--accent);
-  border-color: var(--accent);
+  filter: brightness(1.1);
+  box-shadow: var(--shadow-sm);
 }
 
 .button:disabled {
@@ -332,6 +334,7 @@ body {
 .button--ghost {
   background: var(--paper);
   color: var(--ink);
+  border: 1px solid var(--line);
 }
 
 .button--ghost:hover:not(:disabled) {
@@ -422,7 +425,7 @@ body {
 }
 
 .approval-note--error {
-  color: var(--accent);
+  color: var(--error);
 }
 
 .plan-placeholder {
@@ -434,7 +437,7 @@ body {
 /* --- Footer ------------------------------------------------------------ */
 
 .footer {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: var(--space-5);
   border-top: 1px solid var(--line);
