@@ -6,17 +6,17 @@ Coach Web processes **biometric and health-related personal data** (resting hear
 
 This data is subject to the **Swiss Federal Act on Data Protection (nLPD / FADP)** and the **Cantonal (CH-VD)** data protection regulations.
 
-All data-bearing resources of the v0.6.0 serverless topology are pinned to **`europe-west6` (Zürich)** — see the [nLPD Compliance Checklist](#nlpd-compliance-checklist) below.
+**Local-first posture (ADR-007, 2026-10-03):** dev, qa, and prod run on the local workstation in loopback-only Docker lanes — biometric data storage and processing never leave the host. The former `europe-west6` cloud residency argument is retired with the GCP topology; the residual cross-border consideration is the OpenRouter LLM call (assessed in #112). The cloud-era checklists below are retained as the v0.6.0 historical record until the local-topology rewrite lands (#113).
 
 ---
 
-## Access-Control Boundary (ADR-04, issue #65)
+## Access-Control Boundary (ADR-007; OIDC implementation from #65)
 
-**The email whitelist IS the access-control boundary.** The Cloud Run edge accepts unauthenticated traffic by design (scale-to-zero, `allUsers` invoker at $0 fixed cost); all enforcement happens at the application level:
+**Loopback binding is the primary access control; the Google OIDC email whitelist is defense-in-depth.** All lanes bind `127.0.0.1` only — the application is unreachable from the network by construction. On the prod lane, OIDC adds an authentication layer on top (the lane that can mutate real data via `POST /api/plan/approve`); dev/qa run `AUTH_ENABLED=false`:
 
 - **Google OIDC authorization-code flow** (`/auth/login` → `/auth/callback`): ID tokens are verified as RS256 against the Google JWKS with pinned issuer (both documented Google `iss` forms accepted), pinned audience, single-use nonce binding and a mandatory `email_verified` claim.
 - **Whitelist enforcement**: only emails in `AUTH_WHITELIST_EMAILS` (default: `frederic.pitteloud@gmail.com`) may obtain a session — checked at login **and** re-checked on every authenticated request (403 otherwise). An empty whitelist rejects everyone (fail closed).
-- **Stateless sessions**: short-lived HS256 JWTs (`iss=coach-web`, `aud=coach-web`, ≥32-byte key) carried in an `HttpOnly; Secure; SameSite=Lax` cookie. No server-side session store — compatible with scale-to-zero.
+- **Stateless sessions**: short-lived HS256 JWTs (`iss=coach-web`, `aud=coach-web`, ≥32-byte key) carried in an `HttpOnly; Secure; SameSite=Lax` cookie. No server-side session store — nLPD ephemeral posture.
 - **Fail-closed configuration**: `AUTH_ENABLED=true` without client credentials or with a short session secret refuses to boot. Auth is opt-in (`AUTH_ENABLED=false` locally, default).
 - **Logout CSRF safety**: `/auth/logout` is POST-only (GET returns 405).
 
@@ -30,8 +30,8 @@ graph LR
         GOOGLE["Google OIDC<br/>identity only (email claim)"]
     end
 
-    subgraph "coach-web Container (Cloud Run)"
-        APP["FastAPI App<br/>whitelist middleware (ADR-04)"]
+    subgraph "coach-web Container (local Docker lane)"
+        APP["FastAPI App<br/>whitelist middleware (defense-in-depth)"]
     end
 
     subgraph "MCP Sidecars (coach-net)"
@@ -44,7 +44,7 @@ graph LR
     end
 
     GOOGLE -->|"verified ID token"| APP
-    BROWSER -->|"HTTPS + session cookie"| APP
+    BROWSER -->|"HTTP loopback + session cookie"| APP
     APP -->|"SSE"| MCP
     APP -->|"streamable HTTP"| GHMCP
     MCP -->|"biometric metrics"| APP
@@ -65,15 +65,15 @@ graph LR
 
 ## Secret Boundaries
 
-| Secret | Location | Never in |
+| Secret | Location (ADR-007 local-first) | Never in |
 |:---|:---|:---|
-| `INTERVALS_API_KEY` | coach-mcp sidecar env (Secret Manager) | coach-web app, browser, logs |
-| `GITHUB_TOKEN` | coach-web env → github-mcp sidecar (Secret Manager) | browser, logs |
-| `OPENROUTER_API_KEY` | coach-web env (Secret Manager on Cloud Run) | browser, logs |
-| `GOOGLE_OIDC_CLIENT_SECRET` | coach-web env (Secret Manager on Cloud Run) | browser, logs, repository |
-| `AUTH_SESSION_SECRET` | coach-web env (≥32 bytes, Secret Manager on Cloud Run) | browser, logs, repository |
+| `INTERVALS_API_KEY` | coach-mcp sidecar env only (per-lane env file, #112) | coach-web app, browser, logs |
+| `GITHUB_TOKEN` | coach-web env → github-mcp sidecar (per-lane env file; read-only scope dev/qa, read+write prod) | browser, logs |
+| `OPENROUTER_API_KEY` | coach-web env only (per-lane env file, #112) | browser, logs |
+| `GOOGLE_OIDC_CLIENT_SECRET` | coach-web env only (per-lane env file, #112) | browser, logs, repository |
+| `AUTH_SESSION_SECRET` | coach-web env only (≥32 bytes, **distinct per lane**, #112) | browser, logs, repository |
 
-Secrets are injected via environment variables (Secret Manager on Cloud Run) and are never logged or persisted by the application. **IaC manages secret metadata and IAM only — secret versions are populated out-of-band, so no secret material ever reaches OpenTofu state** (`infra/modules/cloud-run/main.tf`).
+Secrets are injected via per-lane, per-service environment files (`chmod 600`, gitignored) and are never logged or persisted by the application. Each container receives only the secrets it needs — no shared `.env` injecting all secrets into all containers (#112). The former Secret Manager / IaC-managed secret metadata retired with the cloud topology (#111); no secret material ever reached OpenTofu state.
 
 ---
 
@@ -98,6 +98,8 @@ The token is passed via environment variable and **never** exposed to the browse
 ---
 
 ## STRIDE Threat Model — Cloud Topology (v0.6.0, issue #68)
+
+> **⚠️ Topology transition (ADR-007):** the model below is the authoritative STRIDE analysis of the **retired v0.6.0 Cloud Run topology**, retained as the historical record of that release. The GCP platform is decommissioned (#111); the local-topology STRIDE rewrite (loopback reachability by local processes, DNS rebinding, Docker socket / `docker` group, sidecar bridge exposure, plaintext env secrets, LAN exposure if binding changes) lands in #113. Interim local posture: **loopback binding primary, OIDC whitelist defense-in-depth** — see the Access-Control Boundary section above.
 
 The v0.6.0 release moved the application from a single-container local compose topology to a **serverless multi-container Cloud Run service in `europe-west6`** fronted by an unauthenticated edge, with keyless CI federation and Secret Manager. This section is the authoritative STRIDE analysis of that cloud topology; the table below is the per-boundary summary.
 
@@ -234,6 +236,8 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 ## Compliance Checklist
 
+> ℹ️ v0.6.0 cloud-era items below (WIF keyless CI, `europe-west6` pinning) are retained as the historical record of that release; they are retired by ADR-007 (#110/#111), and the local-first checklist lands with the #113 rewrite.
+
 - [x] No biometric data stored persistently in the browser
 - [x] No API key exposed to the client side
 - [x] Non-root container execution
@@ -256,4 +260,4 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 ---
 
-_Last updated: 2026-09-20 (v0.6.0 cloud topology STRIDE audit — issue #68)_
+_Last updated: 2026-10-03 (ADR-007 local-first access-control reframing — issue #108; cloud STRIDE retained as the v0.6.0 historical record pending the #113 rewrite)_

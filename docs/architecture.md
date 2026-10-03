@@ -1,7 +1,9 @@
 # 📕 Architecture — Coach Web
 
 **Audience:** @architect, @devops  
-**Last updated:** 2026-09-19
+**Last updated:** 2026-10-03
+
+> **Authority note:** Sections 1–3 and 7 still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh. **ADR-006 (§9)** is authoritative for the visual/rendering contract; **ADR-007 (§10)** is authoritative for the deployment topology (§4).
 
 ---
 
@@ -136,27 +138,44 @@ graph TD
 
 ---
 
-## 4. Deployment Topology
+## 4. Deployment Topology (ADR-007 — Local-First)
+
+> **Authoritative deployment model: ADR-007 (§10).** The local Docker host on the workstation is the deployment target for all three lanes; the GCP Cloud Run topology (Sprint 08, #64–#68) is retired and decommissioned via #111.
 
 ```mermaid
 graph TD
-    subgraph "Docker Host"
-        WEB_CONTAINER["coach-web Container<br/>UID 10001<br/>:8501"]
-        MCP_CONTAINER["coach Container<br/>UID 10001<br/>:8000"]
+    subgraph "Local Docker Host — workstation (loopback 127.0.0.1 only)"
+        subgraph "Lane (dev :8100 / qa :8200 / prod :8000)"
+            WEB["coach-web Container<br/>UID 10001 · FastAPI/uvicorn"]
+            MCP["coach-mcp :8000 (SSE)<br/>UID 10001 · holds INTERVALS_API_KEY"]
+            GHMCP["github-mcp :8001<br/>holds GITHUB PAT"]
+        end
     end
 
-    subgraph "External Network"
+    subgraph "External"
+        GHCR["ghcr.io"]
         INTERVALS["Intervals.icu"]
         GITHUB["GitHub"]
-        GHCR["ghcr.io"]
     end
 
-    WEB_CONTAINER -->|"HTTP :8000/mcp"| MCP_CONTAINER
-    MCP_CONTAINER -->|"HTTPS"| INTERVALS
-    WEB_CONTAINER -->|"HTTPS"| GITHUB
-    GHCR -->|"docker pull"| WEB_CONTAINER
-    GHCR -->|"docker pull"| MCP_CONTAINER
+    OWNER(["@fpittelo<br/>browser, loopback only"]) -->|"127.0.0.1:<lane-port>"| WEB
+    WEB -->|"http://coach-mcp:8000/sse"| MCP
+    WEB -->|"http://github-mcp:8001/"| GHMCP
+    MCP -->|"HTTPS"| INTERVALS
+    GHMCP -->|"HTTPS"| GITHUB
+    GHCR -->|"docker pull (qa/prod lanes)"| WEB
+    GHCR -->|"docker pull"| MCP
 ```
+
+### Lane Matrix
+
+| Lane | Compose files | coach-web image | Host port | Auth | Purpose |
+|:---|:---|:---|:---|:---|:---|
+| **dev** | `compose.yaml` + `compose.dev.yml` | build from source (`target: runtime`) | `127.0.0.1:8100` | `AUTH_ENABLED=false` | active development |
+| **qa** | `compose.yaml` + `compose.qa.yml` | `ghcr.io/fpittelo/coach-web:qa` | `127.0.0.1:8200` | `AUTH_ENABLED=false` | staging validation of promoted `dev` |
+| **prod** | `compose.yaml` + `compose.prod.yml` | digest-pinned `vX.Y.Z` | `127.0.0.1:8000` | `AUTH_ENABLED=true` (OIDC defense-in-depth) | daily-use deployment |
+
+**Properties (all lanes):** per-lane compose project name (`coach-web-dev|qa|prod`) and network; sidecars publish no host ports; hardening parity (`read_only`, `cap_drop: ALL`, `no-new-privileges`, tmpfs, resource limits, non-root UID 10001). Promotion stays PR-approval-gated (`dev` → `qa` → `main`); the local lane pull is the procedural rollout step. Lane files are delivered by #109.
 
 ---
 
@@ -366,4 +385,59 @@ The v0.7 UI/UX Overhaul epic (Sprint 09, #88 — groomed 2026-09-19 through a co
 
 ---
 
-_Last updated: 2026-09-19_
+## 10. ADR-007: Local-First Deployment
+
+| Field | Value |
+|:---|:---|
+| **Status** | Accepted |
+| **Date** | 2026-10-03 |
+| **Deciders** | @fpittelo (Product Owner decision), @architect, @scrum-master, @devops, @cyber-security |
+| **Reviewed by** | @fpittelo |
+| **Supersedes** | Sprint 08 Phase 2 serverless migration (#64–#68: OpenTofu GCP IaC, multi-container Cloud Run, WIF keyless CI; #68 closed `not_planned`) |
+| **Tracked in** | Epic #107 — Sprint 10 (v0.8.0), Milestone 10 |
+
+### Context
+
+Sprint 08 (Phase 2) delivered a complete serverless GCP topology into `dev`: OpenTofu IaC pinned to `europe-west6` (#64), Google OIDC authentication with an application-level email whitelist (#65), a multi-container Cloud Run service (#66), and keyless Workload Identity Federation CI (#67). Issue #68 (live Cloud Run E2E validation & zero-scale audit) was in progress when the Product Owner re-evaluated the operating model.
+
+On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely** and run the stack on the local workstation (VIDAR) via Docker for all three lanes (dev, qa, prod). #68 was closed `not_planned` (superseded by #113 — local E2E validation & release gate); the already-merged OIDC implementation (#65, PR #99) carries forward unchanged.
+
+### Decision
+
+**Local Docker on the workstation becomes the deployment target for dev, qa, and prod.**
+
+1. **Lanes:** base `compose.yaml` + per-lane override files (`compose.dev.yml`, `compose.qa.yml`, `compose.prod.yml`) with per-lane compose project names and networks, so lanes run concurrently without collisions. All host bindings are `127.0.0.1` only — **loopback binding is the primary access control**. Compose *profiles* were rejected: they select which services run, not variants of the same service.
+2. **Promotion artifact:** GHCR lane-tag images (`:dev`, `:qa`, `:prod`/`vX.Y.Z`) remain the promotion artifact — the qa and prod lanes pull CI-built, zero-warning-gated images rather than building locally; the prod lane is digest-pinned. Promotion `dev` → `qa` → `main` stays PR-approval-gated by @fpittelo; the local lane pull is the procedural rollout step.
+3. **Auth:** loopback binding is the primary boundary; the Google OIDC email whitelist (#65) is **defense-in-depth**, enabled on the prod lane (`AUTH_ENABLED=true`, redirect `http://localhost:8000/auth/callback`); dev/qa run `AUTH_ENABLED=false`.
+4. **Cloud retirement:** `infra/` OpenTofu IaC, the `deploy-gcp` CI stage, the GCP repo variables, and the `production` GitHub environment are removed (#110 — in the same PR as the `ci.yaml` `opentofu` job, or CI breaks); all GCP resources are decommissioned with explicit @fpittelo approval and captured evidence (#111).
+5. **Secrets:** per-lane, per-service env files replace the shared `.env` — each container receives only the secrets it needs, with distinct `AUTH_SESSION_SECRET` per lane (#112).
+
+### Rationale
+
+1. **KIS (@fpittelo):** one Docker host, one compose topology, zero cloud consoles. The local sidecar topology already existed and was proven (issue #63, `e2e-preflight.sh`).
+2. **Cost:** $0 fixed cost, unconditionally — no dependence on scale-to-zero behavior or idle-timeout tuning.
+3. **Swiss nLPD/FADP (@cyber-security):** biometric data storage and processing stay on the workstation — a residency improvement over `europe-west6`. Residual risk: the OpenRouter LLM call remains a cross-border *processing* transfer of biometric context (assessed in #112).
+4. **Security posture:** loopback-only binding removes the public edge entirely; the hardened container posture (non-root, `read_only`, `cap_drop: ALL`, `no-new-privileges`) is unchanged.
+5. **Salvage:** the OIDC implementation (#65) and hardened GHCR images carry forward unchanged — only the platform target changes.
+
+### Alternatives Considered
+
+| Alternative | Pros | Cons | Verdict |
+|:---|:---|:---|:---|
+| **Keep GCP Cloud Run (status quo)** | Already built; remote access; scale-to-zero | Console overhead; standing attention cost; data leaves the workstation; #68 audit still pending | ❌ Rejected (PO decision) |
+| **Local build per lane (drop GHCR)** | No registry dependency | qa/prod would run locally-built images bypassing the CI zero-warning gate; base-image drift; no rollback artifact | ❌ Rejected |
+| **Compose profiles for lanes** | Single file | Profiles select *services*, not service variants; cannot express per-lane images/ports; `container_name` collisions block concurrent lanes | ❌ Rejected |
+| **Base + per-lane override files (chosen)** | Concurrent lanes; CI-gated images; minimal delta from today's compose | Slightly more files; per-lane env discipline required | ✅ Accepted |
+
+### Consequences
+
+- `docs/security.md` access-control framing changes: **loopback binding is primary, the OIDC whitelist is defense-in-depth** (no residual "edge is the boundary" language); the cloud STRIDE model is rewritten for the local topology in #113.
+- `docs/admin_guide.md` documents per-lane operations, GHCR pull prerequisites, and the promotion runbook.
+- The `deploy-gcp` stage and the `ci.yaml` `opentofu` job are removed in #110; GCP resources are destroyed in #111 (state backups captured first, bootstrap bucket last).
+- The v0.7.0 `qa → main` promotion is **held** until #109 + #110 merge — `main` must not ship a deploy stage targeting infrastructure slated for destruction.
+- Version order follows release order: if Sprint 10 completes first, local-first releases as v0.7.0 and the v0.7 UI epic becomes v0.8.0 (decided at release time).
+- Local trust assumptions accepted and documented: Docker socket / `docker` group is root-equivalent; workstation full-disk encryption and access control are part of the nLPD posture (#112, #113).
+
+---
+
+_Last updated: 2026-10-03_
