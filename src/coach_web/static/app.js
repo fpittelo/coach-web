@@ -7,8 +7,13 @@
  * request body — message and history content never appear in a URL or query
  * string (#79, Swiss nLPD). "New chat" (resetChat) is a full client-side
  * reset: it aborts any in-flight stream and clears every state slice without
- * transmitting anything. User data is only ever bound with x-text; no raw
- * HTML is injected.
+ * transmitting anything.
+ *
+ * Rendering posture (ADR-006 §9, gated by STRIDE #87): user data is only
+ * ever bound with x-text. Assistant messages are the sole HTML-rendered
+ * surface, bound to renderMarkdown() — the default-allowlist DOMPurify
+ * sanitizer over marked-parsed markdown, re-sanitizing the accumulated raw
+ * string on every render (#81).
  */
 
 function parsePayload(event) {
@@ -47,6 +52,20 @@ function coachApp() {
           log.scrollTop = log.scrollHeight;
         }
       });
+    },
+
+    renderMarkdown(text) {
+      // Sanitizer helper — the ONLY path from message text to HTML
+      // (ADR-006 §9, STRIDE #87 conditions C1/C3). marked parses the
+      // accumulated raw string and DOMPurify sanitizes the result with its
+      // default allowlist — no allow-list additions of any kind, so
+      // script/style/iframe/object/embed/form, event handlers, javascript:
+      // URIs and every Alpine x-*/@*/:* directive are stripped. The Alpine
+      // x-html binding calls this on every render with the FULL accumulated
+      // content — never per-token sanitized fragments — so a construct split
+      // across tokens (<scr|ipt>) is only ever sanitized as a whole, and
+      // DOMPurify repairs unclosed tags mid-stream.
+      return window.DOMPurify.sanitize(window.marked.parse(text));
     },
 
     send() {
