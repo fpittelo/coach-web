@@ -290,7 +290,11 @@ class TestIdentityBarContract:
 
         assert "badge" not in lowered
         assert "connected" not in lowered
-        assert "status" not in lowered
+        # "status" as a raw substring is brittle: it matches any occurrence of
+        # the word (prose, URLs, unrelated attributes). Scope the ban to
+        # class/id tokens — it still catches a "status-badge" style class.
+        class_id_tokens = re.findall(r'(?:class|id)="([^"]*)"', lowered)
+        assert not any("status" in token for token in class_id_tokens)
 
     # --- AC3: accessibility -------------------------------------------------
 
@@ -364,17 +368,38 @@ class TestIdentityBarContract:
         assert 'this.statusText = ""' in finish
 
     def test_stream_handlers_ignore_stale_events_after_reset(self) -> None:
-        """Transcript handlers bail out once the stream is no longer active.
+        """Every stream handler bails out once its stream is no longer current.
 
         "New chat" closes the EventSource mid-flight; events already queued on
         the JS task queue can still dispatch afterwards. Indexing the cleared
-        transcript would throw, so each handler guards on the phase flag.
+        transcript would throw, and stale activity/plan events would
+        repopulate cleared state, so each handler guards on both the phase
+        flag and a per-stream epoch: a bare phase check alone would even let
+        stale events through once a *new* stream has started (the phase flag
+        is true again), while the epoch pins the guard to the stream that
+        registered the handler.
         """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        for event in ("token", "error", "done"):
+        # Each stream captures its own epoch from the shared counter.
+        start = _rule_block(script, "startStream(message)")
+        assert "this.streamEpoch += 1" in start
+        assert "const epoch = this.streamEpoch" in start
+
+        for event in (
+            "status",
+            "thought",
+            "token",
+            "tool_call",
+            "tool_start",
+            "tool_result",
+            "plan_proposal",
+            "plan",
+            "error",
+            "done",
+        ):
             handler = _rule_block(script, f'addEventListener("{event}", (event) =>')
-            assert "if (!this.streaming)" in handler, event
+            assert "if (!this.streaming || epoch !== this.streamEpoch)" in handler, event
 
     # --- nLPD: client-side only, nothing persisted ----------------------------
 
