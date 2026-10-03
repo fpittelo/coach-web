@@ -51,23 +51,19 @@ ENV PATH="/app/site-packages/bin:${PATH}" \
 USER coach-web:coach-web
 
 # Local compose topology default is 8000 (compose.yaml, issue #63).
-# Cloud Run (issue #66) overrides APP_PORT=8080 via the service spec; the
-# ENTRYPOINT below resolves both APP_HOST and APP_PORT at runtime.
-# EXPOSE and HEALTHCHECK document the local default only — Cloud Run ignores
-# them and uses the probes declared in infra/modules/cloud-run/main.tf.
+# EXPOSE and HEALTHCHECK document the local default only.
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
     CMD python -c "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"
 
-# Cloud Run terminates TLS and forwards plain HTTP to the container; the
-# proxy-headers flags below make uvicorn honor X-Forwarded-Proto so the app
-# derives https URLs (live incident: OIDC redirect_uri mismatch; refs Cloud
-# Run docs). forwarded-allow-ips='*' is safe here because Cloud Run's
-# front-end always sets these headers and is the only ingress path
-# (INGRESS_TRAFFIC_ALL still routes through the front-end); local compose
-# sets no forwarded headers, so behavior is unchanged locally.
+# Local topology (ADR-007, #112): no trusted reverse proxy sits in front of the
+# container — compose publishes coach-web on 127.0.0.1 only. uvicorn therefore
+# trusts X-Forwarded-* headers from loopback peers only (127.0.0.1, ::1), so a
+# remote client cannot spoof the scheme/host used to derive the OIDC
+# redirect_uri. Direct http://localhost access still derives correct http URLs.
+# Any future ingress change (proxy, non-loopback publish) must re-validate this
+# flag in the same change (see docs/security.md, Boundary 3).
 #
-# exec keeps uvicorn as PID 1 so SIGTERM (Cloud Run shutdown signal) is
-# delivered directly to the ASGI server.
-ENTRYPOINT ["sh", "-c", "exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips='*'"]
+# exec keeps uvicorn as PID 1 so SIGTERM is delivered directly to the ASGI server.
+ENTRYPOINT ["sh", "-c", "exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips='127.0.0.1,::1'"]

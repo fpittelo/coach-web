@@ -95,6 +95,18 @@ class Settings(BaseSettings):
     AUTH_REDIRECT_URI: str = ""
     """Explicit OAuth redirect URI; derived from the request base URL when empty."""
 
+    AUTH_COOKIE_SECURE: bool = True
+    """Set the Secure flag on session & OIDC-state cookies (default true).
+
+    Chromium >=89 and Firefox >=75 treat ``http://localhost`` as a trustworthy
+    origin and DO send Secure cookies over plain-HTTP loopback; Safari has no
+    localhost exception and drops them. Only set false for a plain-HTTP
+    non-loopback deployment — never in the local loopback topology.
+    """
+
+    TRUSTED_HOSTS: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
+    """Host header allowlist enforced by TrustedHostMiddleware (DNS rebinding)."""
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""

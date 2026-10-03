@@ -48,14 +48,14 @@ def _resolve_redirect_uri(request: Request, settings: Settings) -> str:
     return str(request.base_url).rstrip("/") + "/auth/callback"
 
 
-def _state_cleared(status_code: int, detail: str) -> Response:
+def _state_cleared(status_code: int, detail: str, secure: bool) -> Response:
     """Build a callback response that also clears the single-use state cookie.
 
     The state value doubles as the ID-token nonce, so it is deleted on every
     callback exit — success and failure — to keep the single-use guarantee.
     """
     response: Response = JSONResponse(status_code=status_code, content={"detail": detail})
-    response.delete_cookie(STATE_COOKIE, path="/", secure=True, httponly=True)
+    response.delete_cookie(STATE_COOKIE, path="/", secure=secure, httponly=True)
     return response
 
 
@@ -83,7 +83,7 @@ async def login(request: Request) -> RedirectResponse:
         max_age=STATE_COOKIE_TTL_SECONDS,
         httponly=True,
         samesite="lax",
-        secure=True,
+        secure=settings.AUTH_COOKIE_SECURE,
         path="/",
     )
     return response
@@ -99,13 +99,13 @@ async def callback(
     settings: Settings = request.app.state.settings
     cookie_state = request.cookies.get(STATE_COOKIE)
     if not code or not state or not cookie_state or not secrets.compare_digest(state, cookie_state):
-        return _state_cleared(400, "Invalid OAuth state")
+        return _state_cleared(400, "Invalid OAuth state", settings.AUTH_COOKIE_SECURE)
 
     try:
         id_token = await _exchange_code(request, settings, code)
         jwks = await _fetch_jwks()
     except HTTPException as exc:
-        return _state_cleared(exc.status_code, str(exc.detail))
+        return _state_cleared(exc.status_code, str(exc.detail), settings.AUTH_COOKIE_SECURE)
 
     try:
         claims = verify_google_id_token(
@@ -116,11 +116,11 @@ async def callback(
             nonce=state,
         )
     except TokenError:
-        return _state_cleared(401, "Invalid Google ID token")
+        return _state_cleared(401, "Invalid Google ID token", settings.AUTH_COOKIE_SECURE)
 
     email: str = claims["email"]
     if not is_whitelisted(email, settings.AUTH_WHITELIST_EMAILS):
-        return _state_cleared(403, "Email not whitelisted")
+        return _state_cleared(403, "Email not whitelisted", settings.AUTH_COOKIE_SECURE)
 
     session = create_session_token(
         email,
@@ -134,22 +134,27 @@ async def callback(
         max_age=settings.AUTH_SESSION_TTL_SECONDS,
         httponly=True,
         samesite="lax",
-        secure=True,
+        secure=settings.AUTH_COOKIE_SECURE,
         path="/",
     )
-    response.delete_cookie(STATE_COOKIE, path="/", secure=True, httponly=True)
+    response.delete_cookie(
+        STATE_COOKIE, path="/", secure=settings.AUTH_COOKIE_SECURE, httponly=True
+    )
     return response
 
 
 @router.post("/logout")
-async def logout() -> RedirectResponse:
+async def logout(request: Request) -> RedirectResponse:
     """Clear the session cookie and return to the public landing page.
 
     POST-only: a state-changing action must not be reachable via GET, or any
     third-party page could force-logout the owner cross-site (logout CSRF).
     """
+    settings: Settings = request.app.state.settings
     response = RedirectResponse("/", status_code=302)
-    response.delete_cookie(SESSION_COOKIE, path="/", secure=True, httponly=True)
+    response.delete_cookie(
+        SESSION_COOKIE, path="/", secure=settings.AUTH_COOKIE_SECURE, httponly=True
+    )
     return response
 
 

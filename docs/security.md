@@ -19,6 +19,24 @@ This data is subject to the **Swiss Federal Act on Data Protection (nLPD / FADP)
 - **Stateless sessions**: short-lived HS256 JWTs (`iss=coach-web`, `aud=coach-web`, ≥32-byte key) carried in an `HttpOnly; Secure; SameSite=Lax` cookie. No server-side session store — nLPD ephemeral posture.
 - **Fail-closed configuration**: `AUTH_ENABLED=true` without client credentials or with a short session secret refuses to boot. Auth is opt-in (`AUTH_ENABLED=false` locally, default).
 - **Logout CSRF safety**: `/auth/logout` is POST-only (GET returns 405).
+- **Host allowlist (DNS rebinding, #112)**: `TrustedHostMiddleware` rejects any request whose `Host` header is not in `TRUSTED_HOSTS` (default `localhost`, `127.0.0.1`) with **400**. This is critical while dev/qa run `AUTH_ENABLED=false`: without it, a malicious website could resolve a hostname to `127.0.0.1` and reach the loopback service same-origin.
+
+### Cookie `Secure` flag over loopback
+
+Session (`cw_session`) and OIDC-state (`cw_oidc_state`) cookies are set with
+`HttpOnly; Secure; SameSite=Lax`. Over the local plain-HTTP topology this is
+safe because modern browsers treat loopback as a **trustworthy origin**:
+
+| Browser | Loopback `Secure` cookie over `http://localhost` | Notes |
+|:---|:---|:---|
+| Chromium ≥ 89 | ✅ sent | `http://localhost` / `http://127.0.0.1` are potentially-trustworthy origins |
+| Firefox ≥ 75 | ✅ sent | same loopback exception |
+| Safari | ❌ dropped | no localhost exception — session/OIDC-state cookies are not stored over plain HTTP |
+
+`AUTH_COOKIE_SECURE` (default `true`) controls the flag. It exists so a future
+plain-HTTP **non-loopback** deployment can be configured; it must never be set
+`false` in the loopback topology. Safari users must use a TLS-terminating
+front-end (or a browser with the loopback exception) for OIDC login.
 
 ### Data Flow & Minimization
 
@@ -87,6 +105,60 @@ The token is passed via environment variable and **never** exposed to the browse
 
 ---
 
+## OpenRouter Cross-Border Assessment (nLPD, issue #112)
+
+> **Status: assessment with recommended actions — not implemented controls.**
+> Local-first (ADR-007) fixes **storage** residency; it does **not** change
+> **processing** residency. The coach agent sends biometric context to
+> OpenRouter (US-based routing to upstream LLM providers), which is the
+> dominant residual nLPD risk.
+
+### (a) Transfer inventory — what reaches OpenRouter
+
+| Field | Source | Sensitivity |
+|:---|:---|:---|
+| Athlete identity (name / Intervals.icu athlete id) | Intervals.icu via coach-mcp | Personal data |
+| Training metrics (FTP, HR, HRV, CTL/ATL/TSB, sleep) | Intervals.icu via coach-mcp | **Health/biometric data (nLPD Art. 5(c))** |
+| Plan text / prompts (may embed the above) | coach-web agent | Derived personal data |
+| Model + attribution headers (`X-Title`, `HTTP-Referer`) | coach-web | Non-personal |
+
+The API key and session material are **never** sent to OpenRouter.
+
+### (b) Legal basis approach
+
+- Single data subject who is also the controller (self-coaching): the
+  processing is within the owner's own sphere. Document a **DPIA-lite** note
+  recording purpose (athletic coaching), categories (health metrics), recipients
+  (OpenRouter + routed LLM provider), and retention (none server-side by the
+  app; provider retention governed by its policy).
+- Swiss nLPD Art. 6 (lawfulness / good faith) and Art. 31 (data security)
+  principles: purpose limitation, proportionality, and appropriate safeguards.
+- Cross-border disclosure to a US recipient requires either an adequacy
+  decision, standard data-protection clauses, or **explicit consent**; for a
+  single self-controller the pragmatic basis is documented legitimate interest
+  plus minimization (below).
+
+### (c) Minimization options (candidate follow-up)
+
+1. **Pseudonymize athlete identity** before the LLM call (replace name/athlete
+   id with a stable opaque token).
+2. **Strip non-essential metrics** — send only the fields the current coaching
+   question needs (e.g. omit sleep/HRV when planning intervals).
+3. **Local model fallback** for sensitive turns (out of scope now; note as a
+   future option).
+
+These are **recommended actions**, tracked as a follow-up; no minimization is
+implemented in this change.
+
+### (d) Provider DPA reference requirement
+
+Before relying on OpenRouter for health data, record a reference to the
+provider's Data Processing Agreement / sub-processor list and its retention
+terms in the project's compliance notes. Until then, treat the transfer as an
+**accepted residual risk** for a single-tenant personal application.
+
+---
+
 ## Container Hardening
 
 - **Non-root execution**: Runs as unprivileged user `coach-web` (`UID:GID 10001:10001`)
@@ -150,13 +222,24 @@ graph TD
 | **Spoofing** | Anonymous access to dashboard/API | `INGRESS_TRAFFIC_ALL` + `allUsers` invoker is **only** acceptable because ADR-04 makes the **application-level Google OIDC email whitelist the access-control boundary** (ADR-04, superseded by ADR-007 — loopback binding is primary in the local topology) (`infra/modules/cloud-run/main.tf`, carried review item #2 from #64). The edge is a transport door, not an authorization decision. Default-deny middleware protects every path except `PUBLIC_PATHS = {/ , /health, /healthz}` and `PUBLIC_PREFIXES = (/static/, /auth/)`; `/api/*` returns **401** without a valid session, and a non-whitelisted identity gets **403** on every request. |
 | **Elevation of Privilege** | Path traversal to reach a public path | `is_public_path()` normalizes the raw ASGI path with `posixpath.normpath` and fails closed on any residual `..` segment, so `/static/../api/...` cannot be classified public. |
 
-### Boundary 3 — GFE → uvicorn: proxy-header trust
+### Boundary 3 — uvicorn proxy-header trust (local posture, #112)
 
-`uvicorn` runs with `--proxy-headers --forwarded-allow-ips='*'` (Dockerfile line 73). This is **safe for the Cloud Run topology** and topology-dependent in general:
+`uvicorn` runs with `--proxy-headers --forwarded-allow-ips='127.0.0.1,::1'`
+(Dockerfile). The local topology has **no trusted reverse proxy**: compose
+publishes coach-web on `127.0.0.1` only, so only loopback peers may set
+`X-Forwarded-*`. A remote client cannot spoof the scheme/host used to derive
+the OIDC `redirect_uri` (`_resolve_redirect_uri()` reads `request.base_url`).
 
-- The Cloud Run front-end (GFE) is the **sole ingress path** (even with `INGRESS_TRAFFIC_ALL`, traffic routes through the front-end) and **always sets/overwrites `X-Forwarded-Proto`**. Trusting it is what makes the app derive `https` URLs and keeps the OIDC `redirect_uri` correct (live incident: redirect_uri mismatch, PR #100).
-- **Caveat (review 5260511893, PR #100):** the trust is **topology-dependent**. If this image were ever published on a non-loopback interface (`docker run -p 0.0.0.0:8000:8000`) or placed behind a proxy that does not sanitize `X-Forwarded-*`, a client could spoof the scheme. Local compose binds `127.0.0.1` only, so the local surface is loopback-only. **Any future change to the ingress topology must re-validate this flag in the same change.**
-- `--forwarded-allow-ips` also broadens trust of `X-Forwarded-For` → `scope["client"]`; the app makes **no security decision on client IP** (no `request.client` / `scope["client"]` usage in `src/` — the boundary is the email whitelist), so there is no impact today.
+- Direct `http://localhost:8000` access derives correct `http://` URLs; no
+  `X-Forwarded-Proto` is needed locally.
+- **Topology-dependent (review 5260511893, PR #100):** the flag was `'*'` for
+  the retired Cloud Run topology, where the GFE was the sole ingress and always
+  set `X-Forwarded-Proto` (live incident: redirect_uri mismatch, PR #100).
+  **Any future ingress change (proxy, non-loopback publish) must re-validate
+  this flag in the same change.**
+- `--forwarded-allow-ips` also broadens trust of `X-Forwarded-For` →
+  `scope["client"]`; the app makes **no security decision on client IP** (no
+  `request.client` / `scope["client"]` usage in `src/`), so there is no impact.
 
 ### Boundary 4 — Runtime SA → Secret Manager
 
@@ -221,11 +304,13 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 ## nLPD Compliance Checklist
 
+> **⚠️ Historical (v0.6.0 cloud topology):** this checklist records the retired Cloud Run posture. Under ADR-007 the primary access control is **loopback binding**; OIDC is defense-in-depth. The local-first checklist lands with the #113 rewrite.
+
 | # | Requirement | Status | Evidence |
 |:---|:---|:---|:---|
 | 1 | All data-bearing resources in `europe-west6` | ✅ | Cloud Run `location=europe-west6`; Secret Manager user-managed replicas `europe-west6` (×5); GCS state bucket `EUROPE-WEST6`; VPC subnet `europe-west6` |
 | 2 | Health/biometric data processed in-region | ✅ | Intervals.icu metrics flow through `coach-mcp` inside the `europe-west6` Cloud Run instance; no cross-region storage |
-| 3 | Access control = OIDC + whitelist | ✅ | Google OIDC (RS256, pinned iss/aud, nonce) + `AUTH_WHITELIST_EMAILS`, re-checked every request (403); fail-closed boot |
+| 3 | Access control = loopback binding (primary) + OIDC whitelist (defense-in-depth) | ✅ | All lanes publish on `127.0.0.1` only; Google OIDC (RS256, pinned iss/aud, nonce) + `AUTH_WHITELIST_EMAILS`, re-checked every request (403); fail-closed boot |
 | 4 | Audit trail available | ✅ | Cloud Audit Logs + Cloud Logging (`roles/logging.logWriter`); GitHub commit history; Intervals.icu records; GCS state versioning |
 | 5 | Data minimization | ✅ | Pertinent metrics only; no client-side persistence; secrets never logged |
 | 6 | Encryption in transit | ✅ | HTTPS/TLS terminated at the GFE; Google APIs over HTTPS |
@@ -260,4 +345,4 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 ---
 
-_Last updated: 2026-10-03 (ADR-007 local-first access-control reframing — issue #108; cloud STRIDE retained as the v0.6.0 historical record pending the #113 rewrite)_
+_Last updated: 2026-10-03 (issue #112 — local auth & secrets posture: TrustedHostMiddleware, AUTH_COOKIE_SECURE, per-lane secrets, OpenRouter cross-border assessment; #113 STRIDE rewrite still pending)_

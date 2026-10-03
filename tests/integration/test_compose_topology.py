@@ -6,6 +6,7 @@ requiring a running Docker daemon, so they remain fast and deterministic in
 CI as well as local development.
 """
 
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,11 @@ LANE_COMPOSE = {
     "prod": "compose.prod.yml",
 }
 LANE_PORTS = {"dev": 8100, "qa": 8200, "prod": 8000}
+LANE_CORS_ORIGINS = {
+    "dev": "http://localhost:8100",
+    "qa": "http://localhost:8200",
+    "prod": "http://localhost:8000",
+}
 GITHUB_MCP_PIN = "ghcr.io/github/github-mcp-server:v1.12.2"
 SERVICES = ("coach-web", "coach-mcp", "github-mcp")
 
@@ -158,6 +164,16 @@ class TestBaseComposeTopology:
         assert env.get("GITHUB_TOKEN") == "${GITHUB_TOKEN:-}"
         assert "INTERVALS_API_KEY" not in env
 
+    def test_coach_web_security_settings_scoping(self, base_compose: dict[str, Any]) -> None:
+        """Cookie/Host settings are scoped to coach-web only (AC5/AC6, #112)."""
+        env = base_compose["services"]["coach-web"].get("environment", {})
+        assert env.get("AUTH_COOKIE_SECURE") == "${AUTH_COOKIE_SECURE:-true}"
+        assert env.get("TRUSTED_HOSTS") == '${TRUSTED_HOSTS:-["localhost", "127.0.0.1"]}'
+        for service in ("coach-mcp", "github-mcp"):
+            foreign = base_compose["services"][service].get("environment", {})
+            assert "AUTH_COOKIE_SECURE" not in foreign
+            assert "TRUSTED_HOSTS" not in foreign
+
     def test_coach_mcp_secret_scoping(self, base_compose: dict[str, Any]) -> None:
         """coach-mcp receives only INTERVALS_API_KEY, never web-app secrets (AC4)."""
         env = base_compose["services"]["coach-mcp"].get("environment", {})
@@ -257,6 +273,15 @@ class TestLaneOverrides:
         env = effective_compose[lane]["services"]["coach-web"]["environment"]
         assert env.get("AUTH_ENABLED") == auth_enabled
 
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_lane_cors_origin_default(
+        self, effective_compose: dict[str, dict[str, Any]], lane: str
+    ) -> None:
+        """Each lane defaults CORS_ORIGINS to its own loopback origin (AC3, #112)."""
+        env = effective_compose[lane]["services"]["coach-web"]["environment"]
+        origin = LANE_CORS_ORIGINS[lane]
+        assert env.get("CORS_ORIGINS") == f'${{CORS_ORIGINS:-["{origin}"]}}'
+
     def test_no_latest_tag_in_any_compose_file(self) -> None:
         """No compose file references a :latest image (AC3)."""
         for name in (BASE_COMPOSE, *LANE_COMPOSE.values()):
@@ -306,6 +331,37 @@ class TestLaneEnvTemplates:
         ):
             assert required in text
 
+    def test_prod_env_template_documents_redirect_uri(self) -> None:
+        """The prod template documents the loopback redirect URI variants (AC4)."""
+        text = (PROJECT_ROOT / ".env.prod.example").read_text(encoding="utf-8")
+        assert "http://localhost:8000/auth/callback" in text
+        assert "127.0.0.1" in text
+
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_lane_env_template_documents_distinct_session_secret(self, lane: str) -> None:
+        """Every lane template documents a distinct AUTH_SESSION_SECRET (AC2, #112)."""
+        text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
+        assert "AUTH_SESSION_SECRET=" in text
+        assert "openssl rand -hex 32" in text
+
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_lane_env_template_documents_cookie_and_host_settings(self, lane: str) -> None:
+        """Every lane template documents AUTH_COOKIE_SECURE and TRUSTED_HOSTS (AC5/AC6)."""
+        text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
+        assert "AUTH_COOKIE_SECURE=true" in text
+        assert "TRUSTED_HOSTS=" in text
+
+    def test_env_example_has_no_duplicate_cache_ttl(self) -> None:
+        """.env.example declares the app CACHE_TTL_SECONDS exactly once (AC2, #112)."""
+        text = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+        active = [
+            line.split("=", 1)[0]
+            for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        assert active.count("CACHE_TTL_SECONDS") == 1
+        assert "COACH_MCP_CACHE_TTL_SECONDS=300" in text
+
     def test_gitignore_covers_real_env_files(self) -> None:
         """.gitignore ignores real lane env files but keeps the templates (AC4)."""
         text = (PROJECT_ROOT / ".gitignore").read_text(encoding="utf-8")
@@ -317,6 +373,20 @@ class TestLaneEnvTemplates:
             "!.env.prod.example",
         ):
             assert template in text
+
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_real_lane_env_files_are_gitignored(self, lane: str) -> None:
+        """Real lane env files are ignored; only the templates are tracked (AC2)."""
+        git = shutil.which("git")
+        assert git is not None, "git must be available to verify ignore rules"
+        result = subprocess.run(
+            [git, "check-ignore", f".env.{lane}"],
+            cwd=PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, f".env.{lane} must be gitignored"
 
 
 class TestE2EPreflightScript:
@@ -423,3 +493,8 @@ class TestDockerfileHardening:
     def test_healthcheck_uses_port_8000(self, dockerfile: str) -> None:
         """The container health check targets localhost:8000/health."""
         assert "http://localhost:8000/health" in dockerfile
+
+    def test_forwarded_allow_ips_is_loopback_only(self, dockerfile: str) -> None:
+        """uvicorn trusts X-Forwarded-* from loopback peers only (AC7, #112)."""
+        assert "--forwarded-allow-ips='127.0.0.1,::1'" in dockerfile
+        assert "--forwarded-allow-ips='*'" not in dockerfile
