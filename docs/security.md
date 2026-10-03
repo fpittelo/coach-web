@@ -274,16 +274,18 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 |:---|:---|:---|
 | **Information Disclosure** | Biometric context is sent to a US-routed LLM provider | Local-first fixes **storage** residency, not **processing** residency. The transfer inventory, legal-basis approach, minimization options and DPA requirement are assessed in the **OpenRouter Cross-Border Assessment (#112)** section above. Accepted residual risk for a single self-controller; minimization tracked as follow-up. |
 
-### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81)
+### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81 — PLANNED, merge-blocked on this sign-off)
 
-Assistant messages render `DOMPurify.sanitize(marked.parse(text))` via `x-html` (assistant-only; user messages stay `x-text`; the plan card stays structured Pydantic→HTML). The threat sources are **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
+**Status:** target design for #81 — **not yet implemented** (the current tree renders all messages via `x-text`; `static/vendor/{marked.min.js, DOMPurify.min.js}` do not exist yet). The controls below are the **conditions C1–C7** that #81 must satisfy before merge; this sign-off (issue #87) is the gate.
+
+**Target design:** assistant messages will render `DOMPurify.sanitize(marked.parse(text))` via `x-html` (assistant-only; user messages stay `x-text`; the plan card stays structured Pydantic→HTML). The threat sources are **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
 
 | STRIDE | Threat | Mitigation |
 |:---|:---|:---|
-| **Tampering** | LLM/MCP content carries `<script>`, `<img onerror=…>`, a `javascript:` URI, or an Alpine `x-` directive into the assistant bubble | Assistant-only `x-html` bound to `DOMPurify.sanitize(marked.parse(text))`; DOMPurify's default allowlist strips `script`/`style`/`iframe`/`object`/`embed`/`form`, event-handler attributes, `javascript:` URIs and every `x-*`/`@*`/`:*` directive; user messages never render as HTML. Contract test asserts the sanitizer helper and assistant-only `x-html`. |
+| **Tampering** | LLM/MCP content carries `<script>`, `<img onerror=…>`, a `javascript:` URI, or an Alpine `x-` directive into the assistant bubble | Assistant-only `x-html` bound to `DOMPurify.sanitize(marked.parse(text))`; DOMPurify's default allowlist strips `script`/`style`/`iframe`/`object`/`embed`/`form`, event-handler attributes, `javascript:` URIs and every `x-*`/`@*`/`:*` directive; user messages never render as HTML. **Condition (C1/C4):** contract test must assert the sanitizer helper and assistant-only `x-html` (rewriting the current `x-html`-absent guard). |
 | **Elevation of Privilege** | An injected `x-init`/`@click`/`x-html` directive is evaluated by Alpine's MutationObserver when the sanitized node is inserted | DOMPurify strips non-allowlisted attributes (Alpine directives are not in the default allowlist); CSP `script-src 'self'` blocks inline script; the sanitizer config must **not** add `ALLOWED_ATTR` entries for `x-*`/`@*`/`:*`. |
 | **Information Disclosure** | A remote `<img>` in LLM markdown leaks the viewer IP or acts as a tracking pixel | CSP `img-src 'self' data:` blocks remote image loads. |
-| **Denial of Service** | Pathological markdown (deep nesting, huge token stream) | Message/history caps (8,000 chars × 10 entries) bound the input; marked/DOMPurify are synchronous and bounded; no server-side render. |
+| **Denial of Service** | Pathological markdown (deep nesting, huge token stream) | The **input** is bounded by the message/history caps (8,000 chars × 10 entries); the **output** vector (a huge LLM token stream) is bounded by the model's own output limit plus the synchronous, bounded marked/DOMPurify render — rendering happens client-side only, no server-side render. |
 
 **Mid-stream partial-render safety:** every token render re-sanitizes the **full accumulated raw text** (never appends per-token sanitized fragments), so a construct split across tokens (`<scr` + `ipt>`) is only ever sanitized as a whole at the final render; DOMPurify repairs unclosed tags. **Condition:** the implementation must sanitize the accumulated raw string, not concatenate per-token sanitized HTML.
 
@@ -329,11 +331,11 @@ Content-Security-Policy:
 | STRIDE | Primary vector (local topology) | Mitigation (anchor) |
 |:---|:---|:---|
 | **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state; forged replayed history (B10) | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce; history role `Literal` + human approval gate (B10) |
-| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9) |
+| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9 — **planned, #81**) |
 | **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + local structured logs (secret-redacted); single whitelisted identity |
 | **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112) |
 | **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap |
-| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9) |
+| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9 — **planned, #81**) |
 
 ---
 
