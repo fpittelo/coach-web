@@ -77,6 +77,24 @@ body {
   display: none !important;
 }
 
+/* Visually-hidden live region (#86 AC3): hidden from sight, kept in the
+   accessibility tree — display: none would silence it entirely. The
+   classic clip pattern keeps it at zero visual footprint while screen
+   readers announce its x-text content changes. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* --- Masthead ---------------------------------------------------------- */
 
 .masthead {
@@ -242,10 +260,60 @@ body {
   line-height: 1.6;
 }
 
+/* Onboarding empty state (#86 AC1): hero monogram, one-line welcome and
+   static starter chips, centered as a column. Replaces the v0.5
+   one-liner. Chips prefill the composer — they never send (PO Q8) — and
+   introduce no animation or transition of their own, so the
+   prefers-reduced-motion contract from #85 needs no chip exception. */
+
 .empty-state {
   margin: 0;
-  color: var(--muted);
-  font-size: 0.95rem;
+  padding: var(--space-6) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  text-align: center;
+}
+
+.monogram--hero {
+  width: 48px;
+  height: 48px;
+}
+
+.empty-state-welcome {
+  margin: 0;
+  max-width: 40ch;
+  font-size: 1.05rem;
+  color: var(--ink);
+}
+
+.starter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-3);
+}
+
+.chip {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  padding: var(--space-2) var(--space-4);
+  font-family: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 /* --- Markdown rendering (assistant messages, #81) ----------------------- */

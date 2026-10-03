@@ -93,6 +93,22 @@ space below the masthead and would itself push the composer below the
 fold. The focus ring selector moves to :focus-visible (text-entry
 controls match on every focus), and the auto-grow border correction reads
 computed border widths (scrollbar-blind).
+
+Issue #86 closes the sprint with the onboarding empty state and the
+accessibility pass. The v0.5 one-liner empty state is replaced by an
+onboarding block — hero monogram, the one-line welcome ("Hello! I'm your
+coach — what should we work on today?") and exactly 3 static endurance
+starter chips (PO Q2/Q7: domain-correct, static client-side strings, no
+personal data). Chips prefill the composer and focus it — NEVER
+auto-send (PO Q8). The accessibility pass (grill T11) moves the
+whole-log aria-live="polite" to a visually-hidden status region that
+announces phase changes and the completed FINAL message only — never per
+token — while the history itself becomes a role="log" region (implicit
+polite additions semantics for newly added messages). Focus returns to
+the composer when a stream ends (disabling the textarea on send drops
+focus to <body>), never stolen from a deliberate target, and the
+prefers-reduced-motion contract from #85 carries over with the chips
+introducing no animation of their own.
 """
 
 import re
@@ -567,11 +583,17 @@ class TestIdentityBarContract:
 
     # --- AC4: monogram -------------------------------------------------------
 
-    def test_monogram_is_single_inline_svg(self) -> None:
-        """One hand-authored inline SVG; no sprite, no icon font, no fetch."""
+    def test_monogram_is_inline_svg_only(self) -> None:
+        """Inline SVGs only: header brand mark + empty-state hero mark.
+
+        Superseded for #86 (explicit, per ADR-006 §2 — never silent
+        deletion): the onboarding empty state repeats the monogram as its
+        hero mark, so the page carries exactly TWO hand-authored inline
+        SVGs. Still no sprite, no icon font, no fetch, no <use>/xlink.
+        """
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-        assert html.count("<svg") == 1
+        assert html.count("<svg") == 2
         assert "currentColor" in html
         assert 'viewBox="0 0 32 32"' in html
         assert "<use" not in html
@@ -1525,3 +1547,242 @@ class TestComposerErgonomicsContract:
 
         assert "outline" in focus, "focus ring missing"
         assert "var(--accent)" in focus, "focus ring must use the accent token"
+
+
+class TestOnboardingEmptyStateContract:
+    """Onboarding empty state, starter chips & accessibility pass (#86).
+
+    The v0.5 one-liner empty state is replaced by an onboarding block: a
+    hero monogram, the one-line welcome ("Hello! I'm your coach — what
+    should we work on today?") and exactly 3 static endurance starter
+    chips (PO Q2/Q7 — domain-correct, static client-side strings, no
+    personal data; Swiss nLPD). Clicking a chip prefills the composer and
+    focuses it — NEVER auto-send (PO Q8).
+
+    The accessibility pass (grill T11) restructures the live-region
+    posture: the whole-log ``aria-live="polite"`` is removed — a
+    token-by-token stream would spam screen readers — and replaced by
+
+    1. ``role="log"`` on the history: structural chat semantics with
+       implicit polite additions announcements for newly added messages;
+    2. a visually-hidden ``role="status"`` region announcing phase
+       changes (short static labels) and the completed FINAL message —
+       never per token.
+
+    Focus returns to the composer when a stream ends (disabling the
+    textarea on send drops focus to ``<body>``), and focus is never
+    stolen from a deliberate target such as a plan-card button. The
+    prefers-reduced-motion contract from #85 carries over; the chips
+    introduce no animation of their own.
+
+    No Node toolchain (ADR-006 §5): JS is contracted via source
+    assertions, the same way as the stream, phase, auto-scroll, plan-card
+    and composer contracts above.
+    """
+
+    WELCOME_LINE = "Hello! I'm your coach — what should we work on today?"
+
+    STARTER_CHIPS = (
+        "Plan my next training week",
+        "How ready am I today?",
+        "Review last week's training load",
+    )
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _empty_state(self) -> str:
+        html = self._html()
+        assert '<div class="empty-state"' in html, "empty-state block missing"
+        start = html.index('<div class="empty-state"')
+        end = html.index("</div>", html.index("</button>", start))
+        return html[start:end]
+
+    # --- AC1: onboarding empty state structure ---------------------------------
+
+    def test_v05_one_liner_is_superseded_by_the_welcome_line(self) -> None:
+        """AC1: the v0.5 one-liner is gone; the welcome line replaces it.
+
+        Explicit supersession (ADR-006 §2): the old empty-state copy is
+        asserted ABSENT so it cannot silently return next to the new one.
+        """
+        html = self._html()
+
+        assert (
+            "Start the conversation with a question about your training." not in html
+        ), "v0.5 one-liner must be removed"
+        assert self.WELCOME_LINE in html, "welcome line missing"
+
+    def test_empty_state_shows_monogram_welcome_and_chips(self) -> None:
+        """AC1: monogram + welcome + chips, bound to the empty transcript."""
+        empty = self._empty_state()
+
+        # The block is the empty-transcript onboarding state.
+        assert 'x-show="messages.length === 0"' in empty
+        # Hero monogram mark (the second inline SVG on the page).
+        assert 'class="monogram monogram--hero"' in empty
+        assert 'aria-hidden="true"' in empty
+        # The one-line welcome.
+        assert self.WELCOME_LINE in empty
+        # The starter chips render from the static array.
+        assert 'x-for="chip in starterChips"' in empty
+        assert 'x-text="chip"' in empty
+
+    def test_exactly_three_starter_chips_with_exact_strings(self) -> None:
+        """AC1: exactly 3 static endurance chips with the exact PO strings."""
+        script = self._script()
+        match = re.search(r"starterChips:\s*\[(.*?)\]", script, re.DOTALL)
+        assert match is not None, "starterChips array missing"
+
+        chips = re.findall(r'"([^"]+)"', match.group(1))
+        assert chips == list(self.STARTER_CHIPS)
+
+    def test_hero_monogram_is_sized_and_token_colored(self) -> None:
+        """AC1: the hero mark scales the base monogram, accent-token colored."""
+        css = self._css()
+        hero = _rule_block(css, ".monogram--hero")
+
+        assert "width:" in hero
+        assert "height:" in hero
+        base = _rule_block(css, ".monogram")
+        assert "color: var(--accent)" in base
+
+    # --- AC2: prefill-and-focus, never auto-send ---------------------------------
+
+    def test_chip_click_prefills_and_focuses_never_sends(self) -> None:
+        """AC2: a chip fills the composer and focuses it — nothing is sent."""
+        script = self._script()
+        prefill = _rule_block(script, "prefillChip(chip)")
+
+        assert prefill, "prefillChip(chip) must exist"
+        assert "this.input = chip" in prefill
+        assert "this.$refs.composer.focus()" in prefill
+        # PO Q8: never auto-send — no send/startStream call in the handler.
+        assert "this.send()" not in prefill
+        assert "startStream" not in prefill
+
+    def test_chips_are_real_buttons_wired_to_prefill(self) -> None:
+        """AC2/AC4: chips are keyboard-operable <button>s wired to prefill."""
+        empty = self._empty_state()
+
+        assert '<button class="chip" type="button"' in empty
+        assert '@click="prefillChip(chip)"' in empty
+
+    # --- AC3: role="log" + visually-hidden status region --------------------------
+
+    def test_chat_log_is_a_log_region_without_whole_log_live(self) -> None:
+        """AC3: the history is role="log"; the whole-log aria-live is gone."""
+        html = self._html()
+        log_at = html.index('<div class="chat-log"')
+        log_tag = html[log_at : html.index(">", log_at) + 1]
+
+        assert 'role="log"' in log_tag
+        assert "aria-live" not in log_tag, "whole-log aria-live must be removed"
+
+    def test_status_region_is_visually_hidden_and_live(self) -> None:
+        """AC3: a visually-hidden role="status" region carries the announcements."""
+        html = self._html()
+        css = self._css()
+
+        assert 'class="visually-hidden"' in html
+        assert 'role="status"' in html
+        assert 'aria-live="polite"' in html
+        assert 'x-text="liveAnnouncement"' in html
+
+        hidden = _rule_block(css, ".visually-hidden")
+        assert "position: absolute" in hidden
+        assert "clip" in hidden, "clip pattern missing"
+        # display: none would remove the region from the accessibility tree.
+        assert "display: none" not in hidden
+
+    def test_phase_changes_are_announced_not_tokens(self) -> None:
+        """AC3: phase transitions announce short labels; tokens never do."""
+        script = self._script()
+
+        init = _rule_block(script, "init()")
+        assert 'this.$watch("phase"' in init, "phase watcher missing"
+
+        announce_phase = _rule_block(script, "announcePhase(phase)")
+        assert announce_phase, "announcePhase(phase) must exist"
+        for phase in ("waiting", "streaming", "tooling", "error"):
+            assert f"{phase}:" in announce_phase, phase
+
+        token = _rule_block(script, "token: (event) =>")
+        assert "announce" not in token, "tokens must never announce"
+
+        # Exactly two announce call sites: the phase label and the final
+        # message — nothing else may write the live region.
+        assert script.count("this.announce(") == 2
+
+    def test_final_message_is_announced_on_done(self) -> None:
+        """AC3: the completed FINAL message is announced once, on done."""
+        done = _rule_block(self._script(), "done: (event) =>")
+
+        assert "this.announce(" in done
+        assert "this.messages[index].content" in done
+
+    def test_reset_chat_clears_the_live_announcement(self) -> None:
+        """New chat clears the announcement channel with every state slice."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert 'this.liveAnnouncement = ""' in reset
+
+    # --- AC4: keyboard usability & focus management --------------------------------
+
+    def test_focus_returns_to_the_composer_after_send(self) -> None:
+        """AC4: stream end refocuses the composer (disable dropped it to body)."""
+        finish = _rule_block(self._script(), "finishStream()")
+
+        assert "this.$refs.composer.focus()" in finish
+        # Focus is never stolen from a deliberate target (e.g. a plan-card
+        # button tabbed to while streaming): the refocus is gated on the
+        # current focus having fallen back to <body>.
+        assert "document.activeElement" in finish
+
+    # --- AC4: reduced motion & chip styling contract ---------------------------------
+
+    def test_chip_styles_are_tokenized_and_motion_free(self) -> None:
+        """AC4: chips use tokens only and introduce no animation/transition."""
+        css = self._css()
+
+        chip = _rule_block(css, ".chip")
+        assert "border: 1px solid var(--line)" in chip
+        assert "var(--radius)" in chip
+        assert "animation" not in chip
+        assert "transition" not in chip
+
+        focus = _rule_block(css, ".chip:focus-visible")
+        assert "outline" in focus
+        assert "var(--accent)" in focus
+
+    def test_empty_state_styles_are_centered_and_tokenized(self) -> None:
+        """AC1: the onboarding block is a centered, token-driven column."""
+        css = self._css()
+
+        empty = _rule_block(css, ".empty-state")
+        assert "display: flex" in empty
+        assert "flex-direction: column" in empty
+        assert "align-items: center" in empty
+        assert "var(--space-" in empty
+
+        chips_row = _rule_block(css, ".starter-chips")
+        assert "display: flex" in chips_row
+        assert "flex-wrap: wrap" in chips_row
+
+    # --- nLPD: onboarding is static, personal-data-free ------------------------------
+
+    def test_onboarding_uses_no_personal_data(self) -> None:
+        """Chips are static client-side strings — no fetch, no user data."""
+        script = self._script()
+        prefill = _rule_block(script, "prefillChip(chip)")
+        empty = self._empty_state()
+
+        assert "fetch" not in prefill
+        assert "localStorage" not in empty
+        assert "sessionStorage" not in empty

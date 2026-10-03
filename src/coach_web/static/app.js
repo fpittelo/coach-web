@@ -47,6 +47,18 @@
  * inserts a newline, and an IME composition guard (event.isComposing)
  * keeps the composition-confirm Enter from sending. The send-disabled
  * bindings (empty input / in-flight stream) are unchanged.
+ *
+ * Onboarding & accessibility (#86): an empty transcript shows the
+ * onboarding block — hero monogram, one-line welcome and 3 static
+ * endurance starter chips (PO Q2/Q7: domain-correct client-side strings,
+ * no personal data). prefillChip() fills the composer and focuses it —
+ * never auto-send (PO Q8). The whole-log aria-live is replaced by a
+ * visually-hidden status region: a $watch("phase") speaks a short static
+ * label per phase transition and the done handler speaks the completed
+ * final message — never per token (AC3). finishStream() returns focus to
+ * the composer (disabling the textarea on send drops it to <body>)
+ * without stealing it from a deliberate target such as a plan-card
+ * button (AC4).
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -107,6 +119,17 @@ function coachApp() {
     // plan is active; a new proposal overwrites both slots (AC4: one card).
     planMessageIndex: -1,
     approval: { state: "idle", message: "" },
+    // Visually-hidden live-region text (#86 AC3): phase labels and the
+    // completed final message — never per token. Static strings or final
+    // message content only (nLPD).
+    liveAnnouncement: "",
+    // Static endurance starter chips (#86 AC1, PO Q2/Q7): domain-correct
+    // client-side strings — no personal data in onboarding (nLPD).
+    starterChips: [
+      "Plan my next training week",
+      "How ready am I today?",
+      "Review last week's training load",
+    ],
     controller: null,
 
     init() {
@@ -117,6 +140,11 @@ function coachApp() {
       // x-model DOM write lands before scrollHeight is read; measuring
       // synchronously would read the stale value and never shrink.
       this.$watch("input", () => this.$nextTick(() => this.autoGrowTextarea()));
+      // Live-region announcements (#86 AC3): every phase transition speaks
+      // a short static label to the visually-hidden status region; the
+      // completed final message is announced by the done handler. Tokens
+      // never announce.
+      this.$watch("phase", (phase) => this.announcePhase(phase));
       this.$nextTick(() => {
         const log = this.$refs.log;
         if (!log) {
@@ -214,6 +242,38 @@ function coachApp() {
         event.preventDefault();
         this.send();
       }
+    },
+
+    announce(text) {
+      // Write the visually-hidden status region (#86 AC3). The only two
+      // call sites are announcePhase (phase labels) and the done handler
+      // (the final message) — tokens never announce.
+      this.liveAnnouncement = text;
+    },
+
+    announcePhase(phase) {
+      // Phase labels (#86 AC3): one short static announcement per phase
+      // transition — never per token. Static strings only: no message
+      // content, no secrets (nLPD). "idle" is silent: the done handler
+      // has already announced the final message.
+      const phaseLabels = {
+        waiting: "Waiting for the coach",
+        streaming: "The coach is responding",
+        tooling: "The coach is checking your training data",
+        error: "The coach hit an error",
+      };
+      if (phaseLabels[phase]) {
+        this.announce(phaseLabels[phase]);
+      }
+    },
+
+    prefillChip(chip) {
+      // Starter chips (AC2, #86; PO Q8): prefill-and-focus — NEVER
+      // auto-send. The composer is filled and focused; sending stays an
+      // explicit Enter / Send action. The $watch("input") hook grows the
+      // textarea to fit the prefilled text.
+      this.input = chip;
+      this.$refs.composer.focus();
     },
 
     send() {
@@ -492,6 +552,11 @@ function coachApp() {
           if (!this.messages[index].content && data.message) {
             this.messages[index].content = data.message;
           }
+          // Announce the completed FINAL message (AC3, #86): the full
+          // text, once — never per token.
+          if (this.messages[index].content) {
+            this.announce(this.messages[index].content);
+          }
           this.finishStream();
         },
       };
@@ -553,6 +618,15 @@ function coachApp() {
         this.controller.abort();
         this.controller = null;
       }
+      // Return focus to the composer (AC4, #86): disabling the textarea
+      // on stream start drops focus to <body>; when the stream ends,
+      // keyboard users get the composer back without re-tabbing. Focus
+      // is never stolen from a deliberate target (e.g. a plan-card
+      // button tabbed to while streaming).
+      const active = document.activeElement;
+      if ((!active || active === document.body) && this.$refs.composer) {
+        this.$refs.composer.focus();
+      }
     },
 
     resetChat() {
@@ -565,6 +639,7 @@ function coachApp() {
       this.approval = { state: "idle", message: "" };
       this.input = "";
       this.errorBanner = "";
+      this.liveAnnouncement = "";
       this.phase = "idle";
       // Re-arm following (#85): the emptied log cannot fire a scroll event
       // (nothing left to scroll), so a fresh chat re-arms explicitly —
