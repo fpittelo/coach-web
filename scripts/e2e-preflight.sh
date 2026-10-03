@@ -7,7 +7,9 @@
 #      a clear message when a lane image is absent from GHCR (qa/prod lanes
 #      pull CI-built promotion artifacts; the dev lane builds coach-web locally
 #      so only its sidecars are checked)
-#   3. all three services turn healthy
+#   3. the expected service set (coach-web, coach-mcp, github-mcp) is PRESENT
+#      and all three services turn healthy — `docker compose ps -a` is used so
+#      a crashed/exited sidecar cannot be silently absent from the gate
 #   4. coach-web /health responds with the expected payload
 #   5. coach-web / serves the SPA
 #   6. coach-web is published on 127.0.0.1 ONLY and the sidecars publish no
@@ -122,26 +124,28 @@ log "Starting the ${LANE} lane (compose project ${PROJECT})..."
 if [[ "${LANE}" == "dev" ]]; then
     if ! dc up -d --build; then
         error "Failed to build/start the dev lane"
-        dc ps || true
+        dc ps -a || true
         dc logs --tail 50 || true
         exit 1
     fi
 else
     if ! dc up -d; then
         error "Failed to start the ${LANE} lane"
-        dc ps || true
+        dc ps -a || true
         dc logs --tail 50 || true
         exit 1
     fi
 fi
 
-log "Waiting for all services to become healthy (timeout ${MAX_WAIT_SECONDS}s)..."
+log "Waiting for the expected service set to be present and healthy (timeout ${MAX_WAIT_SECONDS}s)..."
 seconds_waited=0
 all_healthy="false"
 while [[ "${seconds_waited}" -lt "${MAX_WAIT_SECONDS}" ]]; do
-    if dc ps --format json 2>/dev/null | python3 -c '
+    if dc ps -a --format json 2>/dev/null | python3 -c '
 import json
 import sys
+
+EXPECTED_SERVICES = {"coach-web", "coach-mcp", "github-mcp"}
 
 raw = sys.stdin.read().strip()
 entries = []
@@ -151,8 +155,27 @@ if raw:
         entries = parsed if isinstance(parsed, list) else [parsed]
     except json.JSONDecodeError:
         entries = [json.loads(line) for line in raw.splitlines() if line.strip()]
-ok = bool(entries) and all(entry.get("Health") == "healthy" for entry in entries)
-sys.exit(0 if ok else 1)
+
+present = {entry.get("Service") for entry in entries}
+if present != EXPECTED_SERVICES:
+    missing = sorted(EXPECTED_SERVICES - present)
+    unexpected = sorted(present - EXPECTED_SERVICES)
+    print(
+        "service set mismatch (missing: {0}; unexpected: {1})".format(missing, unexpected),
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+not_healthy = sorted(
+    entry.get("Service", "<unknown>")
+    for entry in entries
+    if entry.get("Health") != "healthy"
+)
+if not_healthy:
+    print("services not healthy: {0}".format(not_healthy), file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)
 '; then
         all_healthy="true"
         break
@@ -162,15 +185,16 @@ sys.exit(0 if ok else 1)
 done
 
 if [[ "${all_healthy}" != "true" ]]; then
-    error "Services did not become healthy within ${MAX_WAIT_SECONDS}s"
-    dc ps || true
+    error "The expected service set (coach-web, coach-mcp, github-mcp) did not become healthy within ${MAX_WAIT_SECONDS}s"
+    error "A crashed or absent sidecar fails this gate: 'docker compose ps -a' below lists every container, including exited ones."
+    dc ps -a || true
     dc logs --tail 50 || true
     exit 1
 fi
-log "All services are healthy."
+log "All expected services are present and healthy."
 
 log "Asserting loopback-only host publishing..."
-ps_json="$(dc ps --format json)"
+ps_json="$(dc ps -a --format json)"
 printf '%s' "${ps_json}" | python3 -c '
 import json
 import sys
