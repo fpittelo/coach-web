@@ -173,7 +173,7 @@ class TestBaseComposeTopology:
         """Cookie/Host settings are scoped to coach-web only (AC5/AC6, #112)."""
         env = base_compose["services"]["coach-web"].get("environment", {})
         assert env.get("AUTH_COOKIE_SECURE") == "${AUTH_COOKIE_SECURE:-true}"
-        assert env.get("TRUSTED_HOSTS") == '${TRUSTED_HOSTS:-"localhost", "127.0.0.1"]}'
+        assert env.get("TRUSTED_HOSTS") == '${TRUSTED_HOSTS:-["localhost", "127.0.0.1"]}'
         for service in ("coach-mcp", "github-mcp"):
             foreign = base_compose["services"][service].get("environment", {})
             assert "AUTH_COOKIE_SECURE" not in foreign
@@ -304,7 +304,7 @@ class TestLaneOverrides:
         """Each lane defaults CORS_ORIGINS to its own loopback origin (AC3, #112)."""
         env = effective_compose[lane]["services"]["coach-web"]["environment"]
         origin = LANE_CORS_ORIGINS[lane]
-        assert env.get("CORS_ORIGINS") == f'${{CORS_ORIGINS:-"[{origin}"]}}'
+        assert env.get("CORS_ORIGINS") == f'${{CORS_ORIGINS:-["{origin}"]}}'
 
     def test_no_latest_tag_in_any_compose_file(self) -> None:
         """No compose file references a :latest image (AC3)."""
