@@ -538,7 +538,35 @@ body {
   border-color: var(--accent);
 }
 
-/* --- Plan approval card ------------------------------------------------ */
+/* --- Inline plan-approval card (#82) ------------------------------------ */
+
+/* The proposed plan renders as a conversation card beneath the assistant
+   message that proposed it (single active card — a new proposal replaces
+   the previous one). Structured Pydantic→HTML only: x-text bindings, no
+   markdown rendering (ADR-006 §9, STRIDE #87). */
+
+.plan-card {
+  margin-top: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.plan-card-label {
+  margin: 0 0 var(--space-3);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.plan-title {
+  margin: 0 0 var(--space-2);
+  font-size: 1rem;
+  font-weight: 700;
+}
 
 .plan-meta {
   display: grid;
@@ -581,10 +609,19 @@ body {
   font-size: 0.9rem;
 }
 
+/* AC3 (#82): the 4-column interval table scrolls horizontally inside its
+   wrapper on narrow viewports instead of overflowing the page. The block
+   margin moves to the wrapper (overflow creates a BFC, so a table margin
+   would otherwise pool inside the scroll container). */
+
+.plan-table-wrap {
+  overflow-x: auto;
+  margin-bottom: var(--space-4);
+}
+
 .interval-table {
   width: 100%;
   border-collapse: collapse;
-  margin-bottom: var(--space-4);
   font-size: 0.85rem;
 }
 
@@ -623,10 +660,16 @@ body {
   color: var(--error);
 }
 
-.plan-placeholder {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.95rem;
+/* --- Narrow viewports (#82 AC3) ------------------------------------------ */
+
+/* At ≤375px the plan card stacks: the meta grid collapses to one column so
+   the date/duration fields never squeeze the interval table; the table
+   itself scrolls horizontally inside .plan-table-wrap. */
+
+@media (max-width: 375px) {
+  .plan-meta {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* --- Footer ------------------------------------------------------------ */
