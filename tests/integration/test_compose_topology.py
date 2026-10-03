@@ -168,9 +168,7 @@ class TestBaseComposeTopology:
         """Cookie/Host settings are scoped to coach-web only (AC5/AC6, #112)."""
         env = base_compose["services"]["coach-web"].get("environment", {})
         assert env.get("AUTH_COOKIE_SECURE") == "${AUTH_COOKIE_SECURE:-true}"
-        assert env.get("TRUSTED_HOSTS") == '${TRUSTED_HOSTS:-"localhost", "127.0.0.1"]}'.replace(
-            '${TRUSTED_HOSTS:-"', '${TRUSTED_HOSTS:-["'
-        )
+        assert env.get("TRUSTED_HOSTS") == '${TRUSTED_HOSTS:-["localhost", "127.0.0.1"]}'
         for service in ("coach-mcp", "github-mcp"):
             foreign = base_compose["services"][service].get("environment", {})
             assert "AUTH_COOKIE_SECURE" not in foreign
