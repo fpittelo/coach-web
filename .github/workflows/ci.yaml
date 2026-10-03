@@ -57,6 +57,27 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  compose-validation:
+    name: Compose Lane Validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Validate dev lane (compose.yaml + compose.dev.yml)
+        run: docker compose -f compose.yaml -f compose.dev.yml config --quiet
+
+      - name: Validate qa lane (compose.yaml + compose.qa.yml)
+        run: docker compose -f compose.yaml -f compose.qa.yml config --quiet
+
+      - name: Validate prod lane (compose.yaml + compose.prod.yml)
+        env:
+          # The prod lane requires a digest-pinned release image reference
+          # (compose.prod.yml fails fast when COACH_WEB_IMAGE is unset).
+          # Validation only needs a syntactically valid digest placeholder.
+          COACH_WEB_IMAGE: ghcr.io/fpittelo/coach-web@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        run: docker compose -f compose.yaml -f compose.prod.yml config --quiet
+
   secret-scan:
     name: Secret Scanning (gitleaks)
     runs-on: ubuntu-latest

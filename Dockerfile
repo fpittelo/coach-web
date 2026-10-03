@@ -50,7 +50,7 @@ ENV PATH="/app/site-packages/bin:${PATH}" \
 
 USER coach-web:coach-web
 
-# Local/compose topology default is 8000 (docker-compose.yml, issue #63).
+# Local compose topology default is 8000 (compose.yaml, issue #63).
 # Cloud Run (issue #66) overrides APP_PORT=8080 via the service spec; the
 # ENTRYPOINT below resolves both APP_HOST and APP_PORT at runtime.
 # EXPOSE and HEALTHCHECK document the local default only — Cloud Run ignores

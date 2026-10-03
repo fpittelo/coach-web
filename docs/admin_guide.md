@@ -16,15 +16,15 @@
 | **prod** | `compose.yaml` + `compose.prod.yml` | digest-pinned `vX.Y.Z` | `127.0.0.1:8000` | `AUTH_ENABLED=true` (OIDC) | daily use |
 
 - **All host bindings are `127.0.0.1` only** — loopback binding is the primary access control (ADR-007). Never bind `0.0.0.0`.
-- Each lane runs as its own compose project (`-p coach-web-dev|qa|prod`) with its own network — lanes can run concurrently without port/name collisions.
+- Each lane runs as its own compose project (`coach-web-dev|qa|prod`, pinned via the lane file's `name:` field and the `-p` flag) with its own network (`<project>_coach-net`) — lanes can run concurrently without port/name collisions.
 - Sidecars (`coach-mcp`, `github-mcp`) publish no host ports; they are reachable only inside the lane network.
-- Lane compose files are delivered by #109; until then the legacy single `docker-compose.yml` (project `coach-web`, port `127.0.0.1:8000`) remains the working topology.
+- **Always pass `--env-file .env.<lane>`** — the lane env file is the interpolation source for the scoped `${...}` references in `compose.yaml`. Without it, compose falls back to a legacy `.env` in the repo root (or empty defaults), and containers start with missing secrets.
 
 ---
 
 ## 📦 Environment Variables
 
-`.env.example` is the single source of truth for the variable catalogue. Summary:
+`.env.example` is the variable catalogue for the non-Docker dev flow (`uv run coach-web` reads `.env` directly). The Docker lanes use per-lane templates instead: `.env.dev.example`, `.env.qa.example`, `.env.prod.example`. Summary:
 
 | Group | Variables | Notes |
 |:---|:---|:---|
@@ -35,11 +35,14 @@
 | **OpenRouter** | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_SECONDS` | coach agent LLM |
 | **coach-mcp** | `INTERVALS_API_KEY`, `INTERVALS_ATHLETE_ID`, `INTERVALS_BASE_URL`, `MCP_TRANSPORT`, `MCP_HOST`, `MCP_PORT` | sidecar-local |
 
-### Per-Lane Env Files (ADR-007, delivered with #109/#112)
+### Per-Lane Env Files (ADR-007, #109)
 
-- `.env.dev`, `.env.qa`, `.env.prod` — one per lane, **never a shared `.env`**; each is `chmod 600` and gitignored.
+- `.env.dev`, `.env.qa`, `.env.prod` — one per lane, created from the matching `*.example` template, **never a shared `.env`**; each is `chmod 600` and gitignored.
+- **Scoping mechanism:** the lane env file is passed to compose via `--env-file` and used for `${...}` **interpolation only** — no `env_file:` injects a whole file into any container. Each service's `environment:` map in `compose.yaml` names exactly the variables it needs, so a leaked lane file can do no more than the declared scope allows.
+- **Per-service secret scoping:** `coach-web` receives only `OPENROUTER_API_KEY`, `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `GITHUB_TOKEN` (+ app config); `coach-mcp` only `INTERVALS_API_KEY` (+ MCP config); `github-mcp` only `GITHUB_TOKEN`.
 - **Distinct `AUTH_SESSION_SECRET` per lane** — a dev/qa session token must not replay in prod.
-- **Per-service secret scoping:** `coach-web` receives only `OPENROUTER_API_KEY`, `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `GITHUB_TOKEN`; `coach-mcp` only `INTERVALS_API_KEY`; `github-mcp` only `GITHUB_TOKEN`.
+- `AUTH_ENABLED` is pinned by the lane compose file (`false` on dev/qa, `true` on prod) and is not read from the env file.
+- The prod lane additionally requires `COACH_WEB_IMAGE` (digest-pinned release image) and, because auth is enabled and fail-closed, the Google OIDC credentials.
 - Prod lane OIDC: register redirect URI `http://localhost:8000/auth/callback` (and the `127.0.0.1` variant, or set `AUTH_REDIRECT_URI` explicitly — the app derives different redirect URIs for the two hostnames).
 
 ---
@@ -57,18 +60,18 @@ docker login ghcr.io
 
 ```bash
 # dev — build from source
-docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml up -d --build
+docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml --env-file .env.dev up -d --build
 
 # qa — pull the promoted :qa image
-docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml pull
-docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml up -d
+docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
+docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
 
-# prod — digest-pinned release image
-docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml pull
-docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml up -d
+# prod — digest-pinned release image (COACH_WEB_IMAGE in .env.prod)
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
 
 # stop one lane (tears down only that project)
-docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml down
+docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa down
 ```
 
 ### Per-lane pre-flight (release gate)
@@ -79,17 +82,25 @@ docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml down
 
 The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have no published ports, all healthchecks healthy, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
 
-> ℹ️ Lane-aware pre-flight (lane argument, per-lane compose files, loopback assertions) lands with #109; the current `scripts/e2e-preflight.sh` targets the legacy single-stack topology.
-
 > **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
 ---
 
 ## 🚀 Promotion Runbook (dev → qa → main)
 
-1. **dev → qa** (requires @fpittelo approval on the promotion PR): merge `dev` into `qa` via PR. CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally: `docker compose -p coach-web-qa … pull && up -d` and run `./scripts/e2e-preflight.sh qa`.
-2. **qa → main** (requires @fpittelo approval): merge `qa` into `main` via PR, then tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: update the prod lane's pinned digest, `pull && up -d`, run `./scripts/e2e-preflight.sh prod`.
-3. **Rollback:** `docker compose -p coach-web-prod … up -d` with the previous digest — no cloud console involved.
+1. **dev → qa** (requires @fpittelo approval on the promotion PR): merge `dev` into `qa` via PR. CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
+   ```bash
+   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
+   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
+   ./scripts/e2e-preflight.sh qa
+   ```
+2. **qa → main** (requires @fpittelo approval): merge `qa` into `main` via PR, then tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
+   ```bash
+   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
+   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
+   ./scripts/e2e-preflight.sh prod
+   ```
+3. **Rollback:** set the previous digest in `.env.prod` and `docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d` — no cloud console involved.
 
 ---
 
@@ -118,6 +129,7 @@ The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have n
 | Types | `mypy --strict src/coach_web` | Zero type errors |
 | Test | `pytest -W error --cov` | Zero failures, zero warnings |
 | Security | `gitleaks` + `pip-audit --strict` | Zero secrets, zero known CVEs |
+| Compose | `docker compose config --quiet` per lane | All three lane combinations validate (base + dev/qa/prod) |
 | OpenTofu | `tofu fmt/validate` on `infra/` | **Removed with #110** (retired with the GCP IaC) |
 
 ### `.github/workflows/deploy.yaml`
@@ -165,7 +177,7 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 |:---|:---|
 | **App health** | `http://localhost:<lane-port>/health` (status, service, version, uptime) |
 | **App liveness** | `http://localhost:<lane-port>/healthz` |
-| **coach-mcp sidecar** | SSE listener on the lane network (`http://coach-mcp:8000/sse`) — TCP healthcheck in compose |
+| **coach-mcp sidecar** | SSE listener on the lane network (`http://coach-mcp:8000/sse`) — HTTP healthcheck in compose |
 
 ---
 
@@ -177,7 +189,7 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 | **Blank dashboard / agent errors** | coach-mcp sidecar unhealthy | `docker compose -p coach-web-<lane> ps` — check healthchecks; verify `INTERVALS_API_KEY` |
 | **Plans empty** | GitHub token missing or wrong scope | Verify `GITHUB_TOKEN` reaches the sidecars with the lane's env file |
 | **Prod lane 401 loop on login** | OIDC redirect URI mismatch | Register both `localhost` and `127.0.0.1` redirect URIs, or set `AUTH_REDIRECT_URI` |
-| **Port already in use** | Legacy single-stack still running | Tear down the legacy project once: `docker compose -p coach-web down` |
+| **Port already in use** | A single-stack from before #109 is still running | Tear down the legacy project once: `docker compose -p coach-web down` (then remove the stale root `.env`) |
 | **CI fails on mypy** | Missing type annotations | Run `mypy --strict src/coach_web` locally and fix all errors |
 
 ---
