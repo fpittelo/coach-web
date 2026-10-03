@@ -280,7 +280,7 @@ class TestLaneOverrides:
         """The prod lane pins github-mcp by tag AND digest (AC7, #113)."""
         image = effective_compose["prod"]["services"]["github-mcp"]["image"]
         assert GITHUB_MCP_DIGEST in image
-        assert image.endswith(GITHUB_MCP_DIGEST)
+        assert image.endswith(GITHUB_MCP_DIGEST + "}")
 
     def test_github_mcp_digest_is_valid_sha256(self) -> None:
         """The pinned digest is a well-formed sha256 reference (AC7)."""
