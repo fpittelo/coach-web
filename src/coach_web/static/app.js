@@ -181,19 +181,23 @@ function coachApp() {
     autoGrowTextarea() {
       // Auto-grow composer (AC1, #83): reset to the intrinsic single-row
       // height first so scrollHeight reflects the current content, then
-      // size the box to fit it. The border-box correction
-      // (offsetHeight - clientHeight = the borders) keeps the measured
-      // height exact, so overflow-y: auto only engages past the
-      // stylesheet's ~5-line max-height cap — never at the fitted size.
-      // Clearing the input (send / reset) shrinks the box back through
-      // the same $watch("input") path.
+      // size the box to fit it. The border correction reads the computed
+      // border widths — scrollbar-blind, unlike a client/offset box
+      // delta, which would absorb a horizontal scrollbar's height
+      // (~15px) and over-size the box if one ever appeared (#130
+      // review). overflow-y: auto only engages past the stylesheet's
+      // ~5-line max-height cap — never at the fitted size. Clearing the
+      // input (send / reset) shrinks the box back through the same
+      // $watch("input") path.
       const textarea = this.$refs.composer;
       if (!textarea) {
         return;
       }
+      const style = getComputedStyle(textarea);
+      const borders =
+        parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth);
       textarea.style.height = "auto";
-      textarea.style.height =
-        textarea.scrollHeight + (textarea.offsetHeight - textarea.clientHeight) + "px";
+      textarea.style.height = textarea.scrollHeight + borders + "px";
     },
 
     onComposerKeydown(event) {

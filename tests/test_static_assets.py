@@ -83,6 +83,16 @@ composer is the pinned footer of the chat panel's flex column — the log
 grows above it (the v0.5 max-height: 30rem log cap is dropped) — and the
 send-disabled bindings (empty input / in-flight stream) are preserved
 verbatim. Input remains ephemeral client state (nLPD: no retention change).
+
+The PR #130 review remediation pins the AC3 mechanism itself: flex: 1 +
+overflow-y: auto only scroll against a container with a definite main
+size, so .chat is viewport-height-bounded (a dvh declaration over a vh
+fallback, a 26rem masthead allowance, and a 40rem tall-monitor cap) and
+the v0.5 min-height: 32rem floor is superseded — on phones it exceeds the
+space below the masthead and would itself push the composer below the
+fold. The focus ring selector moves to :focus-visible (text-entry
+controls match on every focus), and the auto-grow border correction reads
+computed border widths (scrollbar-blind).
 """
 
 import re
@@ -1326,7 +1336,10 @@ class TestComposerErgonomicsContract:
     column — the log grows above it (the v0.5 ``max-height: 30rem`` log cap
     is dropped) — and the send-disabled bindings (empty input / in-flight
     stream) are preserved verbatim. Input remains ephemeral client state
-    (nLPD: no retention change).
+    (nLPD: no retention change). The panel itself is viewport-height-bounded
+    (PR #130 review remediation): a definite main size is what makes
+    ``flex: 1`` + ``overflow-y: auto`` on the log actually pin the composer
+    footer.
 
     No Node toolchain (ADR-006 §5): JS is contracted via source assertions,
     the same way as the stream, phase, auto-scroll and plan-card contracts.
@@ -1366,6 +1379,20 @@ class TestComposerErgonomicsContract:
         assert grow, "autoGrowTextarea() must exist"
         assert 'textarea.style.height = "auto"' in grow
         assert "textarea.scrollHeight" in grow
+
+    def test_auto_grow_border_correction_is_scrollbar_blind(self) -> None:
+        """AC1: the border correction reads computed border widths.
+
+        A client/offset box delta also absorbs a horizontal scrollbar's
+        height (~15px) when one appears, over-sizing the box past the
+        fitted size (PR #130 review nit). Computed border widths are
+        scrollbar-blind and drift-free (they follow the stylesheet).
+        """
+        grow = _rule_block(self._script(), "autoGrowTextarea()")
+
+        assert "offsetHeight" not in grow, "box delta absorbs horizontal scrollbars"
+        assert "borderTopWidth" in grow, "computed top border missing"
+        assert "borderBottomWidth" in grow, "computed bottom border missing"
 
     def test_auto_grow_follows_every_input_change(self) -> None:
         """AC1: the grow hook watches the input model (type, paste, clear).
@@ -1439,7 +1466,16 @@ class TestComposerErgonomicsContract:
         assert "max-height: 30rem" not in css
 
     def test_composer_is_the_pinned_panel_footer(self) -> None:
-        """AC3: the composer is the last child of the chat flex column."""
+        """AC3: the composer is the last child of a height-bounded flex column.
+
+        DOM order and flex direction alone pin nothing: ``flex: 1`` +
+        ``overflow-y: auto`` on the log only scroll against a container
+        with a DEFINITE main size — an auto-height column grows with the
+        transcript and pushes the composer below the fold (PR #130 review
+        blocker). The panel is therefore viewport-height-bounded: a dvh
+        declaration (tracks mobile browser chrome) overriding a vh
+        fallback, plus a max-height cap for very tall monitors.
+        """
         html = self._html()
         css = self._css()
 
@@ -1452,6 +1488,13 @@ class TestComposerErgonomicsContract:
         chat = _rule_block(css, ".chat")
         assert "display: flex" in chat
         assert "flex-direction: column" in chat
+        # The actual pinning mechanism: a definite, viewport-relative
+        # height on the flex column (dvh over vh fallback) + a cap for
+        # very tall monitors. Without it the panel grows with the
+        # transcript and the footer scrolls away.
+        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "max-height:" in chat, "tall-monitor cap missing"
 
     # --- AC4: send-disabled bindings preserved ------------------------------------
 
@@ -1470,9 +1513,15 @@ class TestComposerErgonomicsContract:
     # --- AC5: token-based focus ring ------------------------------------------------
 
     def test_textarea_has_token_based_focus_ring(self) -> None:
-        """AC5: the composer focus ring is drawn from the accent token."""
+        """AC5: the composer focus ring is drawn from the accent token.
+
+        The selector is ``:focus-visible`` (modern convention, PR #130
+        review nit) — text-entry controls match ``:focus-visible`` on
+        every focus, so the ring stays visible for keyboard AND pointer
+        users.
+        """
         css = self._css()
-        focus = _rule_block(css, ".composer textarea:focus")
+        focus = _rule_block(css, ".composer textarea:focus-visible")
 
         assert "outline" in focus, "focus ring missing"
         assert "var(--accent)" in focus, "focus ring must use the accent token"

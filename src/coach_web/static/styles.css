@@ -175,19 +175,37 @@ body {
 
 /* --- Chat console ------------------------------------------------------ */
 
+/* Definite viewport height (#83 AC3, PR 130 review): flex: 1 + overflow-y:
+   auto on the log only scroll against a container with a DEFINITE main
+   size — an auto-height column grows with the transcript and pushes the
+   composer below the fold. The panel is therefore height-bounded to the
+   viewport minus the masthead chrome (26rem covers the worst case:
+   narrow viewports where the lede wraps to five lines); the layout
+   padding and footer sit below the panel and may scroll out of view
+   without affecting the composer. dvh tracks mobile browser chrome, with
+   the vh declaration as the fallback; max-height caps the panel on very
+   tall monitors. The v0.5 min-height: 32rem floor is superseded: on
+   phones it exceeds the space below the masthead, and a floor taller
+   than the computed height would win and un-pin the composer exactly
+   there. */
+
 .chat {
   display: flex;
   flex-direction: column;
-  min-height: 32rem;
+  height: calc(100vh - 26rem);
+  height: calc(100dvh - 26rem);
+  max-height: 40rem;
 }
 
-/* Pinned composer footer (#83 AC3): the panel is a flex column — the log
-   is the growing child (flex: 1) and the composer is its footer, so the
-   input stays pinned to the bottom of the panel on mobile and desktop.
-   The v0.5 30rem log cap is dropped: the log's height is now governed by
-   the flex layout (overflow-y: auto zeroes its automatic minimum size, so
-   long transcripts scroll internally instead of growing the panel), which
-   keeps the composer pinned at every transcript length. */
+/* Pinned composer footer (#83 AC3): the panel is a flex column with a
+   definite viewport height (see .chat above) — the log is the growing
+   child (flex: 1) and the composer is its footer, so the input stays
+   pinned to the bottom of the panel on mobile and desktop. The v0.5
+   30rem log cap is dropped: the log's height is governed by the flex
+   layout against the panel's definite height (overflow-y: auto zeroes
+   its automatic minimum size, so long transcripts scroll internally
+   instead of growing the panel), which keeps the composer pinned at
+   every transcript length. */
 
 .chat-log {
   flex: 1;
@@ -510,7 +528,7 @@ body {
   max-height: calc(7.5em + 2 * var(--space-3) + 2px);
 }
 
-.composer textarea:focus {
+.composer textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
