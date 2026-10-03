@@ -24,6 +24,14 @@
  * it and leaves a visible, non-blocking banner behind. Status and banner
  * strings are static or server-error text only — never message content or
  * secrets (Swiss nLPD).
+ *
+ * Auto-follow (#85): the chat log follows the stream only while the
+ * viewport is within 60 px of the bottom (stickToBottom, armed by a
+ * passive scroll listener); farther away, token arrivals and transcript
+ * mutations never move the viewport, and scrolling back near the bottom
+ * re-arms following automatically — no "jump to latest" pill (KIS cut).
+ * Token-time scrolls are instant (behavior "auto"), and the stylesheet
+ * disables looping animations under prefers-reduced-motion.
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -32,6 +40,12 @@
 // only fires when the stream is truly wedged: no agent event of any kind
 // for 90 s.
 const WATCHDOG_TIMEOUT_MS = 90000;
+
+// Auto-follow proximity band (#85): the log follows the stream only while
+// the viewport is within 60 px of the bottom; farther away, following
+// pauses so scrolling up to re-read is never hijacked (AC1). Scrolling
+// back near the bottom re-arms following automatically (AC2).
+const STICK_THRESHOLD_PX = 60;
 
 function parsePayload(event) {
   try {
@@ -66,6 +80,10 @@ function coachApp() {
     watchdog: null,
     watchdogEpoch: 0,
     watchdogIndex: -1,
+    // Auto-follow flag (#85): armed by proximity (STICK_THRESHOLD_PX) via
+    // the scroll listener on the log. Defaults to armed — a fresh,
+    // non-scrollable log sits at the bottom by definition.
+    stickToBottom: true,
     thoughts: [],
     tools: [],
     plan: null,
@@ -74,15 +92,51 @@ function coachApp() {
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
+      this.$nextTick(() => {
+        const log = this.$refs.log;
+        if (!log) {
+          return;
+        }
+        // Proximity arming (#85): every scroll of the log re-evaluates the
+        // follow flag — within 60 px of the bottom (re-)arms following
+        // (AC2, self-healing), farther away pauses it (AC1). The listener
+        // is passive: the handler never calls preventDefault.
+        log.addEventListener("scroll", () => this.updateStickToBottom(), {
+          passive: true,
+        });
+        this.updateStickToBottom();
+      });
     },
 
     scrollToBottom() {
+      // Proximity-gated follow (#85): the flag is armed by the scroll
+      // listener on the log. While it is false — the user scrolled farther
+      // than 60 px from the bottom — token arrivals and transcript
+      // mutations never move the viewport (AC1).
+      if (!this.stickToBottom) {
+        return;
+      }
       this.$nextTick(() => {
         const log = this.$refs.log;
         if (log) {
-          log.scrollTop = log.scrollHeight;
+          // Instant scroll (AC3): behavior "auto" is never animated, so a
+          // rapid token stream cannot stack eased scrolls into jank.
+          log.scrollTo({ top: log.scrollHeight, behavior: "auto" });
         }
       });
+    },
+
+    updateStickToBottom() {
+      // Proximity arming (#85): within 60 px of the bottom ⇒ follow;
+      // farther ⇒ pause. Scrolling back near the bottom re-arms following
+      // without any action beyond the scroll itself (AC2, self-healing —
+      // no "jump to latest" pill, KIS cut locked in #85).
+      const log = this.$refs.log;
+      if (!log) {
+        return;
+      }
+      this.stickToBottom =
+        log.scrollHeight - log.scrollTop - log.clientHeight <= STICK_THRESHOLD_PX;
     },
 
     renderMarkdown(text) {
@@ -439,6 +493,11 @@ function coachApp() {
       this.input = "";
       this.errorBanner = "";
       this.phase = "idle";
+      // Re-arm following (#85): the emptied log cannot fire a scroll event
+      // (nothing left to scroll), so a fresh chat re-arms explicitly —
+      // otherwise a follow paused on the old transcript would leak into
+      // the new one (AC2).
+      this.stickToBottom = true;
     },
 
     approvePlan() {

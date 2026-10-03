@@ -645,3 +645,21 @@ body {
   text-transform: uppercase;
   color: var(--muted);
 }
+
+/* --- Reduced motion (AC3, #85) ------------------------------------------ */
+
+/* Users who prefer reduced motion get no looping animations (status pulse
+   and thinking dots), and the log pins scroll-behavior to auto so a later
+   stylesheet change can never reintroduce eased token-time scrolling —
+   app.js already scrolls with behavior "auto" (see scrollToBottom). */
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse,
+  .thinking-dots .dot {
+    animation: none;
+  }
+
+  .chat-log {
+    scroll-behavior: auto;
+  }
+}
