@@ -2,6 +2,8 @@
  *
  * Consumes the typed SSE stream exposed by GET /api/agent/stream through a
  * native EventSource and posts approved plans to POST /api/plan/approve.
+ * "New chat" (resetChat) is a full client-side reset: it closes any in-flight
+ * stream and clears every state slice without transmitting anything.
  * User data is only ever bound with x-text; no raw HTML is injected.
  */
 
@@ -81,6 +83,9 @@ function coachApp() {
       });
 
       source.addEventListener("token", (event) => {
+        if (!this.streaming) {
+          return; // stale event after "New chat" reset or stream end
+        }
         const data = parsePayload(event);
         if (data.text) {
           this.messages[index].content += data.text;
@@ -124,6 +129,9 @@ function coachApp() {
       });
 
       source.addEventListener("error", (event) => {
+        if (!this.streaming) {
+          return; // stale event after "New chat" reset or stream end
+        }
         const data = parsePayload(event);
         this.statusText = data.message || "Error";
         if (!this.messages[index].content) {
@@ -132,6 +140,9 @@ function coachApp() {
       });
 
       source.addEventListener("done", (event) => {
+        if (!this.streaming) {
+          return; // stale event after "New chat" reset or stream end
+        }
         const data = parsePayload(event);
         if (!this.messages[index].content && data.message) {
           this.messages[index].content = data.message;
@@ -153,6 +164,16 @@ function coachApp() {
         this.source.close();
         this.source = null;
       }
+    },
+
+    resetChat() {
+      this.finishStream();
+      this.messages = [];
+      this.thoughts = [];
+      this.tools = [];
+      this.plan = null;
+      this.approval = { state: "idle", message: "" };
+      this.input = "";
     },
 
     approvePlan() {

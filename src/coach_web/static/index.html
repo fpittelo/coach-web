@@ -12,6 +12,36 @@
   <body>
     <div x-data="coachApp()" x-init="init()" x-cloak>
       <header class="masthead">
+        <div class="identity-bar">
+          <div class="identity-brand">
+            <svg class="monogram" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+              <rect
+                x="1.5"
+                y="1.5"
+                width="29"
+                height="29"
+                rx="9"
+                stroke="currentColor"
+                stroke-width="2.5"
+              />
+              <path
+                d="M22.4 11.2a8 8 0 1 0 0 9.6"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span class="product-name">Coach Web</span>
+          </div>
+          <button
+            class="button button--ghost new-chat"
+            type="button"
+            aria-label="New chat: clear the conversation and reset the session"
+            @click="resetChat()"
+          >
+            New chat
+          </button>
+        </div>
         <div class="rule"></div>
         <p class="kicker">Endurance Cockpit · Local VIDAR</p>
         <h1>Coach Web</h1>
