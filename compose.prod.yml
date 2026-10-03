@@ -1,0 +1,42 @@
+# Coach Web — prod lane override (ADR-007 / issue #109).
+#
+# Daily-use lane: coach-web runs a DIGEST-PINNED release image —
+# COACH_WEB_IMAGE is REQUIRED in .env.prod
+# (ghcr.io/fpittelo/coach-web@sha256:<digest>; resolve it from the release
+# notes / `docker buildx imagetools inspect ghcr.io/fpittelo/coach-web:vX.Y.Z`).
+# Published on 127.0.0.1:8000 only. OIDC auth is ENABLED (defense-in-depth;
+# loopback binding remains the primary boundary) — the app fail-closes at boot
+# when auth is enabled but misconfigured, so .env.prod must carry the OIDC
+# credentials and a lane-distinct AUTH_SESSION_SECRET.
+#
+# Usage:
+#   cp .env.prod.example .env.prod  # then fill in secrets + release digest
+#   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml \
+#       --env-file .env.prod pull
+#   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml \
+#       --env-file .env.prod up -d
+#   ./scripts/e2e-preflight.sh prod
+
+name: coach-web-prod
+
+services:
+  coach-web:
+    # Required, digest-pinned release image. Unset/empty COACH_WEB_IMAGE fails
+    # fast right here with this message (compose interpolation error).
+    image: ${COACH_WEB_IMAGE:?set COACH_WEB_IMAGE in .env.prod to a digest-pinned release image (ghcr.io/fpittelo/coach-web@sha256:<digest>)}
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      # OIDC whitelist is defense-in-depth on the prod lane (ADR-007); the
+      # required credentials come from .env.prod via the base environment map.
+      AUTH_ENABLED: "true"
+      # Per-lane CORS default (folded finding from PR #116 review, #112).
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8000"]}'
+
+  coach-mcp:
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:prod}
+
+  github-mcp:
+    # Digest-pinned (AC7, #113): the v1.12.2 tag is mutable, the digest is not.
+    # Refresh with: docker buildx imagetools inspect ghcr.io/github/github-mcp-server:v1.12.2
+    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6}

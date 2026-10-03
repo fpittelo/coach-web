@@ -2,10 +2,12 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from coach_web.app import STATIC_DIR, create_app
+from coach_web.config import Settings
 
 
 class TestCreateApp:
@@ -145,3 +147,49 @@ class TestRun:
         assert kwargs["factory"] is True
         assert kwargs["host"] == "0.0.0.0"  # noqa: S104
         assert kwargs["port"] == 8000
+
+
+class TestTrustedHostMiddleware:
+    """AC6 (#112): the Host allowlist rejects DNS-rebinding attempts."""
+
+    def test_default_allowed_hosts_are_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TRUSTED_HOSTS defaults to loopback names only."""
+        monkeypatch.delenv("TRUSTED_HOSTS", raising=False)
+
+        assert Settings().TRUSTED_HOSTS == ["localhost", "127.0.0.1"]
+
+    def test_evil_host_is_rejected(self) -> None:
+        """A request with a non-allowlisted Host is rejected with 400."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://evil.com") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 400
+
+    def test_localhost_host_is_allowed(self) -> None:
+        """A request with Host: localhost passes the allowlist."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://localhost") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+
+    def test_loopback_ip_host_is_allowed(self) -> None:
+        """A request with Host: 127.0.0.1 passes the allowlist."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+
+    def test_allowed_hosts_are_configurable(self) -> None:
+        """A custom TRUSTED_HOSTS entry is honored (testability)."""
+        app = create_app(Settings(TRUSTED_HOSTS=["coach.example.ch"]))
+
+        with TestClient(app, base_url="http://coach.example.ch") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200

@@ -21,6 +21,9 @@ from coach_web.models import ReadinessMetrics, TrainingPlan
 def _isolate_settings_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Clear the ``get_settings`` singleton and disable .env loading during tests."""
     monkeypatch.setattr(Settings, "model_config", SettingsConfigDict(extra="ignore"))
+    # The app's Host allowlist defaults to loopback names only (#112); TestClient
+    # uses the synthetic "testserver" host, so allow it for the test environment.
+    monkeypatch.setenv("TRUSTED_HOSTS", '["localhost", "127.0.0.1", "testserver"]')
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()

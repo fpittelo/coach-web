@@ -63,7 +63,7 @@ ignore = []
 [tool.ruff.lint.per-file-ignores]
 "tests/**/*.py" = ["S101"]
 "src/coach_web/config.py" = ["S104"]
-"tests/integration/test_compose_topology.py" = ["S104", "S108"]
+"tests/integration/test_compose_topology.py" = ["S104", "S108", "S404", "S603"]
 
 [tool.isort]
 profile = "black"
