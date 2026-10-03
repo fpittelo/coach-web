@@ -14,7 +14,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from coach_web.agent import AgentEvent, CoachAgent, create_agent
 from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
@@ -34,6 +36,41 @@ STATIC_DIR = Path(__file__).parent / "static"
 SERVICE_NAME = "coach-web"
 PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
+
+# Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
+# C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
+# vendored Alpine standard build (it compiles x- expressions via AsyncFunction
+# at runtime) and is contained: script-src has no 'unsafe-inline', so injected
+# inline scripts are blocked, and DOMPurify strips every Alpine directive
+# (#81). The Alpine CSP build remains a future hardening item.
+CSP_POLICY = (
+    "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
+
+
+class ContentSecurityPolicyMiddleware:
+    """Stamp every response with the minimal v0.7 CSP header (#84, C2/C5).
+
+    Pure ASGI middleware (no ``BaseHTTPMiddleware``) so the header is applied
+    to every response — pages, static assets, API/SSE routes and
+    middleware-generated error responses alike — without buffering or
+    otherwise touching the SSE stream.
+    """
+
+    def __init__(self, app: ASGIApp, policy: str = CSP_POLICY) -> None:
+        self.app = app
+        self.policy = policy
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_csp(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = self.policy
+            await send(message)
+
+        await self.app(scope, receive, send_with_csp)
 
 
 def resolve_version() -> str:
@@ -110,6 +147,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         allowed_hosts=resolved.TRUSTED_HOSTS,
         www_redirect=False,
     )
+
+    # Content-Security-Policy (STRIDE #87 conditions C2/C5, #84): stamp the
+    # minimal v0.7 policy on every response. Added last => outermost, so even
+    # the TrustedHost 400 and auth 401/403 error responses carry the header.
+    application.add_middleware(ContentSecurityPolicyMiddleware)
 
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 

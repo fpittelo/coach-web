@@ -14,7 +14,24 @@
  * surface, bound to renderMarkdown() — the default-allowlist DOMPurify
  * sanitizer over marked-parsed markdown, re-sanitizing the accumulated raw
  * string on every render (#81).
+ *
+ * Stream phases (#84): the UI state carries an explicit plain-string phase —
+ * idle | waiting | streaming | tooling | error (KIS: no state-machine
+ * framework) — driving the thinking dots, status line and non-blocking
+ * error banner. Typed agent errors and transport failures are separate code
+ * paths: a typed error keeps the stream alive (agent.py emits error THEN
+ * done), while a transport failure or the 90 s no-event watchdog finishes
+ * it and leaves a visible, non-blocking banner behind. Status and banner
+ * strings are static or server-error text only — never message content or
+ * secrets (Swiss nLPD).
  */
+
+// 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
+// deadlines — the 60 s OpenRouter completion timeout (config.py
+// OPENROUTER_TIMEOUT_SECONDS) and the 30 s MCP tool-call timeout — so it
+// only fires when the stream is truly wedged: no agent event of any kind
+// for 90 s.
+const WATCHDOG_TIMEOUT_MS = 90000;
 
 function parsePayload(event) {
   try {
@@ -34,7 +51,21 @@ function coachApp() {
     input: "",
     streaming: false,
     streamEpoch: 0,
+    // Explicit stream phase (#84): idle | waiting | streaming | tooling |
+    // error. A plain string guarded by the existing compound checks — no
+    // state-machine framework (KIS).
+    phase: "idle",
     statusText: "",
+    // Persistent, non-blocking error banner text (#84). Static or
+    // server-error text only — never message content or secrets (nLPD).
+    // Survives finishStream so a failure stays visible; cleared on the next
+    // send or reset.
+    errorBanner: "",
+    // 90 s no-event watchdog (#84): timer id plus the epoch and assistant
+    // bubble index of the stream that armed it.
+    watchdog: null,
+    watchdogEpoch: 0,
+    watchdogIndex: -1,
     thoughts: [],
     tools: [],
     plan: null,
@@ -90,7 +121,13 @@ function coachApp() {
       this.streamEpoch += 1;
       const epoch = this.streamEpoch;
       this.streaming = true;
+      // AC4: the waiting phase (pulsing dots) is set synchronously — before
+      // the fetch is even dispatched, hence before any SSE event arrives.
+      this.phase = "waiting";
       this.statusText = "Connecting";
+      // A new attempt clears the previous failure banner (AC3: retry by
+      // sending again, no reload).
+      this.errorBanner = "";
       this.thoughts = [];
       this.tools = [];
       this.plan = null;
@@ -110,6 +147,9 @@ function coachApp() {
       const controller = new AbortController();
       this.controller = controller;
       const handlers = this.streamHandlers(index, epoch);
+      // Arm the 90 s no-event watchdog before the fetch dispatches, so a
+      // connection that never establishes is covered too (AC3).
+      this.armWatchdog(epoch, index);
 
       fetch("/api/agent/stream", {
         method: "POST",
@@ -130,12 +170,19 @@ function coachApp() {
           }
           if (epoch === this.streamEpoch) {
             if (this.streaming) {
+              // Transport-error path (#84) — separate from the typed agent
+              // error handler in streamHandlers: this one finishes the
+              // stream, because no done event will follow a dead transport.
               // Surface the underlying transport error message when the
               // browser provides one (e.g. "Stream unavailable (500)" or
               // "Failed to fetch"), falling back to the generic "Connection
-              // failed" string; either way the assistant bubble prefixes it
-              // with ⚠️.
+              // failed" string; the assistant bubble prefixes it with ⚠️ and
+              // the banner keeps the failure visible after finishStream
+              // clears the status line (AC5: no silent error path).
+              this.phase = "error";
               this.statusText = error.message || "Connection failed";
+              this.errorBanner =
+                error.message || "Connection failed. You can send another message.";
               if (!this.messages[index].content) {
                 this.messages[index].content = "⚠️ " + this.statusText;
               }
@@ -185,6 +232,13 @@ function coachApp() {
           data += (data ? "\n" : "") + line.slice("data:".length).trim();
         }
       }
+      if (type) {
+        // Any typed event — known or not — proves the agent is alive:
+        // restart the 90 s no-event watchdog (AC3). Ping comment frames
+        // carry no event line and deliberately do NOT reset it, so a wedged
+        // agent behind a live transport still trips the watchdog.
+        this.resetWatchdog();
+      }
       if (type && Object.prototype.hasOwnProperty.call(handlers, type)) {
         // Same payload shape as a native SSE event object, so parsePayload
         // and every handler stay transport-agnostic.
@@ -200,6 +254,11 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.statusText = data.phase === "thinking" ? "Thinking" : (data.phase || "");
+          if (data.phase === "thinking") {
+            // A new agent iteration is thinking (e.g. after a tool round):
+            // back to the waiting dots until the next token arrives (AC1).
+            this.phase = "waiting";
+          }
         },
 
         thought: (event) => {
@@ -218,6 +277,8 @@ function coachApp() {
           }
           const data = parsePayload(event);
           if (data.text) {
+            // First token ends the waiting dots (AC1: streaming is distinct).
+            this.phase = "streaming";
             this.messages[index].content += data.text;
             this.scrollToBottom();
           }
@@ -228,6 +289,7 @@ function coachApp() {
             return; // stale event from an ended or superseded stream
           }
           const data = parsePayload(event);
+          this.phase = "tooling"; // AC1: MCP tools running
           this.tools.push({
             id: data.id,
             name: data.name,
@@ -240,6 +302,7 @@ function coachApp() {
             return; // stale event from an ended or superseded stream
           }
           const data = parsePayload(event);
+          this.phase = "tooling"; // AC1: MCP tools running
           const tool = this.tools.find((item) => item.id === data.id);
           if (tool) {
             tool.state = "running";
@@ -251,6 +314,7 @@ function coachApp() {
             return; // stale event from an ended or superseded stream
           }
           const data = parsePayload(event);
+          this.phase = "tooling"; // AC1: tool events keep the tooling sub-state
           const tool = this.tools.find((item) => item.id === data.id);
           if (tool) {
             tool.state = "done";
@@ -278,7 +342,17 @@ function coachApp() {
             return; // stale event from an ended or superseded stream
           }
           const data = parsePayload(event);
+          // Typed agent error path (#84, AC2) — separate from the
+          // transport-error catch in startStream. agent.py emits a typed
+          // error FOLLOWED BY done on its OpenRouterError path, so this
+          // handler must NOT end the stream: ending it here would flip the
+          // compound guards and truncate the follow-up done. The done
+          // handler ends the stream; the banner keeps the failure visible
+          // after the status line is cleared (AC5).
+          this.phase = "error";
           this.statusText = data.message || "Error";
+          this.errorBanner =
+            data.message || "The coach hit an error. You can send another message.";
           if (!this.messages[index].content) {
             this.messages[index].content = "⚠️ " + this.statusText;
           }
@@ -297,9 +371,58 @@ function coachApp() {
       };
     },
 
+    armWatchdog(epoch, index) {
+      // Arm (or re-arm) the 90 s no-event watchdog for this stream (AC3).
+      // Defensive clear first: a new stream must never inherit a pending
+      // timer from a superseded one.
+      if (this.watchdog !== null) {
+        clearTimeout(this.watchdog);
+      }
+      this.watchdogEpoch = epoch;
+      this.watchdogIndex = index;
+      this.watchdog = setTimeout(() => this.handleWatchdogTimeout(), WATCHDOG_TIMEOUT_MS);
+    },
+
+    resetWatchdog() {
+      // Restart the watchdog on every received typed event (dispatchSseFrame).
+      // A no-op once the stream ended — finishStream cleared the timer — so
+      // late frames cannot resurrect it.
+      if (this.watchdog !== null) {
+        clearTimeout(this.watchdog);
+        this.watchdog = setTimeout(() => this.handleWatchdogTimeout(), WATCHDOG_TIMEOUT_MS);
+      }
+    },
+
+    clearWatchdog() {
+      if (this.watchdog !== null) {
+        clearTimeout(this.watchdog);
+        this.watchdog = null;
+      }
+    },
+
+    handleWatchdogTimeout() {
+      this.watchdog = null;
+      if (!this.streaming || this.watchdogEpoch !== this.streamEpoch) {
+        return; // stale timer from an ended or superseded stream
+      }
+      // No agent event for 90 s (AC3): surface a visible, non-blocking
+      // error and release the composer — the user can retry by sending
+      // again, no reload. Banner text is static: no message content (nLPD).
+      this.phase = "error";
+      this.statusText = "Timed out";
+      this.errorBanner =
+        "The coach stopped responding (no updates for 90 s). You can send another message.";
+      if (!this.messages[this.watchdogIndex].content) {
+        this.messages[this.watchdogIndex].content = "⚠️ " + this.statusText;
+      }
+      this.finishStream();
+    },
+
     finishStream() {
       this.streaming = false;
       this.statusText = "";
+      this.phase = "idle";
+      this.clearWatchdog();
       if (this.controller) {
         this.controller.abort();
         this.controller = null;
@@ -314,6 +437,8 @@ function coachApp() {
       this.plan = null;
       this.approval = { state: "idle", message: "" };
       this.input = "";
+      this.errorBanner = "";
+      this.phase = "idle";
     },
 
     approvePlan() {
