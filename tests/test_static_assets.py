@@ -12,6 +12,21 @@ assertions were rewritten, never silently deleted.
 Issue #80 adds the header identity bar contract (inline SVG monogram, product
 name, exactly one "New chat" action) and the nLPD guard that the new-chat
 reset is a pure client-side operation: nothing transmitted, nothing persisted.
+
+Issue #79 supersedes the SSE transport: EventSource cannot POST, so the
+component streams via fetch + ReadableStream against POST /api/agent/stream
+with a {message, history} body. Message and history content never appear in
+a URL or query string (access-log privacy, Swiss nLPD), and the client
+replays the last ≤ 10 transcript messages as history, excluding the
+in-flight assistant turn. The per-handler stale-event guards from #80 carry
+over unchanged.
+
+The #79 review remediation adds TestSseParserContract: source-level
+assertions pinning the three SSE parser correctness properties the PR
+claims (whole-buffer CRLF re-normalisation, ping-comment skipping, and the
+hasOwnProperty dispatch guard), so a future refactor cannot silently break
+them without a test failing (ADR-006 §5 — no Node toolchain; JS contracted
+via source assertions).
 """
 
 import re
@@ -214,13 +229,39 @@ class TestSwissMinimalistContract:
         assert 1.5 <= line_height <= 1.6
 
     def test_application_script_wires_stream_and_approval(self) -> None:
-        """The component consumes the SSE stream and posts plan approvals."""
+        """The component streams via fetch POST and posts plan approvals (#79)."""
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        assert "EventSource" in script
-        assert "/api/agent/stream" in script
+        # EventSource cannot POST: the SSE transport is fetch + ReadableStream
+        # against POST /api/agent/stream (supersedes the #79 GET transport).
+        assert "EventSource" not in script
+        assert 'fetch("/api/agent/stream"' in script
+        assert 'method: "POST"' in script
+        assert "getReader()" in script
         assert "/api/plan/approve" in script
         assert "plan_proposal" in script
+
+    def test_stream_payload_carries_message_and_history_in_body(self) -> None:
+        """Message and history travel in the POST body — never in a URL (AC4)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        assert "JSON.stringify({ message: message, history: history })" in script
+        # Regression guards for the access-log privacy leak (#79): the stream
+        # URL is bare and no query-string encoding helper remains.
+        assert "/api/agent/stream?" not in script
+        assert "encodeURIComponent" not in script
+
+    def test_history_replay_caps_at_ten_excluding_in_flight_turn(self) -> None:
+        """History replays the prior turns only, capped at the last 10 (#79)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        # Prior turns only: the just-submitted user message travels as
+        # `message` (never duplicated in history), and the snapshot is taken
+        # before the in-flight assistant placeholder is pushed.
+        assert "this.messages.slice(0, -1).slice(-10)" in script
+        history_at = script.index("this.messages.slice(0, -1).slice(-10)")
+        placeholder_at = script.index('this.messages.push({ role: "assistant", content: "" })')
+        assert history_at < placeholder_at
 
     def test_application_script_renders_plan_fields(self) -> None:
         """The plan card surfaces date, title, watts, duration and intervals."""
@@ -357,27 +398,35 @@ class TestIdentityBarContract:
         # Composer input is cleared.
         assert 'this.input = ""' in reset
 
-    def test_finish_stream_closes_source_and_idles_phase(self) -> None:
-        """Closing the stream stops the EventSource and clears the phase."""
+    def test_finish_stream_aborts_controller_and_idles_phase(self) -> None:
+        """Aborting the fetch stops the stream and clears the phase (#79).
+
+        Supersedes the EventSource close() contract: the stream handle is now
+        an AbortController, and abort() is what cancels an in-flight fetch or
+        body read (it is a no-op once the stream already completed).
+        """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
         finish = _rule_block(script, "finishStream()")
 
-        assert "this.source.close()" in finish
-        assert "this.source = null" in finish
+        assert "this.controller.abort()" in finish
+        assert "this.controller = null" in finish
         assert "this.streaming = false" in finish
         assert 'this.statusText = ""' in finish
 
     def test_stream_handlers_ignore_stale_events_after_reset(self) -> None:
         """Every stream handler bails out once its stream is no longer current.
 
-        "New chat" closes the EventSource mid-flight; events already queued on
-        the JS task queue can still dispatch afterwards. Indexing the cleared
-        transcript would throw, and stale activity/plan events would
-        repopulate cleared state, so each handler guards on both the phase
-        flag and a per-stream epoch: a bare phase check alone would even let
-        stale events through once a *new* stream has started (the phase flag
-        is true again), while the epoch pins the guard to the stream that
-        registered the handler.
+        "New chat" aborts the fetch mid-flight; frames already buffered can
+        still dispatch afterwards. Indexing the cleared transcript would
+        throw, and stale activity/plan events would repopulate cleared state,
+        so each handler guards on both the phase flag and a per-stream epoch:
+        a bare phase check alone would even let stale events through once a
+        *new* stream has started (the phase flag is true again), while the
+        epoch pins the guard to the stream that registered the handler.
+
+        Superseded for #79: handlers are now entries of the dispatch map
+        consumed by the fetch + ReadableStream SSE parser (EventSource cannot
+        POST); the guard idiom carries over unchanged.
         """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
@@ -398,7 +447,7 @@ class TestIdentityBarContract:
             "error",
             "done",
         ):
-            handler = _rule_block(script, f'addEventListener("{event}", (event) =>')
+            handler = _rule_block(script, f"{event}: (event) =>")
             assert "if (!this.streaming || epoch !== this.streamEpoch)" in handler, event
 
     # --- nLPD: client-side only, nothing persisted ----------------------------
@@ -433,3 +482,93 @@ class TestIdentityBarContract:
         assert "display: flex" in bar
         assert "align-items: center" in bar
         assert "var(--space-" in bar
+
+
+class TestSseParserContract:
+    """SSE parser correctness properties pinned at source level (#79 review).
+
+    The fetch + ReadableStream parser (`consumeSse`/`dispatchSseFrame`) is
+    the riskiest JS in the POST transport story, and the repo ships no Node
+    toolchain (ADR-006 §5), so — like the rest of the JS — it is contracted
+    through source assertions. Three properties the PR claims are pinned so
+    a future refactor cannot silently break them:
+
+    1. Whole-buffer ``\\r\\n → \\n`` re-normalisation: sse-starlette
+       terminates lines with ``\\r\\n``; a CRLF pair split across two chunk
+       boundaries must still be normalised before frames are split. The
+       replace therefore runs over the *accumulated* buffer (prior remainder
+       + freshly decoded chunk) on every read — not per chunk — and the
+       stream tail is normalised too.
+    2. Ping-comment skipping: ``": ping …"`` comment frames carry no
+       ``event:`` line, so dispatch must require a non-empty event type
+       before any handler can run.
+    3. Prototype-poisoning dispatch guard: handler lookup must go through
+       ``Object.prototype.hasOwnProperty`` so a forged frame with
+       ``event: constructor`` / ``event: toString`` cannot dispatch
+       inherited Object.prototype keys.
+    """
+
+    def test_consume_sse_renormalises_crlf_across_chunk_boundaries(self) -> None:
+        """The whole pending buffer is re-normalised on every read (#79)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        consume = _rule_block(script, "consumeSse(body, handlers)")
+        assert consume, "consumeSse(body, handlers) must exist"
+
+        # In-loop normalisation runs over the WHOLE accumulated buffer (prior
+        # remainder + freshly decoded chunk) — this is exactly the property
+        # that makes a \r\n pair split across two chunk boundaries survive:
+        # the second half joins the first half in the buffer before the
+        # regex ever runs.
+        loop_normalisation = (
+            r"(buffer + decoder.decode(value, { stream: true }))" r'.replace(/\r\n/g, "\n")'
+        )
+        assert loop_normalisation in consume
+
+        # The stream tail (final decode without { stream: true }) is
+        # normalised too, so a trailing CRLF cannot leak into the last frame.
+        tail_normalisation = r'(buffer + decoder.decode()).replace(/\r\n/g, "\n")'
+        assert tail_normalisation in consume
+
+        # Normalisation happens BEFORE frame splitting: the first blank-line
+        # boundary search follows the normalising assignment, so no frame is
+        # ever split off an un-normalised buffer.
+        normalisation_at = consume.index(loop_normalisation)
+        first_split_at = consume.index(r'buffer.indexOf("\n\n")')
+        assert normalisation_at < first_split_at
+
+        # Frames are delimited by a blank line and the delimiter (2 chars)
+        # is consumed — the SSE frame delimiter after \r\n → \n flattening.
+        assert r'buffer.indexOf("\n\n")' in consume
+        assert "buffer.slice(boundary + 2)" in consume
+
+    def test_dispatch_skips_ping_comment_frames(self) -> None:
+        """Comment-only frames (": ping …") never reach any handler."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        dispatch = _rule_block(script, "dispatchSseFrame(frame, handlers)")
+        assert dispatch, "dispatchSseFrame(frame, handlers) must exist"
+
+        # Only `event:` lines set the type and only `data:` lines carry
+        # payload — a ping comment (": ping …") matches neither, so its type
+        # stays "".
+        assert 'line.startsWith("event:")' in dispatch
+        assert 'line.startsWith("data:")' in dispatch
+
+        # Dispatch requires a non-empty type: the `type &&` half of the
+        # guard is what skips comment-only frames, and it precedes the
+        # handler invocation.
+        guard_at = dispatch.index("if (type &&")
+        invocation_at = dispatch.index("handlers[type](")
+        assert guard_at < invocation_at
+
+    def test_dispatch_guard_blocks_prototype_keys(self) -> None:
+        """Handler lookup goes through hasOwnProperty (prototype poisoning)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        dispatch = _rule_block(script, "dispatchSseFrame(frame, handlers)")
+        assert dispatch, "dispatchSseFrame(frame, handlers) must exist"
+
+        # A forged frame with `event: constructor` / `event: toString` must
+        # not dispatch inherited Object.prototype keys: the guard is the
+        # canonical hasOwnProperty call, not `in` or a bare map read.
+        guard = "Object.prototype.hasOwnProperty.call(handlers, type)"
+        assert guard in dispatch
+        assert dispatch.index(guard) < dispatch.index("handlers[type](")

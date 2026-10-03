@@ -8,7 +8,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +21,11 @@ from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
 from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
-from coach_web.models import PlanApprovalRequest, PlanApprovalResponse
+from coach_web.models import (
+    AgentStreamRequest,
+    PlanApprovalRequest,
+    PlanApprovalResponse,
+)
 from coach_web.plan_approval import approve_plan
 
 logger = logging.getLogger("coach_web")
@@ -126,15 +130,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             uptime_seconds=round(time.monotonic() - started_at, 3),
         )
 
-    @application.get("/api/agent/stream", tags=["agent"])
-    @application.get("/api/chat/stream", include_in_schema=False)
+    @application.post("/api/agent/stream", tags=["agent"])
     async def agent_stream(
         request: Request,
-        message: str = Query(..., min_length=1, description="User message for the coach agent"),
+        payload: AgentStreamRequest,
     ) -> EventSourceResponse:
         """Stream the coach agent's reasoning, tool calls and plan over SSE.
 
-        Native ``EventSource`` clients consume the typed events emitted by
+        The conversation is client-owned (nLPD ephemeral posture): the request
+        body carries the current ``message`` plus the replayed ``history``
+        (validated and capped by :class:`AgentStreamRequest`) and nothing is
+        persisted server-side. Message content travels in the POST body —
+        never in the URL or query string (#79). Native ``fetch``/ReadableStream
+        clients consume the typed events emitted by
         :meth:`coach_web.agent.CoachAgent.run`.
         """
         settings: Settings = request.app.state.settings
@@ -144,7 +152,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
-                    async for event in agent.run(message):
+                    async for event in agent.run(payload.message, history=payload.history):
                         yield ServerSentEvent(event=event.type, data=event.model_dump_json())
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)

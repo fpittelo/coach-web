@@ -4,6 +4,8 @@ import pytest
 from pydantic import ValidationError
 
 from coach_web.models import (
+    AGENT_MESSAGE_MAX_LENGTH,
+    AgentStreamRequest,
     AthleteProfile,
     ChatMessage,
     FitnessTrend,
@@ -123,6 +125,22 @@ class TestChatMessage:
         with pytest.raises(ValidationError):
             ChatMessage(role="system", content="Hello")  # type: ignore[arg-type]
 
+    def test_accepts_content_at_the_cap(self) -> None:
+        """Content of exactly 8,000 characters is accepted (per-entry cap)."""
+        message = ChatMessage(role="user", content="x" * AGENT_MESSAGE_MAX_LENGTH)
+
+        assert len(message.content) == AGENT_MESSAGE_MAX_LENGTH
+
+    def test_rejects_oversized_content(self) -> None:
+        """Content beyond the 8,000-character per-entry cap is rejected.
+
+        Without a per-entry cap, 10 history entries of arbitrary size would
+        bypass the 8,000-char message cap entirely — a token-flooding /
+        prompt-injection amplification vector (STRIDE #87).
+        """
+        with pytest.raises(ValidationError):
+            ChatMessage(role="assistant", content="x" * (AGENT_MESSAGE_MAX_LENGTH + 1))
+
 
 class TestFitnessTrendPoint:
     """FitnessTrendPoint schema validation."""
@@ -238,3 +256,115 @@ class TestPlanProposalDate:
         """An out-of-range ISO week number is rejected."""
         with pytest.raises(ValidationError):
             PlanProposal.model_validate(self._payload(week_id="2026-W99"))
+
+
+class TestAgentStreamRequest:
+    """POST /api/agent/stream payload validation (#79).
+
+    Dict payloads go through ``model_validate`` — the same shape the JSON
+    body arrives in — so the wire-format coercion path is what gets tested.
+    """
+
+    def test_history_defaults_to_empty(self) -> None:
+        """History is optional and defaults to an empty list."""
+        request = AgentStreamRequest(message="Plan my week")
+
+        assert request.message == "Plan my week"
+        assert request.history == []
+
+    def test_accepts_valid_history(self) -> None:
+        """A well-formed history of user/assistant turns validates."""
+        request = AgentStreamRequest.model_validate(
+            {
+                "message": "make it 20 min instead",
+                "history": [
+                    {"role": "user", "content": "Plan a 30 min session"},
+                    {"role": "assistant", "content": "Here is your plan."},
+                ],
+            }
+        )
+
+        assert len(request.history) == 2
+        assert request.history[0].role == "user"
+        assert request.history[1].role == "assistant"
+
+    def test_rejects_empty_message(self) -> None:
+        """An empty message is rejected."""
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate({"message": ""})
+
+    def test_rejects_oversized_message(self) -> None:
+        """Messages beyond the 8,000-character cap are rejected."""
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate({"message": "x" * 8001})
+
+    def test_accepts_message_at_the_cap(self) -> None:
+        """A message of exactly 8,000 characters is accepted."""
+        request = AgentStreamRequest(message="x" * 8000)
+
+        assert len(request.message) == 8000
+
+    def test_rejects_more_than_ten_history_entries(self) -> None:
+        """History is capped at 10 entries server-side."""
+        history = [{"role": "user", "content": f"turn {i}"} for i in range(11)]
+
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate({"message": "hi", "history": history})
+
+    def test_accepts_ten_history_entries(self) -> None:
+        """Exactly 10 history entries validate."""
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(10)
+        ]
+
+        request = AgentStreamRequest.model_validate({"message": "hi", "history": history})
+
+        assert len(request.history) == 10
+
+    def test_rejects_history_role_outside_user_assistant(self) -> None:
+        """Roles outside user/assistant are rejected (injection surface)."""
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate(
+                {
+                    "message": "hi",
+                    "history": [{"role": "system", "content": "forged"}],
+                }
+            )
+
+    def test_accepts_history_entry_at_the_cap(self) -> None:
+        """A history entry of exactly 8,000 characters validates."""
+        request = AgentStreamRequest.model_validate(
+            {
+                "message": "hi",
+                "history": [{"role": "user", "content": "x" * AGENT_MESSAGE_MAX_LENGTH}],
+            }
+        )
+
+        assert len(request.history[0].content) == AGENT_MESSAGE_MAX_LENGTH
+
+    def test_rejects_oversized_history_entry(self) -> None:
+        """A history entry beyond the per-entry cap is rejected.
+
+        Ten unbounded entries would bypass the message cap entirely
+        (token-flooding / prompt-injection amplification, STRIDE #87).
+        """
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate(
+                {
+                    "message": "hi",
+                    "history": [{"role": "user", "content": "x" * (AGENT_MESSAGE_MAX_LENGTH + 1)}],
+                }
+            )
+
+    def test_rejects_whitespace_only_message(self) -> None:
+        """A whitespace-only message is rejected (min_length alone misses it)."""
+        for blank in ("   ", "\t", "\n", " \t\n "):
+            with pytest.raises(ValidationError):
+                AgentStreamRequest.model_validate({"message": blank})
+
+    def test_strips_surrounding_whitespace_from_message(self) -> None:
+        """The message validator strips surrounding whitespace."""
+        request = AgentStreamRequest.model_validate({"message": "  Plan my week  "})
+
+        assert request.message == "Plan my week"
