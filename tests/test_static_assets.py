@@ -8,6 +8,10 @@ Swiss minimalist tokens (pure-red accent, 2px radii, zero elevation, 1180px
 two-panel grid) are replaced by the v0.7 slate/teal palette, 10px radii, soft
 shadows, and a centered 760px reading column. The supersession is explicit —
 assertions were rewritten, never silently deleted.
+
+Issue #80 adds the header identity bar contract (inline SVG monogram, product
+name, exactly one "New chat" action) and the nLPD guard that the new-chat
+reset is a pure client-side operation: nothing transmitted, nothing persisted.
 """
 
 import re
@@ -50,6 +54,11 @@ def _rule_block(css: str, selector: str) -> str:
             depth -= 1
         index += 1
     return css[start : index - 1]
+
+
+def _header_block(html: str) -> str:
+    """Return the <header>…</header> block of the page."""
+    return html[html.index("<header") : html.index("</header>")]
 
 
 class TestStaticAssetServing:
@@ -231,3 +240,196 @@ class TestSwissMinimalistContract:
         assert (VENDOR_DIR / "inter-latin-400-normal.woff2").is_file()
         assert (VENDOR_DIR / "inter-latin-600-normal.woff2").is_file()
         assert (VENDOR_DIR / "inter-latin-700-normal.woff2").is_file()
+
+
+class TestIdentityBarContract:
+    """Header identity bar & new-chat full client reset (issue #80, ADR-006).
+
+    The identity bar is the compact app chrome at the top of the centered
+    column: inline SVG monogram, product name, and exactly one "New chat"
+    action. The reset is a pure client-side operation — nothing is
+    transmitted and no transcript is persisted (Swiss nLPD posture).
+
+    app.js behavior is contracted through source assertions: the repo ships
+    no Node toolchain (ADR-006 §5, KIS), so JS is verified the same way as
+    the existing stream/approval wiring tests above.
+    """
+
+    # --- AC1: identity bar structure ---------------------------------------
+
+    def test_identity_bar_renders_brand_and_single_new_chat(self) -> None:
+        """The bar shows the monogram, the product name and one New chat button."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        header = _header_block(html)
+
+        assert 'class="identity-bar"' in header
+        assert '<svg class="monogram"' in header
+        assert ">Coach Web</span>" in header
+        assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
+
+    def test_identity_bar_sits_inside_centered_column(self) -> None:
+        """The identity bar is a child of the centered 760px masthead."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        masthead = html.index('<header class="masthead">')
+        bar = html.index('<div class="identity-bar">')
+        close = html.index("</header>")
+        assert masthead < bar < close
+
+    def test_legacy_session_buttons_are_gone(self) -> None:
+        """KIS cut: the single New chat replaces New Session / Clear Context."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        assert "New Session" not in html
+        assert "Clear Context" not in html
+
+    def test_identity_bar_has_no_status_badge(self) -> None:
+        """KIS cut: no connectivity/active badge (#84 owns the status surface)."""
+        header = _header_block((STATIC_DIR / "index.html").read_text(encoding="utf-8"))
+        lowered = header.lower()
+
+        assert "badge" not in lowered
+        assert "connected" not in lowered
+        # "status" as a raw substring is brittle: it matches any occurrence of
+        # the word (prose, URLs, unrelated attributes). Scope the ban to
+        # class/id tokens — it still catches a "status-badge" style class.
+        class_id_tokens = re.findall(r'(?:class|id)="([^"]*)"', lowered)
+        assert not any("status" in token for token in class_id_tokens)
+
+    # --- AC3: accessibility -------------------------------------------------
+
+    def test_new_chat_button_is_accessible(self) -> None:
+        """The New chat action is a real button with a labelled, wired click."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        match = re.search(r"<button\b[^>]*new-chat[^>]*>.*?</button>", html, re.DOTALL)
+        assert match is not None, "New chat button not found"
+        button = match.group(0)
+
+        assert 'type="button"' in button
+        assert 'aria-label="New chat' in button
+        assert '@click="resetChat()"' in button
+
+    def test_new_chat_button_has_visible_focus_ring(self) -> None:
+        """Keyboard focus draws a visible accent outline (AC3)."""
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        focus = _rule_block(css, ".button:focus-visible")
+
+        assert "outline" in focus
+        assert "var(--accent)" in focus
+
+    # --- AC4: monogram -------------------------------------------------------
+
+    def test_monogram_is_single_inline_svg(self) -> None:
+        """One hand-authored inline SVG; no sprite, no icon font, no fetch."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        assert html.count("<svg") == 1
+        assert "currentColor" in html
+        assert 'viewBox="0 0 32 32"' in html
+        assert "<use" not in html
+        assert "xlink" not in html
+
+    def test_monogram_is_sized_and_token_colored(self) -> None:
+        """The monogram renders at a fixed pixel size in the accent color."""
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        monogram = _rule_block(css, ".monogram")
+
+        assert "width:" in monogram
+        assert "height:" in monogram
+        assert "color: var(--accent)" in monogram
+
+    # --- AC2: new-chat reset --------------------------------------------------
+
+    def test_new_chat_resets_all_client_state(self) -> None:
+        """Reset clears transcript, activity, plan card, composer and phase."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        reset = _rule_block(script, "resetChat()")
+
+        # Closes any in-flight stream and returns the phase to idle.
+        assert "this.finishStream()" in reset
+        # Transcript, thoughts and tool activity are cleared.
+        assert "this.messages = []" in reset
+        assert "this.thoughts = []" in reset
+        assert "this.tools = []" in reset
+        # Plan card and its approval state are cleared.
+        assert "this.plan = null" in reset
+        assert 'this.approval = { state: "idle", message: "" }' in reset
+        # Composer input is cleared.
+        assert 'this.input = ""' in reset
+
+    def test_finish_stream_closes_source_and_idles_phase(self) -> None:
+        """Closing the stream stops the EventSource and clears the phase."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        finish = _rule_block(script, "finishStream()")
+
+        assert "this.source.close()" in finish
+        assert "this.source = null" in finish
+        assert "this.streaming = false" in finish
+        assert 'this.statusText = ""' in finish
+
+    def test_stream_handlers_ignore_stale_events_after_reset(self) -> None:
+        """Every stream handler bails out once its stream is no longer current.
+
+        "New chat" closes the EventSource mid-flight; events already queued on
+        the JS task queue can still dispatch afterwards. Indexing the cleared
+        transcript would throw, and stale activity/plan events would
+        repopulate cleared state, so each handler guards on both the phase
+        flag and a per-stream epoch: a bare phase check alone would even let
+        stale events through once a *new* stream has started (the phase flag
+        is true again), while the epoch pins the guard to the stream that
+        registered the handler.
+        """
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        # Each stream captures its own epoch from the shared counter.
+        start = _rule_block(script, "startStream(message)")
+        assert "this.streamEpoch += 1" in start
+        assert "const epoch = this.streamEpoch" in start
+
+        for event in (
+            "status",
+            "thought",
+            "token",
+            "tool_call",
+            "tool_start",
+            "tool_result",
+            "plan_proposal",
+            "plan",
+            "error",
+            "done",
+        ):
+            handler = _rule_block(script, f'addEventListener("{event}", (event) =>')
+            assert "if (!this.streaming || epoch !== this.streamEpoch)" in handler, event
+
+    # --- nLPD: client-side only, nothing persisted ----------------------------
+
+    def test_new_chat_reset_is_client_side_only(self) -> None:
+        """The reset transmits nothing — no fetch, no beacon, no new stream."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        reset = _rule_block(script, "resetChat()")
+        assert reset, "resetChat() must exist"
+
+        assert "fetch" not in reset
+        assert "EventSource" not in reset
+        assert "XMLHttpRequest" not in reset
+        assert "sendBeacon" not in reset
+
+    def test_no_persistent_client_storage(self) -> None:
+        """The transcript lives only in memory — no browser persistence."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        assert "localStorage" not in script
+        assert "sessionStorage" not in script
+        assert "indexedDB" not in script
+        assert "document.cookie" not in script
+
+    # --- AC5: styling contract -------------------------------------------------
+
+    def test_identity_bar_styles_use_tokens(self) -> None:
+        """The bar is a token-driven flex row; no new color literals."""
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        bar = _rule_block(css, ".identity-bar")
+
+        assert "display: flex" in bar
+        assert "align-items: center" in bar
+        assert "var(--space-" in bar

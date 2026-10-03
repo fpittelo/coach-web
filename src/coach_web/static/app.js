@@ -2,6 +2,8 @@
  *
  * Consumes the typed SSE stream exposed by GET /api/agent/stream through a
  * native EventSource and posts approved plans to POST /api/plan/approve.
+ * "New chat" (resetChat) is a full client-side reset: it closes any in-flight
+ * stream and clears every state slice without transmitting anything.
  * User data is only ever bound with x-text; no raw HTML is injected.
  */
 
@@ -22,6 +24,7 @@ function coachApp() {
     messages: [],
     input: "",
     streaming: false,
+    streamEpoch: 0,
     statusText: "",
     thoughts: [],
     tools: [],
@@ -53,6 +56,16 @@ function coachApp() {
     },
 
     startStream(message) {
+      // Stale-event hardening: every SSE handler below captures the epoch at
+      // registration and bails unless it is still current. resetChat() closes
+      // the source mid-flight, but events already queued on the JS task queue
+      // can still dispatch afterwards — and a bare `this.streaming` check
+      // would even let them through once a NEW stream is active again. The
+      // epoch half rejects anything from an older stream; the `this.streaming`
+      // half rejects late same-stream events after done/onerror ended it.
+      // One guard idiom, applied consistently to every stream handler.
+      this.streamEpoch += 1;
+      const epoch = this.streamEpoch;
       this.streaming = true;
       this.statusText = "Connecting";
       this.thoughts = [];
@@ -69,11 +82,17 @@ function coachApp() {
       this.source = source;
 
       source.addEventListener("status", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         this.statusText = data.phase === "thinking" ? "Thinking" : (data.phase || "");
       });
 
       source.addEventListener("thought", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         if (data.text) {
           this.thoughts.push(data.text);
@@ -81,6 +100,9 @@ function coachApp() {
       });
 
       source.addEventListener("token", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         if (data.text) {
           this.messages[index].content += data.text;
@@ -89,6 +111,9 @@ function coachApp() {
       });
 
       source.addEventListener("tool_call", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         this.tools.push({
           id: data.id,
@@ -98,6 +123,9 @@ function coachApp() {
       });
 
       source.addEventListener("tool_start", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         const tool = this.tools.find((item) => item.id === data.id);
         if (tool) {
@@ -106,6 +134,9 @@ function coachApp() {
       });
 
       source.addEventListener("tool_result", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         const tool = this.tools.find((item) => item.id === data.id);
         if (tool) {
@@ -114,16 +145,25 @@ function coachApp() {
       });
 
       source.addEventListener("plan_proposal", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         this.plan = data.plan || data;
       });
 
       source.addEventListener("plan", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         this.plan = data.plan || data;
       });
 
       source.addEventListener("error", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         this.statusText = data.message || "Error";
         if (!this.messages[index].content) {
@@ -132,6 +172,9 @@ function coachApp() {
       });
 
       source.addEventListener("done", (event) => {
+        if (!this.streaming || epoch !== this.streamEpoch) {
+          return; // stale event from an ended or superseded stream
+        }
         const data = parsePayload(event);
         if (!this.messages[index].content && data.message) {
           this.messages[index].content = data.message;
@@ -153,6 +196,16 @@ function coachApp() {
         this.source.close();
         this.source = null;
       }
+    },
+
+    resetChat() {
+      this.finishStream();
+      this.messages = [];
+      this.thoughts = [];
+      this.tools = [];
+      this.plan = null;
+      this.approval = { state: "idle", message: "" };
+      this.input = "";
     },
 
     approvePlan() {
