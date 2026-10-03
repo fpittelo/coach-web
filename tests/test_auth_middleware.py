@@ -26,8 +26,8 @@ class TestRouteProtection:
     """AC3: /api/* requires a valid, whitelisted session."""
 
     def test_api_stream_requires_session(self, auth_client: TestClient) -> None:
-        """GET /api/agent/stream without a session returns 401."""
-        response = auth_client.get("/api/agent/stream", params={"message": "hi"})
+        """POST /api/agent/stream without a session returns 401 (#79)."""
+        response = auth_client.post("/api/agent/stream", json={"message": "hi"})
 
         assert response.status_code == 401
 

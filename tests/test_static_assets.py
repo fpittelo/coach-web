@@ -12,6 +12,14 @@ assertions were rewritten, never silently deleted.
 Issue #80 adds the header identity bar contract (inline SVG monogram, product
 name, exactly one "New chat" action) and the nLPD guard that the new-chat
 reset is a pure client-side operation: nothing transmitted, nothing persisted.
+
+Issue #79 supersedes the SSE transport: EventSource cannot POST, so the
+component streams via fetch + ReadableStream against POST /api/agent/stream
+with a {message, history} body. Message and history content never appear in
+a URL or query string (access-log privacy, Swiss nLPD), and the client
+replays the last ≤ 10 transcript messages as history, excluding the
+in-flight assistant turn. The per-handler stale-event guards from #80 carry
+over unchanged.
 """
 
 import re
@@ -214,13 +222,39 @@ class TestSwissMinimalistContract:
         assert 1.5 <= line_height <= 1.6
 
     def test_application_script_wires_stream_and_approval(self) -> None:
-        """The component consumes the SSE stream and posts plan approvals."""
+        """The component streams via fetch POST and posts plan approvals (#79)."""
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        assert "EventSource" in script
-        assert "/api/agent/stream" in script
+        # EventSource cannot POST: the SSE transport is fetch + ReadableStream
+        # against POST /api/agent/stream (supersedes the #79 GET transport).
+        assert "EventSource" not in script
+        assert 'fetch("/api/agent/stream"' in script
+        assert 'method: "POST"' in script
+        assert "getReader()" in script
         assert "/api/plan/approve" in script
         assert "plan_proposal" in script
+
+    def test_stream_payload_carries_message_and_history_in_body(self) -> None:
+        """Message and history travel in the POST body — never in a URL (AC4)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        assert "JSON.stringify({ message: message, history: history })" in script
+        # Regression guards for the access-log privacy leak (#79): the stream
+        # URL is bare and no query-string encoding helper remains.
+        assert "/api/agent/stream?" not in script
+        assert "encodeURIComponent" not in script
+
+    def test_history_replay_caps_at_ten_excluding_in_flight_turn(self) -> None:
+        """History replays the prior turns only, capped at the last 10 (#79)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        # Prior turns only: the just-submitted user message travels as
+        # `message` (never duplicated in history), and the snapshot is taken
+        # before the in-flight assistant placeholder is pushed.
+        assert "this.messages.slice(0, -1).slice(-10)" in script
+        history_at = script.index("this.messages.slice(0, -1).slice(-10)")
+        placeholder_at = script.index('this.messages.push({ role: "assistant", content: "" })')
+        assert history_at < placeholder_at
 
     def test_application_script_renders_plan_fields(self) -> None:
         """The plan card surfaces date, title, watts, duration and intervals."""
@@ -357,27 +391,35 @@ class TestIdentityBarContract:
         # Composer input is cleared.
         assert 'this.input = ""' in reset
 
-    def test_finish_stream_closes_source_and_idles_phase(self) -> None:
-        """Closing the stream stops the EventSource and clears the phase."""
+    def test_finish_stream_aborts_controller_and_idles_phase(self) -> None:
+        """Aborting the fetch stops the stream and clears the phase (#79).
+
+        Supersedes the EventSource close() contract: the stream handle is now
+        an AbortController, and abort() is what cancels an in-flight fetch or
+        body read (it is a no-op once the stream already completed).
+        """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
         finish = _rule_block(script, "finishStream()")
 
-        assert "this.source.close()" in finish
-        assert "this.source = null" in finish
+        assert "this.controller.abort()" in finish
+        assert "this.controller = null" in finish
         assert "this.streaming = false" in finish
         assert 'this.statusText = ""' in finish
 
     def test_stream_handlers_ignore_stale_events_after_reset(self) -> None:
         """Every stream handler bails out once its stream is no longer current.
 
-        "New chat" closes the EventSource mid-flight; events already queued on
-        the JS task queue can still dispatch afterwards. Indexing the cleared
-        transcript would throw, and stale activity/plan events would
-        repopulate cleared state, so each handler guards on both the phase
-        flag and a per-stream epoch: a bare phase check alone would even let
-        stale events through once a *new* stream has started (the phase flag
-        is true again), while the epoch pins the guard to the stream that
-        registered the handler.
+        "New chat" aborts the fetch mid-flight; frames already buffered can
+        still dispatch afterwards. Indexing the cleared transcript would
+        throw, and stale activity/plan events would repopulate cleared state,
+        so each handler guards on both the phase flag and a per-stream epoch:
+        a bare phase check alone would even let stale events through once a
+        *new* stream has started (the phase flag is true again), while the
+        epoch pins the guard to the stream that registered the handler.
+
+        Superseded for #79: handlers are now entries of the dispatch map
+        consumed by the fetch + ReadableStream SSE parser (EventSource cannot
+        POST); the guard idiom carries over unchanged.
         """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
@@ -398,7 +440,7 @@ class TestIdentityBarContract:
             "error",
             "done",
         ):
-            handler = _rule_block(script, f'addEventListener("{event}", (event) =>')
+            handler = _rule_block(script, f"{event}: (event) =>")
             assert "if (!this.streaming || epoch !== this.streamEpoch)" in handler, event
 
     # --- nLPD: client-side only, nothing persisted ----------------------------

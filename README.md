@@ -29,7 +29,7 @@ The Phase 1 core delivers:
 - **Static asset serving** for the Swiss minimalist UI at `/static/`
 - **Pydantic v2 settings** with `.env` loading
 - **Dual MCP client hub** and OpenRouter agent loop streaming typed SSE events
-- **Chat console** consuming `GET /api/agent/stream` via native `EventSource`
+- **Chat console** consuming `POST /api/agent/stream` via `fetch` + ReadableStream (client-owned multi-turn history, #79)
 - **Plan approval card** posting to `POST /api/plan/approve` (Intervals.icu event + GitHub Markdown commit)
 
 ---

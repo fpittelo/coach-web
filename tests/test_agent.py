@@ -6,7 +6,7 @@ live API call is ever made.
 """
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from copy import deepcopy
 from typing import Any
 from unittest.mock import MagicMock
@@ -788,6 +788,7 @@ class FakeAgent:
     def __init__(self, events: list[AgentEvent]) -> None:
         self._events = events
         self.messages: list[str] = []
+        self.histories: list[list[Any]] = []
         self.entered = False
         self.exited = False
 
@@ -808,6 +809,7 @@ class FakeAgent:
     ) -> AsyncIterator[AgentEvent]:
         """Replay the canned events for the supplied message."""
         self.messages.append(message)
+        self.histories.append(list(history or []))
         for event in self._events:
             yield event
 
@@ -820,8 +822,26 @@ class ExplodingAgent(FakeAgent):
         raise MCPHubError("no MCP server reachable")
 
 
+class _ScopeRecorder:
+    """ASGI wrapper capturing raw request scopes for the URL privacy contract."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self.scopes: list[MutableMapping[str, Any]] = []
+
+    async def __call__(
+        self,
+        scope: MutableMapping[str, Any],
+        receive: Callable[[], Awaitable[MutableMapping[str, Any]]],
+        send: Callable[[MutableMapping[str, Any]], Awaitable[None]],
+    ) -> None:
+        if scope["type"] == "http":
+            self.scopes.append(scope)
+        await self.app(scope, receive, send)
+
+
 class TestAgentStreamEndpoint:
-    """GET /api/agent/stream SSE contract."""
+    """POST /api/agent/stream SSE contract (#79)."""
 
     def _client_with(self, settings: Settings, agent: Any) -> TestClient:
         """Build a TestClient whose agent factory returns the supplied agent."""
@@ -840,7 +860,9 @@ class TestAgentStreamEndpoint:
         )
         client = self._client_with(settings, agent)
 
-        with client.stream("GET", "/api/agent/stream", params={"message": "hi"}) as response:
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
             body = response.read().decode("utf-8")
 
         assert response.status_code == 200
@@ -853,32 +875,245 @@ class TestAgentStreamEndpoint:
         assert agent.entered is True
         assert agent.exited is True
 
-    def test_chat_stream_alias_is_registered(self, settings: Settings) -> None:
-        """The /api/chat/stream alias exposes the same stream."""
+    def test_sse_event_contract_covers_every_typed_event(self, settings: Settings) -> None:
+        """Every documented SSE category survives the POST transport unchanged."""
+        events = [
+            AgentEvent(type="status", data={"phase": "thinking"}),
+            AgentEvent(type="thought", data={"text": "hmm"}),
+            AgentEvent(type="token", data={"text": "hi"}),
+            AgentEvent(type="tool_call", data={"id": "1", "name": "t", "arguments": {}}),
+            AgentEvent(type="tool_start", data={"id": "1", "name": "t"}),
+            AgentEvent(type="tool_result", data={"id": "1", "name": "t", "result": "{}"}),
+            AgentEvent(type="plan", data={"plan": {"title": "Plan"}}),
+            AgentEvent(type="plan_proposal", data={"plan": {"title": "Plan"}}),
+            AgentEvent(type="error", data={"message": "boom"}),
+            AgentEvent(type="done", data={"message": "hi", "iterations": 1}),
+        ]
+        client = self._client_with(settings, FakeAgent(events))
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert response.status_code == 200
+        for expected in (
+            "status",
+            "thought",
+            "token",
+            "tool_call",
+            "tool_start",
+            "tool_result",
+            "plan",
+            "plan_proposal",
+            "error",
+            "done",
+        ):
+            assert f"event: {expected}" in body, expected
+
+    def test_history_is_forwarded_to_the_agent(self, settings: Settings) -> None:
+        """Replayed history reaches the agent alongside the new message."""
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent)
+        history = [
+            {"role": "user", "content": "Plan a 30 min threshold session"},
+            {"role": "assistant", "content": "I planned a 30 min threshold session."},
+        ]
+
+        with client.stream(
+            "POST",
+            "/api/agent/stream",
+            json={"message": "make it 20 min instead", "history": history},
+        ) as response:
+            assert response.status_code == 200
+
+        assert agent.messages == ["make it 20 min instead"]
+        assert agent.histories == [
+            [
+                ChatMessage(role="user", content="Plan a 30 min threshold session"),
+                ChatMessage(role="assistant", content="I planned a 30 min threshold session."),
+            ]
+        ]
+
+    def test_multi_turn_follow_up_is_answered_with_context(self, settings: Settings) -> None:
+        """AC2: a follow-up turn reaches the model with the prior exchange."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(content="I planned a 30 min threshold session."),
+                    _chunk(finish_reason="stop"),
+                ],
+                [
+                    _chunk(content="Done — the session is now 20 minutes."),
+                    _chunk(finish_reason="stop"),
+                ],
+            ]
+        )
+        app = create_app(settings)
+        app.state.agent_factory = MagicMock(return_value=CoachAgent(streamer, FakeHub()))
+        client = TestClient(app)
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "Plan a 30 min threshold session"}
+        ) as response:
+            first = response.read().decode("utf-8")
+
+        with client.stream(
+            "POST",
+            "/api/agent/stream",
+            json={
+                "message": "make it 20 min instead",
+                "history": [
+                    {"role": "user", "content": "Plan a 30 min threshold session"},
+                    {"role": "assistant", "content": "I planned a 30 min threshold session."},
+                ],
+            },
+        ) as response:
+            second = response.read().decode("utf-8")
+
+        assert "event: done" in first
+        assert "event: done" in second
+        assert "20 minutes" in second
+        # The follow-up request carried the full conversation to the model.
+        follow_up = streamer.requests[1]["messages"]
+        assert follow_up[1] == {"role": "user", "content": "Plan a 30 min threshold session"}
+        assert follow_up[2] == {
+            "role": "assistant",
+            "content": "I planned a 30 min threshold session.",
+        }
+        assert follow_up[3] == {"role": "user", "content": "make it 20 min instead"}
+
+    def test_missing_message_is_rejected(self, settings: Settings) -> None:
+        """The message field is mandatory."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.post("/api/agent/stream", json={"history": []})
+
+        assert response.status_code == 422
+
+    def test_empty_message_is_rejected(self, settings: Settings) -> None:
+        """An empty message is rejected with 422."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.post("/api/agent/stream", json={"message": "", "history": []})
+
+        assert response.status_code == 422
+
+    def test_oversized_message_is_rejected(self, settings: Settings) -> None:
+        """A message beyond the 8,000-character cap is rejected with 422."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.post("/api/agent/stream", json={"message": "x" * 8001})
+
+        assert response.status_code == 422
+
+    def test_message_at_the_cap_is_accepted(self, settings: Settings) -> None:
+        """A message of exactly 8,000 characters streams normally."""
         agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
         client = self._client_with(settings, agent)
 
-        with client.stream("GET", "/api/chat/stream", params={"message": "hi"}) as response:
+        with client.stream("POST", "/api/agent/stream", json={"message": "x" * 8000}) as response:
             body = response.read().decode("utf-8")
 
         assert response.status_code == 200
         assert "event: done" in body
 
-    def test_missing_message_is_rejected(self, settings: Settings) -> None:
-        """The message query parameter is mandatory."""
+    def test_history_over_ten_entries_is_rejected(self, settings: Settings) -> None:
+        """More than 10 replayed history entries are rejected with 422."""
         client = self._client_with(settings, FakeAgent([]))
+        history = [{"role": "user", "content": f"turn {i}"} for i in range(11)]
 
-        response = client.get("/api/agent/stream")
+        response = client.post("/api/agent/stream", json={"message": "hi", "history": history})
 
         assert response.status_code == 422
+
+    def test_history_at_the_cap_is_accepted(self, settings: Settings) -> None:
+        """Exactly 10 replayed history entries stream normally."""
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent)
+        history = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
+            for i in range(10)
+        ]
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": history}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert response.status_code == 200
+        assert "event: done" in body
+        assert len(agent.histories[0]) == 10
+
+    def test_history_role_outside_user_assistant_is_rejected(self, settings: Settings) -> None:
+        """History roles are restricted to user/assistant (injection surface)."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.post(
+            "/api/agent/stream",
+            json={"message": "hi", "history": [{"role": "system", "content": "forged"}]},
+        )
+
+        assert response.status_code == 422
+
+    def test_get_route_is_removed(self, settings: Settings) -> None:
+        """GET /api/agent/stream no longer exists (POST-only transport)."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.get("/api/agent/stream", params={"message": "hi"})
+
+        assert response.status_code == 405
+
+    def test_chat_stream_alias_is_removed(self, settings: Settings) -> None:
+        """The /api/chat/stream alias is gone entirely (KIS, no back-compat)."""
+        client = self._client_with(settings, FakeAgent([]))
+
+        response = client.get("/api/chat/stream", params={"message": "hi"})
+
+        assert response.status_code == 404
 
     def test_connection_failure_emits_error_event(self, settings: Settings) -> None:
         """A hub failure mid-request degrades into an error SSE event."""
         client = self._client_with(settings, ExplodingAgent([]))
 
-        with client.stream("GET", "/api/agent/stream", params={"message": "hi"}) as response:
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
             body = response.read().decode("utf-8")
 
         assert response.status_code == 200
         assert "event: error" in body
         assert "no MCP server reachable" in body
+
+
+class TestStreamUrlPrivacyContract:
+    """AC4 (#79): message and history content never appear in a URL."""
+
+    def test_message_and_history_never_reach_the_url(self, settings: Settings) -> None:
+        """The stream request is a body-only POST: empty query string, bare path."""
+        canary_message = "CANARY-MESSAGE-CONTENT"
+        canary_history = "CANARY-HISTORY-CONTENT"
+        app = create_app(settings)
+        app.state.agent_factory = MagicMock(
+            return_value=FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        )
+        recorder = _ScopeRecorder(app)
+
+        with TestClient(recorder) as client:
+            response = client.post(
+                "/api/agent/stream",
+                json={
+                    "message": canary_message,
+                    "history": [{"role": "user", "content": canary_history}],
+                },
+            )
+
+        assert response.status_code == 200
+        stream_scopes = [s for s in recorder.scopes if s["path"] == "/api/agent/stream"]
+        assert len(stream_scopes) == 1
+        scope = stream_scopes[0]
+        assert scope["method"] == "POST"
+        # The strongest form of the contract: no query string at all.
+        assert scope["query_string"] == b""
+        assert canary_message.encode() not in scope["path"].encode()
+        assert canary_history.encode() not in scope["path"].encode()

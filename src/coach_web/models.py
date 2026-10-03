@@ -95,6 +95,35 @@ class ChatMessage(BaseModel):
     content: str = Field(..., description="Message content")
 
 
+AGENT_MESSAGE_MAX_LENGTH = 8000
+"""Hard cap on a single user message (characters) at the SSE boundary."""
+
+AGENT_HISTORY_MAX_ENTRIES = 10
+"""Hard cap on replayed history entries enforced server-side (#79)."""
+
+
+class AgentStreamRequest(BaseModel):
+    """Payload for ``POST /api/agent/stream`` (multi-turn SSE transport, #79).
+
+    The conversation is client-owned: ``history`` replays the prior turns and
+    nothing is persisted server-side (nLPD ephemeral posture). Roles are
+    restricted to ``user``/``assistant`` and the entry count is capped here —
+    client-forged history is a prompt-injection surface (STRIDE #87).
+    """
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=AGENT_MESSAGE_MAX_LENGTH,
+        description="Current user message for the coach agent",
+    )
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        max_length=AGENT_HISTORY_MAX_ENTRIES,
+        description="Prior conversation turns (oldest first), capped at 10",
+    )
+
+
 class WorkoutStep(BaseModel):
     """A single structured workout step within a plan proposal."""
 

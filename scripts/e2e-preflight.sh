@@ -249,7 +249,8 @@ log "Root endpoint OK."
 
 if [[ "${LANE}" == "prod" ]]; then
     log "Validating the prod auth boundary (/api/* must deny anonymous access)..."
-    status_code="$(curl -sS -o /dev/null -w '%{http_code}' "${COACH_WEB_URL}/api/agent/stream" 2>/dev/null || true)"
+    # POST matches the live transport (#79): the SSE endpoint is POST-only.
+    status_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' -d '{"message":"preflight"}' "${COACH_WEB_URL}/api/agent/stream" 2>/dev/null || true)"
     if [[ "${status_code}" != "401" ]]; then
         error "Expected 401 from /api/agent/stream without a session, got: ${status_code:-none}"
         exit 1
