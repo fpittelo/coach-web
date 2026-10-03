@@ -223,6 +223,102 @@ body {
   font-size: 0.95rem;
 }
 
+/* --- Markdown rendering (assistant messages, #81) ----------------------- */
+
+/* Assistant bubbles render sanitized markdown (ADR-006 §9). Block elements
+   handle their own breaks, so the plain-text pre-wrap override is dropped.
+   KIS scope: bold, lists, blockquotes, inline code, headings — no syntax
+   highlighting, no table styling. */
+
+.message-body--markdown {
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+.message-body--markdown > :first-child {
+  margin-top: 0;
+}
+
+.message-body--markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.message-body--markdown p {
+  margin: 0 0 var(--space-3);
+}
+
+.message-body--markdown strong {
+  font-weight: 700;
+}
+
+.message-body--markdown ul,
+.message-body--markdown ol {
+  margin: 0 0 var(--space-3);
+  padding-left: 1.4rem;
+}
+
+.message-body--markdown li {
+  margin: 0 0 var(--space-1);
+}
+
+.message-body--markdown blockquote {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-4);
+  border-left: 2px solid var(--accent);
+  color: var(--muted);
+}
+
+.message-body--markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.message-body--markdown pre {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.message-body--markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.message-body--markdown h1,
+.message-body--markdown h2,
+.message-body--markdown h3,
+.message-body--markdown h4,
+.message-body--markdown h5,
+.message-body--markdown h6 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.message-body--markdown h1 {
+  font-size: 1.15rem;
+}
+
+.message-body--markdown h2 {
+  font-size: 1.05rem;
+}
+
+.message-body--markdown h3,
+.message-body--markdown h4,
+.message-body--markdown h5,
+.message-body--markdown h6 {
+  font-size: 1rem;
+}
+
+.message-body--markdown a {
+  color: var(--accent);
+}
+
 /* --- Agent activity ---------------------------------------------------- */
 
 .activity {

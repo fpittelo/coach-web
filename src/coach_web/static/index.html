@@ -6,6 +6,11 @@
     <meta name="color-scheme" content="light" />
     <title>Coach Web</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <!-- Vendor libs load before app.js (marked → DOMPurify → app.js); Alpine
+         boots last so the component registration listener is already in place
+         and renderMarkdown() has its dependencies when first called. -->
+    <script defer src="/static/vendor/marked.min.js"></script>
+    <script defer src="/static/vendor/DOMPurify.min.js"></script>
     <script defer src="/static/app.js"></script>
     <script defer src="/static/vendor/alpine.min.js"></script>
   </head>
@@ -64,7 +69,21 @@
             <template x-for="(message, index) in messages" :key="index">
               <article class="message" :class="{ 'message--user': message.role === 'user' }">
                 <span class="message-role" x-text="message.role"></span>
-                <p class="message-body" x-text="message.content"></p>
+                <!-- User messages stay x-text forever: untrusted input is
+                     never HTML-rendered (ADR-006 §9, STRIDE #87 C4). -->
+                <template x-if="message.role === 'user'">
+                  <p class="message-body" x-text="message.content"></p>
+                </template>
+                <!-- Assistant messages are the sole HTML-rendered surface,
+                     bound to the renderMarkdown sanitizer helper over the
+                     accumulated raw content (re-sanitized on every token
+                     render). -->
+                <template x-if="message.role === 'assistant'">
+                  <div
+                    class="message-body message-body--markdown"
+                    x-html="renderMarkdown(message.content)"
+                  ></div>
+                </template>
               </article>
             </template>
           </div>

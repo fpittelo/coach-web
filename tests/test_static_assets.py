@@ -27,6 +27,17 @@ claims (whole-buffer CRLF re-normalisation, ping-comment skipping, and the
 hasOwnProperty dispatch guard), so a future refactor cannot silently break
 them without a test failing (ADR-006 §5 — no Node toolchain; JS contracted
 via source assertions).
+
+Issue #81 reverses the x-html ban for assistant messages only (ADR-006 §9,
+gated by the STRIDE sign-off #87): assistant bubbles render
+DOMPurify.sanitize(marked.parse(text)) through a renderMarkdown helper,
+user messages keep x-text forever, and the plan card stays structured
+Pydantic→HTML. The STRIDE conditions are pinned at source level: C1
+(DOMPurify default config — no ALLOWED_ATTR/ALLOWED_TAGS additions), C3
+(every render sanitizes the accumulated raw string, never per-token
+fragments), C4 (x-html only on the assistant branch via the helper), and
+C6/C7 as regression guards (models.py/app.py untouched — the role Literal,
+history caps and approval gate are guarded by the existing API tests).
 """
 
 import re
@@ -76,6 +87,15 @@ def _header_block(html: str) -> str:
     return html[html.index("<header") : html.index("</header>")]
 
 
+def _has_rule(css: str, selector: str) -> bool:
+    """True if any rule's selector list includes *selector* (group-aware)."""
+    for match in re.finditer(r"([^{}]+)\{", css):
+        selectors = [part.strip() for part in match.group(1).split(",")]
+        if selector in selectors:
+            return True
+    return False
+
+
 class TestStaticAssetServing:
     """Every frontend asset is served from the FastAPI origin."""
 
@@ -119,6 +139,15 @@ class TestStaticAssetServing:
                 assert response.status_code == 200, weight
                 assert response.content[:4] == b"wOF2", weight
 
+    def test_vendored_markdown_libraries_are_served(self) -> None:
+        """GET /static/vendor/{marked,DOMPurify}.min.js serve the local builds."""
+        with TestClient(create_app()) as client:
+            for name in ("marked.min.js", "DOMPurify.min.js"):
+                response = client.get(f"/static/vendor/{name}")
+                assert response.status_code == 200, name
+                assert "javascript" in response.headers["content-type"], name
+                assert len(response.content) > 1000, name
+
 
 class TestSwissMinimalistContract:
     """Design-token and privacy constraints on the shipped assets.
@@ -136,19 +165,66 @@ class TestSwissMinimalistContract:
         assert "//cdn" not in html
 
     def test_index_references_local_assets(self) -> None:
-        """The page wires the local stylesheet, Alpine build and component."""
+        """The page wires the local stylesheet, vendor builds and component."""
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
         assert "/static/styles.css" in html
+        assert "/static/vendor/marked.min.js" in html
+        assert "/static/vendor/DOMPurify.min.js" in html
         assert "/static/vendor/alpine.min.js" in html
         assert "/static/app.js" in html
 
     def test_index_uses_text_interpolation_only(self) -> None:
-        """User data is bound with x-text; x-html is never used."""
+        """User data is bound with x-text; x-html is assistant-only + sanitized.
+
+        Rewritten per ADR-006 §9 and STRIDE #87 condition C4: the v0.3
+        blanket x-html ban is superseded — exactly one x-html binding is
+        allowed, on the assistant message body, through the renderMarkdown
+        sanitizer helper. User messages keep x-text forever (untrusted input
+        is never HTML-rendered).
+        """
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
         assert "x-text" in html
-        assert "x-html" not in html
+        assert html.count("x-html") == 1
+
+        user_branch = re.search(
+            r"<template x-if=\"message.role === 'user'\">.*?</template>", html, re.DOTALL
+        )
+        assistant_branch = re.search(
+            r"<template x-if=\"message.role === 'assistant'\">.*?</template>",
+            html,
+            re.DOTALL,
+        )
+        assert user_branch is not None, "user message branch missing"
+        assert assistant_branch is not None, "assistant message branch missing"
+
+        # User branch: plain text interpolation only — never HTML.
+        assert 'x-text="message.content"' in user_branch.group(0)
+        assert "x-html" not in user_branch.group(0)
+
+        # Assistant branch: the single x-html binding goes through the
+        # sanitizer helper with the accumulated raw content.
+        assert 'x-html="renderMarkdown(message.content)"' in assistant_branch.group(0)
+        assert "x-text=" not in assistant_branch.group(0)
+
+    def test_script_load_order_vendors_before_app(self) -> None:
+        """marked and DOMPurify load before app.js; Alpine boots last."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        for asset in (
+            "/static/vendor/marked.min.js",
+            "/static/vendor/DOMPurify.min.js",
+            "/static/app.js",
+            "/static/vendor/alpine.min.js",
+        ):
+            assert asset in html, asset
+
+        marked_at = html.index("/static/vendor/marked.min.js")
+        purify_at = html.index("/static/vendor/DOMPurify.min.js")
+        app_at = html.index("/static/app.js")
+        alpine_at = html.index("/static/vendor/alpine.min.js")
+        assert marked_at < purify_at < app_at < alpine_at
 
     def test_stylesheet_uses_swiss_tokens(self) -> None:
         """The stylesheet encodes the v0.7 design tokens (ADR-006 supersedes v0.3)."""
@@ -228,6 +304,31 @@ class TestSwissMinimalistContract:
         line_height = float(match.group(1))
         assert 1.5 <= line_height <= 1.6
 
+    def test_markdown_css_covers_required_elements(self) -> None:
+        """AC2: bold, lists, blockquotes, inline code and headings are styled."""
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        for selector in (
+            ".message-body--markdown strong",
+            ".message-body--markdown ul",
+            ".message-body--markdown ol",
+            ".message-body--markdown li",
+            ".message-body--markdown blockquote",
+            ".message-body--markdown code",
+            ".message-body--markdown h1",
+            ".message-body--markdown h2",
+            ".message-body--markdown h3",
+        ):
+            assert _has_rule(css, selector), f"missing markdown rule: {selector}"
+
+    def test_markdown_body_does_not_clip_or_double_space(self) -> None:
+        """AC2: block layout replaces pre-wrap; long tokens wrap; code scrolls."""
+        css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        body = _rule_block(css, ".message-body--markdown")
+        assert "white-space: normal" in body
+        assert "overflow-wrap: break-word" in body
+        pre = _rule_block(css, ".message-body--markdown pre")
+        assert "overflow-x: auto" in pre
+
     def test_application_script_wires_stream_and_approval(self) -> None:
         """The component streams via fetch POST and posts plan approvals (#79)."""
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -276,11 +377,38 @@ class TestSwissMinimalistContract:
         assert "rejectPlan()" in html
 
     def test_vendor_directory_is_self_contained(self) -> None:
-        """The vendor directory ships Alpine and the Inter fonts locally."""
+        """The vendor directory ships Alpine, marked, DOMPurify and fonts locally."""
         assert (VENDOR_DIR / "alpine.min.js").is_file()
+        assert (VENDOR_DIR / "marked.min.js").is_file()
+        assert (VENDOR_DIR / "DOMPurify.min.js").is_file()
         assert (VENDOR_DIR / "inter-latin-400-normal.woff2").is_file()
         assert (VENDOR_DIR / "inter-latin-600-normal.woff2").is_file()
         assert (VENDOR_DIR / "inter-latin-700-normal.woff2").is_file()
+
+    def test_vendor_libraries_carry_license_notices(self) -> None:
+        """marked and DOMPurify ship their license notices in vendor/ (#81 AC1)."""
+        for name in ("marked", "DOMPurify"):
+            notice = VENDOR_DIR / f"{name}.LICENSE"
+            assert notice.is_file(), name
+            text = notice.read_text(encoding="utf-8")
+            assert "License" in text, name
+            assert len(text) > 200, name
+
+    def test_vendored_marked_is_the_parser_build(self) -> None:
+        """The vendored marked.min.js is the real markdown parser build."""
+        lib = VENDOR_DIR / "marked.min.js"
+        assert lib.is_file()
+        content = lib.read_text(encoding="utf-8")
+        assert "marked" in content
+        assert "parse" in content
+
+    def test_vendored_dompurify_is_the_sanitizer_build(self) -> None:
+        """The vendored DOMPurify.min.js is the real sanitizer build."""
+        lib = VENDOR_DIR / "DOMPurify.min.js"
+        assert lib.is_file()
+        content = lib.read_text(encoding="utf-8")
+        assert "DOMPurify" in content
+        assert "sanitize" in content
 
 
 class TestIdentityBarContract:
@@ -572,3 +700,78 @@ class TestSseParserContract:
         guard = "Object.prototype.hasOwnProperty.call(handlers, type)"
         assert guard in dispatch
         assert dispatch.index(guard) < dispatch.index("handlers[type](")
+
+
+class TestMarkdownRenderingContract:
+    """Sanitized markdown rendering of assistant messages (#81, ADR-006 §9).
+
+    STRIDE #87 conditions C1/C3 are pinned at source level (no Node
+    toolchain, ADR-006 §5): the sanitizer helper composition, the DOMPurify
+    default configuration, and the accumulated-string mid-stream render
+    path. C4 is pinned by the rewritten test_index_uses_text_interpolation_only;
+    C6/C7 (role Literal, history caps, approval gate) are regression guards
+    satisfied by not touching models.py/app.py — their API tests must keep
+    passing untouched.
+    """
+
+    def test_app_js_defines_the_sanitizer_helper(self) -> None:
+        """The component exposes renderMarkdown(text) as the only HTML path."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        helper = _rule_block(script, "renderMarkdown(text)")
+        assert helper, "renderMarkdown(text) helper must exist"
+
+        # Exact composition (ADR-006 §9): DOMPurify.sanitize(marked.parse(text)).
+        assert "window.DOMPurify.sanitize(window.marked.parse(text))" in helper
+
+    def test_sanitizer_uses_dompurify_default_config(self) -> None:
+        """C1: the sanitizer call adds no allowlist entries of any kind."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        # The default allowlist strips script/style/iframe/object/embed/form,
+        # event handlers, javascript: URIs and every Alpine x-*/@*/:* directive.
+        # Any config addition would weaken that contract.
+        for forbidden in ("ALLOWED_ATTR", "ALLOWED_TAGS", "ADD_ATTR", "ADD_TAGS"):
+            assert forbidden not in script, forbidden
+
+    def test_assistant_binding_sanitizes_the_accumulated_string(self) -> None:
+        """C3/AC3: every render re-sanitizes the full accumulated raw text."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        # The binding passes the whole message content — the accumulated raw
+        # string — through the helper, so each incremental token render
+        # re-sanitizes from scratch (DOMPurify repairs unclosed tags
+        # mid-stream; a <scr|ipt> split across tokens is only ever sanitized
+        # as a whole).
+        assert 'x-html="renderMarkdown(message.content)"' in html
+
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        token = _rule_block(script, "token: (event) =>")
+        assert token, "token handler must exist"
+
+        # Tokens append RAW text to the accumulated content; no sanitization
+        # or HTML construction happens per token.
+        assert "this.messages[index].content += data.text" in token
+        assert "renderMarkdown" not in token
+        assert "sanitize" not in token
+
+    def test_no_html_path_bypasses_the_sanitizer(self) -> None:
+        """AC3: no raw HTML injection API outside the DOMPurify helper."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+        assert "innerHTML" not in script
+        assert "insertAdjacentHTML" not in script
+        assert "document.write" not in script
+        # Exactly one sanitize call: the default-config helper.
+        assert script.count("DOMPurify.sanitize") == 1
+
+    def test_plan_card_is_not_markdown_rendered(self) -> None:
+        """AC5: the plan card stays structured Pydantic→HTML (x-text only)."""
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        plan_at = html.index('<aside class="panel plan"')
+        plan_block = html[plan_at : html.index("</aside>")]
+
+        assert "x-html" not in plan_block
+        assert "renderMarkdown" not in plan_block
+        # The approve-flow contract is untouched.
+        assert "approvePlan()" in plan_block
+        assert "rejectPlan()" in plan_block
