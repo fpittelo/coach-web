@@ -3,6 +3,8 @@ name: Debug Mypy
 on:
   push:
     branches: [feature/112-auth-secrets-posture]
+  pull_request:
+    branches: [dev]
 
 permissions:
   contents: read
