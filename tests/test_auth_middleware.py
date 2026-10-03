@@ -99,11 +99,11 @@ class TestPublicPaths:
         assert response.status_code == 200
 
     def test_health_is_public(self, auth_client: TestClient) -> None:
-        """GET /health stays public for Cloud Run liveness probes."""
+        """GET /health stays public (healthcheck surface, #66)."""
         assert auth_client.get("/health").status_code == 200
 
     def test_healthz_is_public(self, auth_client: TestClient) -> None:
-        """GET /healthz stays public for Cloud Run startup probes."""
+        """GET /healthz stays public (healthcheck surface, #66)."""
         assert auth_client.get("/healthz").status_code == 200
 
     def test_login_route_is_public(self, auth_client: TestClient) -> None:
