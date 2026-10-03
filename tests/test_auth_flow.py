@@ -56,7 +56,7 @@ def _state_cookie_cleared(response: Any) -> bool:
     return any('cw_oidc_state=""' in cookie for cookie in response.headers.get_list("set-cookie"))
 
 
-def _cookie_header(response: Any, name: str) -> str:
+def _cookie_header(response: httpx.Response, name: str) -> str:
     """Return the Set-Cookie header for ``name`` (fails when absent)."""
     for header in response.headers.get_list("set-cookie"):
         if header.startswith(f"{name}="):
