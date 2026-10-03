@@ -168,7 +168,7 @@ The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `
 |:---|:---|
 | **Language** | Python 3.12 |
 | **Framework** | FastAPI + uvicorn |
-| **Frontend** | Alpine.js + Tailwind CSS (static assets) |
+| **Frontend** | Alpine.js + hand-written CSS with v0.7 design tokens (static assets, zero CDN) |
 | **Streaming** | Server-Sent Events (`sse-starlette`) |
 | **MCP Client** | `mcp[cli]` Python SDK (streamable_http transport) |
 | **GitHub API** | `httpx` async client (for training plan issues) |
