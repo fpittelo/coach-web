@@ -14,7 +14,9 @@ import respx
 from fastapi.testclient import TestClient
 from httpx import Response
 
+from coach_web.app import create_app
 from coach_web.auth.tokens import verify_session_token
+from coach_web.config import Settings, get_settings
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
 SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
@@ -52,6 +54,28 @@ def _login_state(client: TestClient) -> str:
 def _state_cookie_cleared(response: Any) -> bool:
     """Return True when the response clears the single-use state cookie."""
     return any('cw_oidc_state=""' in cookie for cookie in response.headers.get_list("set-cookie"))
+
+
+def _cookie_header(response: Any, name: str) -> str:
+    """Return the Set-Cookie header for ``name`` (fails when absent)."""
+    for header in response.headers.get_list("set-cookie"):
+        if header.startswith(f"{name}="):
+            return header
+    raise AssertionError(f"no Set-Cookie header for {name}")
+
+
+def _auth_app(cookie_secure: bool) -> Any:
+    """Build an auth-enabled app with a deterministic cookie-secure setting (#112)."""
+    return create_app(
+        Settings(
+            AUTH_ENABLED=True,
+            GOOGLE_OIDC_CLIENT_ID=CLIENT_ID,
+            GOOGLE_OIDC_CLIENT_SECRET="test-client-secret",  # noqa: S106
+            AUTH_SESSION_SECRET=SESSION_SECRET,
+            AUTH_COOKIE_SECURE=cookie_secure,
+            TRUSTED_HOSTS=["localhost", "127.0.0.1", "testserver"],
+        )
+    )
 
 
 def _mock_google_token_exchange(
@@ -96,9 +120,6 @@ class TestLoginRedirect:
 
     def test_login_uses_explicit_redirect_uri(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """AUTH_REDIRECT_URI overrides the request-derived redirect URI."""
-        from coach_web.app import create_app
-        from coach_web.config import get_settings
-
         monkeypatch.setenv("AUTH_ENABLED", "true")
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_ID", CLIENT_ID)
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_SECRET", "test-client-secret")
@@ -343,3 +364,46 @@ class TestLogout:
         # The browser applies the clearing Set-Cookie: the jar drops the session.
         auth_client.cookies.clear()
         assert auth_client.get("/api/nonexistent").status_code == 401
+
+
+class TestCookieSecureFlag:
+    """AC5 (#112): the Secure flag on session & OIDC-state cookies is configurable."""
+
+    def test_state_cookie_secure_by_default(self, auth_client: TestClient) -> None:
+        """The OIDC-state cookie carries Secure by default."""
+        response = auth_client.get("/auth/login", follow_redirects=False)
+
+        assert "Secure" in _cookie_header(response, "cw_oidc_state")
+
+    def test_state_cookie_not_secure_when_disabled(self) -> None:
+        """AUTH_COOKIE_SECURE=false drops Secure from the OIDC-state cookie."""
+        with TestClient(_auth_app(False), base_url="https://testserver") as client:
+            response = client.get("/auth/login", follow_redirects=False)
+
+        assert "Secure" not in _cookie_header(response, "cw_oidc_state")
+
+    @respx.mock
+    def test_session_cookie_secure_by_default(self, google_test_keys: Any) -> None:
+        """The session cookie carries Secure by default."""
+        with TestClient(_auth_app(True), base_url="https://testserver") as client:
+            state = _login_state(client)
+            id_token = google_test_keys.sign(_id_token_claims(nonce=state))
+            _mock_google_token_exchange(google_test_keys, id_token)
+            response = client.get(
+                f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+            )
+
+        assert "Secure" in _cookie_header(response, "cw_session")
+
+    @respx.mock
+    def test_session_cookie_not_secure_when_disabled(self, google_test_keys: Any) -> None:
+        """AUTH_COOKIE_SECURE=false drops Secure from the session cookie."""
+        with TestClient(_auth_app(False), base_url="https://testserver") as client:
+            state = _login_state(client)
+            id_token = google_test_keys.sign(_id_token_claims(nonce=state))
+            _mock_google_token_exchange(google_test_keys, id_token)
+            response = client.get(
+                f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+            )
+
+        assert "Secure" not in _cookie_header(response, "cw_session")

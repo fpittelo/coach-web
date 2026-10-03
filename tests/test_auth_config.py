@@ -44,6 +44,20 @@ class TestAuthSettingsDefaults:
 
         assert get_settings().AUTH_SESSION_TTL_SECONDS == 3600
 
+    def test_cookie_secure_defaults_true(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """AUTH_COOKIE_SECURE defaults to true (Secure cookies, #112 AC5)."""
+        monkeypatch.delenv("AUTH_COOKIE_SECURE", raising=False)
+        get_settings.cache_clear()
+
+        assert get_settings().AUTH_COOKIE_SECURE is True
+
+    def test_trusted_hosts_default_is_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TRUSTED_HOSTS defaults to loopback names only (DNS rebinding, #112 AC6)."""
+        monkeypatch.delenv("TRUSTED_HOSTS", raising=False)
+        get_settings.cache_clear()
+
+        assert get_settings().TRUSTED_HOSTS == ["localhost", "127.0.0.1"]
+
 
 class TestAuthSettingsOverrides:
     """Environment overrides (Cloud Run injects the same names, #66)."""
@@ -58,6 +72,8 @@ class TestAuthSettingsOverrides:
         monkeypatch.setenv("AUTH_SESSION_TTL_SECONDS", "1800")
         monkeypatch.setenv("GOOGLE_OIDC_ISSUER", "https://other.issuer")
         monkeypatch.setenv("AUTH_REDIRECT_URI", "https://coach.example.ch/auth/callback")
+        monkeypatch.setenv("AUTH_COOKIE_SECURE", "false")
+        monkeypatch.setenv("TRUSTED_HOSTS", '["coach.example.ch"]')
         get_settings.cache_clear()
 
         settings = get_settings()
@@ -70,6 +86,8 @@ class TestAuthSettingsOverrides:
         assert settings.AUTH_SESSION_TTL_SECONDS == 1800
         assert settings.GOOGLE_OIDC_ISSUER == "https://other.issuer"
         assert settings.AUTH_REDIRECT_URI == "https://coach.example.ch/auth/callback"
+        assert settings.AUTH_COOKIE_SECURE is False
+        assert settings.TRUSTED_HOSTS == ["coach.example.ch"]
 
 
 class TestFailClosedValidation:
