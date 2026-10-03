@@ -55,6 +55,15 @@ and 30 s MCP tool-call timeout) is armed on stream start, reset on every
 received typed event, cleared on stream end, and its timeout transitions
 to a visible error state. Ping comment frames deliberately do NOT reset
 the watchdog: a wedged agent behind a live transport must still trip it.
+
+Issue #85 replaces the unconditional auto-scroll with a proximity-armed
+follow flag: the log follows the stream only while the viewport sits
+within 60 px of the bottom; farther away, token arrivals and transcript
+mutations never move the viewport (scrolling up to re-read is never
+hijacked), and scrolling back near the bottom re-arms following
+automatically (self-healing — the locked KIS cut drops a "jump to latest"
+pill). Token-time scrolls are instant (behavior "auto"), and a
+prefers-reduced-motion media query disables the looping animations.
 """
 
 import re
@@ -84,6 +93,24 @@ V07_PALETTE = frozenset(
 def _rule_block(css: str, selector: str) -> str:
     """Return the declaration block of the first CSS rule matching *selector*."""
     match = re.search(re.escape(selector) + r"\s*\{", css)
+    if match is None:
+        return ""
+    depth = 1
+    start = match.end()
+    index = start
+    while index < len(css) and depth > 0:
+        char = css[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+        index += 1
+    return css[start : index - 1]
+
+
+def _media_block(css: str, query: str) -> str:
+    """Return the body of the first ``@media`` block matching *query*."""
+    match = re.search(re.escape(query) + r"\s*\{", css)
     if match is None:
         return ""
     depth = 1
@@ -1041,3 +1068,94 @@ class TestStreamPhaseContract:
 
         banner = _rule_block(css, ".error-banner")
         assert "var(--error)" in banner
+
+
+class TestAutoScrollContract:
+    """Non-hijacking auto-scroll for streaming chat (#85, ADR-006 §9).
+
+    The v0.5 chat scrolled unconditionally on every token and every
+    transcript mutation, yanking the viewport back to the bottom while the
+    user scrolled up to re-read. #85 replaces that with a proximity-armed
+    follow flag: within 60 px of the bottom the log follows the stream;
+    farther away it pauses, and scrolling back near the bottom re-arms
+    following automatically (self-healing — the locked KIS cut explicitly
+    drops a "jump to latest" pill).
+
+    No Node toolchain (ADR-006 §5): the JS is contracted via source
+    assertions, the same way as the SSE parser and stream-phase contracts.
+    """
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- AC1: scrolling up is never hijacked ----------------------------------
+
+    def test_component_declares_the_stick_to_bottom_flag(self) -> None:
+        """The follow flag defaults to armed (a fresh log sits at the bottom)."""
+        script = self._script()
+
+        assert "stickToBottom: true" in script
+
+    def test_scroll_to_bottom_is_gated_by_the_follow_flag(self) -> None:
+        """scrollToBottom() is a no-op while following is paused (AC1)."""
+        scroll = _rule_block(self._script(), "scrollToBottom()")
+
+        assert "if (!this.stickToBottom)" in scroll, "follow gate missing"
+        # The gate precedes the scroll: a paused log is never touched.
+        assert scroll.index("if (!this.stickToBottom)") < scroll.index("log.scrollTo(")
+
+    # --- AC2: proximity arming / self-healing ----------------------------------
+
+    def test_proximity_threshold_is_60px(self) -> None:
+        """The follow band is the 60 px proximity threshold from the spec."""
+        script = self._script()
+
+        assert "STICK_THRESHOLD_PX = 60" in script
+
+    def test_proximity_arming_compares_bottom_distance_to_threshold(self) -> None:
+        """Within 60 px of the bottom ⇒ follow; farther ⇒ pause (AC1/AC2)."""
+        update = _rule_block(self._script(), "updateStickToBottom()")
+
+        assert update, "updateStickToBottom() must exist"
+        assert "log.scrollHeight - log.scrollTop - log.clientHeight <= STICK_THRESHOLD_PX" in update
+
+    def test_scroll_listener_updates_the_flag(self) -> None:
+        """A passive scroll listener on the log re-evaluates the flag."""
+        init = _rule_block(self._script(), "init()")
+
+        assert 'addEventListener("scroll"' in init, "scroll listener missing"
+        assert "this.updateStickToBottom()" in init
+        assert "passive: true" in init
+
+    def test_reset_chat_rearms_following(self) -> None:
+        """A fresh chat follows again: the emptied log cannot fire a scroll."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.stickToBottom = true" in reset
+
+    # --- AC3: instant token-time scrolls, reduced motion ------------------------
+
+    def test_token_time_scrolls_are_instant(self) -> None:
+        """Token-time scrolls use behavior "auto" — never eased (AC3)."""
+        scroll = _rule_block(self._script(), "scrollToBottom()")
+
+        assert 'log.scrollTo({ top: log.scrollHeight, behavior: "auto" })' in scroll
+        # Explicit supersession: the v0.5 bare scrollTop assignment is gone,
+        # and no eased scroll behavior exists anywhere in the component —
+        # eased scrolls would stack into jank during rapid token streams.
+        assert "log.scrollTop = log.scrollHeight" not in self._script()
+        assert "smooth" not in self._script()
+
+    def test_reduced_motion_media_query_disables_animations(self) -> None:
+        """prefers-reduced-motion kills the looping animations (AC3)."""
+        css = self._css()
+        media = _media_block(css, "@media (prefers-reduced-motion: reduce)")
+
+        assert media, "prefers-reduced-motion block missing"
+        assert ".pulse" in media
+        assert ".thinking-dots .dot" in media
+        assert "animation: none" in media
+        assert "scroll-behavior: auto" in media
