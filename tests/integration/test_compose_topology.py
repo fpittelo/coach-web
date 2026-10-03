@@ -6,6 +6,7 @@ requiring a running Docker daemon, so they remain fast and deterministic in
 CI as well as local development.
 """
 
+import datetime
 import re
 import shutil
 import subprocess
@@ -510,7 +511,8 @@ class TestCIContainerScan:
     """CI must scan the built image with trivy (AC3, #113)."""
 
     @pytest.fixture(scope="class")
-    def ci(self) -> dict[str, Any]:
+    @classmethod
+    def ci(cls) -> dict[str, Any]:
         """Load the parsed CI workflow."""
         return load_yaml(".github/workflows/ci.yaml")
 
@@ -553,11 +555,47 @@ class TestCIContainerScan:
         assert builds[0]["with"].get("load") is True
 
 
+class TestTrivyIgnoreRegister:
+    """The .trivyignore accepted-risk register is auditable (issue #113)."""
+
+    @pytest.fixture
+    def trivyignore(self) -> str:
+        """Return the .trivyignore contents."""
+        path = PROJECT_ROOT / ".trivyignore"
+        assert path.is_file(), ".trivyignore must exist at the repo root"
+        return path.read_text(encoding="utf-8")
+
+    def test_register_exists_at_repo_root(self) -> None:
+        """The accepted-risk register exists at the repo root."""
+        assert (PROJECT_ROOT / ".trivyignore").is_file()
+
+    def test_every_cve_entry_is_time_boxed(self, trivyignore: str) -> None:
+        """Every CVE entry carries an '# exp:' comment within 2 lines above."""
+        lines = trivyignore.splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip().startswith("CVE-"):
+                continue
+            window = lines[max(0, index - 2) : index]
+            assert any(
+                entry.strip().startswith("# exp:") for entry in window
+            ), f"{line.strip()} is not time-boxed by an '# exp:' comment"
+
+    def test_all_expiry_dates_are_valid_and_future(self, trivyignore: str) -> None:
+        """Every '# exp:' date parses as YYYY-MM-DD and lies in the future."""
+        today = datetime.date.today()
+        expiries = re.findall(r"# exp: (\d{4}-\d{2}-\d{2})", trivyignore)
+        assert expiries, "the register must declare at least one expiry date"
+        for expiry in expiries:
+            parsed = datetime.date.fromisoformat(expiry)
+            assert parsed > today, f"expiry {expiry} has passed; re-triage required"
+
+
 class TestSecurityDocsLocalTopology:
     """docs/security.md must carry the local-topology STRIDE + nLPD model (AC4/AC5)."""
 
     @pytest.fixture(scope="class")
-    def security(self) -> str:
+    @classmethod
+    def security(cls) -> str:
         """Return the security policy contents."""
         return (PROJECT_ROOT / "docs" / "security.md").read_text(encoding="utf-8")
 

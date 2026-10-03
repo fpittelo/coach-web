@@ -447,6 +447,12 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 - **Docker**: `trivy` image scan runs in CI (`ci.yaml`, `image-scan` job) — fails on **HIGH/CRITICAL** OS/library CVEs (`--exit-code 1 --severity HIGH,CRITICAL`); LOW/MEDIUM are reported but non-failing.
 - **Secrets**: `gitleaks` scans the **full commit history** (`fetch-depth: 0`) in CI (`ci.yaml`, `secret-scan` job) — zero leaked credentials.
 
+### Accepted-Risk Register (`.trivyignore`)
+
+The trivy gate stays strict (`--exit-code 1`, no ignore-unfixed) for everything except the time-boxed entries in `.trivyignore` at the repo root. Each entry carries an `# exp: YYYY-MM-DD` comment and is re-triaged at that date; a test in `tests/integration/test_compose_topology.py` enforces that every CVE entry is time-boxed and that no expiry has passed.
+
+Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in the `python:3.12-slim` base image (util-linux, acl, ncurses, systemd, perl — no fixed version available upstream; re-triage 2027-01-03) and 1 pcre2 CVE whose fix (`10.46-1~deb13u3`) is not yet in the base image (re-triage 2026-11-03). Python dependencies are clean via `pip-audit --strict`. The openssl findings were cleared by a fresh base pull; the pcre2 acceptance expires pending a base refresh.
+
 ---
 
 ## nLPD Compliance Checklist (local-first, v0.8.0)
