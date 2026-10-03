@@ -15,6 +15,13 @@
  * sanitizer over marked-parsed markdown, re-sanitizing the accumulated raw
  * string on every render (#81).
  *
+ * Inline plan card (#82): the proposed plan renders as a single
+ * conversation card beneath the assistant message that proposed it —
+ * planMessageIndex pins the card to the proposing message, and a new
+ * proposal replaces the previous card (KIS: no stacked plan history). The
+ * approve/reject POST contract is unchanged: {plan: <PlanProposal>} to
+ * POST /api/plan/approve; reject dismisses the card and clears plan state.
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -87,6 +94,10 @@ function coachApp() {
     thoughts: [],
     tools: [],
     plan: null,
+    // Index of the assistant message that proposed the active plan (#82):
+    // pins the single inline card beneath the proposing message. -1 when no
+    // plan is active; a new proposal overwrites both slots (AC4: one card).
+    planMessageIndex: -1,
     approval: { state: "idle", message: "" },
     controller: null,
 
@@ -185,6 +196,7 @@ function coachApp() {
       this.thoughts = [];
       this.tools = [];
       this.plan = null;
+      this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
 
       // History replay (#79): the conversation is client-owned. Snapshot the
@@ -381,6 +393,10 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.plan = data.plan || data;
+          // Pin the card to the message that proposed it (#82) and follow
+          // the log if armed, so the card is visible when it appears.
+          this.planMessageIndex = index;
+          this.scrollToBottom();
         },
 
         plan: (event) => {
@@ -389,6 +405,10 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.plan = data.plan || data;
+          // Same pinning as plan_proposal (#82): one active card, beneath
+          // the message that proposed it.
+          this.planMessageIndex = index;
+          this.scrollToBottom();
         },
 
         error: (event) => {
@@ -489,6 +509,7 @@ function coachApp() {
       this.thoughts = [];
       this.tools = [];
       this.plan = null;
+      this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
       this.input = "";
       this.errorBanner = "";
@@ -534,7 +555,10 @@ function coachApp() {
     },
 
     rejectPlan() {
+      // Dismiss the card and clear plan state (#82 AC2): the pin goes with
+      // it so no stale index survives an approved/rejected proposal.
       this.plan = null;
+      this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
     },
 

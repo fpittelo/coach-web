@@ -64,6 +64,15 @@ hijacked), and scrolling back near the bottom re-arms following
 automatically (self-healing — the locked KIS cut drops a "jump to latest"
 pill). Token-time scrolls are instant (behavior "auto"), and a
 prefers-reduced-motion media query disables the looping animations.
+
+Issue #82 removes the v0.5 plan aside (`.panel.plan`): the proposed plan
+renders as a single inline conversation card beneath the assistant message
+that proposed it — planMessageIndex pins the card to the proposing message,
+and a new proposal replaces the previous card (KIS: no stacked plan
+history). The approve/reject contract is untouched (exact PlanProposal JSON
+to POST /api/plan/approve; reject dismisses the card and clears plan
+state), and the 4-column interval table scrolls inside an overflow wrapper
+with a ≤375px stacking fallback so nothing overflows mobile (AC3).
 """
 
 import re
@@ -73,6 +82,12 @@ from fastapi.testclient import TestClient
 from coach_web.app import STATIC_DIR, create_app
 
 VENDOR_DIR = STATIC_DIR / "vendor"
+
+# The inline plan card template (#82): pinned to the proposing assistant
+# message via planMessageIndex (AC4 — single active card).
+PLAN_CARD_TEMPLATE = (
+    "<template x-if=\"message.role === 'assistant' && plan" ' && planMessageIndex === index">'
+)
 
 # v0.7 palette (ADR-006) plus one functional addition: --error (red-700). The
 # v0.3 contract overloaded #ff0000 as both brand accent and error color; with
@@ -564,8 +579,9 @@ class TestIdentityBarContract:
         assert "this.messages = []" in reset
         assert "this.thoughts = []" in reset
         assert "this.tools = []" in reset
-        # Plan card and its approval state are cleared.
+        # Plan card and its approval state are cleared (the card pin too, #82).
         assert "this.plan = null" in reset
+        assert "this.planMessageIndex = -1" in reset
         assert 'this.approval = { state: "idle", message: "" }' in reset
         # Composer input is cleared.
         assert 'this.input = ""' in reset
@@ -809,16 +825,20 @@ class TestMarkdownRenderingContract:
         assert script.count("DOMPurify.sanitize") == 1
 
     def test_plan_card_is_not_markdown_rendered(self) -> None:
-        """AC5: the plan card stays structured Pydantic→HTML (x-text only)."""
-        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
-        plan_at = html.index('<aside class="panel plan"')
-        plan_block = html[plan_at : html.index("</aside>")]
+        """AC5: the plan card stays structured Pydantic→HTML (x-text only).
 
-        assert "x-html" not in plan_block
-        assert "renderMarkdown" not in plan_block
+        Rewritten for #82: the card is the inline conversation card beneath
+        the proposing assistant message (the v0.5 aside is removed).
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        card_at = html.index(PLAN_CARD_TEMPLATE)
+        card_block = html[card_at : html.index("</article>", card_at)]
+
+        assert "x-html" not in card_block
+        assert "renderMarkdown" not in card_block
         # The approve-flow contract is untouched.
-        assert "approvePlan()" in plan_block
-        assert "rejectPlan()" in plan_block
+        assert "approvePlan()" in card_block
+        assert "rejectPlan()" in card_block
 
 
 class TestStreamPhaseContract:
@@ -1159,3 +1179,126 @@ class TestAutoScrollContract:
         assert ".thinking-dots .dot" in media
         assert "animation: none" in media
         assert "scroll-behavior: auto" in media
+
+
+class TestInlinePlanCardContract:
+    """Inline plan-approval conversation card (#82, ADR-006 single column).
+
+    The v0.5 plan aside (``.panel.plan``) is removed: the proposed plan
+    renders as a single conversation card beneath the assistant message that
+    proposed it. KIS cut: one active card — a new proposal replaces the
+    previous one (no stacked plan history). The approve/reject POST contract
+    is untouched (exact ``PlanProposal`` JSON to ``POST /api/plan/approve``),
+    reject dismisses the card and clears plan state, and the 4-column
+    interval table scrolls inside an overflow wrapper with a ≤375px stacking
+    fallback so nothing overflows mobile.
+
+    No Node toolchain (ADR-006 §5): JS is contracted via source assertions,
+    the same way as the stream, phase and auto-scroll contracts above.
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- AC1: aside removed, card inline in the chat flow ----------------------
+
+    def test_plan_aside_is_removed(self) -> None:
+        """The v0.5 `.panel.plan` aside and its placeholder are gone (AC1)."""
+        html = self._html()
+
+        assert '<aside class="panel plan"' not in html
+        assert "Plan approval</h2>" not in html
+        assert "plan-placeholder" not in html
+
+    def test_plan_card_renders_beneath_the_proposing_message(self) -> None:
+        """AC1: the card is a child of the message loop, after the bubble."""
+        html = self._html()
+
+        assert PLAN_CARD_TEMPLATE in html, "inline plan card template missing"
+
+        log_at = html.index('<div class="chat-log"')
+        loop_at = html.index('<template x-for="(message, index) in messages"')
+        bubble_at = html.index('x-html="renderMarkdown(message.content)"')
+        card_at = html.index(PLAN_CARD_TEMPLATE)
+        composer_at = html.index('<form class="composer"')
+
+        # The card lives inside the chat log's message loop, beneath the
+        # assistant bubble it belongs to, and above the composer.
+        assert log_at < loop_at < bubble_at < card_at < composer_at
+
+    # --- AC4: single active card pinned to the proposing message ---------------
+
+    def test_card_is_pinned_to_the_proposing_message_index(self) -> None:
+        """AC4: planMessageIndex pins the card to the proposing message."""
+        html = self._html()
+        script = self._script()
+
+        assert "planMessageIndex === index" in html
+        assert "planMessageIndex: -1" in script
+
+        for event in ("plan_proposal", "plan"):
+            handler = _rule_block(script, f"{event}: (event) =>")
+            assert "this.planMessageIndex = index" in handler, event
+
+    def test_new_proposal_replaces_the_previous_card(self) -> None:
+        """AC4: one plan slot — a new stream clears and re-pins the card."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+
+        assert "this.plan = null" in start
+        assert "this.planMessageIndex = -1" in start
+        # The card clears before the fetch dispatches: the new turn starts
+        # with no card, and the next proposal re-pins a fresh one.
+        assert start.index("this.planMessageIndex = -1") < start.index('fetch("/api/agent/stream"')
+
+    # --- AC2: approve/reject end-to-end contract preserved ----------------------
+
+    def test_approve_post_contract_is_unchanged(self) -> None:
+        """AC2: approve posts the exact PlanProposal JSON wrapper (#82)."""
+        script = self._script()
+        html = self._html()
+
+        assert 'fetch("/api/plan/approve"' in script
+        assert "body: JSON.stringify({ plan: this.plan })" in script
+        assert '@click="approvePlan()"' in html
+        assert (
+            ":disabled=\"approval.state === 'submitting'"
+            " || approval.state === 'approved'\"" in html
+        )
+
+    def test_reject_dismisses_the_card_and_clears_state(self) -> None:
+        """AC2: reject clears the plan, its pin and the approval state."""
+        reject = _rule_block(self._script(), "rejectPlan()")
+
+        assert "this.plan = null" in reject
+        assert "this.planMessageIndex = -1" in reject
+        assert 'this.approval = { state: "idle", message: "" }' in reject
+
+    # --- AC3: interval table never overflows mobile ------------------------------
+
+    def test_interval_table_scrolls_inside_its_wrapper(self) -> None:
+        """AC3: the 4-column table scrolls in an overflow-x wrapper."""
+        html = self._html()
+        css = self._css()
+
+        wrap = _rule_block(css, ".plan-table-wrap")
+        assert "overflow-x: auto" in wrap
+
+        wrap_at = html.index('class="plan-table-wrap"')
+        table_at = html.index('<table class="interval-table"')
+        assert wrap_at < table_at, "interval table must live inside the scroll wrapper"
+
+    def test_plan_card_stacks_at_375px(self) -> None:
+        """AC3: at ≤375px the plan meta grid stacks to a single column."""
+        css = self._css()
+        media = _media_block(css, "@media (max-width: 375px)")
+
+        assert media, "≤375px media query missing"
+        assert ".plan-meta" in media
+        assert "grid-template-columns: 1fr" in media

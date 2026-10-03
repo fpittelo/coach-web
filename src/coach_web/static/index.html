@@ -84,6 +84,91 @@
                     x-html="renderMarkdown(message.content)"
                   ></div>
                 </template>
+                <!-- Inline plan-approval card (#82): renders beneath the
+                     assistant message that proposed it. planMessageIndex
+                     pins the single active card to the proposing message —
+                     a new proposal replaces the previous one (AC4).
+                     Structured Pydantic→HTML only: x-text bindings, never
+                     markdown (ADR-006 §9, STRIDE #87). -->
+                <template x-if="message.role === 'assistant' && plan && planMessageIndex === index">
+                  <div class="plan-card" role="region" aria-label="Proposed plan">
+                    <p class="plan-card-label">Proposed plan</p>
+                    <dl class="plan-meta">
+                      <div class="plan-field">
+                        <dt>Date</dt>
+                        <dd x-text="plan.date || '—'"></dd>
+                      </div>
+                      <div class="plan-field">
+                        <dt>Duration</dt>
+                        <dd x-text="planDuration + ' min'"></dd>
+                      </div>
+                    </dl>
+                    <h3 class="plan-title" x-text="plan.title"></h3>
+                    <p class="plan-summary" x-text="plan.summary"></p>
+                    <p
+                      class="plan-rationale"
+                      x-show="plan.rationale"
+                      x-text="plan.rationale"
+                    ></p>
+                    <!-- AC3: the 4-column table scrolls inside this wrapper
+                         on narrow viewports instead of overflowing the page. -->
+                    <div class="plan-table-wrap" x-show="plan.steps && plan.steps.length > 0">
+                      <table class="interval-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Interval</th>
+                            <th scope="col">Duration</th>
+                            <th scope="col">Target</th>
+                            <th scope="col">Cadence</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="(step, index) in plan.steps" :key="index">
+                            <tr>
+                              <td x-text="step.label"></td>
+                              <td x-text="step.duration_minutes + ' min'"></td>
+                              <td
+                                x-text="
+                                  step.target_power_watts
+                                    ? step.target_power_watts + ' W'
+                                    : step.target_power_pct
+                                      ? step.target_power_pct + ' %'
+                                      : '—'
+                                "
+                              ></td>
+                              <td
+                                x-text="step.cadence_rpm ? step.cadence_rpm + ' rpm' : '—'"
+                              ></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="plan-actions">
+                      <button
+                        class="button"
+                        type="button"
+                        @click="approvePlan()"
+                        :disabled="approval.state === 'submitting' || approval.state === 'approved'"
+                      >
+                        Approve &amp; Push
+                      </button>
+                      <button
+                        class="button button--ghost"
+                        type="button"
+                        @click="rejectPlan()"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                    <p
+                      class="approval-note"
+                      :class="{ 'approval-note--error': approval.state === 'error' }"
+                      x-show="approval.message"
+                      x-text="approval.message"
+                    ></p>
+                  </div>
+                </template>
               </article>
             </template>
           </div>
@@ -151,83 +236,6 @@
             </button>
           </form>
         </section>
-
-        <aside class="panel plan" aria-label="Plan approval">
-          <h2 class="panel-title">Plan approval</h2>
-
-          <p class="plan-placeholder" x-show="!plan">
-            Proposed workouts appear here for review before anything is scheduled.
-          </p>
-
-          <template x-if="plan">
-            <div>
-              <dl class="plan-meta">
-                <div class="plan-field">
-                  <dt>Date</dt>
-                  <dd x-text="plan.date || '—'"></dd>
-                </div>
-                <div class="plan-field">
-                  <dt>Duration</dt>
-                  <dd x-text="planDuration + ' min'"></dd>
-                </div>
-              </dl>
-
-              <h3 class="plan-title" x-text="plan.title"></h3>
-              <p class="plan-summary" x-text="plan.summary"></p>
-              <p class="plan-rationale" x-show="plan.rationale" x-text="plan.rationale"></p>
-
-              <table class="interval-table" x-show="plan.steps && plan.steps.length > 0">
-                <thead>
-                  <tr>
-                    <th scope="col">Interval</th>
-                    <th scope="col">Duration</th>
-                    <th scope="col">Target</th>
-                    <th scope="col">Cadence</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <template x-for="(step, index) in plan.steps" :key="index">
-                    <tr>
-                      <td x-text="step.label"></td>
-                      <td x-text="step.duration_minutes + ' min'"></td>
-                      <td
-                        x-text="
-                          step.target_power_watts
-                            ? step.target_power_watts + ' W'
-                            : step.target_power_pct
-                              ? step.target_power_pct + ' %'
-                              : '—'
-                        "
-                      ></td>
-                      <td x-text="step.cadence_rpm ? step.cadence_rpm + ' rpm' : '—'"></td>
-                    </tr>
-                  </template>
-                </tbody>
-              </table>
-
-              <div class="plan-actions">
-                <button
-                  class="button"
-                  type="button"
-                  @click="approvePlan()"
-                  :disabled="approval.state === 'submitting' || approval.state === 'approved'"
-                >
-                  Approve &amp; Push
-                </button>
-                <button class="button button--ghost" type="button" @click="rejectPlan()">
-                  Reject
-                </button>
-              </div>
-
-              <p
-                class="approval-note"
-                :class="{ 'approval-note--error': approval.state === 'error' }"
-                x-show="approval.message"
-                x-text="approval.message"
-              ></p>
-            </div>
-          </template>
-        </aside>
       </main>
 
       <footer class="footer">
