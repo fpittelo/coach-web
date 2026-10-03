@@ -60,7 +60,7 @@ class TestAuthSettingsDefaults:
 
 
 class TestAuthSettingsOverrides:
-    """Environment overrides (Cloud Run injects the same names, #66)."""
+    """Environment overrides (lane env files use the same names, #66)."""
 
     def test_env_overrides(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """All auth settings are configurable via environment variables."""
