@@ -43,6 +43,7 @@
 - **Distinct `AUTH_SESSION_SECRET` per lane** — a dev/qa session token must not replay in prod.
 - `AUTH_ENABLED` is pinned by the lane compose file (`false` on dev/qa, `true` on prod) and is not read from the env file.
 - The prod lane additionally requires `COACH_WEB_IMAGE` (digest-pinned release image) and, because auth is enabled and fail-closed, the Google OIDC credentials.
+- **`github-mcp` is digest-pinned on the prod lane** (`ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a…cac6`, AC7 / #113); dev/qa stay tag-pinned. Refresh the digest with `docker buildx imagetools inspect ghcr.io/github/github-mcp-server:v1.12.2`.
 - Prod lane OIDC: register redirect URI `http://localhost:8000/auth/callback` (and the `127.0.0.1` variant, or set `AUTH_REDIRECT_URI` explicitly — the app derives different redirect URIs for the two hostnames).
 
 ---
@@ -80,7 +81,7 @@ docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env
 ./scripts/e2e-preflight.sh dev   # or qa / prod
 ```
 
-The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have no published ports, all healthchecks healthy, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
+The pre-flight asserts: the **exact service set** (`coach-web`, `coach-mcp`, `github-mcp`) is present and healthy — it uses `docker compose ps -a`, so a crashed/exited sidecar fails the gate instead of being silently absent — coach-web is published on `127.0.0.1` only, sidecars have no published ports, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
 
 > **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
@@ -101,6 +102,27 @@ The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have n
    ./scripts/e2e-preflight.sh prod
    ```
 3. **Rollback:** set the previous digest in `.env.prod` and `docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d` — no cloud console involved.
+
+---
+
+## 🚦 Release Gate (v0.8.0)
+
+The v0.8.0 release is gated on **all** of the following. No `dev → qa → main` promotion may proceed until every item is green:
+
+| # | Gate | Owner | Evidence |
+|:---|:---|:---|:---|
+| 1 | **All CI checks green** — `test`, `compose-validation`, `secret-scan` (gitleaks full history), `dependency-scan` (`pip-audit --strict`), **`image-scan` (trivy HIGH/CRITICAL)** | @developer / @devops | GitHub Actions run on the promotion PR |
+| 2 | **Pre-flight green on all three lanes** — `./scripts/e2e-preflight.sh dev`, `qa`, `prod` | @fpittelo | Local terminal output |
+| 3 | **Manual E2E checklist signed off** — OIDC login → agent chat → tool calls → plan approval on the prod lane | @fpittelo | [`docs/e2e-checklist.md`](e2e-checklist.md), signed in the PR |
+| 4 | **Security audit report** — STRIDE + nLPD review recorded in the #113 closing comment | @cyber-security | Issue #113 closing comment |
+
+> The trivy gate is **not** weakened to pass: a HIGH/CRITICAL finding is a real release blocker. If the base image carries an unfixed HIGH/CRITICAL, it is reported and triaged, not suppressed.
+
+---
+
+## 🧪 Manual E2E Verification (prod lane)
+
+The automatable parts of the prod happy path (401 without a session, healthchecks, loopback publishing, service-set presence) are covered by `tests/` and `scripts/e2e-preflight.sh`. The credential-dependent happy path — **OIDC login → agent chat → tool calls → plan approval** — requires real Google, OpenRouter and Intervals.icu credentials and is verified manually by @fpittelo using the step-by-step checklist in [`docs/e2e-checklist.md`](e2e-checklist.md).
 
 ---
 
@@ -129,6 +151,7 @@ The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have n
 | Types | `mypy --strict src/coach_web` | Zero type errors |
 | Test | `pytest -W error --cov` | Zero failures, zero warnings |
 | Security | `gitleaks` + `pip-audit --strict` | Zero secrets, zero known CVEs |
+| Image scan | `trivy` (`image-scan` job) | Zero HIGH/CRITICAL OS/library CVEs (LOW/MEDIUM reported, non-failing) |
 | Compose | `docker compose config --quiet` per lane | All three lane combinations validate (base + dev/qa/prod) |
 | OpenTofu | `tofu fmt/validate` on `infra/` | **Removed with #110** (retired with the GCP IaC) |
 
@@ -136,7 +159,7 @@ The pre-flight asserts: coach-web published on `127.0.0.1` only, sidecars have n
 
 - **Trigger:** push to `dev`, PR closed into `qa`, `v*` tags, `workflow_dispatch`
 - **Registry:** `ghcr.io/fpittelo/coach-web` — lane tags `dev`, `qa`, `prod`, `latest`, `<sha>`, `vX.Y.Z`
-- **Sidecar verification:** the digest-resolution step proves `ghcr.io/fpittelo/coach:<lane>` and the pinned `github-mcp-server` tag resolve before a lane image is declared good
+- **Sidecar verification:** the digest-resolution step proves `ghcr.io/fpittelo/coach:<lane>` and the digest-pinned `github-mcp-server` release resolve before a lane image is declared good
 - **GCP deploy stage:** removed by #110 (ADR-007); the @fpittelo promotion approval lives in the promotion PRs
 
 ---
@@ -186,12 +209,14 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 | Problem | Cause | Fix |
 |:---|:---|:---|
 | **qa/prod lane pull fails** | Lane image not yet published (first promotion pending) or no GHCR auth | Check the promotion ran; `docker login ghcr.io` with a `read:packages` PAT |
-| **Blank dashboard / agent errors** | coach-mcp sidecar unhealthy | `docker compose -p coach-web-<lane> ps` — check healthchecks; verify `INTERVALS_API_KEY` |
+| **Blank dashboard / agent errors** | coach-mcp sidecar unhealthy | `docker compose -p coach-web-<lane> ps -a` — check healthchecks; verify `INTERVALS_API_KEY` |
+| **Pre-flight fails on service set** | A sidecar crashed or never started | `docker compose -p coach-web-<lane> ps -a` and `logs`; the gate uses `ps -a` so exited containers are visible |
 | **Plans empty** | GitHub token missing or wrong scope | Verify `GITHUB_TOKEN` reaches the sidecars with the lane's env file |
 | **Prod lane 401 loop on login** | OIDC redirect URI mismatch | Register both `localhost` and `127.0.0.1` redirect URIs, or set `AUTH_REDIRECT_URI` |
 | **Port already in use** | A single-stack from before #109 is still running | Tear down the legacy project once: `docker compose -p coach-web down` (then remove the stale root `.env`) |
 | **CI fails on mypy** | Missing type annotations | Run `mypy --strict src/coach_web` locally and fix all errors |
+| **CI `image-scan` fails** | HIGH/CRITICAL CVE in the image | Triage the trivy table; bump the base image/dependency. Do **not** lower the severity threshold |
 
 ---
 
-_Last updated: 2026-10-03 (ADR-007 local-first refresh — issue #108)_
+_Last updated: 2026-10-03 (issue #113 — release gate, trivy image scan, preflight service-set assertion, manual E2E checklist)_

@@ -113,3 +113,36 @@ jobs:
 
       - name: Audit dependencies for known vulnerabilities
         run: pip-audit --strict .
+
+  image-scan:
+    name: Container Image Vulnerability Scanning (trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build OCI Docker Image (for scanning)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: false
+          load: true
+          tags: coach-web:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Release gate (AC3, #113): fail on HIGH/CRITICAL OS/library CVEs.
+      # LOW/MEDIUM are reported in the table but do not fail the job.
+      # No ignore-unfixed: an unfixed HIGH/CRITICAL is still a real finding.
+      - name: Scan image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: coach-web:scan
+          format: table
+          vuln-type: os,library
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"

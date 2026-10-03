@@ -6,6 +6,8 @@ requiring a running Docker daemon, so they remain fast and deterministic in
 CI as well as local development.
 """
 
+import datetime
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -29,6 +31,10 @@ LANE_CORS_ORIGINS = {
     "prod": "http://localhost:8000",
 }
 GITHUB_MCP_PIN = "ghcr.io/github/github-mcp-server:v1.12.2"
+GITHUB_MCP_DIGEST = "sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6"
+GITHUB_MCP_DIGEST_PIN = f"{GITHUB_MCP_PIN}@{GITHUB_MCP_DIGEST}"
+GITHUB_MCP_TAG_DEFAULT = f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_PIN}}}"
+GITHUB_MCP_DIGEST_DEFAULT = f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_DIGEST_PIN}}}"
 SERVICES = ("coach-web", "coach-mcp", "github-mcp")
 
 
@@ -254,13 +260,32 @@ class TestLaneOverrides:
         image = effective_compose[lane]["services"]["coach-mcp"]["image"]
         assert image == f"${{COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:{lane}}}"
 
-    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    @pytest.mark.parametrize(
+        ("lane", "expected"),
+        [
+            ("dev", GITHUB_MCP_TAG_DEFAULT),
+            ("qa", GITHUB_MCP_TAG_DEFAULT),
+            ("prod", GITHUB_MCP_DIGEST_DEFAULT),
+        ],
+    )
     def test_github_mcp_pinned_version(
-        self, effective_compose: dict[str, dict[str, Any]], lane: str
+        self, effective_compose: dict[str, dict[str, Any]], lane: str, expected: str
     ) -> None:
-        """github-mcp defaults to the pinned v1.12.2 tag in every lane (AC3)."""
+        """github-mcp is tag-pinned on dev/qa and digest-pinned on prod (AC7)."""
         image = effective_compose[lane]["services"]["github-mcp"]["image"]
-        assert image == f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_PIN}}}"
+        assert image == expected
+
+    def test_prod_github_mcp_digest_pinned(
+        self, effective_compose: dict[str, dict[str, Any]]
+    ) -> None:
+        """The prod lane pins github-mcp by tag AND digest (AC7, #113)."""
+        image = effective_compose["prod"]["services"]["github-mcp"]["image"]
+        assert GITHUB_MCP_DIGEST in image
+        assert image.endswith(GITHUB_MCP_DIGEST + "}")
+
+    def test_github_mcp_digest_is_valid_sha256(self) -> None:
+        """The pinned digest is a well-formed sha256 reference (AC7)."""
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", GITHUB_MCP_DIGEST)
 
     @pytest.mark.parametrize(
         ("lane", "auth_enabled"),
@@ -304,16 +329,25 @@ class TestLaneEnvTemplates:
         assert f"COACH_MCP_IMAGE=ghcr.io/fpittelo/coach:{lane}" in text
 
     def test_templates_pin_github_mcp_version(self) -> None:
-        """Every template pins github-mcp to v1.12.2, never :latest (AC3)."""
-        for lane in ("dev", "qa", "prod"):
+        """dev/qa templates tag-pin github-mcp; prod digest-pins it (AC7)."""
+        for lane in ("dev", "qa"):
             text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
             assert f"GITHUB_MCP_IMAGE={GITHUB_MCP_PIN}" in text
+        prod_text = (PROJECT_ROOT / ".env.prod.example").read_text(encoding="utf-8")
+        assert f"GITHUB_MCP_IMAGE={GITHUB_MCP_DIGEST_PIN}" in prod_text
+        for lane in ("dev", "qa", "prod"):
+            text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
             active = [
                 line
                 for line in text.splitlines()
                 if line.strip() and not line.strip().startswith("#")
             ]
             assert ":latest" not in "\n".join(active)
+
+    def test_prod_env_template_pins_github_mcp_digest(self) -> None:
+        """The prod template digest-pins the github-mcp sidecar (AC7, #113)."""
+        text = (PROJECT_ROOT / ".env.prod.example").read_text(encoding="utf-8")
+        assert f"GITHUB_MCP_IMAGE={GITHUB_MCP_DIGEST_PIN}" in text
 
     def test_prod_env_template_pins_digest(self) -> None:
         """The prod template carries the digest-pinned COACH_WEB_IMAGE (AC1)."""
@@ -390,7 +424,7 @@ class TestLaneEnvTemplates:
 
 
 class TestE2EPreflightScript:
-    """Declarative checks for the lane-aware E2E pre-flight script (AC5)."""
+    """Declarative checks for the lane-aware E2E pre-flight script (AC5/AC6)."""
 
     @pytest.fixture
     def script(self) -> str:
@@ -444,6 +478,14 @@ class TestE2EPreflightScript:
         assert "manifest inspect" in script
         assert "not yet published to GHCR" in script
 
+    def test_script_asserts_expected_service_set(self, script: str) -> None:
+        """The health gate asserts all three services are present (folded #116 finding)."""
+        assert "ps -a" in script
+        assert "EXPECTED_SERVICES" in script
+        assert "service set mismatch" in script
+        for service in SERVICES:
+            assert service in script
+
     def test_script_asserts_loopback_only_publishing(self, script: str) -> None:
         """The script asserts coach-web binds 127.0.0.1 and sidecars publish nothing."""
         assert "127.0.0.1" in script
@@ -463,6 +505,140 @@ class TestE2EPreflightScript:
         """The prod lane probe asserts /api/* returns 401 without a session."""
         assert "401" in script
         assert "/api/agent/stream" in script
+
+
+class TestCIContainerScan:
+    """CI must scan the built image with trivy (AC3, #113)."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def ci(cls) -> dict[str, Any]:
+        """Load the parsed CI workflow."""
+        return load_yaml(".github/workflows/ci.yaml")
+
+    def test_trivy_image_scan_job_present(self, ci: dict[str, Any]) -> None:
+        """A dedicated image-scan job exists."""
+        assert "image-scan" in ci.get("jobs", {})
+
+    def test_trivy_action_pinned(self, ci: dict[str, Any]) -> None:
+        """The trivy action is pinned to a specific version tag."""
+        steps = ci["jobs"]["image-scan"]["steps"]
+        trivy = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@")
+        ]
+        assert len(trivy) == 1
+        assert trivy[0]["uses"] == "aquasecurity/trivy-action@v0.36.0"
+
+    def test_trivy_fails_on_high_critical(self, ci: dict[str, Any]) -> None:
+        """The scan fails on HIGH/CRITICAL and reports lower severities."""
+        steps = ci["jobs"]["image-scan"]["steps"]
+        trivy = next(
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@")
+        )
+        with_ = trivy.get("with", {})
+        assert with_.get("severity") == "HIGH,CRITICAL"
+        assert str(with_.get("exit-code")) == "1"
+
+    def test_image_scan_builds_and_loads_image(self, ci: dict[str, Any]) -> None:
+        """The job builds the image and loads it into the local daemon for scanning."""
+        steps = ci["jobs"]["image-scan"]["steps"]
+        builds = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("docker/build-push-action@")
+        ]
+        assert len(builds) == 1
+        assert builds[0]["with"].get("load") is True
+
+
+class TestTrivyIgnoreRegister:
+    """The .trivyignore accepted-risk register is auditable (issue #113)."""
+
+    @pytest.fixture
+    def trivyignore(self) -> str:
+        """Return the .trivyignore contents."""
+        path = PROJECT_ROOT / ".trivyignore"
+        assert path.is_file(), ".trivyignore must exist at the repo root"
+        return path.read_text(encoding="utf-8")
+
+    def test_register_exists_at_repo_root(self) -> None:
+        """The accepted-risk register exists at the repo root."""
+        assert (PROJECT_ROOT / ".trivyignore").is_file()
+
+    def test_every_cve_entry_is_time_boxed(self, trivyignore: str) -> None:
+        """Every CVE entry carries an '# exp:' comment within 2 lines above."""
+        lines = trivyignore.splitlines()
+        for index, line in enumerate(lines):
+            if not line.strip().startswith("CVE-"):
+                continue
+            window = lines[max(0, index - 2) : index]
+            assert any(
+                entry.strip().startswith("# exp:") for entry in window
+            ), f"{line.strip()} is not time-boxed by an '# exp:' comment"
+
+    def test_all_expiry_dates_are_valid_and_future(self, trivyignore: str) -> None:
+        """Every '# exp:' date parses as YYYY-MM-DD and lies in the future."""
+        today = datetime.date.today()
+        expiries = re.findall(r"# exp: (\d{4}-\d{2}-\d{2})", trivyignore)
+        assert expiries, "the register must declare at least one expiry date"
+        for expiry in expiries:
+            parsed = datetime.date.fromisoformat(expiry)
+            assert parsed > today, f"expiry {expiry} has passed; re-triage required"
+
+
+class TestSecurityDocsLocalTopology:
+    """docs/security.md must carry the local-topology STRIDE + nLPD model (AC4/AC5)."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def security(cls) -> str:
+        """Return the security policy contents."""
+        return (PROJECT_ROOT / "docs" / "security.md").read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("boundary", ["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8"])
+    def test_local_stride_boundaries_present(self, security: str, boundary: str) -> None:
+        """Every local trust boundary B1-B8 is documented (AC4)."""
+        assert f"Boundary {boundary}" in security
+
+    def test_cloud_model_retained_as_historical_appendix(self, security: str) -> None:
+        """The retired cloud model is preserved, not silently deleted (AC4)."""
+        assert "Historical Appendix" in security
+        assert "Cloud Run" in security
+
+    def test_local_nlpd_rows_present(self, security: str) -> None:
+        """The local-first nLPD checklist covers the required controls (AC5)."""
+        for marker in ("LUKS", "chmod 600", "OpenRouter", "loopback"):
+            assert marker in security
+
+    def test_trivy_documented(self, security: str) -> None:
+        """The dependency-scanning section documents the trivy image gate (AC3)."""
+        assert "trivy" in security
+        assert "HIGH/CRITICAL" in security
+
+
+class TestReleaseGateDocs:
+    """The v0.8.0 release gate and manual E2E checklist are documented (AC8/AC9)."""
+
+    def test_admin_guide_defines_release_gate(self) -> None:
+        """The admin guide defines the release gate and links the E2E checklist."""
+        text = (PROJECT_ROOT / "docs" / "admin_guide.md").read_text(encoding="utf-8")
+        assert "Release Gate" in text
+        assert "trivy" in text.lower()
+        assert "e2e-checklist" in text
+
+    def test_e2e_checklist_exists(self) -> None:
+        """The manual prod-lane E2E checklist exists."""
+        assert (PROJECT_ROOT / "docs" / "e2e-checklist.md").is_file()
+
+    def test_e2e_checklist_covers_happy_path(self) -> None:
+        """The checklist covers OIDC login, agent chat, tool calls and plan approval."""
+        text = (PROJECT_ROOT / "docs" / "e2e-checklist.md").read_text(encoding="utf-8")
+        for step in ("OIDC login", "Agent chat", "Tool calls", "Plan approval"):
+            assert step in text
 
 
 class TestDockerfileHardening:

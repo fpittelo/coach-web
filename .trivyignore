@@ -1,0 +1,25 @@
+# coach-web — trivy accepted-risk register (issue #113, ADR-007 local-first)
+# Time-boxed acceptances: each entry re-triages at its expiry; the gate
+# stays strict (exit-code 1, no ignore-unfixed) for everything else.
+# Unfixed debian 13.7 (trixie) CVEs in the python:3.12-slim base image —
+# no fixed version available upstream. Re-triage 2027-01-03.
+# exp: 2027-01-03
+CVE-2026-76642
+# exp: 2027-01-03
+CVE-2026-78408
+# exp: 2027-01-03
+CVE-2026-78409
+# exp: 2027-01-03
+CVE-2026-78410
+# exp: 2027-01-03
+CVE-2026-54369
+# exp: 2027-01-03
+CVE-2025-69720
+# exp: 2027-01-03
+CVE-2026-16742
+# exp: 2027-01-03
+CVE-2026-9538
+# pcre2 — fix available (10.46-1~deb13u3) but not yet in the python:3.12-slim
+# base image; short expiry pending a base refresh. Re-triage 2026-11-03.
+# exp: 2026-11-03
+CVE-2026-103111

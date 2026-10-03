@@ -121,13 +121,13 @@ jobs:
       # Sidecar lane verification (issue #110): before a lane image is
       # declared good, prove the companion images it runs with actually
       # resolve in GHCR — the coach repo publishes matching dev/qa/prod
-      # lane tags, and github-mcp is the pinned upstream release tag.
-      # Verification only: no outputs are exported.
+      # lane tags, and github-mcp is the pinned upstream release (digest-pinned
+      # on the prod lane, AC7 / #113). Verification only: no outputs exported.
       # ---------------------------------------------------------------------
       - name: Verify sidecar lane images resolve
         env:
           COACH_MCP_REF: ghcr.io/fpittelo/coach:${{ steps.env.outputs.deploy_env }}
-          GITHUB_MCP_REF: ghcr.io/github/github-mcp-server:v1.12.2
+          GITHUB_MCP_REF: ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6
         run: |
           set -euo pipefail
 
