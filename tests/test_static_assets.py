@@ -38,6 +38,23 @@ Pydantic→HTML. The STRIDE conditions are pinned at source level: C1
 fragments), C4 (x-html only on the assistant branch via the helper), and
 C6/C7 as regression guards (models.py/app.py untouched — the role Literal,
 history caps and approval gate are guarded by the existing API tests).
+
+Issue #84 adds the explicit stream-phase contract: a plain-string `phase`
+property (idle | waiting | streaming | tooling | error — KIS, no
+state-machine framework) driving the status surfaces. Three genuine v0.5
+defects are fixed and pinned here: (1) the typed `error` handler and the
+transport-error path are separate code paths, and the typed handler must
+NOT finish the stream — agent.py emits a typed `error` FOLLOWED BY `done`
+on the OpenRouterError path, so finishing on the typed event would flip
+the compound guards and truncate the follow-up done; (2) the transport
+catch leaves a visible, non-blocking error banner (the pre-#84 path only
+wrote statusText, which finishStream immediately cleared — a mid-stream
+transport death was silent once tokens existed); (3) a 90 s no-event
+watchdog (backstop above the server's 60 s OpenRouter completion timeout
+and 30 s MCP tool-call timeout) is armed on stream start, reset on every
+received typed event, cleared on stream end, and its timeout transitions
+to a visible error state. Ping comment frames deliberately do NOT reset
+the watchdog: a wedged agent behind a live transport must still trip it.
 """
 
 import re
@@ -775,3 +792,252 @@ class TestMarkdownRenderingContract:
         # The approve-flow contract is untouched.
         assert "approvePlan()" in plan_block
         assert "rejectPlan()" in plan_block
+
+
+class TestStreamPhaseContract:
+    """Explicit stream phases, error separation & timeout watchdog (#84).
+
+    Three genuine v0.5 defects are fixed here and pinned at source level
+    (no Node toolchain, ADR-006 §5 — JS is contracted via source assertions):
+
+    1. Handler collision (AC2): the typed ``error`` handler and the
+       transport-error path are separate code paths. The typed handler must
+       NOT finish the stream — agent.py emits a typed ``error`` FOLLOWED BY
+       ``done`` on its OpenRouterError path, so finishing on the typed event
+       would flip the compound guards and truncate the follow-up ``done``.
+    2. Silent transport failures (AC5): the transport catch path leaves a
+       visible, non-blocking error banner — the pre-#84 path only wrote
+       statusText, which finishStream() immediately cleared, so a mid-stream
+       transport death was invisible once tokens existed.
+    3. No timeout (AC3): a 90 s no-event watchdog (backstop above the
+       server's 60 s OpenRouter completion timeout and the 30 s MCP
+       tool-call timeout) is armed on stream start, reset on every received
+       typed event, cleared on stream end, and its timeout transitions to a
+       visible error state with a non-blocking banner. Ping comment frames
+       deliberately do NOT reset it: a wedged agent behind a live transport
+       must still trip the watchdog.
+
+    The phase is a plain string property — idle | waiting | streaming |
+    tooling | error (KIS: no state-machine framework) — and the #80 compound
+    stale-event guards in all ten handlers carry over verbatim.
+    """
+
+    PHASES = ("idle", "waiting", "streaming", "tooling", "error")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- AC1: explicit phase property ----------------------------------------
+
+    def test_component_declares_the_explicit_phase_property(self) -> None:
+        """The component state carries a plain-string phase starting at idle."""
+        script = self._script()
+
+        assert 'phase: "idle"' in script
+        for phase in self.PHASES:
+            assert f'this.phase = "{phase}"' in script, phase
+
+    def test_start_stream_enters_waiting_before_the_fetch(self) -> None:
+        """AC4: the phase flips to waiting synchronously, before any event."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert 'this.phase = "waiting"' in start
+        waiting_at = start.index('this.phase = "waiting"')
+        fetch_at = start.index('fetch("/api/agent/stream"')
+        assert waiting_at < fetch_at
+
+    def test_first_token_transitions_to_streaming(self) -> None:
+        """The first token moves the phase from waiting to streaming."""
+        token = _rule_block(self._script(), "token: (event) =>")
+
+        assert 'this.phase = "streaming"' in token
+
+    def test_thinking_status_returns_to_the_waiting_phase(self) -> None:
+        """A thinking status (new agent iteration) returns to the waiting dots."""
+        status = _rule_block(self._script(), "status: (event) =>")
+
+        assert 'this.phase = "waiting"' in status
+
+    def test_tool_events_display_the_tooling_substate(self) -> None:
+        """AC1: tool_call, tool_start and tool_result all show tooling."""
+        script = self._script()
+
+        for event in ("tool_call", "tool_start", "tool_result"):
+            handler = _rule_block(script, f"{event}: (event) =>")
+            assert 'this.phase = "tooling"' in handler, event
+
+    def test_finish_stream_idles_the_phase(self) -> None:
+        """Stream end returns the phase to idle (the banner persists)."""
+        finish = _rule_block(self._script(), "finishStream()")
+
+        assert 'this.phase = "idle"' in finish
+
+    def test_reset_chat_returns_to_idle(self) -> None:
+        """New chat returns the phase to idle."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert 'this.phase = "idle"' in reset
+
+    # --- AC2: typed vs transport error separation -----------------------------
+
+    def test_typed_error_does_not_finish_the_stream(self) -> None:
+        """A typed error must not truncate the follow-up done (agent.py:274-280).
+
+        The typed handler surfaces the error and keeps the stream alive so
+        the subsequent done event still runs its compound guard and finishes
+        the stream normally.
+        """
+        error = _rule_block(self._script(), "error: (event) =>")
+
+        # The exact call syntax: the typed path must never end the stream.
+        assert "this.finishStream()" not in error
+        assert 'this.phase = "error"' in error
+        assert "this.errorBanner" in error
+
+    def test_done_handler_still_finishes_after_a_typed_error(self) -> None:
+        """The done handler keeps its finishStream call (error→done intact)."""
+        done = _rule_block(self._script(), "done: (event) =>")
+
+        assert "this.finishStream()" in done
+
+    def test_transport_errors_are_a_separate_path_with_visible_state(self) -> None:
+        """AC5: the transport catch surfaces a banner; it is not the typed path.
+
+        The transport path lives in startStream's catch (fetch rejection /
+        body-read failure), distinct from the typed handler in
+        streamHandlers — and it finishes the stream, unlike the typed
+        handler, because no done event will follow a dead transport.
+        """
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "AbortError" in start
+        assert "Connection failed" in start
+        assert 'this.phase = "error"' in start
+        assert "this.errorBanner" in start
+        assert "this.finishStream()" in start
+
+    # --- AC3: 90 s no-event watchdog -------------------------------------------
+
+    def test_watchdog_constant_is_90_seconds(self) -> None:
+        """The watchdog backstop sits above the server's 60 s OpenRouter timeout."""
+        script = self._script()
+
+        assert "WATCHDOG_TIMEOUT_MS = 90000" in script
+
+    def test_watchdog_is_armed_when_the_stream_starts(self) -> None:
+        """The watchdog is armed before the fetch dispatches (AC3)."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.armWatchdog(epoch, index)" in start
+        arm_at = start.index("this.armWatchdog(epoch, index)")
+        fetch_at = start.index('fetch("/api/agent/stream"')
+        assert arm_at < fetch_at
+
+    def test_watchdog_resets_on_every_received_typed_event(self) -> None:
+        """Every typed event restarts the watchdog; ping comments do not."""
+        dispatch = _rule_block(self._script(), "dispatchSseFrame(frame, handlers)")
+
+        assert "this.resetWatchdog()" in dispatch
+        # The reset is gated on a non-empty event type — ping comment frames
+        # carry no event line and must not mask a wedged agent.
+        gate_at = dispatch.index("if (type)")
+        reset_at = dispatch.index("this.resetWatchdog()")
+        assert gate_at < reset_at
+        # And the reset happens before the handler dispatch.
+        invoke_at = dispatch.index("handlers[type](")
+        assert reset_at < invoke_at
+
+    def test_watchdog_clears_when_the_stream_ends(self) -> None:
+        """finishStream clears the watchdog (no timer survives the stream)."""
+        finish = _rule_block(self._script(), "finishStream()")
+
+        assert "this.clearWatchdog()" in finish
+
+    def test_watchdog_timeout_surfaces_a_visible_non_blocking_error(self) -> None:
+        """The timeout transitions to error with a banner and releases the composer."""
+        handler = _rule_block(self._script(), "handleWatchdogTimeout()")
+
+        assert 'this.phase = "error"' in handler
+        assert "this.errorBanner" in handler
+        assert "this.finishStream()" in handler
+        # Stale-timer guard: a fired timer from an ended or superseded stream
+        # must not corrupt the current one (same idiom as the SSE handlers).
+        assert "this.streaming" in handler
+        assert "this.watchdogEpoch !== this.streamEpoch" in handler
+
+    # --- AC4: immediate thinking indicator --------------------------------------
+
+    def test_thinking_indicator_shows_pulsing_dots_on_waiting(self) -> None:
+        """AC4: a pulsing-dots indicator is bound to the waiting phase."""
+        html = self._html()
+
+        assert 'class="thinking-indicator"' in html
+        assert "x-show=\"phase === 'waiting'\"" in html
+        assert html.count('class="dot"') == 3
+
+    def test_status_line_covers_streaming_tooling_and_error(self) -> None:
+        """AC1: the status line is visible in streaming, tooling and error."""
+        html = self._html()
+
+        assert "phase === 'streaming'" in html
+        assert "phase === 'tooling'" in html
+        assert "phase === 'error'" in html
+
+    # --- AC3/AC5: non-blocking error banner ---------------------------------------
+
+    def test_error_banner_is_present_and_non_blocking(self) -> None:
+        """The banner is a separate element; the composer is never phase-gated."""
+        html = self._html()
+
+        assert 'class="error-banner"' in html
+        assert 'x-show="errorBanner"' in html
+        assert 'x-text="errorBanner"' in html
+
+        banner_at = html.index('class="error-banner"')
+        composer_at = html.index('<form class="composer"')
+        assert banner_at < composer_at
+
+        composer = html[composer_at : html.index("</form>", composer_at)]
+        # Errors never block the composer: the only disable condition is the
+        # in-flight flag (plus the empty-input guard on the button).
+        assert ':disabled="streaming"' in composer
+        assert "phase" not in composer
+
+    def test_error_banner_clears_on_the_next_send_and_reset(self) -> None:
+        """A stale banner never survives into a new stream or a reset."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+        reset = _rule_block(script, "resetChat()")
+
+        assert 'this.errorBanner = ""' in start
+        assert 'this.errorBanner = ""' in reset
+
+    # --- AC1: phase styling ---------------------------------------------------------
+
+    def test_phase_styles_are_tokenized(self) -> None:
+        """Thinking dots, error status and banner styles use tokens only."""
+        css = self._css()
+
+        thinking = _rule_block(css, ".thinking-indicator")
+        assert "display: flex" in thinking
+
+        dot = _rule_block(css, ".thinking-dots .dot")
+        assert "var(--accent)" in dot
+        assert "animation" in dot
+
+        # Staggered dots: the 2nd/3rd dots delay their pulse.
+        assert "nth-child(2)" in css
+        assert "nth-child(3)" in css
+        assert "animation-delay" in css
+
+        error_status = _rule_block(css, ".status-line--error")
+        assert "var(--error)" in error_status
+
+        banner = _rule_block(css, ".error-banner")
+        assert "var(--error)" in banner

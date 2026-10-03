@@ -358,6 +358,68 @@ body {
   }
 }
 
+/* --- Stream phases (#84) ------------------------------------------------ */
+
+/* Thinking indicator: three staggered, pulsing dots — visible immediately
+   on submit (phase "waiting"), before any token arrives (AC4). Reuses the
+   pulse keyframes with per-dot delays; token-driven colors only. */
+
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.thinking-dots {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.thinking-dots .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius);
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.thinking-dots .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinking-dots .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+/* In-stream error: the status line turns error-red while a typed agent
+   error is surfaced (the stream stays alive until the follow-up done). */
+
+.status-line--error {
+  color: var(--error);
+}
+
+.status-line--error .pulse {
+  background: var(--error);
+}
+
+/* Non-blocking error banner (AC3/AC5): persistent failure surface between
+   the activity feed and the composer. Token-driven; never blocks input. */
+
+.error-banner {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3);
+  border-left: 2px solid var(--error);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--error);
+  font-size: 0.85rem;
+}
+
 .thought {
   margin: 0;
   padding-left: var(--space-4);

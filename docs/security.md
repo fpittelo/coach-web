@@ -274,20 +274,20 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 |:---|:---|:---|
 | **Information Disclosure** | Biometric context is sent to a US-routed LLM provider | Local-first fixes **storage** residency, not **processing** residency. The transfer inventory, legal-basis approach, minimization options and DPA requirement are assessed in the **OpenRouter Cross-Border Assessment (#112)** section above. Accepted residual risk for a single self-controller; minimization tracked as follow-up. |
 
-### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81 — PLANNED, merge-blocked on this sign-off)
+### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81 — IMPLEMENTED)
 
-**Status:** target design for #81 — **not yet implemented** (the current tree renders all messages via `x-text`; `static/vendor/{marked.min.js, DOMPurify.min.js}` do not exist yet). The controls below are the **conditions C1–C7** that #81 must satisfy before merge; this sign-off (issue #87) is the gate.
+**Status:** implemented and merged in #81 — assistant messages render `DOMPurify.sanitize(marked.parse(text))` via assistant-only `x-html` (user messages stay `x-text`; the plan card stays structured Pydantic→HTML), with `static/vendor/{marked.min.js, DOMPurify.min.js}` vendored and self-hosted. The controls below are the **conditions C1–C7** from the #87 sign-off (the former merge gate) — now **implemented and verified**, pinned by contract tests in `tests/test_static_assets.py` (`TestMarkdownRenderingContract` and the rewritten `test_index_uses_text_interpolation_only`).
 
-**Target design:** assistant messages will render `DOMPurify.sanitize(marked.parse(text))` via `x-html` (assistant-only; user messages stay `x-text`; the plan card stays structured Pydantic→HTML). The threat sources are **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
+**Threat sources:** **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
 
 | STRIDE | Threat | Mitigation |
 |:---|:---|:---|
-| **Tampering** | LLM/MCP content carries `<script>`, `<img onerror=…>`, a `javascript:` URI, or an Alpine `x-` directive into the assistant bubble | Assistant-only `x-html` bound to `DOMPurify.sanitize(marked.parse(text))`; DOMPurify's default allowlist strips `script`/`style`/`iframe`/`object`/`embed`/`form`, event-handler attributes, `javascript:` URIs and every `x-*`/`@*`/`:*` directive; user messages never render as HTML. **Condition (C1/C4):** contract test must assert the sanitizer helper and assistant-only `x-html` (rewriting the current `x-html`-absent guard). |
+| **Tampering** | LLM/MCP content carries `<script>`, `<img onerror=…>`, a `javascript:` URI, or an Alpine `x-` directive into the assistant bubble | Assistant-only `x-html` bound to `DOMPurify.sanitize(marked.parse(text))`; DOMPurify's default allowlist strips `script`/`style`/`iframe`/`object`/`embed`/`form`, event-handler attributes, `javascript:` URIs and every `x-*`/`@*`/`:*` directive; user messages never render as HTML. **Verified (C1/C4):** contract tests assert the sanitizer helper and assistant-only `x-html` (`TestMarkdownRenderingContract`, the rewritten `test_index_uses_text_interpolation_only`). |
 | **Elevation of Privilege** | An injected `x-init`/`@click`/`x-html` directive is evaluated by Alpine's MutationObserver when the sanitized node is inserted | DOMPurify strips non-allowlisted attributes (Alpine directives are not in the default allowlist); CSP `script-src 'self'` blocks inline script; the sanitizer config must **not** add `ALLOWED_ATTR` entries for `x-*`/`@*`/`:*`. |
 | **Information Disclosure** | A remote `<img>` in LLM markdown leaks the viewer IP or acts as a tracking pixel | CSP `img-src 'self' data:` blocks remote image loads. |
 | **Denial of Service** | Pathological markdown (deep nesting, huge token stream) | The **input** is bounded by the message/history caps (8,000 chars × 10 entries); the **output** vector (a huge LLM token stream) is bounded by the model's own output limit plus the synchronous, bounded marked/DOMPurify render — rendering happens client-side only, no server-side render. |
 
-**Mid-stream partial-render safety:** every token render re-sanitizes the **full accumulated raw text** (never appends per-token sanitized fragments), so a construct split across tokens (`<scr` + `ipt>`) is only ever sanitized as a whole at the final render; DOMPurify repairs unclosed tags. **Condition:** the implementation must sanitize the accumulated raw string, not concatenate per-token sanitized HTML.
+**Mid-stream partial-render safety:** every token render re-sanitizes the **full accumulated raw text** (never appends per-token sanitized fragments), so a construct split across tokens (`<scr` + `ipt>`) is only ever sanitized as a whole at the final render; DOMPurify repairs unclosed tags. **Verified (C3):** the contract tests pin the accumulated-string render path (`test_assistant_binding_sanitizes_the_accumulated_string`).
 
 ### Boundary B10 — Client-owned replayed history (prompt injection, #79)
 
@@ -306,22 +306,12 @@ The conversation is client-owned: the browser replays the last ≤ 10 turns in t
 
 ### CSP Posture (v0.7)
 
-The repo ships **no CSP header** today. The vendored Alpine 3.14.9 is the **standard build**: it compiles `x-` expressions at runtime via `Object.getPrototypeOf(async function(){}).constructor` (`AsyncFunction`), so `script-src` must include `'unsafe-eval'`. **Decision (KIS): ship the minimal defensible CSP now**, not the Alpine CSP build — the latter would require rewriting every inline `x-` expression to `Alpine.bind`/`x-data` methods, disproportionate churn for v0.7.
+The minimal CSP decided in the #87 sign-off is **shipped as ASGI middleware** — `ContentSecurityPolicyMiddleware` in `src/coach_web/app.py` (#84, STRIDE conditions **C2/C5**) — and stamped on every response: pages, static assets, API/SSE routes and middleware-generated error responses (TrustedHost 400, auth 401/403) alike, pinned by `TestCspMiddleware` in `tests/test_app.py`. The vendored Alpine 3.14.9 is the **standard build**: it compiles `x-` expressions at runtime via `Object.getPrototypeOf(async function(){}).constructor` (`AsyncFunction`), so `script-src` must include `'unsafe-eval'`. **Decision (KIS): ship the minimal defensible CSP**, not the Alpine CSP build — the latter would require rewriting every inline `x-` expression to `Alpine.bind`/`x-data` methods, disproportionate churn for v0.7.
 
-Recommended header (implemented in #81 or a dedicated follow-up):
+Shipped header (#84) — the middleware stamps this exact single-line value:
 
 ```
-Content-Security-Policy:
-  default-src 'self';
-  script-src 'self' 'unsafe-eval';
-  style-src 'self';
-  img-src 'self' data:;
-  font-src 'self';
-  connect-src 'self';
-  object-src 'none';
-  base-uri 'self';
-  frame-ancestors 'none';
-  form-action 'self'
+Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'
 ```
 
 **Rationale:** `'unsafe-eval'` is required by Alpine and is **contained** — `script-src` has no `'unsafe-inline'`, so an injected inline `<script>` is blocked, and DOMPurify strips `x-` directives, so the eval primitive has no injection vector to reach it. The remaining directives are free defense-in-depth: `object-src 'none'` (plugins), `base-uri 'self'` (base-tag injection), `frame-ancestors 'none'` (clickjacking), `form-action 'self'` (form exfiltration), `img-src 'self' data:` (tracking pixels). The Alpine CSP build is tracked as a **future hardening item**, not a v0.7 requirement.
@@ -331,11 +321,11 @@ Content-Security-Policy:
 | STRIDE | Primary vector (local topology) | Mitigation (anchor) |
 |:---|:---|:---|
 | **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state; forged replayed history (B10) | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce; history role `Literal` + human approval gate (B10) |
-| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9 — **planned, #81**) |
+| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9 — implemented, #81); CSP middleware stamps the minimal policy on every response (#84) |
 | **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + local structured logs (secret-redacted); single whitelisted identity |
 | **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112) |
 | **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap |
-| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9 — **planned, #81**) |
+| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9 — implemented, #81/#84) |
 
 ---
 
@@ -554,4 +544,4 @@ Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in 
 
 ---
 
-_Last updated: 2026-10-03 (issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
+_Last updated: 2026-10-03 (issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_

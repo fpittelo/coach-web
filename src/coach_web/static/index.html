@@ -89,7 +89,27 @@
           </div>
 
           <div class="activity" x-show="streaming || thoughts.length > 0 || tools.length > 0">
-            <div class="status-line" x-show="streaming">
+            <!-- Thinking indicator (#84 AC4): bound to the waiting phase,
+                 which startStream sets synchronously on submit — the dots
+                 are visible before the fetch is even dispatched, hence
+                 before any SSE event arrives. -->
+            <div class="thinking-indicator" x-show="phase === 'waiting'">
+              <span class="thinking-dots" aria-hidden="true">
+                <span class="dot"></span>
+                <span class="dot"></span>
+                <span class="dot"></span>
+              </span>
+              <span class="thinking-label" x-text="statusText || 'Thinking'"></span>
+            </div>
+
+            <!-- Streaming / tooling / in-stream error status line (#84 AC1):
+                 the typed-error path keeps the stream alive until the
+                 follow-up done, so the line turns error-red for that gap. -->
+            <div
+              class="status-line"
+              x-show="phase === 'streaming' || phase === 'tooling' || phase === 'error'"
+              :class="{ 'status-line--error': phase === 'error' }"
+            >
               <span class="pulse" aria-hidden="true"></span>
               <span x-text="statusText || 'Working'"></span>
             </div>
@@ -107,6 +127,14 @@
               </template>
             </ul>
           </div>
+
+          <!-- Non-blocking error banner (#84 AC3/AC5): a persistent,
+               phase-independent failure surface between the activity feed
+               and the composer. It never overlays or disables anything —
+               the only composer disable condition is the in-flight
+               streaming flag, so the user can always retry by sending
+               again. -->
+          <p class="error-banner" x-show="errorBanner" x-text="errorBanner"></p>
 
           <form class="composer" @submit.prevent="send()">
             <input
