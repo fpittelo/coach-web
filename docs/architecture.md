@@ -175,7 +175,7 @@ graph TD
 | **qa** | `compose.yaml` + `compose.qa.yml` | `ghcr.io/fpittelo/coach-web:qa` | `127.0.0.1:8200` | `AUTH_ENABLED=false` | staging validation of promoted `dev` |
 | **prod** | `compose.yaml` + `compose.prod.yml` | digest-pinned `vX.Y.Z` | `127.0.0.1:8000` | `AUTH_ENABLED=true` (OIDC defense-in-depth) | daily-use deployment |
 
-**Properties (all lanes):** per-lane compose project name (`coach-web-dev|qa|prod`) and network; sidecars publish no host ports; hardening parity (`read_only`, `cap_drop: ALL`, `no-new-privileges`, tmpfs, resource limits, non-root UID 10001). Promotion stays PR-approval-gated (`dev` → `qa` → `main`); the local lane pull is the procedural rollout step. Lane files are delivered by #109.
+**Properties (all lanes):** per-lane compose project name (`coach-web-dev|qa|prod`) and network; sidecars publish no host ports; hardening parity (`read_only`, `cap_drop: ALL`, `no-new-privileges`, tmpfs, resource limits, non-root UID 10001). Promotion stays PR-approval-gated (`dev` → `qa` → `main`); the local lane pull is the procedural rollout step. Lane files delivered by #109 (`compose.yaml` + `compose.dev.yml|qa.yml|prod.yml`; per-lane env templates `.env.<lane>.example`).
 
 ---
 

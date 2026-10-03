@@ -45,7 +45,14 @@ coverage.xml
 .pytest_cache/
 
 # Environments
+# Real env values are NEVER committed. The lane templates (*.example) are
+# tracked; everything else matching .env* is ignored (ADR-007 per-lane files).
 .env
+.env.*
+!.env.example
+!.env.dev.example
+!.env.qa.example
+!.env.prod.example
 .venv
 env/
 venv/

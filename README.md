@@ -96,15 +96,23 @@ Healthcheck: [http://localhost:8000/health](http://localhost:8000/health)
 The stack runs on the local workstation in three isolated lanes (dev / qa / prod), all bound to `127.0.0.1` only:
 
 ```bash
-cp .env.example .env   # then edit with your secrets
+# one-time per lane: create the lane env file from its template
+cp .env.dev.example .env.dev   # then edit with your secrets
 
 # dev lane — build from source
-docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml up -d --build
+docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml \
+    --env-file .env.dev up -d --build
 ```
 
 Then open [http://localhost:8100](http://localhost:8100) (dev), `:8200` (qa), or `:8000` (prod) and meet your coach.
 
-See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the promotion runbook, and the per-lane pre-flight. The lane compose files are delivered in Sprint 10 (#109); until then, the legacy `docker-compose.yml` serves the stack on `127.0.0.1:8000`.
+| Lane | Host port | Compose files | Env file |
+|:---|:---|:---|:---|
+| dev | `127.0.0.1:8100` | `compose.yaml` + `compose.dev.yml` | `.env.dev` |
+| qa | `127.0.0.1:8200` | `compose.yaml` + `compose.qa.yml` | `.env.qa` |
+| prod | `127.0.0.1:8000` | `compose.yaml` + `compose.prod.yml` | `.env.prod` |
+
+Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|prod`) with its own network, and sidecars publish no host ports. See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the promotion runbook, and the per-lane pre-flight (`./scripts/e2e-preflight.sh dev|qa|prod`).
 
 ---
 
