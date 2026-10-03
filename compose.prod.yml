@@ -30,6 +30,8 @@ services:
       # OIDC whitelist is defense-in-depth on the prod lane (ADR-007); the
       # required credentials come from .env.prod via the base environment map.
       AUTH_ENABLED: "true"
+      # Per-lane CORS default (folded finding from PR #116 review, #112).
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8000"]}'
 
   coach-mcp:
     image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:prod}

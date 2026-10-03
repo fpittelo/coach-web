@@ -26,6 +26,8 @@ services:
       # Loopback binding is the primary access control (ADR-007); the OIDC
       # whitelist is defense-in-depth and stays off on the dev lane.
       AUTH_ENABLED: "false"
+      # Per-lane CORS default (folded finding from PR #116 review, #112).
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8100"]}'
 
   coach-mcp:
     image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:dev}

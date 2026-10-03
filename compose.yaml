@@ -9,7 +9,7 @@
 # The base file holds everything shared across lanes: services, healthchecks,
 # container hardening and the per-service environment scoping. Each lane file
 # holds the compose project name, the coach-web image (build or GHCR pull),
-# the loopback host port and the lane's auth mode.
+# the loopback host port, the lane's auth mode and its CORS origin default.
 #
 # Deliberately NOT in the base file (ADR-007, issue #109):
 #   - container_name / hostname → lanes are disambiguated by compose project
@@ -45,6 +45,8 @@ services:
       AUTH_SESSION_SECRET: '${AUTH_SESSION_SECRET:-}'
       AUTH_SESSION_TTL_SECONDS: '${AUTH_SESSION_TTL_SECONDS:-3600}'
       AUTH_REDIRECT_URI: '${AUTH_REDIRECT_URI:-}'
+      AUTH_COOKIE_SECURE: '${AUTH_COOKIE_SECURE:-true}'
+      TRUSTED_HOSTS: '${TRUSTED_HOSTS:-["localhost", "127.0.0.1"]}'
       GITHUB_TOKEN: '${GITHUB_TOKEN:-}'
       GITHUB_REPO: '${GITHUB_REPO:-fpittelo/coach}'
       GITHUB_PLAN_BRANCH: '${GITHUB_PLAN_BRANCH:-main}'

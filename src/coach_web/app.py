@@ -14,6 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from coach_web.agent import AgentEvent, CoachAgent, create_agent
 from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
@@ -95,6 +96,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # is enforced before any route, mount or CORS logic runs.
         application.include_router(auth_router)
         application.add_middleware(AuthMiddleware)
+
+    # Host allowlist (DNS-rebinding mitigation, #112): a malicious page that
+    # resolves a hostname to 127.0.0.1 must not reach the loopback service
+    # same-origin. Added last => outermost, so a bad Host is rejected before
+    # auth/CORS. Critical while dev/qa run AUTH_ENABLED=false.
+    application.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=resolved.TRUSTED_HOSTS,
+        www_redirect=False,
+    )
 
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
