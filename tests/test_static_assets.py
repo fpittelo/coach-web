@@ -73,6 +73,16 @@ history). The approve/reject contract is untouched (exact PlanProposal JSON
 to POST /api/plan/approve; reject dismisses the card and clears plan
 state), and the 4-column interval table scrolls inside an overflow wrapper
 with a ≤375px stacking fallback so nothing overflows mobile (AC3).
+
+Issue #83 delivers the composer ergonomics: the single-line <input> becomes
+a <textarea rows="1"> that auto-grows with content up to a ~5-line cap
+(internal scroll beyond) and shrinks back when the input is cleared. Enter
+sends, Shift+Enter inserts a newline, and an IME composition guard
+(event.isComposing) keeps the composition-confirm Enter from sending. The
+composer is the pinned footer of the chat panel's flex column — the log
+grows above it (the v0.5 max-height: 30rem log cap is dropped) — and the
+send-disabled bindings (empty input / in-flight stream) are preserved
+verbatim. Input remains ephemeral client state (nLPD: no retention change).
 """
 
 import re
@@ -1302,3 +1312,167 @@ class TestInlinePlanCardContract:
         assert media, "≤375px media query missing"
         assert ".plan-meta" in media
         assert "grid-template-columns: 1fr" in media
+
+
+class TestComposerErgonomicsContract:
+    """Auto-growing textarea composer with Enter-to-send (#83, ADR-006 §9).
+
+    The v0.5 single-line ``<input>`` is replaced by a ``<textarea rows="1">``
+    that auto-grows with content up to a ~5-line cap (internal scroll
+    beyond) and shrinks back when the input is cleared. Enter sends,
+    Shift+Enter inserts a newline, and an IME composition guard
+    (``event.isComposing``) keeps the composition-confirm Enter from
+    sending. The composer is the pinned footer of the chat panel's flex
+    column — the log grows above it (the v0.5 ``max-height: 30rem`` log cap
+    is dropped) — and the send-disabled bindings (empty input / in-flight
+    stream) are preserved verbatim. Input remains ephemeral client state
+    (nLPD: no retention change).
+
+    No Node toolchain (ADR-006 §5): JS is contracted via source assertions,
+    the same way as the stream, phase, auto-scroll and plan-card contracts.
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _composer(self) -> str:
+        html = self._html()
+        composer_at = html.index('<form class="composer"')
+        return html[composer_at : html.index("</form>", composer_at)]
+
+    # --- AC1: auto-growing textarea ---------------------------------------------
+
+    def test_composer_is_a_single_row_textarea(self) -> None:
+        """AC1: the single-line input is replaced by a rows="1" textarea."""
+        composer = self._composer()
+
+        assert "<textarea" in composer
+        assert 'rows="1"' in composer
+        assert "<input" not in composer
+        # The x-model / disabled bindings carry over verbatim (#79/#84).
+        assert 'x-model="input"' in composer
+        assert ':disabled="streaming"' in composer
+
+    def test_auto_grow_resets_height_before_measuring(self) -> None:
+        """AC1: autoGrowTextarea() resets to auto, then sizes to scrollHeight."""
+        grow = _rule_block(self._script(), "autoGrowTextarea()")
+
+        assert grow, "autoGrowTextarea() must exist"
+        assert 'textarea.style.height = "auto"' in grow
+        assert "textarea.scrollHeight" in grow
+
+    def test_auto_grow_follows_every_input_change(self) -> None:
+        """AC1: the grow hook watches the input model (type, paste, clear).
+
+        The measurement must run on the next tick so the x-model DOM write
+        lands before scrollHeight is read — otherwise a programmatic clear
+        (send / reset) would measure the stale value and never shrink.
+        """
+        init = _rule_block(self._script(), "init()")
+
+        assert (
+            'this.$watch("input", () => this.$nextTick(() => this.autoGrowTextarea()));' in init
+        ), "$watch(input) → $nextTick → autoGrowTextarea() hook missing"
+
+    def test_textarea_caps_at_five_lines_and_scrolls_internally(self) -> None:
+        """AC1: the CSS cap is ~5 lines; overflow scrolls inside the box."""
+        css = self._css()
+        textarea = _rule_block(css, ".composer textarea")
+
+        assert "max-height:" in textarea, "textarea max-height cap missing"
+        assert "7.5em" in textarea, "cap must encode 5 lines × 1.5 line-height"
+        assert "overflow-y: auto" in textarea, "internal scroll beyond the cap missing"
+        assert "resize: none" in textarea, "manual resize handle must be gone"
+
+    def test_send_clears_input_and_shrinks_via_the_watcher(self) -> None:
+        """AC1: clearing the input after send shrinks the box (same watcher).
+
+        No parallel height-reset mechanism is added in send() — the shrink
+        is the $watch("input") → autoGrowTextarea() path (KIS).
+        """
+        send = _rule_block(self._script(), "send()")
+
+        assert 'this.input = ""' in send
+        assert "style.height" not in send
+
+    # --- AC2: Enter-to-send keyboard contract ------------------------------------
+
+    def test_keydown_handler_sends_on_plain_enter(self) -> None:
+        """AC2: Enter (no Shift) prevents the newline and sends."""
+        handler = _rule_block(self._script(), "onComposerKeydown(event)")
+
+        assert handler, "onComposerKeydown(event) must exist"
+        assert 'event.key === "Enter" && !event.shiftKey' in handler
+        assert "event.preventDefault()" in handler
+        assert "this.send()" in handler
+
+    def test_keydown_handler_guards_ime_composition(self) -> None:
+        """AC2: the composition-confirm Enter never sends (IME guard)."""
+        handler = _rule_block(self._script(), "onComposerKeydown(event)")
+
+        assert "event.isComposing" in handler
+        # The guard precedes the send branch: a composing Enter returns early.
+        assert handler.index("event.isComposing") < handler.index("this.send()")
+
+    def test_textarea_wires_the_keydown_handler(self) -> None:
+        """AC2: the composer textarea binds onComposerKeydown($event)."""
+        composer = self._composer()
+
+        assert '@keydown="onComposerKeydown($event)"' in composer
+
+    # --- AC3: pinned composer footer ----------------------------------------------
+
+    def test_chat_log_grows_without_max_height_cap(self) -> None:
+        """AC3: the v0.5 max-height: 30rem log cap is dropped (supersession)."""
+        css = self._css()
+        log = _rule_block(css, ".chat-log")
+
+        assert "flex: 1" in log, "the log must remain the growing flex child"
+        assert "overflow-y: auto" in log, "the log must still scroll internally"
+        assert "max-height" not in log, "the 30rem log cap must be gone"
+        assert "max-height: 30rem" not in css
+
+    def test_composer_is_the_pinned_panel_footer(self) -> None:
+        """AC3: the composer is the last child of the chat flex column."""
+        html = self._html()
+        css = self._css()
+
+        panel_at = html.index('<section class="panel chat"')
+        close_at = html.index("</section>", panel_at)
+        log_at = html.index('<div class="chat-log"')
+        composer_at = html.index('<form class="composer"')
+
+        assert panel_at < log_at < composer_at < close_at
+        chat = _rule_block(css, ".chat")
+        assert "display: flex" in chat
+        assert "flex-direction: column" in chat
+
+    # --- AC4: send-disabled bindings preserved ------------------------------------
+
+    def test_send_button_disabled_when_empty_or_streaming(self) -> None:
+        """AC4: the button disable binding is preserved verbatim."""
+        composer = self._composer()
+
+        assert ":disabled=\"streaming || input.trim() === ''\"" in composer
+
+    def test_send_guard_still_blocks_empty_and_in_flight(self) -> None:
+        """AC4: send() keeps its empty-input and streaming guards."""
+        send = _rule_block(self._script(), "send()")
+
+        assert "if (!message || this.streaming)" in send
+
+    # --- AC5: token-based focus ring ------------------------------------------------
+
+    def test_textarea_has_token_based_focus_ring(self) -> None:
+        """AC5: the composer focus ring is drawn from the accent token."""
+        css = self._css()
+        focus = _rule_block(css, ".composer textarea:focus")
+
+        assert "outline" in focus, "focus ring missing"
+        assert "var(--accent)" in focus, "focus ring must use the accent token"

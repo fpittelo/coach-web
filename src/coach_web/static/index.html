@@ -222,15 +222,22 @@
           <p class="error-banner" x-show="errorBanner" x-text="errorBanner"></p>
 
           <form class="composer" @submit.prevent="send()">
-            <input
-              type="text"
+            <!-- Auto-growing composer (#83): rows="1" starts as a single
+                 line, autoGrowTextarea() grows it with content up to the
+                 ~5-line CSS cap (internal scroll beyond) and the input
+                 clear on send/reset shrinks it back via the $watch hook.
+                 Enter sends, Shift+Enter newlines, IME-guarded (AC2). -->
+            <textarea
+              rows="1"
               name="message"
               autocomplete="off"
               placeholder="Ask your coach…"
               aria-label="Message for the coach"
               x-model="input"
+              x-ref="composer"
               :disabled="streaming"
-            />
+              @keydown="onComposerKeydown($event)"
+            ></textarea>
             <button class="button" type="submit" :disabled="streaming || input.trim() === ''">
               Send
             </button>

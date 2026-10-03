@@ -39,6 +39,14 @@
  * re-arms following automatically — no "jump to latest" pill (KIS cut).
  * Token-time scrolls are instant (behavior "auto"), and the stylesheet
  * disables looping animations under prefers-reduced-motion.
+ *
+ * Composer ergonomics (#83): the composer is a single-row textarea that
+ * auto-grows with content up to the stylesheet's ~5-line cap (internal
+ * scroll beyond) and shrinks back when the input is cleared — one
+ * $watch("input") hook drives both directions. Enter sends, Shift+Enter
+ * inserts a newline, and an IME composition guard (event.isComposing)
+ * keeps the composition-confirm Enter from sending. The send-disabled
+ * bindings (empty input / in-flight stream) are unchanged.
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -103,6 +111,12 @@ function coachApp() {
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
+      // Auto-grow composer (#83): every input mutation — typing, paste,
+      // and the programmatic clears in send()/resetChat() — re-fits the
+      // textarea height. The measurement runs on the next tick so the
+      // x-model DOM write lands before scrollHeight is read; measuring
+      // synchronously would read the stale value and never shrink.
+      this.$watch("input", () => this.$nextTick(() => this.autoGrowTextarea()));
       this.$nextTick(() => {
         const log = this.$refs.log;
         if (!log) {
@@ -162,6 +176,40 @@ function coachApp() {
       // across tokens (<scr|ipt>) is only ever sanitized as a whole, and
       // DOMPurify repairs unclosed tags mid-stream.
       return window.DOMPurify.sanitize(window.marked.parse(text));
+    },
+
+    autoGrowTextarea() {
+      // Auto-grow composer (AC1, #83): reset to the intrinsic single-row
+      // height first so scrollHeight reflects the current content, then
+      // size the box to fit it. The border-box correction
+      // (offsetHeight - clientHeight = the borders) keeps the measured
+      // height exact, so overflow-y: auto only engages past the
+      // stylesheet's ~5-line max-height cap — never at the fitted size.
+      // Clearing the input (send / reset) shrinks the box back through
+      // the same $watch("input") path.
+      const textarea = this.$refs.composer;
+      if (!textarea) {
+        return;
+      }
+      textarea.style.height = "auto";
+      textarea.style.height =
+        textarea.scrollHeight + (textarea.offsetHeight - textarea.clientHeight) + "px";
+    },
+
+    onComposerKeydown(event) {
+      // Enter-to-send (AC2, #83): plain Enter prevents the newline and
+      // sends; Shift+Enter fails the !event.shiftKey half and falls
+      // through to the textarea's default action (newline inserted). The
+      // IME composition guard returns early while an input method editor
+      // is composing (e.g. Japanese kana conversion) — the
+      // composition-confirm Enter must never send.
+      if (event.isComposing) {
+        return;
+      }
+      if (event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        this.send();
+      }
     },
 
     send() {

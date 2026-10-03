@@ -181,10 +181,17 @@ body {
   min-height: 32rem;
 }
 
+/* Pinned composer footer (#83 AC3): the panel is a flex column — the log
+   is the growing child (flex: 1) and the composer is its footer, so the
+   input stays pinned to the bottom of the panel on mobile and desktop.
+   The v0.5 30rem log cap is dropped: the log's height is now governed by
+   the flex layout (overflow-y: auto zeroes its automatic minimum size, so
+   long transcripts scroll internally instead of growing the panel), which
+   keeps the composer pinned at every transcript length. */
+
 .chat-log {
   flex: 1;
   overflow-y: auto;
-  max-height: 30rem;
   padding-right: var(--space-2);
   display: flex;
   flex-direction: column;
@@ -470,15 +477,24 @@ body {
 
 /* --- Composer ---------------------------------------------------------- */
 
+/* Pinned footer (AC3, #83): flex-end keeps the Send button on the bottom
+   edge of the composer row while the textarea grows above it. */
+
 .composer {
   margin-top: var(--space-4);
   border-top: 1px solid var(--line);
   padding-top: var(--space-4);
   display: flex;
+  align-items: flex-end;
   gap: var(--space-3);
 }
 
-.composer input {
+/* Auto-growing textarea (AC1, #83): rows="1" starts as a single line and
+   app.js sizes the box to its content; the max-height cap encodes ~5
+   lines (5 × 1.5 line-height) plus the vertical padding and border, and
+   overflow-y: auto scrolls internally beyond the cap. */
+
+.composer textarea {
   flex: 1;
   min-width: 0;
   border: 1px solid var(--line);
@@ -486,11 +502,15 @@ body {
   padding: var(--space-3);
   font-family: inherit;
   font-size: 0.95rem;
+  line-height: 1.5;
   color: var(--ink);
   background: var(--paper);
+  resize: none;
+  overflow-y: auto;
+  max-height: calc(7.5em + 2 * var(--space-3) + 2px);
 }
 
-.composer input:focus {
+.composer textarea:focus {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
