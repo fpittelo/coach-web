@@ -61,10 +61,55 @@
         <section class="panel chat" aria-label="Coach chat console">
           <h2 class="panel-title">Chat console</h2>
 
-          <div class="chat-log" x-ref="log" aria-live="polite">
-            <p class="empty-state" x-show="messages.length === 0">
-              Start the conversation with a question about your training.
-            </p>
+          <!-- Visually-hidden live region (#86 AC3): announces phase changes
+               and the completed FINAL message to screen readers — never per
+               token. Replaces the v0.5 whole-log aria-live="polite" (a
+               token-by-token stream would spam assistive tech); the log
+               below is a role="log" region whose implicit polite semantics
+               cover newly added messages. -->
+          <p
+            class="visually-hidden"
+            role="status"
+            aria-live="polite"
+            x-text="liveAnnouncement"
+          ></p>
+
+          <div class="chat-log" x-ref="log" role="log" aria-label="Conversation with your coach">
+            <!-- Onboarding empty state (#86 AC1): hero monogram, one-line
+                 welcome and 3 static endurance starter chips (PO Q2/Q7 —
+                 domain-correct, client-side strings, no personal data).
+                 Chips prefill the composer and focus it — never auto-send
+                 (PO Q8). -->
+            <div class="empty-state" x-show="messages.length === 0">
+              <svg
+                class="monogram monogram--hero"
+                viewBox="0 0 32 32"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="1.5"
+                  y="1.5"
+                  width="29"
+                  height="29"
+                  rx="9"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                />
+                <path
+                  d="M22.4 11.2a8 8 0 1 0 0 9.6"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <p class="empty-state-welcome">Hello! I'm your coach — what should we work on today?</p>
+              <div class="starter-chips" role="group" aria-label="Starter prompts">
+                <template x-for="chip in starterChips" :key="chip">
+                  <button class="chip" type="button" x-text="chip" @click="prefillChip(chip)"></button>
+                </template>
+              </div>
+            </div>
 
             <template x-for="(message, index) in messages" :key="index">
               <article class="message" :class="{ 'message--user': message.role === 'user' }">
