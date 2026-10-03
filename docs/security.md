@@ -274,16 +274,66 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 |:---|:---|:---|
 | **Information Disclosure** | Biometric context is sent to a US-routed LLM provider | Local-first fixes **storage** residency, not **processing** residency. The transfer inventory, legal-basis approach, minimization options and DPA requirement are assessed in the **OpenRouter Cross-Border Assessment (#112)** section above. Accepted residual risk for a single self-controller; minimization tracked as follow-up. |
 
+### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81)
+
+Assistant messages render `DOMPurify.sanitize(marked.parse(text))` via `x-html` (assistant-only; user messages stay `x-text`; the plan card stays structured Pydantic→HTML). The threat sources are **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Tampering** | LLM/MCP content carries `<script>`, `<img onerror=…>`, a `javascript:` URI, or an Alpine `x-` directive into the assistant bubble | Assistant-only `x-html` bound to `DOMPurify.sanitize(marked.parse(text))`; DOMPurify's default allowlist strips `script`/`style`/`iframe`/`object`/`embed`/`form`, event-handler attributes, `javascript:` URIs and every `x-*`/`@*`/`:*` directive; user messages never render as HTML. Contract test asserts the sanitizer helper and assistant-only `x-html`. |
+| **Elevation of Privilege** | An injected `x-init`/`@click`/`x-html` directive is evaluated by Alpine's MutationObserver when the sanitized node is inserted | DOMPurify strips non-allowlisted attributes (Alpine directives are not in the default allowlist); CSP `script-src 'self'` blocks inline script; the sanitizer config must **not** add `ALLOWED_ATTR` entries for `x-*`/`@*`/`:*`. |
+| **Information Disclosure** | A remote `<img>` in LLM markdown leaks the viewer IP or acts as a tracking pixel | CSP `img-src 'self' data:` blocks remote image loads. |
+| **Denial of Service** | Pathological markdown (deep nesting, huge token stream) | Message/history caps (8,000 chars × 10 entries) bound the input; marked/DOMPurify are synchronous and bounded; no server-side render. |
+
+**Mid-stream partial-render safety:** every token render re-sanitizes the **full accumulated raw text** (never appends per-token sanitized fragments), so a construct split across tokens (`<scr` + `ipt>`) is only ever sanitized as a whole at the final render; DOMPurify repairs unclosed tags. **Condition:** the implementation must sanitize the accumulated raw string, not concatenate per-token sanitized HTML.
+
+### Boundary B10 — Client-owned replayed history (prompt injection, #79)
+
+The conversation is client-owned: the browser replays the last ≤ 10 turns in the POST body and nothing is persisted server-side (nLPD ephemeral posture). The history is therefore fully forgeable.
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Spoofing** | Client forges assistant turns to impersonate the coach | Inherent to client-owned history; no server session store (nLPD ephemeral). **Accepted residual.** |
+| **Tampering** | Forged history injects instructions (jailbreak / system-prompt override) | `ChatMessage.role` is `Literal["user", "assistant"]` — a forged `system`/`tool` role is rejected at the Pydantic boundary; the system prompt is always first in `_build_messages`; entry/length caps bound the payload. |
+| **Elevation of Privilege** | Forged history induces tool invocation with attacker-chosen arguments | Tools are read-only (Intervals.icu, GitHub issues) except the synthetic `propose_plan`, which only emits a validated `PlanProposal`; the sole state-changing path `POST /api/plan/approve` requires an explicit human click and re-validates the exact `PlanProposal` JSON. **Human approval is the security boundary.** |
+| **Repudiation** | Forged transcript misrepresents what the coach said | The transcript is client-owned and ephemeral; there is no server-side conversation audit. The approval audit trail (GitHub commits + Intervals.icu records) is independent of the transcript. |
+| **Denial of Service** | Oversized or looping history | `max_length=10` entries × 8,000 chars; agent tool-iteration cap (`AGENT_MAX_TOOL_ITERATIONS`). |
+| **Information Disclosure** | Forged history exfiltrates biometric data to a third party | Single-tenant; the only recipient is the owner's own browser; no attacker-controlled outbound channel. OpenRouter processing is already assessed (B8). |
+
+**Residual-risk acceptance:** prompt injection via forged assistant turns cannot be eliminated without server-side session state, which contradicts the nLPD ephemeral posture. Accepted for a single-tenant personal app where the only user is the owner and every state-changing action is gated by explicit human approval.
+
+### CSP Posture (v0.7)
+
+The repo ships **no CSP header** today. The vendored Alpine 3.14.9 is the **standard build**: it compiles `x-` expressions at runtime via `Object.getPrototypeOf(async function(){}).constructor` (`AsyncFunction`), so `script-src` must include `'unsafe-eval'`. **Decision (KIS): ship the minimal defensible CSP now**, not the Alpine CSP build — the latter would require rewriting every inline `x-` expression to `Alpine.bind`/`x-data` methods, disproportionate churn for v0.7.
+
+Recommended header (implemented in #81 or a dedicated follow-up):
+
+```
+Content-Security-Policy:
+  default-src 'self';
+  script-src 'self' 'unsafe-eval';
+  style-src 'self';
+  img-src 'self' data:;
+  font-src 'self';
+  connect-src 'self';
+  object-src 'none';
+  base-uri 'self';
+  frame-ancestors 'none';
+  form-action 'self'
+```
+
+**Rationale:** `'unsafe-eval'` is required by Alpine and is **contained** — `script-src` has no `'unsafe-inline'`, so an injected inline `<script>` is blocked, and DOMPurify strips `x-` directives, so the eval primitive has no injection vector to reach it. The remaining directives are free defense-in-depth: `object-src 'none'` (plugins), `base-uri 'self'` (base-tag injection), `frame-ancestors 'none'` (clickjacking), `form-action 'self'` (form exfiltration), `img-src 'self' data:` (tracking pixels). The Alpine CSP build is tracked as a **future hardening item**, not a v0.7 requirement.
+
 ### Local STRIDE Summary Table
 
 | STRIDE | Primary vector (local topology) | Mitigation (anchor) |
 |:---|:---|:---|
-| **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce |
-| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS |
+| **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state; forged replayed history (B10) | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce; history role `Literal` + human approval gate (B10) |
+| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9) |
 | **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + local structured logs (secret-redacted); single whitelisted identity |
 | **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112) |
 | **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap |
-| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers |
+| **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9) |
 
 ---
 
@@ -502,4 +552,4 @@ Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in 
 
 ---
 
-_Last updated: 2026-10-03 (issue #113 — local-topology STRIDE rewrite, nLPD local-first checklist, trivy image scan, preflight service-set assertion, github-mcp prod digest pin)_
+_Last updated: 2026-10-03 (issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
