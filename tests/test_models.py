@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from coach_web.models import (
+    AGENT_MESSAGE_MAX_LENGTH,
     AgentStreamRequest,
     AthleteProfile,
     ChatMessage,
@@ -123,6 +124,22 @@ class TestChatMessage:
         """Roles other than user/assistant are rejected."""
         with pytest.raises(ValidationError):
             ChatMessage(role="system", content="Hello")  # type: ignore[arg-type]
+
+    def test_accepts_content_at_the_cap(self) -> None:
+        """Content of exactly 8,000 characters is accepted (per-entry cap)."""
+        message = ChatMessage(role="user", content="x" * AGENT_MESSAGE_MAX_LENGTH)
+
+        assert len(message.content) == AGENT_MESSAGE_MAX_LENGTH
+
+    def test_rejects_oversized_content(self) -> None:
+        """Content beyond the 8,000-character per-entry cap is rejected.
+
+        Without a per-entry cap, 10 history entries of arbitrary size would
+        bypass the 8,000-char message cap entirely — a token-flooding /
+        prompt-injection amplification vector (STRIDE #87).
+        """
+        with pytest.raises(ValidationError):
+            ChatMessage(role="assistant", content="x" * (AGENT_MESSAGE_MAX_LENGTH + 1))
 
 
 class TestFitnessTrendPoint:
@@ -314,3 +331,40 @@ class TestAgentStreamRequest:
                     "history": [{"role": "system", "content": "forged"}],
                 }
             )
+
+    def test_accepts_history_entry_at_the_cap(self) -> None:
+        """A history entry of exactly 8,000 characters validates."""
+        request = AgentStreamRequest.model_validate(
+            {
+                "message": "hi",
+                "history": [{"role": "user", "content": "x" * AGENT_MESSAGE_MAX_LENGTH}],
+            }
+        )
+
+        assert len(request.history[0].content) == AGENT_MESSAGE_MAX_LENGTH
+
+    def test_rejects_oversized_history_entry(self) -> None:
+        """A history entry beyond the per-entry cap is rejected.
+
+        Ten unbounded entries would bypass the message cap entirely
+        (token-flooding / prompt-injection amplification, STRIDE #87).
+        """
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate(
+                {
+                    "message": "hi",
+                    "history": [{"role": "user", "content": "x" * (AGENT_MESSAGE_MAX_LENGTH + 1)}],
+                }
+            )
+
+    def test_rejects_whitespace_only_message(self) -> None:
+        """A whitespace-only message is rejected (min_length alone misses it)."""
+        for blank in ("   ", "\t", "\n", " \t\n "):
+            with pytest.raises(ValidationError):
+                AgentStreamRequest.model_validate({"message": blank})
+
+    def test_strips_surrounding_whitespace_from_message(self) -> None:
+        """The message validator strips surrounding whitespace."""
+        request = AgentStreamRequest.model_validate({"message": "  Plan my week  "})
+
+        assert request.message == "Plan my week"

@@ -111,6 +111,11 @@ function coachApp() {
           }
           if (epoch === this.streamEpoch) {
             if (this.streaming) {
+              // Surface the underlying transport error message when the
+              // browser provides one (e.g. "Stream unavailable (500)" or
+              // "Failed to fetch"), falling back to the generic "Connection
+              // failed" string; either way the assistant bubble prefixes it
+              // with ⚠️.
               this.statusText = error.message || "Connection failed";
               if (!this.messages[index].content) {
                 this.messages[index].content = "⚠️ " + this.statusText;

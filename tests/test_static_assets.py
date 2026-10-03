@@ -20,6 +20,13 @@ a URL or query string (access-log privacy, Swiss nLPD), and the client
 replays the last ≤ 10 transcript messages as history, excluding the
 in-flight assistant turn. The per-handler stale-event guards from #80 carry
 over unchanged.
+
+The #79 review remediation adds TestSseParserContract: source-level
+assertions pinning the three SSE parser correctness properties the PR
+claims (whole-buffer CRLF re-normalisation, ping-comment skipping, and the
+hasOwnProperty dispatch guard), so a future refactor cannot silently break
+them without a test failing (ADR-006 §5 — no Node toolchain; JS contracted
+via source assertions).
 """
 
 import re
@@ -475,3 +482,93 @@ class TestIdentityBarContract:
         assert "display: flex" in bar
         assert "align-items: center" in bar
         assert "var(--space-" in bar
+
+
+class TestSseParserContract:
+    """SSE parser correctness properties pinned at source level (#79 review).
+
+    The fetch + ReadableStream parser (`consumeSse`/`dispatchSseFrame`) is
+    the riskiest JS in the POST transport story, and the repo ships no Node
+    toolchain (ADR-006 §5), so — like the rest of the JS — it is contracted
+    through source assertions. Three properties the PR claims are pinned so
+    a future refactor cannot silently break them:
+
+    1. Whole-buffer ``\\r\\n → \\n`` re-normalisation: sse-starlette
+       terminates lines with ``\\r\\n``; a CRLF pair split across two chunk
+       boundaries must still be normalised before frames are split. The
+       replace therefore runs over the *accumulated* buffer (prior remainder
+       + freshly decoded chunk) on every read — not per chunk — and the
+       stream tail is normalised too.
+    2. Ping-comment skipping: ``": ping …"`` comment frames carry no
+       ``event:`` line, so dispatch must require a non-empty event type
+       before any handler can run.
+    3. Prototype-poisoning dispatch guard: handler lookup must go through
+       ``Object.prototype.hasOwnProperty`` so a forged frame with
+       ``event: constructor`` / ``event: toString`` cannot dispatch
+       inherited Object.prototype keys.
+    """
+
+    def test_consume_sse_renormalises_crlf_across_chunk_boundaries(self) -> None:
+        """The whole pending buffer is re-normalised on every read (#79)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        consume = _rule_block(script, "consumeSse(body, handlers)")
+        assert consume, "consumeSse(body, handlers) must exist"
+
+        # In-loop normalisation runs over the WHOLE accumulated buffer (prior
+        # remainder + freshly decoded chunk) — this is exactly the property
+        # that makes a \r\n pair split across two chunk boundaries survive:
+        # the second half joins the first half in the buffer before the
+        # regex ever runs.
+        loop_normalisation = (
+            r"(buffer + decoder.decode(value, { stream: true }))" r'.replace(/\r\n/g, "\n")'
+        )
+        assert loop_normalisation in consume
+
+        # The stream tail (final decode without { stream: true }) is
+        # normalised too, so a trailing CRLF cannot leak into the last frame.
+        tail_normalisation = r'(buffer + decoder.decode()).replace(/\r\n/g, "\n")'
+        assert tail_normalisation in consume
+
+        # Normalisation happens BEFORE frame splitting: the first blank-line
+        # boundary search follows the normalising assignment, so no frame is
+        # ever split off an un-normalised buffer.
+        normalisation_at = consume.index(loop_normalisation)
+        first_split_at = consume.index(r'buffer.indexOf("\n\n")')
+        assert normalisation_at < first_split_at
+
+        # Frames are delimited by a blank line and the delimiter (2 chars)
+        # is consumed — the SSE frame delimiter after \r\n → \n flattening.
+        assert r'buffer.indexOf("\n\n")' in consume
+        assert "buffer.slice(boundary + 2)" in consume
+
+    def test_dispatch_skips_ping_comment_frames(self) -> None:
+        """Comment-only frames (": ping …") never reach any handler."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        dispatch = _rule_block(script, "dispatchSseFrame(frame, handlers)")
+        assert dispatch, "dispatchSseFrame(frame, handlers) must exist"
+
+        # Only `event:` lines set the type and only `data:` lines carry
+        # payload — a ping comment (": ping …") matches neither, so its type
+        # stays "".
+        assert 'line.startsWith("event:")' in dispatch
+        assert 'line.startsWith("data:")' in dispatch
+
+        # Dispatch requires a non-empty type: the `type &&` half of the
+        # guard is what skips comment-only frames, and it precedes the
+        # handler invocation.
+        guard_at = dispatch.index("if (type &&")
+        invocation_at = dispatch.index("handlers[type](")
+        assert guard_at < invocation_at
+
+    def test_dispatch_guard_blocks_prototype_keys(self) -> None:
+        """Handler lookup goes through hasOwnProperty (prototype poisoning)."""
+        script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+        dispatch = _rule_block(script, "dispatchSseFrame(frame, handlers)")
+        assert dispatch, "dispatchSseFrame(frame, handlers) must exist"
+
+        # A forged frame with `event: constructor` / `event: toString` must
+        # not dispatch inherited Object.prototype keys: the guard is the
+        # canonical hasOwnProperty call, not `in` or a bare map read.
+        guard = "Object.prototype.hasOwnProperty.call(handlers, type)"
+        assert guard in dispatch
+        assert dispatch.index(guard) < dispatch.index("handlers[type](")
