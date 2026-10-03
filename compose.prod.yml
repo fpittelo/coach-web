@@ -37,4 +37,6 @@ services:
     image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:prod}
 
   github-mcp:
-    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2}
+    # Digest-pinned (AC7, #113): the v1.12.2 tag is mutable, the digest is not.
+    # Refresh with: docker buildx imagetools inspect ghcr.io/github/github-mcp-server:v1.12.2
+    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6}
