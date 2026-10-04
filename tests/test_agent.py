@@ -6,6 +6,7 @@ live API call is ever made.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from copy import deepcopy
 from typing import Any
@@ -27,6 +28,7 @@ from coach_web.agent import (
     _first_choice,
     _parse_arguments,
     create_agent,
+    plan_tool_schema,
 )
 from coach_web.app import create_app
 from coach_web.config import Settings
@@ -202,6 +204,32 @@ def _plan_payload(**overrides: Any) -> dict[str, Any]:
     }
     payload.update(overrides)
     return payload
+
+
+def _plan_call_streamer(
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "plan_1",
+) -> FakeStreamer:
+    """Build a streamer emitting a single propose_plan call, then a closing turn."""
+    return FakeStreamer(
+        [
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=call_id,
+                            name=PROPOSE_PLAN_TOOL,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [_chunk(content="Noted."), _chunk(finish_reason="stop")],
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -602,33 +630,89 @@ class TestCoachAgentPlanProposal:
         assert "plan_proposal_emitted" in result.data["result"]
 
     async def test_invalid_plan_is_reported_without_plan_event(self) -> None:
-        """An invalid proposal is rejected and reported back to the model."""
-        streamer = FakeStreamer(
-            [
-                [
-                    _chunk(
-                        tool_calls=[
-                            _tool_call_delta(
-                                0,
-                                call_id="plan_bad",
-                                name=PROPOSE_PLAN_TOOL,
-                                arguments=json.dumps(_plan_payload(week_id="nope")),
-                            )
-                        ],
-                        finish_reason="tool_calls",
-                    )
-                ],
-                [_chunk(content="Let me fix that."), _chunk(finish_reason="stop")],
-            ]
+        """An invalid proposal is rejected: field detail for the model, generic UI message."""
+        streamer = _plan_call_streamer(
+            _plan_payload(week_id="nope"),
+            call_id="plan_bad",
         )
         agent = CoachAgent(streamer, FakeHub())
 
         events = await _collect(agent, "Plan my week")
 
         assert all(e.type != "plan" for e in events)
-        assert any(e.type == "error" for e in events)
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid plan proposal — the coach will retry with corrected arguments."
+        )
         result = next(e for e in events if e.type == "tool_result")
         assert "Invalid plan proposal" in result.data["result"]
+        assert "week_id" in result.data["result"]
+        assert "nope" not in result.data["result"]
+
+    async def test_params_wrapped_plan_arguments_are_unwrapped(self) -> None:
+        """A payload nested under a single ``params`` key is unwrapped before validation."""
+        streamer = _plan_call_streamer({"params": _plan_payload()}, call_id="plan_params")
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        plan_event = next(e for e in events if e.type == "plan")
+        proposal_event = next(e for e in events if e.type == "plan_proposal")
+        assert plan_event.data["plan"]["title"] == "Threshold Builder"
+        assert proposal_event.data["plan"]["week_id"] == "2026-W38"
+        result = next(e for e in events if e.type == "tool_result")
+        assert "plan_proposal_emitted" in result.data["result"]
+
+    async def test_params_wrapped_invalid_plan_hides_rejected_values(self) -> None:
+        """Field-level detail reaches the model while rejected values stay out of the result."""
+        streamer = _plan_call_streamer(
+            {"params": _plan_payload(week_id="nope")},
+            call_id="plan_bad_params",
+        )
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        assert all(e.type != "plan" for e in events)
+        result = next(e for e in events if e.type == "tool_result")
+        assert "Invalid plan proposal" in result.data["result"]
+        assert "week_id" in result.data["result"]
+        assert "nope" not in result.data["result"]
+
+    async def test_invalid_plan_error_event_is_generic(self) -> None:
+        """The UI-facing error event carries a generic message without payload details."""
+        streamer = _plan_call_streamer(_plan_payload(week_id="nope"), call_id="plan_bad")
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid plan proposal — the coach will retry with corrected arguments."
+        )
+        assert "nope" not in error.data["message"]
+        assert "week_id" not in error.data["message"]
+
+    async def test_invalid_plan_is_logged_server_side_with_input(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The full validation error (including rejected input) is logged server-side only."""
+        streamer = _plan_call_streamer(_plan_payload(week_id="nope"), call_id="plan_bad")
+        agent = CoachAgent(streamer, FakeHub())
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            await _collect(agent, "Plan my week")
+
+        assert any("nope" in record.getMessage() for record in caplog.records)
+
+    async def test_plan_tool_schema_instructs_top_level_arguments(self) -> None:
+        """The tool description tells the model to pass plan fields as top-level arguments."""
+        schema = plan_tool_schema()
+
+        description = schema["function"]["description"]
+        assert "top-level" in description
+        assert "params" in description
 
     async def test_propose_plan_schema_is_advertised_to_the_model(self) -> None:
         """The propose_plan tool schema is merged into the advertised tools."""
