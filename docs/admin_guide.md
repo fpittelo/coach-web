@@ -85,6 +85,22 @@ The pre-flight asserts: the **exact service set** (`coach-web`, `coach-mcp`, `gi
 
 > **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
+### Local lane lifecycle (`scripts/lane.sh`)
+
+Agents (and humans) drive the dev/qa lanes through one entrypoint instead of hand-written compose invocations:
+
+```bash
+./scripts/lane.sh dev up              # build/start + wait until all three services are healthy
+./scripts/lane.sh dev status          # ps -a for the lane's compose project only
+./scripts/lane.sh dev logs coach-web  # --tail=100, optional service filter
+./scripts/lane.sh dev down            # project-scoped teardown (--remove-orphans)
+```
+
+- `up` prints the lane URL (`http://127.0.0.1:8100` dev / `:8200` qa) and the per-service states once every service reports healthy.
+- Scope is **dev/qa only**: `prod` is rejected with a pointer to the manual procedure (usage header in `compose.prod.yml`, Promotion Runbook below) — prod stays a human-owned, digest-pinned + OIDC operation.
+- Every action is scoped to the lane's own compose project (`coach-web-<lane>`); concurrent lanes and unrelated compose projects are never touched.
+- `scripts/e2e-preflight.sh` remains the validation gate — `lane.sh up` gets the lane running for browser-based verification, it does not replace the pre-flight assertions.
+
 ---
 
 ## 🚀 Promotion Runbook (dev → qa → main)
