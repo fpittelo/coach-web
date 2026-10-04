@@ -489,7 +489,17 @@ class TestE2EPreflightScript:
     def test_script_asserts_loopback_only_publishing(self, script: str) -> None:
         """The script asserts coach-web binds 127.0.0.1 and sidecars publish nothing."""
         assert "127.0.0.1" in script
-        assert "Publishers" in script
+        assert "preflight_loopback_check.py" in script
+        assert "coach-web" in script
+
+    def test_loopback_checker_module_enforces_boundary(self) -> None:
+        """The extracted publisher validator pins the loopback boundary (#138)."""
+        module = PROJECT_ROOT / "scripts" / "preflight_loopback_check.py"
+        assert module.is_file(), "scripts/preflight_loopback_check.py must exist"
+        text = module.read_text(encoding="utf-8")
+        assert "Publishers" in text
+        assert "127.0.0.1" in text
+        assert "publishes host ports but must publish none" in text
 
     def test_script_validates_compose_config(self, script: str) -> None:
         """The script runs docker compose config as a lint step."""
@@ -505,6 +515,48 @@ class TestE2EPreflightScript:
         """The prod lane probe asserts /api/* returns 401 without a session."""
         assert "401" in script
         assert "/api/agent/stream" in script
+
+
+class TestLaneScript:
+    """Minimal tracking assertions for the lane.sh entrypoint (#134)."""
+
+    @pytest.fixture
+    def script(self) -> str:
+        """Return the lane script contents."""
+        path = PROJECT_ROOT / "scripts" / "lane.sh"
+        assert path.is_file(), "scripts/lane.sh must exist"
+        return path.read_text(encoding="utf-8")
+
+    def test_script_exists_and_is_executable(self) -> None:
+        """scripts/lane.sh exists and is executable."""
+        script = PROJECT_ROOT / "scripts" / "lane.sh"
+        assert script.is_file()
+        assert script.stat().st_mode & 0o111, "script must be executable"
+
+    def test_script_passes_bash_syntax_check(self) -> None:
+        """bash -n validates the script syntax."""
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(PROJECT_ROOT / "scripts" / "lane.sh")],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_script_rejects_prod_with_manual_procedure_pointer(self, script: str) -> None:
+        """The prod lane is refused and points at the manual procedure (AC1)."""
+        assert "manual" in script.lower()
+        assert "compose.prod.yml" in script
+
+    def test_script_scopes_teardown_to_its_own_project(self, script: str) -> None:
+        """Teardown targets only the lane's compose project (AC2)."""
+        assert 'PROJECT="coach-web-${LANE}"' in script
+        assert "down --remove-orphans" in script
+
+    def test_script_uses_lane_env_file(self, script: str) -> None:
+        """The script passes the lane env file via --env-file (AC2)."""
+        assert "--env-file" in script
+        assert ".env.${LANE}" in script
 
 
 class TestCIContainerScan:
