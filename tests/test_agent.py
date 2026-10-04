@@ -706,6 +706,64 @@ class TestCoachAgentPlanProposal:
 
         assert any("nope" in record.getMessage() for record in caplog.records)
 
+    async def test_semantic_invalid_week_id_value_never_reaches_browser_surfaces(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A regex-valid but semantically invalid week_id must not leak via msg/ctx.
+
+        ``2026-W99`` passes the ISO week *pattern* but fails the semantic check,
+        whose ValueError message embeds the rejected value. The value must stay
+        out of the browser-facing tool result and UI error event (nLPD), while
+        the model still learns which field is wrong and the server-side log
+        keeps the full detail.
+        """
+        streamer = _plan_call_streamer(
+            _plan_payload(week_id="2026-W99"),
+            call_id="plan_bad_semantic_week",
+        )
+        agent = CoachAgent(streamer, FakeHub())
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            events = await _collect(agent, "Plan my week")
+
+        result = next(e for e in events if e.type == "tool_result")
+        error = next(e for e in events if e.type == "error")
+        assert "2026-W99" not in result.data["result"]
+        assert "2026-W99" not in error.data["message"]
+        # The model still learns WHICH field is wrong so it can self-correct.
+        assert "week_id" in result.data["result"]
+        # The full error (with the rejected value) stays server-side only.
+        assert any("2026-W99" in record.getMessage() for record in caplog.records)
+
+    async def test_semantic_invalid_date_value_never_reaches_browser_surfaces(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A regex-valid but semantically invalid date must not leak via msg/ctx.
+
+        ``2026-02-30`` passes the ISO date *pattern* but is not a calendar
+        date; the ValueError message embeds the rejected value, which must not
+        reach any browser-facing surface (nLPD).
+        """
+        streamer = _plan_call_streamer(
+            _plan_payload(date="2026-02-30"),
+            call_id="plan_bad_semantic_date",
+        )
+        agent = CoachAgent(streamer, FakeHub())
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            events = await _collect(agent, "Plan my week")
+
+        result = next(e for e in events if e.type == "tool_result")
+        error = next(e for e in events if e.type == "error")
+        assert "2026-02-30" not in result.data["result"]
+        assert "2026-02-30" not in error.data["message"]
+        # The model still learns WHICH field is wrong so it can self-correct.
+        assert "date" in result.data["result"]
+        # The full error (with the rejected value) stays server-side only.
+        assert any("2026-02-30" in record.getMessage() for record in caplog.records)
+
     async def test_plan_tool_schema_instructs_top_level_arguments(self) -> None:
         """The tool description tells the model to pass plan fields as top-level arguments."""
         schema = plan_tool_schema()

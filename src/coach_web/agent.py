@@ -353,7 +353,17 @@ class CoachAgent:
             plan = PlanProposal.model_validate(candidate)
         except ValidationError as exc:
             logger.warning("Rejected plan proposal arguments: %s", exc.errors())
-            detail = exc.errors(include_url=False, include_input=False)
+            # nLPD: project the model-facing detail down to loc/type only.
+            # ``include_input=False`` strips ``input`` but NOT ``msg``/``ctx``,
+            # and custom validators embed the rejected value in their message
+            # on the semantic branch. Enforcing value-freeness centrally at the
+            # emission point protects against ALL current and future validators;
+            # the model still learns WHICH field is wrong (``loc``) and can
+            # self-correct (formats are documented in the tool schema).
+            detail = [
+                {"loc": err.get("loc"), "type": err.get("type")}
+                for err in exc.errors(include_url=False, include_input=False)
+            ]
             return json.dumps({"error": f"Invalid plan proposal: {detail}"}), [
                 AgentEvent(
                     type="error",
