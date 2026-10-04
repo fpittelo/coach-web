@@ -194,39 +194,12 @@ fi
 log "All expected services are present and healthy."
 
 log "Asserting loopback-only host publishing..."
-ps_json="$(dc ps -a --format json)"
-printf '%s' "${ps_json}" | python3 -c '
-import json
-import sys
-
-raw = sys.stdin.read().strip()
-entries = []
-if raw:
-    try:
-        parsed = json.loads(raw)
-        entries = parsed if isinstance(parsed, list) else [parsed]
-    except json.JSONDecodeError:
-        entries = [json.loads(line) for line in raw.splitlines() if line.strip()]
-violations = []
-for entry in entries:
-    service = entry.get("Service", "<unknown>")
-    publishers = entry.get("Publishers") or []
-    if service == "coach-web":
-        for publisher in publishers:
-            published_port = publisher.get("PublishedPort") or 0
-            if published_port == 0:
-                continue
-            host_ip = publisher.get("PublishedIP") or publisher.get("URL") or publisher.get("IP") or ""
-            if host_ip != "127.0.0.1":
-                violations.append(
-                    "coach-web published on {0}:{1} (must be 127.0.0.1)".format(host_ip, published_port)
-                )
-    elif publishers:
-        violations.append("{0} publishes host ports but must publish none".format(service))
-for violation in violations:
-    print(violation, file=sys.stderr)
-sys.exit(1 if violations else 0)
-'
+# Publisher validation lives in scripts/preflight_loopback_check.py (#138):
+# it filters compose v5.1.3 phantom publishers (PublishedPort == 0, empty
+# URL, ports.scheme=v2) for ALL services, then enforces the loopback-only
+# boundary (ADR-007): coach-web on 127.0.0.1 only, sidecars unpublished.
+# Violations go to stderr; a non-zero exit fails the gate (set -euo pipefail).
+dc ps -a --format json | python3 "${PROJECT_DIR}/scripts/preflight_loopback_check.py" coach-web
 log "Publishing is loopback-only (coach-web on 127.0.0.1:${LANE_PORT}, sidecars unpublished)."
 
 log "Validating coach-web health endpoint..."
