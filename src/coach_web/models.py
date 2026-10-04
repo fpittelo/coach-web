@@ -88,11 +88,61 @@ class TrainingPlan(BaseModel):
         return _validate_iso_week(value)
 
 
+AGENT_MESSAGE_MAX_LENGTH = 8000
+"""Hard cap on a single user message (characters) at the SSE boundary."""
+
+AGENT_HISTORY_MAX_ENTRIES = 10
+"""Hard cap on replayed history entries enforced server-side (#79)."""
+
+
 class ChatMessage(BaseModel):
     """A single chat message exchanged with the coach."""
 
     role: Literal["user", "assistant"] = Field(..., description="Message role: user or assistant")
-    content: str = Field(..., description="Message content")
+    content: str = Field(
+        ...,
+        max_length=AGENT_MESSAGE_MAX_LENGTH,
+        description=(
+            "Message content, capped per entry: 10 unbounded history entries "
+            "would bypass the message cap entirely (STRIDE #87)"
+        ),
+    )
+
+
+class AgentStreamRequest(BaseModel):
+    """Payload for ``POST /api/agent/stream`` (multi-turn SSE transport, #79).
+
+    The conversation is client-owned: ``history`` replays the prior turns and
+    nothing is persisted server-side (nLPD ephemeral posture). Roles are
+    restricted to ``user``/``assistant`` and the entry count is capped here —
+    client-forged history is a prompt-injection surface (STRIDE #87).
+    """
+
+    message: str = Field(
+        ...,
+        min_length=1,
+        max_length=AGENT_MESSAGE_MAX_LENGTH,
+        description="Current user message for the coach agent",
+    )
+    history: list[ChatMessage] = Field(
+        default_factory=list,
+        max_length=AGENT_HISTORY_MAX_ENTRIES,
+        description="Prior conversation turns (oldest first), capped at 10",
+    )
+
+    @field_validator("message")
+    @classmethod
+    def _reject_blank_message(cls, value: str) -> str:
+        """Strip the message and reject whitespace-only input.
+
+        ``min_length=1`` rejects ``""`` but not ``"   "``; the client already
+        trims, so stripping here keeps the wire contract honest for direct
+        API callers too.
+        """
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("message must not be empty or whitespace-only")
+        return stripped
 
 
 class WorkoutStep(BaseModel):

@@ -8,19 +8,26 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette import EventSourceResponse, ServerSentEvent
+from starlette.datastructures import MutableHeaders
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from coach_web.agent import AgentEvent, CoachAgent, create_agent
 from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
 from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
-from coach_web.models import PlanApprovalRequest, PlanApprovalResponse
+from coach_web.models import (
+    AgentStreamRequest,
+    PlanApprovalRequest,
+    PlanApprovalResponse,
+)
 from coach_web.plan_approval import approve_plan
 
 logger = logging.getLogger("coach_web")
@@ -29,6 +36,41 @@ STATIC_DIR = Path(__file__).parent / "static"
 SERVICE_NAME = "coach-web"
 PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
+
+# Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
+# C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
+# vendored Alpine standard build (it compiles x- expressions via AsyncFunction
+# at runtime) and is contained: script-src has no 'unsafe-inline', so injected
+# inline scripts are blocked, and DOMPurify strips every Alpine directive
+# (#81). The Alpine CSP build remains a future hardening item.
+CSP_POLICY = (
+    "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
+
+
+class ContentSecurityPolicyMiddleware:
+    """Stamp every response with the minimal v0.7 CSP header (#84, C2/C5).
+
+    Pure ASGI middleware (no ``BaseHTTPMiddleware``) so the header is applied
+    to every response — pages, static assets, API/SSE routes and
+    middleware-generated error responses alike — without buffering or
+    otherwise touching the SSE stream.
+    """
+
+    def __init__(self, app: ASGIApp, policy: str = CSP_POLICY) -> None:
+        self.app = app
+        self.policy = policy
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def send_with_csp(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Content-Security-Policy"] = self.policy
+            await send(message)
+
+        await self.app(scope, receive, send_with_csp)
 
 
 def resolve_version() -> str:
@@ -96,6 +138,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         application.include_router(auth_router)
         application.add_middleware(AuthMiddleware)
 
+    # Host allowlist (DNS-rebinding mitigation, #112): a malicious page that
+    # resolves a hostname to 127.0.0.1 must not reach the loopback service
+    # same-origin. Added last => outermost, so a bad Host is rejected before
+    # auth/CORS. Critical while dev/qa run AUTH_ENABLED=false.
+    application.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=resolved.TRUSTED_HOSTS,
+        www_redirect=False,
+    )
+
+    # Content-Security-Policy (STRIDE #87 conditions C2/C5, #84): stamp the
+    # minimal v0.7 policy on every response. Added last => outermost, so even
+    # the TrustedHost 400 and auth 401/403 error responses carry the header.
+    application.add_middleware(ContentSecurityPolicyMiddleware)
+
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @application.get("/", include_in_schema=False)
@@ -115,15 +172,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             uptime_seconds=round(time.monotonic() - started_at, 3),
         )
 
-    @application.get("/api/agent/stream", tags=["agent"])
-    @application.get("/api/chat/stream", include_in_schema=False)
+    @application.post("/api/agent/stream", tags=["agent"])
     async def agent_stream(
         request: Request,
-        message: str = Query(..., min_length=1, description="User message for the coach agent"),
+        payload: AgentStreamRequest,
     ) -> EventSourceResponse:
         """Stream the coach agent's reasoning, tool calls and plan over SSE.
 
-        Native ``EventSource`` clients consume the typed events emitted by
+        The conversation is client-owned (nLPD ephemeral posture): the request
+        body carries the current ``message`` plus the replayed ``history``
+        (validated and capped by :class:`AgentStreamRequest`) and nothing is
+        persisted server-side. Message content travels in the POST body —
+        never in the URL or query string (#79). Native ``fetch``/ReadableStream
+        clients consume the typed events emitted by
         :meth:`coach_web.agent.CoachAgent.run`.
         """
         settings: Settings = request.app.state.settings
@@ -133,7 +194,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
-                    async for event in agent.run(message):
+                    async for event in agent.run(payload.message, history=payload.history):
                         yield ServerSentEvent(event=event.type, data=event.model_dump_json())
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)

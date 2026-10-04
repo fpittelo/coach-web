@@ -6,12 +6,47 @@
     <meta name="color-scheme" content="light" />
     <title>Coach Web</title>
     <link rel="stylesheet" href="/static/styles.css" />
+    <!-- Vendor libs load before app.js (marked → DOMPurify → app.js); Alpine
+         boots last so the component registration listener is already in place
+         and renderMarkdown() has its dependencies when first called. -->
+    <script defer src="/static/vendor/marked.min.js"></script>
+    <script defer src="/static/vendor/DOMPurify.min.js"></script>
     <script defer src="/static/app.js"></script>
     <script defer src="/static/vendor/alpine.min.js"></script>
   </head>
   <body>
     <div x-data="coachApp()" x-init="init()" x-cloak>
       <header class="masthead">
+        <div class="identity-bar">
+          <div class="identity-brand">
+            <svg class="monogram" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+              <rect
+                x="1.5"
+                y="1.5"
+                width="29"
+                height="29"
+                rx="9"
+                stroke="currentColor"
+                stroke-width="2.5"
+              />
+              <path
+                d="M22.4 11.2a8 8 0 1 0 0 9.6"
+                stroke="currentColor"
+                stroke-width="2.5"
+                stroke-linecap="round"
+              />
+            </svg>
+            <span class="product-name">Coach Web</span>
+          </div>
+          <button
+            class="button button--ghost new-chat"
+            type="button"
+            aria-label="New chat: clear the conversation and reset the session"
+            @click="resetChat()"
+          >
+            New chat
+          </button>
+        </div>
         <div class="rule"></div>
         <p class="kicker">Endurance Cockpit · Local VIDAR</p>
         <h1>Coach Web</h1>
@@ -26,21 +61,185 @@
         <section class="panel chat" aria-label="Coach chat console">
           <h2 class="panel-title">Chat console</h2>
 
-          <div class="chat-log" x-ref="log" aria-live="polite">
-            <p class="empty-state" x-show="messages.length === 0">
-              Start the conversation with a question about your training.
-            </p>
+          <!-- Visually-hidden live region (#86 AC3): announces phase changes
+               and the completed FINAL message to screen readers — never per
+               token. Replaces the v0.5 whole-log aria-live="polite" (a
+               token-by-token stream would spam assistive tech); the log
+               below is a role="log" region whose implicit polite semantics
+               cover newly added messages. -->
+          <p
+            class="visually-hidden"
+            role="status"
+            aria-live="polite"
+            x-text="liveAnnouncement"
+          ></p>
+
+          <div class="chat-log" x-ref="log" role="log" aria-label="Conversation with your coach">
+            <!-- Onboarding empty state (#86 AC1): hero monogram, one-line
+                 welcome and 3 static endurance starter chips (PO Q2/Q7 —
+                 domain-correct, client-side strings, no personal data).
+                 Chips prefill the composer and focus it — never auto-send
+                 (PO Q8). -->
+            <div class="empty-state" x-show="messages.length === 0">
+              <svg
+                class="monogram monogram--hero"
+                viewBox="0 0 32 32"
+                fill="none"
+                aria-hidden="true"
+              >
+                <rect
+                  x="1.5"
+                  y="1.5"
+                  width="29"
+                  height="29"
+                  rx="9"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                />
+                <path
+                  d="M22.4 11.2a8 8 0 1 0 0 9.6"
+                  stroke="currentColor"
+                  stroke-width="2.5"
+                  stroke-linecap="round"
+                />
+              </svg>
+              <p class="empty-state-welcome">Hello! I'm your coach — what should we work on today?</p>
+              <div class="starter-chips" role="group" aria-label="Starter prompts">
+                <template x-for="chip in starterChips" :key="chip">
+                  <button class="chip" type="button" x-text="chip" @click="prefillChip(chip)"></button>
+                </template>
+              </div>
+            </div>
 
             <template x-for="(message, index) in messages" :key="index">
               <article class="message" :class="{ 'message--user': message.role === 'user' }">
                 <span class="message-role" x-text="message.role"></span>
-                <p class="message-body" x-text="message.content"></p>
+                <!-- User messages stay x-text forever: untrusted input is
+                     never HTML-rendered (ADR-006 §9, STRIDE #87 C4). -->
+                <template x-if="message.role === 'user'">
+                  <p class="message-body" x-text="message.content"></p>
+                </template>
+                <!-- Assistant messages are the sole HTML-rendered surface,
+                     bound to the renderMarkdown sanitizer helper over the
+                     accumulated raw content (re-sanitized on every token
+                     render). -->
+                <template x-if="message.role === 'assistant'">
+                  <div
+                    class="message-body message-body--markdown"
+                    x-html="renderMarkdown(message.content)"
+                  ></div>
+                </template>
+                <!-- Inline plan-approval card (#82): renders beneath the
+                     assistant message that proposed it. planMessageIndex
+                     pins the single active card to the proposing message —
+                     a new proposal replaces the previous one (AC4).
+                     Structured Pydantic→HTML only: x-text bindings, never
+                     markdown (ADR-006 §9, STRIDE #87). -->
+                <template x-if="message.role === 'assistant' && plan && planMessageIndex === index">
+                  <div class="plan-card" role="region" aria-label="Proposed plan">
+                    <p class="plan-card-label">Proposed plan</p>
+                    <dl class="plan-meta">
+                      <div class="plan-field">
+                        <dt>Date</dt>
+                        <dd x-text="plan.date || '—'"></dd>
+                      </div>
+                      <div class="plan-field">
+                        <dt>Duration</dt>
+                        <dd x-text="planDuration + ' min'"></dd>
+                      </div>
+                    </dl>
+                    <h3 class="plan-title" x-text="plan.title"></h3>
+                    <p class="plan-summary" x-text="plan.summary"></p>
+                    <p
+                      class="plan-rationale"
+                      x-show="plan.rationale"
+                      x-text="plan.rationale"
+                    ></p>
+                    <!-- AC3: the 4-column table scrolls inside this wrapper
+                         on narrow viewports instead of overflowing the page. -->
+                    <div class="plan-table-wrap" x-show="plan.steps && plan.steps.length > 0">
+                      <table class="interval-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Interval</th>
+                            <th scope="col">Duration</th>
+                            <th scope="col">Target</th>
+                            <th scope="col">Cadence</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="(step, index) in plan.steps" :key="index">
+                            <tr>
+                              <td x-text="step.label"></td>
+                              <td x-text="step.duration_minutes + ' min'"></td>
+                              <td
+                                x-text="
+                                  step.target_power_watts
+                                    ? step.target_power_watts + ' W'
+                                    : step.target_power_pct
+                                      ? step.target_power_pct + ' %'
+                                      : '—'
+                                "
+                              ></td>
+                              <td
+                                x-text="step.cadence_rpm ? step.cadence_rpm + ' rpm' : '—'"
+                              ></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="plan-actions">
+                      <button
+                        class="button"
+                        type="button"
+                        @click="approvePlan()"
+                        :disabled="approval.state === 'submitting' || approval.state === 'approved'"
+                      >
+                        Approve &amp; Push
+                      </button>
+                      <button
+                        class="button button--ghost"
+                        type="button"
+                        @click="rejectPlan()"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                    <p
+                      class="approval-note"
+                      :class="{ 'approval-note--error': approval.state === 'error' }"
+                      x-show="approval.message"
+                      x-text="approval.message"
+                    ></p>
+                  </div>
+                </template>
               </article>
             </template>
           </div>
 
           <div class="activity" x-show="streaming || thoughts.length > 0 || tools.length > 0">
-            <div class="status-line" x-show="streaming">
+            <!-- Thinking indicator (#84 AC4): bound to the waiting phase,
+                 which startStream sets synchronously on submit — the dots
+                 are visible before the fetch is even dispatched, hence
+                 before any SSE event arrives. -->
+            <div class="thinking-indicator" x-show="phase === 'waiting'">
+              <span class="thinking-dots" aria-hidden="true">
+                <span class="dot"></span>
+                <span class="dot"></span>
+                <span class="dot"></span>
+              </span>
+              <span class="thinking-label" x-text="statusText || 'Thinking'"></span>
+            </div>
+
+            <!-- Streaming / tooling / in-stream error status line (#84 AC1):
+                 the typed-error path keeps the stream alive until the
+                 follow-up done, so the line turns error-red for that gap. -->
+            <div
+              class="status-line"
+              x-show="phase === 'streaming' || phase === 'tooling' || phase === 'error'"
+              :class="{ 'status-line--error': phase === 'error' }"
+            >
               <span class="pulse" aria-hidden="true"></span>
               <span x-text="statusText || 'Working'"></span>
             </div>
@@ -59,98 +258,36 @@
             </ul>
           </div>
 
+          <!-- Non-blocking error banner (#84 AC3/AC5): a persistent,
+               phase-independent failure surface between the activity feed
+               and the composer. It never overlays or disables anything —
+               the only composer disable condition is the in-flight
+               streaming flag, so the user can always retry by sending
+               again. -->
+          <p class="error-banner" x-show="errorBanner" x-text="errorBanner"></p>
+
           <form class="composer" @submit.prevent="send()">
-            <input
-              type="text"
+            <!-- Auto-growing composer (#83): rows="1" starts as a single
+                 line, autoGrowTextarea() grows it with content up to the
+                 ~5-line CSS cap (internal scroll beyond) and the input
+                 clear on send/reset shrinks it back via the $watch hook.
+                 Enter sends, Shift+Enter newlines, IME-guarded (AC2). -->
+            <textarea
+              rows="1"
               name="message"
               autocomplete="off"
               placeholder="Ask your coach…"
               aria-label="Message for the coach"
               x-model="input"
+              x-ref="composer"
               :disabled="streaming"
-            />
+              @keydown="onComposerKeydown($event)"
+            ></textarea>
             <button class="button" type="submit" :disabled="streaming || input.trim() === ''">
               Send
             </button>
           </form>
         </section>
-
-        <aside class="panel plan" aria-label="Plan approval">
-          <h2 class="panel-title">Plan approval</h2>
-
-          <p class="plan-placeholder" x-show="!plan">
-            Proposed workouts appear here for review before anything is scheduled.
-          </p>
-
-          <template x-if="plan">
-            <div>
-              <dl class="plan-meta">
-                <div class="plan-field">
-                  <dt>Date</dt>
-                  <dd x-text="plan.date || '—'"></dd>
-                </div>
-                <div class="plan-field">
-                  <dt>Duration</dt>
-                  <dd x-text="planDuration + ' min'"></dd>
-                </div>
-              </dl>
-
-              <h3 class="plan-title" x-text="plan.title"></h3>
-              <p class="plan-summary" x-text="plan.summary"></p>
-              <p class="plan-rationale" x-show="plan.rationale" x-text="plan.rationale"></p>
-
-              <table class="interval-table" x-show="plan.steps && plan.steps.length > 0">
-                <thead>
-                  <tr>
-                    <th scope="col">Interval</th>
-                    <th scope="col">Duration</th>
-                    <th scope="col">Target</th>
-                    <th scope="col">Cadence</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <template x-for="(step, index) in plan.steps" :key="index">
-                    <tr>
-                      <td x-text="step.label"></td>
-                      <td x-text="step.duration_minutes + ' min'"></td>
-                      <td
-                        x-text="
-                          step.target_power_watts
-                            ? step.target_power_watts + ' W'
-                            : step.target_power_pct
-                              ? step.target_power_pct + ' %'
-                              : '—'
-                        "
-                      ></td>
-                      <td x-text="step.cadence_rpm ? step.cadence_rpm + ' rpm' : '—'"></td>
-                    </tr>
-                  </template>
-                </tbody>
-              </table>
-
-              <div class="plan-actions">
-                <button
-                  class="button"
-                  type="button"
-                  @click="approvePlan()"
-                  :disabled="approval.state === 'submitting' || approval.state === 'approved'"
-                >
-                  Approve &amp; Push
-                </button>
-                <button class="button button--ghost" type="button" @click="rejectPlan()">
-                  Reject
-                </button>
-              </div>
-
-              <p
-                class="approval-note"
-                :class="{ 'approval-note--error': approval.state === 'error' }"
-                x-show="approval.message"
-                x-text="approval.message"
-              ></p>
-            </div>
-          </template>
-        </aside>
       </main>
 
       <footer class="footer">

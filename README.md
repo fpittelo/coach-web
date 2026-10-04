@@ -29,7 +29,7 @@ The Phase 1 core delivers:
 - **Static asset serving** for the Swiss minimalist UI at `/static/`
 - **Pydantic v2 settings** with `.env` loading
 - **Dual MCP client hub** and OpenRouter agent loop streaming typed SSE events
-- **Chat console** consuming `GET /api/agent/stream` via native `EventSource`
+- **Chat console** consuming `POST /api/agent/stream` via `fetch` + ReadableStream (client-owned multi-turn history, #79)
 - **Plan approval card** posting to `POST /api/plan/approve` (Intervals.icu event + GitHub Markdown commit)
 
 ---
@@ -81,29 +81,38 @@ uv sync
 cp .env.example .env
 # Edit .env with your COACH_MCP_URL and GITHUB_TOKEN
 
-# Run (FastAPI + uvicorn)
+# Run (FastAPI + uvicorn — binds APP_PORT, default 8000)
 uv run coach-web
-# or with autoreload
+# or with autoreload on an explicit port override
 uv run uvicorn coach_web.app:create_app --factory --reload --port 8080
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) — the Swiss minimalist shell is served from `/`.
+Then open [http://localhost:8000](http://localhost:8000) (or `:8080` with the override above) — the Swiss minimalist shell is served from `/`.
 
-Healthcheck: [http://localhost:8080/health](http://localhost:8080/health)
+Healthcheck: [http://localhost:8000/health](http://localhost:8000/health)
 
-### Option 2: Docker
+### Option 2: Docker (local lanes — ADR-007)
+
+The stack runs on the local workstation in three isolated lanes (dev / qa / prod), all bound to `127.0.0.1` only:
 
 ```bash
-docker build -t coach-web .
+# one-time per lane: create the lane env file from its template
+cp .env.dev.example .env.dev   # then edit with your secrets
 
-docker run -d --rm -p 8080:8080 \
-  -e COACH_MCP_URL="http://localhost:8000/mcp" \
-  -e GITHUB_TOKEN="ghp_xxx" \
-  --name coach-web-app \
-  coach-web
+# dev lane — build from source
+docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml \
+    --env-file .env.dev up -d --build
 ```
 
-Then open [http://localhost:8080](http://localhost:8080) and meet your coach.
+Then open [http://localhost:8100](http://localhost:8100) (dev), `:8200` (qa), or `:8000` (prod) and meet your coach.
+
+| Lane | Host port | Compose files | Env file |
+|:---|:---|:---|:---|
+| dev | `127.0.0.1:8100` | `compose.yaml` + `compose.dev.yml` | `.env.dev` |
+| qa | `127.0.0.1:8200` | `compose.yaml` + `compose.qa.yml` | `.env.qa` |
+| prod | `127.0.0.1:8000` | `compose.yaml` + `compose.prod.yml` | `.env.prod` |
+
+Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|prod`) with its own network, and sidecars publish no host ports. See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the promotion runbook, and the per-lane pre-flight (`./scripts/e2e-preflight.sh dev|qa|prod`).
 
 ---
 
@@ -139,13 +148,14 @@ The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `
 | [Specifications](docs/specifications.md) | @architect — technical specs, data flow, MCP integration |
 | [Architecture](docs/architecture.md) | @architect — ArchiMate 3.x model, C4 diagrams, ADRs |
 
-> ℹ️ The `docs/` set is being refreshed by @architect for the Phase 1 FastAPI migration (ADR-01).
+> ℹ️ The `docs/` set is refreshed for the local-first deployment model (ADR-007, issue #108); the local-topology STRIDE rewrite lands with #113.
 
 ---
 
 ## 🔒 Security & Privacy
 
 - **Swiss nLPD (FADP) Compliant** — all biometric data (HR, HRV, sleep, training loads) stays in ephemeral browser session. No persistent client-side storage.
+- **Local-First Deployment (ADR-007)** — dev, qa, and prod run on the local workstation in hardened, loopback-only Docker lanes; biometric data never leaves the host. Loopback binding is the primary access control; Google OIDC (prod lane) is defense-in-depth.
 - **No API Key in the Browser** — the Intervals.icu API key lives **only** in the Coach MCP server's environment. The web app never touches it.
 - **OCI Non-Root Container** — runs as unprivileged user `coach-web` (`UID:GID 10001:10001`), same hardening as the Coach MCP server.
 - **Clean stdout** — structured logging with no secrets logged.
@@ -158,7 +168,7 @@ The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `
 |:---|:---|
 | **Language** | Python 3.12 |
 | **Framework** | FastAPI + uvicorn |
-| **Frontend** | Alpine.js + Tailwind CSS (static assets) |
+| **Frontend** | Alpine.js + hand-written CSS with v0.7 design tokens (static assets, zero CDN) |
 | **Streaming** | Server-Sent Events (`sse-starlette`) |
 | **MCP Client** | `mcp[cli]` Python SDK (streamable_http transport) |
 | **GitHub API** | `httpx` async client (for training plan issues) |

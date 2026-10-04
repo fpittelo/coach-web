@@ -73,13 +73,13 @@ class Settings(BaseSettings):
     """Enable Google OIDC authentication & whitelist middleware (opt-in, #65)."""
 
     GOOGLE_OIDC_CLIENT_ID: str = ""
-    """Google OAuth web client ID (Cloud Run injects GOOGLE_OIDC_CLIENT_ID, #66)."""
+    """Google OAuth web client ID (lane env files wire GOOGLE_OIDC_CLIENT_ID, #66)."""
 
     GOOGLE_OIDC_CLIENT_SECRET: str = ""
     """Google OAuth client secret (env var only; never logged or persisted)."""
 
     GOOGLE_OIDC_ISSUER: str = "https://accounts.google.com"
-    """Expected issuer of Google ID tokens (aligns with the Cloud Run spec, #66)."""
+    """Expected issuer of Google ID tokens (Google accounts issuer, #66)."""
 
     AUTH_WHITELIST_EMAILS: list[str] = Field(
         default_factory=lambda: ["frederic.pitteloud@gmail.com"]
@@ -94,6 +94,18 @@ class Settings(BaseSettings):
 
     AUTH_REDIRECT_URI: str = ""
     """Explicit OAuth redirect URI; derived from the request base URL when empty."""
+
+    AUTH_COOKIE_SECURE: bool = True
+    """Set the Secure flag on session & OIDC-state cookies (default true).
+
+    Chromium >=89 and Firefox >=75 treat ``http://localhost`` as a trustworthy
+    origin and DO send Secure cookies over plain-HTTP loopback; Safari has no
+    localhost exception and drops them. Only set false for a plain-HTTP
+    non-loopback deployment — never in the local loopback topology.
+    """
+
+    TRUSTED_HOSTS: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
+    """Host header allowlist enforced by TrustedHostMiddleware (DNS rebinding)."""
 
     @property
     def service_name(self) -> str:

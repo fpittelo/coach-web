@@ -1,6 +1,7 @@
-/* Coach Web — Swiss minimalist interface (EPFL Elements inspired).
-   Pure white surfaces, hairline borders, 2px radii, Inter typography,
-   no elevation. All assets are self-hosted; no external requests. */
+/* Coach Web — v0.7 conversational interface (ADR-006 visual contract).
+   Off-white surfaces, slate ink, deep-teal accent, 10px radii, soft
+   elevation, and a single centered reading column. All assets are
+   self-hosted; no external requests. */
 
 @font-face {
   font-family: "Inter";
@@ -27,12 +28,19 @@
 }
 
 :root {
-  --ink: #111111;
-  --muted: #6b6b6b;
+  /* v0.7 palette (ADR-006): slate-on-off-white with a deep teal accent. */
+  --surface: #f8fafc;
   --paper: #ffffff;
-  --line: #d5d5d5;
-  --accent: #ff0000;
-  --radius: 2px;
+  --ink: #1e293b;
+  --muted: #475569;
+  --line: #e2e8f0;
+  --accent: #0f766e;
+  --accent-ink: #ffffff;
+  --error: #b91c1c;
+  /* Soft geometry: 10px radius band, elevation replaces harsh borders. */
+  --radius: 10px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.08);
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -56,7 +64,7 @@ body {
 
 body {
   min-height: 100vh;
-  background: var(--paper);
+  background: var(--surface);
   color: var(--ink);
   font-family: var(--font-sans);
   font-weight: 400;
@@ -69,10 +77,28 @@ body {
   display: none !important;
 }
 
+/* Visually-hidden live region (#86 AC3): hidden from sight, kept in the
+   accessibility tree — display: none would silence it entirely. The
+   classic clip pattern keeps it at zero visual footprint while screen
+   readers announce its x-text content changes. */
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 /* --- Masthead ---------------------------------------------------------- */
 
 .masthead {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: var(--space-6) var(--space-5) var(--space-5);
 }
@@ -106,28 +132,53 @@ body {
   color: var(--muted);
 }
 
+/* --- Identity bar ------------------------------------------------------ */
+
+.identity-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+
+.identity-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.monogram {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  color: var(--accent);
+}
+
+.product-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
 /* --- Layout ------------------------------------------------------------ */
 
 .layout {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: 0 var(--space-5) var(--space-7);
-  display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+  display: flex;
+  flex-direction: column;
   gap: var(--space-5);
-  align-items: start;
-}
-
-@media (max-width: 900px) {
-  .layout {
-    grid-template-columns: minmax(0, 1fr);
-  }
 }
 
 .panel {
   background: var(--paper);
-  border: 1px solid var(--line);
   border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
   padding: var(--space-5);
 }
 
@@ -142,16 +193,41 @@ body {
 
 /* --- Chat console ------------------------------------------------------ */
 
+/* Definite viewport height (#83 AC3, PR 130 review): flex: 1 + overflow-y:
+   auto on the log only scroll against a container with a DEFINITE main
+   size — an auto-height column grows with the transcript and pushes the
+   composer below the fold. The panel is therefore height-bounded to the
+   viewport minus the masthead chrome (26rem covers the worst case:
+   narrow viewports where the lede wraps to five lines); the layout
+   padding and footer sit below the panel and may scroll out of view
+   without affecting the composer. dvh tracks mobile browser chrome, with
+   the vh declaration as the fallback; max-height caps the panel on very
+   tall monitors. The v0.5 min-height: 32rem floor is superseded: on
+   phones it exceeds the space below the masthead, and a floor taller
+   than the computed height would win and un-pin the composer exactly
+   there. */
+
 .chat {
   display: flex;
   flex-direction: column;
-  min-height: 32rem;
+  height: calc(100vh - 26rem);
+  height: calc(100dvh - 26rem);
+  max-height: 40rem;
 }
+
+/* Pinned composer footer (#83 AC3): the panel is a flex column with a
+   definite viewport height (see .chat above) — the log is the growing
+   child (flex: 1) and the composer is its footer, so the input stays
+   pinned to the bottom of the panel on mobile and desktop. The v0.5
+   30rem log cap is dropped: the log's height is governed by the flex
+   layout against the panel's definite height (overflow-y: auto zeroes
+   its automatic minimum size, so long transcripts scroll internally
+   instead of growing the panel), which keeps the composer pinned at
+   every transcript length. */
 
 .chat-log {
   flex: 1;
   overflow-y: auto;
-  max-height: 30rem;
   padding-right: var(--space-2);
   display: flex;
   flex-direction: column;
@@ -181,12 +257,159 @@ body {
   margin: 0;
   white-space: pre-wrap;
   word-break: break-word;
+  line-height: 1.6;
 }
+
+/* Onboarding empty state (#86 AC1): hero monogram, one-line welcome and
+   static starter chips, centered as a column. Replaces the v0.5
+   one-liner. Chips prefill the composer — they never send (PO Q8) — and
+   introduce no animation or transition of their own, so the
+   prefers-reduced-motion contract from #85 needs no chip exception. */
 
 .empty-state {
   margin: 0;
+  padding: var(--space-6) var(--space-4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+  text-align: center;
+}
+
+.monogram--hero {
+  width: 48px;
+  height: 48px;
+}
+
+.empty-state-welcome {
+  margin: 0;
+  max-width: 40ch;
+  font-size: 1.05rem;
+  color: var(--ink);
+}
+
+.starter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-3);
+}
+
+.chip {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  padding: var(--space-2) var(--space-4);
+  font-family: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.chip:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* --- Markdown rendering (assistant messages, #81) ----------------------- */
+
+/* Assistant bubbles render sanitized markdown (ADR-006 §9). Block elements
+   handle their own breaks, so the plain-text pre-wrap override is dropped.
+   KIS scope: bold, lists, blockquotes, inline code, headings — no syntax
+   highlighting, no table styling. */
+
+.message-body--markdown {
+  white-space: normal;
+  overflow-wrap: break-word;
+}
+
+.message-body--markdown > :first-child {
+  margin-top: 0;
+}
+
+.message-body--markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.message-body--markdown p {
+  margin: 0 0 var(--space-3);
+}
+
+.message-body--markdown strong {
+  font-weight: 700;
+}
+
+.message-body--markdown ul,
+.message-body--markdown ol {
+  margin: 0 0 var(--space-3);
+  padding-left: 1.4rem;
+}
+
+.message-body--markdown li {
+  margin: 0 0 var(--space-1);
+}
+
+.message-body--markdown blockquote {
+  margin: 0 0 var(--space-3);
+  padding-left: var(--space-4);
+  border-left: 2px solid var(--accent);
   color: var(--muted);
-  font-size: 0.95rem;
+}
+
+.message-body--markdown code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+}
+
+.message-body--markdown pre {
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3);
+  background: var(--surface);
+  border-radius: 4px;
+  overflow-x: auto;
+}
+
+.message-body--markdown pre code {
+  background: none;
+  padding: 0;
+}
+
+.message-body--markdown h1,
+.message-body--markdown h2,
+.message-body--markdown h3,
+.message-body--markdown h4,
+.message-body--markdown h5,
+.message-body--markdown h6 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-weight: 700;
+  line-height: 1.3;
+}
+
+.message-body--markdown h1 {
+  font-size: 1.15rem;
+}
+
+.message-body--markdown h2 {
+  font-size: 1.05rem;
+}
+
+.message-body--markdown h3,
+.message-body--markdown h4,
+.message-body--markdown h5,
+.message-body--markdown h6 {
+  font-size: 1rem;
+}
+
+.message-body--markdown a {
+  color: var(--accent);
 }
 
 /* --- Agent activity ---------------------------------------------------- */
@@ -226,6 +449,68 @@ body {
   50% {
     opacity: 0.25;
   }
+}
+
+/* --- Stream phases (#84) ------------------------------------------------ */
+
+/* Thinking indicator: three staggered, pulsing dots — visible immediately
+   on submit (phase "waiting"), before any token arrives (AC4). Reuses the
+   pulse keyframes with per-dot delays; token-driven colors only. */
+
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.thinking-dots {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.thinking-dots .dot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius);
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.thinking-dots .dot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinking-dots .dot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+/* In-stream error: the status line turns error-red while a typed agent
+   error is surfaced (the stream stays alive until the follow-up done). */
+
+.status-line--error {
+  color: var(--error);
+}
+
+.status-line--error .pulse {
+  background: var(--error);
+}
+
+/* Non-blocking error banner (AC3/AC5): persistent failure surface between
+   the activity feed and the composer. Token-driven; never blocks input. */
+
+.error-banner {
+  margin: var(--space-4) 0 0;
+  padding: var(--space-3);
+  border-left: 2px solid var(--error);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--error);
+  font-size: 0.85rem;
 }
 
 .thought {
@@ -278,15 +563,24 @@ body {
 
 /* --- Composer ---------------------------------------------------------- */
 
+/* Pinned footer (AC3, #83): flex-end keeps the Send button on the bottom
+   edge of the composer row while the textarea grows above it. */
+
 .composer {
   margin-top: var(--space-4);
   border-top: 1px solid var(--line);
   padding-top: var(--space-4);
   display: flex;
+  align-items: flex-end;
   gap: var(--space-3);
 }
 
-.composer input {
+/* Auto-growing textarea (AC1, #83): rows="1" starts as a single line and
+   app.js sizes the box to its content; the max-height cap encodes ~5
+   lines (5 × 1.5 line-height) plus the vertical padding and border, and
+   overflow-y: auto scrolls internally beyond the cap. */
+
+.composer textarea {
   flex: 1;
   min-width: 0;
   border: 1px solid var(--line);
@@ -294,11 +588,15 @@ body {
   padding: var(--space-3);
   font-family: inherit;
   font-size: 0.95rem;
+  line-height: 1.5;
   color: var(--ink);
   background: var(--paper);
+  resize: none;
+  overflow-y: auto;
+  max-height: calc(7.5em + 2 * var(--space-3) + 2px);
 }
 
-.composer input:focus {
+.composer textarea:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -1px;
 }
@@ -306,10 +604,10 @@ body {
 /* --- Buttons ----------------------------------------------------------- */
 
 .button {
-  border: 1px solid var(--ink);
+  border: none;
   border-radius: var(--radius);
-  background: var(--ink);
-  color: var(--paper);
+  background: var(--accent);
+  color: var(--accent-ink);
   padding: var(--space-3) var(--space-5);
   font-family: inherit;
   font-size: 0.8rem;
@@ -320,8 +618,13 @@ body {
 }
 
 .button:hover:not(:disabled) {
-  background: var(--accent);
-  border-color: var(--accent);
+  filter: brightness(1.1);
+  box-shadow: var(--shadow-sm);
+}
+
+.button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 .button:disabled {
@@ -332,6 +635,7 @@ body {
 .button--ghost {
   background: var(--paper);
   color: var(--ink);
+  border: 1px solid var(--line);
 }
 
 .button--ghost:hover:not(:disabled) {
@@ -340,7 +644,35 @@ body {
   border-color: var(--accent);
 }
 
-/* --- Plan approval card ------------------------------------------------ */
+/* --- Inline plan-approval card (#82) ------------------------------------ */
+
+/* The proposed plan renders as a conversation card beneath the assistant
+   message that proposed it (single active card — a new proposal replaces
+   the previous one). Structured Pydantic→HTML only: x-text bindings, no
+   markdown rendering (ADR-006 §9, STRIDE #87). */
+
+.plan-card {
+  margin-top: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+
+.plan-card-label {
+  margin: 0 0 var(--space-3);
+  font-size: 0.65rem;
+  font-weight: 600;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.plan-title {
+  margin: 0 0 var(--space-2);
+  font-size: 1rem;
+  font-weight: 700;
+}
 
 .plan-meta {
   display: grid;
@@ -383,10 +715,19 @@ body {
   font-size: 0.9rem;
 }
 
+/* AC3 (#82): the 4-column interval table scrolls horizontally inside its
+   wrapper on narrow viewports instead of overflowing the page. The block
+   margin moves to the wrapper (overflow creates a BFC, so a table margin
+   would otherwise pool inside the scroll container). */
+
+.plan-table-wrap {
+  overflow-x: auto;
+  margin-bottom: var(--space-4);
+}
+
 .interval-table {
   width: 100%;
   border-collapse: collapse;
-  margin-bottom: var(--space-4);
   font-size: 0.85rem;
 }
 
@@ -422,19 +763,25 @@ body {
 }
 
 .approval-note--error {
-  color: var(--accent);
+  color: var(--error);
 }
 
-.plan-placeholder {
-  margin: 0;
-  color: var(--muted);
-  font-size: 0.95rem;
+/* --- Narrow viewports (#82 AC3) ------------------------------------------ */
+
+/* At ≤375px the plan card stacks: the meta grid collapses to one column so
+   the date/duration fields never squeeze the interval table; the table
+   itself scrolls horizontally inside .plan-table-wrap. */
+
+@media (max-width: 375px) {
+  .plan-meta {
+    grid-template-columns: 1fr;
+  }
 }
 
 /* --- Footer ------------------------------------------------------------ */
 
 .footer {
-  max-width: 1180px;
+  max-width: 760px;
   margin: 0 auto;
   padding: var(--space-5);
   border-top: 1px solid var(--line);
@@ -446,4 +793,22 @@ body {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* --- Reduced motion (AC3, #85) ------------------------------------------ */
+
+/* Users who prefer reduced motion get no looping animations (status pulse
+   and thinking dots), and the log pins scroll-behavior to auto so a later
+   stylesheet change can never reintroduce eased token-time scrolling —
+   app.js already scrolls with behavior "auto" (see scrollToBottom). */
+
+@media (prefers-reduced-motion: reduce) {
+  .pulse,
+  .thinking-dots .dot {
+    animation: none;
+  }
+
+  .chat-log {
+    scroll-behavior: auto;
+  }
 }

@@ -1,0 +1,159 @@
+# Coach Web — base Compose file (shared lane topology, ADR-007 / issue #109).
+#
+# This file is ALWAYS combined with exactly one lane override:
+#
+#   docker compose -p coach-web-dev  -f compose.yaml -f compose.dev.yml  --env-file .env.dev  up -d --build
+#   docker compose -p coach-web-qa   -f compose.yaml -f compose.qa.yml   --env-file .env.qa   up -d
+#   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
+#
+# The base file holds everything shared across lanes: services, healthchecks,
+# container hardening and the per-service environment scoping. Each lane file
+# holds the compose project name, the coach-web image (build or GHCR pull),
+# the loopback host port, the lane's auth mode and its CORS origin default.
+#
+# Deliberately NOT in the base file (ADR-007, issue #109):
+#   - container_name / hostname → lanes are disambiguated by compose project
+#     name; service DNS names (coach-mcp, github-mcp) stay stable per network
+#   - host ports                → loopback ports are lane-specific (8100/8200/8000)
+#   - network name:             → the network derives from the project name
+#     (<project>_coach-net), so concurrent lanes never share a network
+#
+# Secret scoping (ADR-007): the lane env file is passed via --env-file and is
+# used for ${...} INTERPOLATION ONLY — no env_file injects a whole file into
+# any container. Each service's environment mapping below names exactly the
+# variables that service needs:
+#   coach-web  → app config + OPENROUTER_API_KEY, GOOGLE_OIDC_CLIENT_SECRET,
+#                AUTH_SESSION_SECRET, GITHUB_TOKEN
+#   coach-mcp  → MCP config + INTERVALS_API_KEY
+#   github-mcp → GITHUB_TOKEN (as GITHUB_PERSONAL_ACCESS_TOKEN) + toolsets
+
+services:
+  coach-web:
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: "8000"
+      COACH_MCP_URL: http://coach-mcp:8000/sse
+      GITHUB_MCP_URL: http://github-mcp:8001/
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8000"]}'
+      LOG_LEVEL: '${LOG_LEVEL:-INFO}'
+      CACHE_TTL_SECONDS: '${CACHE_TTL_SECONDS:-60}'
+      AGENT_MAX_TOOL_ITERATIONS: '${AGENT_MAX_TOOL_ITERATIONS:-8}'
+      GOOGLE_OIDC_CLIENT_ID: '${GOOGLE_OIDC_CLIENT_ID:-}'
+      GOOGLE_OIDC_CLIENT_SECRET: '${GOOGLE_OIDC_CLIENT_SECRET:-}'
+      GOOGLE_OIDC_ISSUER: '${GOOGLE_OIDC_ISSUER:-https://accounts.google.com}'
+      AUTH_WHITELIST_EMAILS: '${AUTH_WHITELIST_EMAILS:-[]}'
+      AUTH_SESSION_SECRET: '${AUTH_SESSION_SECRET:-}'
+      AUTH_SESSION_TTL_SECONDS: '${AUTH_SESSION_TTL_SECONDS:-3600}'
+      AUTH_REDIRECT_URI: '${AUTH_REDIRECT_URI:-}'
+      AUTH_COOKIE_SECURE: '${AUTH_COOKIE_SECURE:-true}'
+      TRUSTED_HOSTS: '${TRUSTED_HOSTS:-["localhost", "127.0.0.1"]}'
+      GITHUB_TOKEN: '${GITHUB_TOKEN:-}'
+      GITHUB_REPO: '${GITHUB_REPO:-fpittelo/coach}'
+      GITHUB_PLAN_BRANCH: '${GITHUB_PLAN_BRANCH:-main}'
+      GITHUB_PLAN_DIR: '${GITHUB_PLAN_DIR:-plans}'
+      OPENROUTER_API_KEY: '${OPENROUTER_API_KEY:-}'
+      OPENROUTER_BASE_URL: '${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}'
+      OPENROUTER_MODEL: '${OPENROUTER_MODEL:-anthropic/claude-sonnet-4.5}'
+      OPENROUTER_TIMEOUT_SECONDS: '${OPENROUTER_TIMEOUT_SECONDS:-60}'
+      OPENROUTER_APP_TITLE: '${OPENROUTER_APP_TITLE:-Coach Web}'
+      OPENROUTER_REFERER: '${OPENROUTER_REFERER:-https://github.com/fpittelo/coach-web}'
+    depends_on:
+      coach-mcp:
+        condition: service_healthy
+      github-mcp:
+        condition: service_healthy
+    networks:
+      - coach-net
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+  coach-mcp:
+    environment:
+      MCP_TRANSPORT: sse
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: "8000"
+      INTERVALS_API_KEY: '${INTERVALS_API_KEY:-}'
+      INTERVALS_ATHLETE_ID: '${INTERVALS_ATHLETE_ID:-0}'
+      INTERVALS_BASE_URL: '${INTERVALS_BASE_URL:-https://intervals.icu/api/v1}'
+      HTTP_TIMEOUT_SECONDS: '${HTTP_TIMEOUT_SECONDS:-30.0}'
+      HTTP_MAX_RETRIES: '${HTTP_MAX_RETRIES:-3}'
+      # The sidecar's cache knobs are interpolated from COACH_MCP_* names so
+      # they never collide with coach-web's CACHE_TTL_SECONDS in the lane env
+      # file; the container-side names stay CACHE_TTL_SECONDS / _VOLATILE_.
+      CACHE_TTL_SECONDS: '${COACH_MCP_CACHE_TTL_SECONDS:-300}'
+      CACHE_TTL_VOLATILE_SECONDS: '${COACH_MCP_CACHE_TTL_VOLATILE_SECONDS:-60}'
+    networks:
+      - coach-net
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/sse', timeout=5).status == 200 else 1)"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+  github-mcp:
+    command: ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
+    environment:
+      GITHUB_PERSONAL_ACCESS_TOKEN: '${GITHUB_TOKEN:-}'
+      GITHUB_TOOLSETS: '${GITHUB_TOOLSETS:-default}'
+    networks:
+      - coach-net
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    healthcheck:
+      test: ["CMD", "/server/github-mcp-server", "--version"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+networks:
+  coach-net:
+    driver: bridge

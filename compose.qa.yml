@@ -1,0 +1,37 @@
+# Coach Web — qa lane override (ADR-007 / issue #109).
+#
+# Staging validation lane: coach-web PULLS the CI-built, zero-warning-gated
+# ghcr.io/fpittelo/coach-web:qa image (a local build would bypass the CI
+# verification chain) and publishes on 127.0.0.1:8200 only. Auth is disabled.
+# Runs concurrently with the dev/prod lanes (project coach-web-qa).
+#
+# Precondition: the :qa images exist only after the first post-change
+# dev → qa promotion (coach-web:qa here, coach:qa in the coach repo).
+#
+# Usage:
+#   cp .env.qa.example .env.qa      # then fill in your secrets
+#   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml \
+#       --env-file .env.qa pull
+#   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml \
+#       --env-file .env.qa up -d
+#   ./scripts/e2e-preflight.sh qa
+
+name: coach-web-qa
+
+services:
+  coach-web:
+    image: ghcr.io/fpittelo/coach-web:qa
+    ports:
+      - "127.0.0.1:8200:8000"
+    environment:
+      # Loopback binding is the primary access control (ADR-007); the OIDC
+      # whitelist is defense-in-depth and stays off on the qa lane.
+      AUTH_ENABLED: "false"
+      # Per-lane CORS default (folded finding from PR #116 review, #112).
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8200"]}'
+
+  coach-mcp:
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:qa}
+
+  github-mcp:
+    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2}

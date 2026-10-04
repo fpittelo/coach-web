@@ -2,10 +2,21 @@
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from coach_web.app import STATIC_DIR, create_app
+from coach_web.app import CSP_POLICY, STATIC_DIR, create_app
+from coach_web.config import Settings
+
+# The exact minimal policy decided in the STRIDE #87 sign-off (conditions
+# C2/C5) and shipped as middleware in #84. Hardcoded here — independent of
+# the application constant — so an accidental policy change fails this test.
+EXPECTED_CSP_POLICY = (
+    "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
+    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
+    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+)
 
 
 class TestCreateApp:
@@ -145,3 +156,97 @@ class TestRun:
         assert kwargs["factory"] is True
         assert kwargs["host"] == "0.0.0.0"  # noqa: S104
         assert kwargs["port"] == 8000
+
+
+class TestTrustedHostMiddleware:
+    """AC6 (#112): the Host allowlist rejects DNS-rebinding attempts."""
+
+    def test_default_allowed_hosts_are_loopback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """TRUSTED_HOSTS defaults to loopback names only."""
+        monkeypatch.delenv("TRUSTED_HOSTS", raising=False)
+
+        assert Settings().TRUSTED_HOSTS == ["localhost", "127.0.0.1"]
+
+    def test_evil_host_is_rejected(self) -> None:
+        """A request with a non-allowlisted Host is rejected with 400."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://evil.com") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 400
+
+    def test_localhost_host_is_allowed(self) -> None:
+        """A request with Host: localhost passes the allowlist."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://localhost") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+
+    def test_loopback_ip_host_is_allowed(self) -> None:
+        """A request with Host: 127.0.0.1 passes the allowlist."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://127.0.0.1") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+
+    def test_allowed_hosts_are_configurable(self) -> None:
+        """A custom TRUSTED_HOSTS entry is honored (testability)."""
+        app = create_app(Settings(TRUSTED_HOSTS=["coach.example.ch"]))
+
+        with TestClient(app, base_url="http://coach.example.ch") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+
+
+class TestCspMiddleware:
+    """AC (#84, STRIDE #87 conditions C2/C5): the minimal v0.7 CSP everywhere.
+
+    The vendored Alpine standard build compiles ``x-`` expressions at runtime,
+    so ``script-src`` must carry ``'unsafe-eval'``; it is contained because
+    ``script-src`` has no ``'unsafe-inline'`` (injected inline scripts are
+    blocked) and DOMPurify strips every Alpine directive (#81). The
+    middleware is registered outermost, so even middleware-generated error
+    responses (TrustedHost 400, auth 401/403) carry the header.
+    """
+
+    def test_shipped_policy_matches_the_87_signoff(self) -> None:
+        """The shipped constant equals the policy decided in #87 verbatim."""
+        assert CSP_POLICY == EXPECTED_CSP_POLICY
+
+    def test_index_response_carries_the_exact_policy(self) -> None:
+        """GET / is stamped with the exact CSP directive string."""
+        with TestClient(create_app()) as client:
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+    def test_health_response_carries_the_exact_policy(self) -> None:
+        """GET /health is stamped with the exact CSP directive string."""
+        with TestClient(create_app()) as client:
+            response = client.get("/health")
+
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+    def test_static_assets_carry_the_exact_policy(self) -> None:
+        """Static assets are stamped too (single-origin delivery)."""
+        with TestClient(create_app()) as client:
+            for path in ("/static/styles.css", "/static/app.js"):
+                response = client.get(path)
+                assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY, path
+
+    def test_middleware_generated_error_responses_carry_the_policy(self) -> None:
+        """Even the TrustedHost 400 rejection path is stamped (outermost)."""
+        app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
+
+        with TestClient(app, base_url="http://evil.com") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 400
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY

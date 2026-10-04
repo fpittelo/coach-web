@@ -1,0 +1,36 @@
+# Coach Web — dev lane override (ADR-007 / issue #109).
+#
+# Active development lane: coach-web is BUILT from source (target: runtime)
+# and published on 127.0.0.1:8100 only. Auth is disabled. Sidecars track the
+# dev lane tags. Runs concurrently with the qa/prod lanes: the project name
+# below isolates container and network names (coach-web-dev_coach-net).
+#
+# Usage:
+#   cp .env.dev.example .env.dev    # then fill in your secrets
+#   docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml \
+#       --env-file .env.dev up -d --build
+#   ./scripts/e2e-preflight.sh dev
+
+name: coach-web-dev
+
+services:
+  coach-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: ghcr.io/fpittelo/coach-web:dev
+    ports:
+      - "127.0.0.1:8100:8000"
+    environment:
+      # Loopback binding is the primary access control (ADR-007); the OIDC
+      # whitelist is defense-in-depth and stays off on the dev lane.
+      AUTH_ENABLED: "false"
+      # Per-lane CORS default (folded finding from PR #116 review, #112).
+      CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8100"]}'
+
+  coach-mcp:
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:dev}
+
+  github-mcp:
+    image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2}
