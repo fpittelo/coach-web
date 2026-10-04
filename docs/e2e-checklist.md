@@ -30,10 +30,11 @@ docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file 
 ## Step 1 — Anonymous access is denied (auth boundary)
 
 ```bash
-curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8000/api/agent/stream
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/json' \
+  -d '{"message":"probe"}' http://127.0.0.1:8000/api/agent/stream
 ```
 
-- [ ] Returns **401** (no session).
+- [ ] Returns **401** (no session). The stream endpoint is POST-only (#79).
 - [ ] `curl -sS -o /dev/null -w '%{http_code}\n' -H 'Host: evil.example' http://127.0.0.1:8000/` returns **400** (TrustedHostMiddleware, DNS-rebinding mitigation).
 
 ## Step 2 — OIDC login
