@@ -9,6 +9,7 @@ SSE endpoint serialises verbatim.
 """
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from types import TracebackType
 from typing import Any, Literal, Protocol
@@ -20,6 +21,8 @@ from coach_web.config import Settings
 from coach_web.mcp_hub import MCPClientHub
 from coach_web.models import ChatMessage, PlanProposal
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.5"
 """Model routed through OpenRouter when no override is configured."""
 
@@ -28,6 +31,11 @@ OPENROUTER_CHAT_COMPLETIONS_PATH = "/chat/completions"
 
 PROPOSE_PLAN_TOOL = "propose_plan"
 """Name of the synthetic tool the model calls to submit a structured plan."""
+
+PLAN_VALIDATION_UI_MESSAGE = (
+    "Invalid plan proposal — the coach will retry with corrected arguments."
+)
+"""Generic UI-facing validation failure message (nLPD: no plan data echoed)."""
 
 AgentEventType = Literal[
     "status",
@@ -332,15 +340,35 @@ class CoachAgent:
     def _handle_plan_proposal(arguments: dict[str, Any]) -> tuple[str, list[AgentEvent]]:
         """Validate a plan proposal and build its approval events.
 
-        Invalid proposals never reach the UI: the validation error is returned
-        to the model so it can correct itself on the next iteration.
+        A payload nested under a single ``params`` key (a shape some models
+        emit) is unwrapped before validation. On failure the model receives
+        field-level detail without the rejected values, the UI only receives a
+        generic error message, and the full validation error is logged
+        server-side (nLPD: plan data never reaches browser-facing surfaces).
         """
+        candidate = arguments
+        if set(arguments) == {"params"} and isinstance(arguments["params"], dict):
+            candidate = arguments["params"]
         try:
-            plan = PlanProposal.model_validate(arguments)
+            plan = PlanProposal.model_validate(candidate)
         except ValidationError as exc:
-            message = f"Invalid plan proposal: {exc.errors()}"
-            return json.dumps({"error": message}), [
-                AgentEvent(type="error", data={"message": message})
+            logger.warning("Rejected plan proposal arguments: %s", exc.errors())
+            # nLPD: project the model-facing detail down to loc/type only.
+            # ``include_input=False`` strips ``input`` but NOT ``msg``/``ctx``,
+            # and custom validators embed the rejected value in their message
+            # on the semantic branch. Enforcing value-freeness centrally at the
+            # emission point protects against ALL current and future validators;
+            # the model still learns WHICH field is wrong (``loc``) and can
+            # self-correct (formats are documented in the tool schema).
+            detail = [
+                {"loc": err.get("loc"), "type": err.get("type")}
+                for err in exc.errors(include_url=False, include_input=False)
+            ]
+            return json.dumps({"error": f"Invalid plan proposal: {detail}"}), [
+                AgentEvent(
+                    type="error",
+                    data={"message": PLAN_VALIDATION_UI_MESSAGE},
+                )
             ]
 
         payload = plan.model_dump()
@@ -383,7 +411,9 @@ def plan_tool_schema() -> dict[str, Any]:
             "name": PROPOSE_PLAN_TOOL,
             "description": (
                 "Propose a structured workout plan for the athlete to approve "
-                "before it is scheduled."
+                "before it is scheduled. Pass every plan field (title, week_id, "
+                "summary, steps, ...) as top-level tool arguments; never nest "
+                "them under a params key."
             ),
             "parameters": PlanProposal.model_json_schema(),
         },
