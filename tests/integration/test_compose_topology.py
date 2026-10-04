@@ -489,7 +489,17 @@ class TestE2EPreflightScript:
     def test_script_asserts_loopback_only_publishing(self, script: str) -> None:
         """The script asserts coach-web binds 127.0.0.1 and sidecars publish nothing."""
         assert "127.0.0.1" in script
-        assert "Publishers" in script
+        assert "preflight_loopback_check.py" in script
+        assert "coach-web" in script
+
+    def test_loopback_checker_module_enforces_boundary(self) -> None:
+        """The extracted publisher validator pins the loopback boundary (#138)."""
+        module = PROJECT_ROOT / "scripts" / "preflight_loopback_check.py"
+        assert module.is_file(), "scripts/preflight_loopback_check.py must exist"
+        text = module.read_text(encoding="utf-8")
+        assert "Publishers" in text
+        assert "127.0.0.1" in text
+        assert "publishes host ports but must publish none" in text
 
     def test_script_validates_compose_config(self, script: str) -> None:
         """The script runs docker compose config as a lint step."""
