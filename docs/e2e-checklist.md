@@ -45,7 +45,7 @@ Execute with `BROWSER_*` tools: `browser_navigate` → `browser_snapshot` (acces
 | J5 | Plan proposal + approval card | Ask for a weekly plan; snapshot after proposal | Inline plan card beneath the proposing message with Approve/Reject; exactly one active card |
 | J6 | Plan reject | Click Reject; snapshot | Card dismissed; no plan state residue |
 | J7 | New chat reset | Click New chat mid- or post-stream; snapshot | Log cleared, empty state returns; no stale stream events resurrect content |
-| J8 | XSS sanitization | Send `<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`, `[x](javascript:alert(1))` | All inert in assistant bubble (sanitized markdown); user bubble plain text; no execution; no console errors |
+| J8 | XSS sanitization | Send `<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`, `[x](javascript:alert(1))`, and `<scr` + `ipt>` as two consecutive messages (accumulated-string re-sanitization across stream chunks, STRIDE C3) | All inert in assistant bubble (sanitized markdown); user bubble plain text; no execution; no console errors |
 | J9 | Console hygiene | After J1–J8, read console messages | No uncaught errors/warnings attributable to the app (browser-extension noise excluded) |
 
 **Pass criterion:** every journey's snapshot assertions hold and J9 is clean. A failed journey blocks sign-off and is filed as `type::bug` with the snapshot excerpt.
@@ -56,13 +56,15 @@ Execute with `BROWSER_*` tools: `browser_navigate` → `browser_snapshot` (acces
 ### 🧪 Agent Journey Verification Report
 
 - **Lane:** dev | qa — `http://127.0.0.1:<port>`
-- **Image:** `<image>@sha256:<digest>` (from `lane.sh status` / compose)
+- **Image:** `<image>@sha256:<digest>` (from `docker compose images` or the release notes)
 - **Journeys:** J1 ✅ · J2 ✅ · J3 ✅ · J4 ✅ · J5 ✅ · J6 ✅ · J7 ✅ · J8 ✅ · J9 ✅
 - **Console errors:** none | <list>
 - **Failures:** none | <journey # + snapshot excerpt + filed issue>
 - **Teardown:** ✅ `lane.sh <lane> down` executed — host clean (verified via `lane.sh status` empty)
 - **Verdict:** PASS | FAIL
 ```
+
+**Redaction rule (MADR-0009, binding):** reports and PR comments must **not** include console/page content containing personal or health data, credentials, or tokens — summarize, redact, or omit. Snapshot excerpts quoted in failure reports are limited to the minimum lines needed to demonstrate the failing assertion.
 
 ## DoD hook
 
