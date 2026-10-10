@@ -699,6 +699,7 @@ class TestIdentityBarContract:
             "tool_result",
             "plan_proposal",
             "plan",
+            "week_plan",
             "error",
             "done",
         ):
@@ -2371,3 +2372,225 @@ class TestPeriodizationSettingsContract:
         assert title, ".phases-title rule missing"
         assert "var(--" in title
         assert "#" not in title
+
+
+class TestWeeklyPlanCardContract:
+    """Weekly plan card — state pair, chips, approval & adjust contract (#168).
+
+    The weekly microcycle (epic #161 story 2.1) renders as a single
+    conversation card pinned to the proposing assistant message via the
+    ``weekPlan`` / ``weekMessageIndex`` state pair (#82 replacement rule —
+    a new ``week_plan`` event replaces the card). Per-day status chips are
+    word + color, never color alone (#165); Adjust prefills the composer and
+    NEVER auto-sends (PO Q8); the approval POST carries the validated draft
+    plus the optional retry-failed-days dates subset (#163 non-atomic
+    writes). JS is contracted via source assertions (no Node toolchain,
+    ADR-006 §5).
+    """
+
+    WEEK_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && weekPlan && "
+        'weekMessageIndex === index">'
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _week_card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.WEEK_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    # --- state pair & card pinning -------------------------------------------
+
+    def test_week_state_pair_is_declared_once(self) -> None:
+        """The weekPlan/weekMessageIndex pair is declared exactly once."""
+        script = self._script()
+
+        assert script.count("weekPlan: null") == 1
+        assert script.count("weekMessageIndex: -1") == 1
+
+    def test_week_card_is_pinned_to_the_proposing_message(self) -> None:
+        """The card template binds the weekPlan/weekMessageIndex pair."""
+        html = self._html()
+
+        assert self.WEEK_CARD_TEMPLATE in html
+
+    def test_week_plan_handler_pins_and_resets_day_statuses(self) -> None:
+        """The week_plan handler pins the card and seeds per-day statuses."""
+        script = self._script()
+        handler = _rule_block(script, "week_plan: (event) =>")
+
+        assert "this.weekPlan = data.draft" in handler
+        assert "this.weekMessageIndex = index" in handler
+        assert '"proposed"' in handler
+        assert "this.scrollToBottom()" in handler
+
+    def test_week_card_is_a_labelled_region(self) -> None:
+        """The card is a role=region with the #165 aria-label."""
+        card = self._week_card()
+
+        assert 'role="region"' in card
+        assert 'aria-label="Proposed weekly plan"' in card
+
+    # --- structured rendering (no markdown) -----------------------------------
+
+    def test_week_card_is_structured_pydantic_to_html(self) -> None:
+        """The week card binds x-text only — never markdown/x-html."""
+        card = self._week_card()
+
+        assert "x-html" not in card
+        assert "renderMarkdown" not in card
+        assert "weekPlan.title" in card
+        assert "weekPlan.summary" in card
+        assert "day.session_title" in card
+        assert "day.planned_tss" in card
+
+    def test_week_card_renders_the_week_summary_line(self) -> None:
+        """The week summary (total TSS, hard/easy/rest) is rendered."""
+        card = self._week_card()
+
+        assert "weekSummaryLine" in card
+
+    # --- per-day status chips: word + color, never color alone -----------------
+
+    def test_day_status_words_are_pinned(self) -> None:
+        """Every chip state carries a word — color is never the sole carrier."""
+        script = self._script()
+
+        assert '"proposed"' in script
+        assert '"pushing…"' in script
+        assert '"approved ✓"' in script
+        assert '"write failed"' in script
+
+    def test_day_chip_classes_map_to_tokens(self) -> None:
+        """Chip color classes exist and resolve to design tokens only."""
+        css = self._css()
+
+        assert ".day-chip--proposed" in css
+        assert ".day-chip--pushing" in css
+        assert ".day-chip--approved" in css
+        assert ".day-chip--failed" in css
+        approved = _rule_block(css, ".day-chip--approved")
+        failed = _rule_block(css, ".day-chip--failed")
+        assert "var(--accent)" in approved
+        assert "var(--error)" in failed
+
+    # --- approval flow (#163 non-atomic writes) --------------------------------
+
+    def test_approve_week_posts_the_week_and_dates_contract(self) -> None:
+        """Approve All posts {week, dates} to /api/week/approve."""
+        script = self._script()
+        approve = _rule_block(script, "approveWeek(dates)")
+
+        assert 'fetch("/api/week/approve"' in approve
+        assert 'method: "POST"' in approve
+        assert "JSON.stringify({ week: this.weekPlan, dates: dates || null })" in approve
+
+    def test_approve_week_marks_target_days_pushing_before_the_post(self) -> None:
+        """Target days flip to pushing synchronously, before the fetch."""
+        approve = _rule_block(self._script(), "approveWeek(dates)")
+
+        pushing_at = approve.index('"pushing"')
+        fetch_at = approve.index('fetch("/api/week/approve"')
+        assert pushing_at < fetch_at
+
+    def test_partial_failure_surfaces_the_retry_affordance(self) -> None:
+        """A partial failure sets the partially_failed state and retry button."""
+        script = self._script()
+        approve = _rule_block(script, "approveWeek(dates)")
+
+        assert '"partially_failed"' in approve
+        retry = _rule_block(script, "retryFailedDays()")
+        assert "this.approveWeek(" in retry
+        assert '"failed"' in retry
+
+    def test_retry_posts_only_the_failed_dates(self) -> None:
+        """The retry affordance collects the failed dates as the subset."""
+        retry = _rule_block(self._script(), "retryFailedDays()")
+
+        assert '"failed"' in retry
+
+    def test_transport_error_returns_pushing_days_to_proposed(self) -> None:
+        """A failed request never leaves days stuck in pushing."""
+        approve = _rule_block(self._script(), "approveWeek(dates)")
+
+        assert '"proposed"' in approve
+
+    # --- Adjust: prefill, never auto-send (PO Q8) -------------------------------
+
+    def test_adjust_day_prefills_the_composer_without_sending(self) -> None:
+        """Adjust fills the composer and focuses it — never auto-send."""
+        adjust = _rule_block(self._script(), "adjustDay(day)")
+
+        assert "this.input = " in adjust
+        assert "this.$refs.composer.focus()" in adjust
+        assert "this.send()" not in adjust
+        assert "this.startStream(" not in adjust
+
+    def test_rest_days_offer_no_adjust_button(self) -> None:
+        """The Adjust button is hidden for rest days."""
+        card = self._week_card()
+
+        assert 'x-show="!day.rest_day"' in card
+
+    # --- reject & reset ---------------------------------------------------------
+
+    def test_reject_week_clears_the_card_state(self) -> None:
+        """Reject dismisses the card and clears every week state slice."""
+        reject = _rule_block(self._script(), "rejectWeek()")
+
+        assert "this.weekPlan = null" in reject
+        assert "this.weekMessageIndex = -1" in reject
+        assert "this.weekDayStatus = {}" in reject
+
+    def test_reset_chat_clears_the_week_state(self) -> None:
+        """New chat clears the weekly card state too."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.weekPlan = null" in reset
+        assert "this.weekMessageIndex = -1" in reset
+        assert "this.weekDayStatus = {}" in reset
+
+    def test_start_stream_clears_the_week_state(self) -> None:
+        """A new stream clears the weekly card (the #82 replacement posture)."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.weekPlan = null" in start
+        assert "this.weekMessageIndex = -1" in start
+
+    # --- accessibility -----------------------------------------------------------
+
+    def test_week_note_is_a_live_status_region(self) -> None:
+        """The approval note is a role=status region (WCAG 4.1.3, #165)."""
+        card = self._week_card()
+
+        assert 'role="status"' in card
+
+    def test_week_table_headers_are_scoped(self) -> None:
+        """The day table declares scope=col headers."""
+        card = self._week_card()
+
+        assert 'scope="col"' in card
+
+    # --- mobile stacking (≤375px, #165 wireframe) --------------------------------
+
+    def test_week_table_stacks_on_narrow_viewports(self) -> None:
+        """At ≤375px the day table stacks into per-day blocks."""
+        css = self._css()
+        media = _media_block(css, "@media (max-width: 375px)")
+
+        assert ".week-table" in media
+        assert "display: block" in media
+
+    def test_week_table_scrolls_in_an_overflow_wrapper(self) -> None:
+        """The desktop day table rides the existing overflow-x wrapper."""
+        card = self._week_card()
+
+        assert "plan-table-wrap" in card

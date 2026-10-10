@@ -28,6 +28,14 @@ from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
+from coach_web.microcycle import (
+    PlanDraftRow,
+    WeekApprovalRequest,
+    WeekApprovalResponse,
+    transition_draft_status,
+    upsert_week_draft,
+    write_week_days,
+)
 from coach_web.models import (
     AgentStreamRequest,
     PlanApprovalRequest,
@@ -59,6 +67,9 @@ FALLBACK_VERSION = "0.0.0"
 
 GENERIC_VALIDATION_DETAIL = "Invalid request payload"
 """Static 422 detail — validation errors stay server-side (nLPD, #142)."""
+
+GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
+"""Static 503 detail for persistence outages — no internals echoed (nLPD)."""
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
 # C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
@@ -333,6 +344,59 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         except MCPHubError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @application.post("/api/week/approve", response_model=WeekApprovalResponse, tags=["plan"])
+    async def approve_week_endpoint(
+        request: Request,
+        payload: WeekApprovalRequest,
+    ) -> WeekApprovalResponse:
+        """Approve a weekly plan and write one Intervals.icu event per day.
+
+        The draft is persisted first (MADR-008 ``plan_drafts``: create-or-reuse
+        per week, replacement rule, ``submitted`` while the write is in
+        flight), then the days are written SEQUENTIALLY through ``coach-mcp``
+        (#163: no batch tool — the write is not atomic). Every day yields its
+        own :class:`~coach_web.microcycle.DayWriteResult`; the draft only
+        transitions to ``approved`` when every requested day succeeded, so a
+        partial failure stays ``submitted`` for the retry-failed-days
+        affordance (AC5: no silent partial calendar). The explicit POST is
+        the approval gate — human-in-the-loop preserved (#87 C7).
+        """
+        settings: Settings = request.app.state.settings
+        factory = getattr(request.app.state, "hub_factory", MCPClientHub.from_settings)
+        hub = factory(settings)
+        session_factory = request.app.state.db_session_factory
+
+        # 1. Persist the draft before any side effect (MADR-008, AC4).
+        try:
+            async with session_factory() as session:
+                row = await upsert_week_draft(session, payload.week)
+                draft_id = row.id
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Week draft persistence failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+
+        # 2. Sequential per-day calendar writes (#163).
+        try:
+            async with hub:
+                results = await write_week_days(hub, payload.week, payload.dates)
+        except MCPHubError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        # 3. Transition on outcome: approved only when EVERY requested day
+        # succeeded; a partial failure stays submitted for retry. A
+        # transition failure after successful writes must not mask the
+        # per-day results — it is logged and the response still reports them.
+        if all(result.success for result in results):
+            try:
+                async with session_factory() as session:
+                    stored = await session.get(PlanDraftRow, draft_id)
+                    if stored is not None and stored.status == "submitted":
+                        await transition_draft_status(session, stored, "approved")
+            except (OSError, SQLAlchemyError) as exc:
+                logger.warning("Week draft approval transition failed: %s", exc)
+
+        return WeekApprovalResponse(results=results)
 
     @application.get(
         "/api/objectives",

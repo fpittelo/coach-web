@@ -9,6 +9,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from copy import deepcopy
+from datetime import date
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -19,7 +20,9 @@ from pydantic import ValidationError
 
 from coach_web.agent import (
     DEFAULT_OPENROUTER_MODEL,
+    DEFAULT_SYSTEM_PROMPT,
     PROPOSE_PLAN_TOOL,
+    PROPOSE_WEEK_PLAN_TOOL,
     AgentEvent,
     CoachAgent,
     OpenRouterClient,
@@ -29,6 +32,7 @@ from coach_web.agent import (
     _parse_arguments,
     create_agent,
     plan_tool_schema,
+    week_plan_tool_schema,
 )
 from coach_web.app import create_app
 from coach_web.config import Settings
@@ -773,7 +777,12 @@ class TestCoachAgentPlanProposal:
         assert "params" in description
 
     async def test_propose_plan_schema_is_advertised_to_the_model(self) -> None:
-        """The propose_plan tool schema is merged into the advertised tools."""
+        """The propose_plan tool schema is merged into the advertised tools.
+
+        Superseded for #168: the weekly-plan tool schema is advertised
+        alongside it (the coach can propose both single workouts and full
+        weeks).
+        """
         streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
         hub = FakeHub(tools=[{"type": "function", "function": {"name": "mcp_tool"}}])
         agent = CoachAgent(streamer, hub)
@@ -781,7 +790,7 @@ class TestCoachAgentPlanProposal:
         await _collect(agent, "hi")
 
         names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
-        assert names == ["mcp_tool", PROPOSE_PLAN_TOOL]
+        assert names == ["mcp_tool", PROPOSE_PLAN_TOOL, PROPOSE_WEEK_PLAN_TOOL]
 
 
 # ---------------------------------------------------------------------------
@@ -1259,3 +1268,125 @@ class TestStreamUrlPrivacyContract:
         assert scope["query_string"] == b""
         assert canary_message.encode() not in scope["path"].encode()
         assert canary_history.encode() not in scope["path"].encode()
+
+
+# ---------------------------------------------------------------------------
+# Weekly plan proposal (#168)
+# ---------------------------------------------------------------------------
+
+
+def _week_payload(**overrides: Any) -> dict[str, Any]:
+    """Build a valid weekly-plan draft payload: 2 hard / 4 easy / 1 rest."""
+    day_names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    days = []
+    for index in range(7):
+        hard = index in (1, 3)
+        rest = index == 6
+        days.append(
+            {
+                "day_of_week": day_names[index],
+                "date": date.fromisocalendar(2026, 41, index + 1).isoformat(),
+                "session_title": "Rest day" if rest else ("VO2 intervals" if hard else "Easy spin"),
+                "focus": None if rest else ("Threshold zones" if hard else "Endurance zones"),
+                "zones": [] if rest else (["Z4", "Z5"] if hard else ["Z1", "Z2"]),
+                "planned_tss": 0.0 if rest else (85.0 if hard else 45.0),
+                "duration_minutes": 0.0 if rest else (75.0 if hard else 60.0),
+                "rest_day": rest,
+            }
+        )
+    payload: dict[str, Any] = {
+        "week_id": "2026-W41",
+        "title": "Base week 41",
+        "summary": "Two hard days after the recovery block.",
+        "rationale": "Volume capped at the availability budget.",
+        "days": days,
+        "total_tss": 350.0,
+        "hard_days": 2,
+        "easy_days": 4,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _week_call_streamer(
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "week_1",
+) -> FakeStreamer:
+    """Build a streamer emitting a single propose_week_plan call, then a close."""
+    return FakeStreamer(
+        [
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=call_id,
+                            name=PROPOSE_WEEK_PLAN_TOOL,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [_chunk(content="Here is your week."), _chunk(finish_reason="stop")],
+        ]
+    )
+
+
+class TestCoachAgentWeekPlanProposal:
+    """Weekly microcycle proposal emission (#168)."""
+
+    async def test_propose_week_plan_emits_a_validated_week_plan_event(self) -> None:
+        """A propose_week_plan call emits the week_plan SSE event with the draft."""
+        streamer = _week_call_streamer(_week_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        week_event = next(e for e in events if e.type == "week_plan")
+        assert week_event.data["draft"]["week_id"] == "2026-W41"
+        assert len(week_event.data["draft"]["days"]) == 7
+        result = next(e for e in events if e.type == "tool_result")
+        assert "week_plan_emitted" in result.data["result"]
+
+    async def test_invalid_week_is_reported_without_a_week_plan_event(self) -> None:
+        """An invalid draft is rejected: field detail for the model, generic UI message."""
+        streamer = _week_call_streamer(_week_payload(total_tss=999.0), call_id="week_bad")
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        assert all(e.type != "week_plan" for e in events)
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid weekly plan — the coach will retry with corrected arguments."
+        )
+        result = next(e for e in events if e.type == "tool_result")
+        assert "Invalid weekly plan" in result.data["result"]
+        assert "total_tss" in result.data["result"]
+        assert "999" not in result.data["result"]
+
+    async def test_params_wrapped_week_arguments_are_unwrapped(self) -> None:
+        """A payload nested under a single ``params`` key is unwrapped."""
+        streamer = _week_call_streamer({"params": _week_payload()}, call_id="week_params")
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        assert any(e.type == "week_plan" for e in events)
+
+    async def test_week_plan_schema_is_advertised_with_summary_rules(self) -> None:
+        """The week tool schema documents the top-level args and summary invariants."""
+        schema = week_plan_tool_schema()
+
+        assert schema["function"]["name"] == PROPOSE_WEEK_PLAN_TOOL
+        description = schema["function"]["description"]
+        assert "top-level" in description
+        assert "params" in description
+        assert "total_tss" in description
+
+    async def test_system_prompt_advertises_the_weekly_capability(self) -> None:
+        """The default system prompt tells the model it CAN propose a weekly plan."""
+        assert PROPOSE_WEEK_PLAN_TOOL in DEFAULT_SYSTEM_PROMPT
+        assert "7-day" in DEFAULT_SYSTEM_PROMPT

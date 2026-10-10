@@ -22,6 +22,15 @@
  * approve/reject POST contract is unchanged: {plan: <PlanProposal>} to
  * POST /api/plan/approve; reject dismisses the card and clears plan state.
  *
+ * Weekly plan card (#168): the proposed 7-day microcycle renders as a
+ * second single-active conversation card pinned via the weekPlan /
+ * weekMessageIndex pair (one state pair per card type, so both cards can
+ * coexist). Approval posts {week, dates} to POST /api/week/approve — the
+ * write is NOT atomic (#163): per-day status chips track proposed →
+ * pushing… → approved ✓ / write failed, and a partial failure offers the
+ * retry-failed-days subset. Adjust prefills the composer and never
+ * auto-sends (PO Q8).
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -76,6 +85,41 @@ const WATCHDOG_TIMEOUT_MS = 90000;
 // pauses so scrolling up to re-read is never hijacked (AC1). Scrolling
 // back near the bottom re-arms following automatically (AC2).
 const STICK_THRESHOLD_PX = 60;
+
+// Week-card label vocabulary (#168): static client-side strings for the
+// per-day status chips (word + color, never color alone — #165) and the
+// compact day labels rendered in the day table.
+const WEEK_DAY_STATUS_WORDS = {
+  proposed: "proposed",
+  pushing: "pushing…",
+  approved: "approved ✓",
+  failed: "write failed",
+};
+
+const WEEK_DAY_LABELS = {
+  mon: "Mon",
+  tue: "Tue",
+  wed: "Wed",
+  thu: "Thu",
+  fri: "Fri",
+  sat: "Sat",
+  sun: "Sun",
+};
+
+const WEEK_DAY_FULL_NAMES = {
+  mon: "Monday",
+  tue: "Tuesday",
+  wed: "Wednesday",
+  thu: "Thursday",
+  fri: "Friday",
+  sat: "Saturday",
+  sun: "Sunday",
+};
+
+const MONTH_LABELS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 function parsePayload(event) {
   try {
@@ -177,6 +221,17 @@ function coachApp() {
     // plan is active; a new proposal overwrites both slots (AC4: one card).
     planMessageIndex: -1,
     approval: { state: "idle", message: "" },
+    // Weekly plan card (#168): the proposed 7-day microcycle renders as a
+    // single conversation card pinned to the proposing message via the
+    // weekPlan/weekMessageIndex pair (#82 replacement rule — a new
+    // week_plan event replaces the card). Per-day write statuses ride
+    // their own map keyed by ISO date (proposed | pushing | approved |
+    // failed — #165 chips, word + color never color alone); the card-level
+    // approval state mirrors the plan card's plain-string machine.
+    weekPlan: null,
+    weekMessageIndex: -1,
+    weekApproval: { state: "idle", message: "" },
+    weekDayStatus: {},
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -671,6 +726,13 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+      // The weekly card follows the same replacement posture (#82): a new
+      // stream clears the previous card; the agent's week_plan event (if
+      // any) re-pins a fresh one.
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -887,6 +949,27 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        week_plan: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Weekly plan card (#168): the validated draft arrives as
+          // data.draft; the card replaces any previous week card (#82
+          // rule) and every day chip starts as "proposed".
+          this.weekPlan = data.draft || null;
+          this.weekMessageIndex = index;
+          this.weekApproval = { state: "idle", message: "" };
+          const statuses = {};
+          (this.weekPlan && this.weekPlan.days ? this.weekPlan.days : []).forEach(
+            (day) => {
+              statuses[day.date] = "proposed";
+            }
+          );
+          this.weekDayStatus = statuses;
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -1004,6 +1087,10 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
       this.input = "";
       this.errorBanner = "";
       this.liveAnnouncement = "";
@@ -1054,6 +1141,155 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+    },
+
+    // ------------------------------------------------------------------
+    // Weekly plan card (#168). The proposed 7-day microcycle is approved
+    // as one POST (/api/week/approve) that writes one Intervals.icu event
+    // per day — NOT atomic (#163): every day reports its own outcome, a
+    // partial failure stays retryable via the failed-days subset, and the
+    // card state mirrors the plan card's plain-string machine. Adjust
+    // prefills the composer and NEVER auto-sends (PO Q8).
+    // ------------------------------------------------------------------
+
+    setDayStatus(date, status) {
+      // Immutable update: reassign the map so Alpine's reactivity sees the
+      // per-day chip change (word + color, never color alone — #165).
+      this.weekDayStatus = Object.assign({}, this.weekDayStatus, { [date]: status });
+    },
+
+    weekDayStatusText(day) {
+      // Chip word per state (#165): proposed → pushing… → approved ✓ /
+      // write failed. Unknown days default to "proposed".
+      return WEEK_DAY_STATUS_WORDS[this.weekDayStatus[day.date] || "proposed"];
+    },
+
+    weekDayChipClass(day) {
+      // Chip color class per state — always rendered NEXT TO the word.
+      return "day-chip--" + (this.weekDayStatus[day.date] || "proposed");
+    },
+
+    weekDayLabel(day) {
+      // Compact day label, e.g. "Mon 06 Oct" (#165 wireframe). Built from
+      // the ISO parts — no Date parsing, no timezone drift.
+      const parts = day.date.split("-");
+      const month = MONTH_LABELS[Number(parts[1]) - 1] || "";
+      return (WEEK_DAY_LABELS[day.day_of_week] || "") + " " + parts[2] + " " + month;
+    },
+
+    weekDayFocus(day) {
+      // Focus/zones cell: zones joined, falling back to the focus line.
+      if (day.rest_day) {
+        return "—";
+      }
+      const zones = (day.zones || []).join("–");
+      return zones || day.focus || "—";
+    },
+
+    get weekSummaryLine() {
+      // Week summary (#165): "520 TSS · 2 hard · 4 easy · 1 rest". The
+      // rest count is derived from the day slots (the ground truth).
+      if (!this.weekPlan) {
+        return "";
+      }
+      const rest = this.weekPlan.days.filter((day) => day.rest_day).length;
+      return (
+        this.weekPlan.total_tss +
+        " TSS · " +
+        this.weekPlan.hard_days +
+        " hard · " +
+        this.weekPlan.easy_days +
+        " easy · " +
+        rest +
+        " rest"
+      );
+    },
+
+    approveWeek(dates) {
+      // Approve All (dates = null) or retry the failed-days subset. Target
+      // days flip to "pushing" synchronously — before the fetch — and a
+      // failed request returns them to "proposed" so no day is ever stuck.
+      if (!this.weekPlan || this.weekApproval.state === "submitting") {
+        return;
+      }
+      const targetDays = this.weekPlan.days.filter(
+        (day) => !dates || dates.indexOf(day.date) !== -1
+      );
+      if (targetDays.length === 0) {
+        return;
+      }
+      targetDays.forEach((day) => this.setDayStatus(day.date, "pushing"));
+      this.weekApproval = {
+        state: "submitting",
+        message: dates ? "Retrying failed days…" : "Pushing weekly plan…",
+      };
+
+      fetch("/api/week/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ week: this.weekPlan, dates: dates || null }),
+      })
+        .then(async (response) => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(body.detail || "Approval failed");
+          }
+          let failed = 0;
+          body.results.forEach((result) => {
+            this.setDayStatus(result.date, result.success ? "approved" : "failed");
+            if (!result.success) {
+              failed += 1;
+            }
+          });
+          if (failed === 0) {
+            this.weekApproval = {
+              state: "approved",
+              message: "Weekly plan approved and pushed.",
+            };
+          } else {
+            this.weekApproval = {
+              state: "partially_failed",
+              message:
+                failed + " of " + body.results.length + " days failed to write. Retry the failed days.",
+            };
+          }
+        })
+        .catch((error) => {
+          targetDays.forEach((day) => {
+            if (this.weekDayStatus[day.date] === "pushing") {
+              this.setDayStatus(day.date, "proposed");
+            }
+          });
+          this.weekApproval = { state: "error", message: error.message };
+        });
+    },
+
+    retryFailedDays() {
+      // Retry affordance (#163): post ONLY the failed dates subset —
+      // succeeded days are never re-written (no duplicate calendar events).
+      if (!this.weekPlan) {
+        return;
+      }
+      const failedDates = this.weekPlan.days
+        .map((day) => day.date)
+        .filter((date) => this.weekDayStatus[date] === "failed");
+      this.approveWeek(failedDates);
+    },
+
+    adjustDay(day) {
+      // Per-day Adjust (PO Q8): prefill-and-focus — NEVER auto-send. The
+      // agent's next turn emits a fresh week_plan that replaces the card
+      // (#82 rule), keeping one approval contract.
+      this.input = "Adjust " + (WEEK_DAY_FULL_NAMES[day.day_of_week] || "that") + "'s session: ";
+      this.$refs.composer.focus();
+    },
+
+    rejectWeek() {
+      // Dismiss the weekly card and clear every week state slice.
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
     },
 
     get planDuration() {
