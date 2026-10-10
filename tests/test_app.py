@@ -10,6 +10,8 @@ from fastapi.testclient import TestClient
 
 from coach_web.agent import AgentEvent
 from coach_web.app import CSP_POLICY, STATIC_DIR, create_app
+from coach_web.auth.middleware import SESSION_COOKIE
+from coach_web.auth.tokens import create_session_token
 from coach_web.config import Settings
 
 # The exact minimal policy decided in the STRIDE #87 sign-off (conditions
@@ -136,6 +138,100 @@ class TestStaticServing:
 
         assert response.status_code == 200
         assert "Coach Web" in response.text
+
+
+class TestSignInAffordance:
+    """Conditional sign-in affordance on the public landing route (#180).
+
+    ``/`` is public by design (AC4 #65), but an unauthenticated visitor in an
+    auth-enabled lane previously hit a silent 401 dead-end: the shell offered
+    no path to ``/auth/login``. The route now reads the session cookie with
+    the existing HS256 verification and conditionally injects a "Sign in"
+    link into the identity bar. Fail-safe by contract: any cookie/validation
+    error resolves to the unauthenticated variant — the landing page can
+    never 500.
+    """
+
+    OWNER_EMAIL = "frederic.pitteloud@gmail.com"
+    SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
+
+    # The exact server-injected identity-bar link (no x-show — the banner's
+    # Alpine-gated sign-in action in the static file carries one, so this
+    # exact string is unambiguous between the two surfaces).
+    INJECTED_SIGNIN_LINK = '<a class="signin-link" href="/auth/login">Sign in</a>'
+    SIGNIN_SLOT_PREFIX = "<!-- #180 signin-slot:"
+
+    def _session_cookie(self, ttl_seconds: int = 600) -> str:
+        """Craft a session token as if issued by a successful login."""
+        return create_session_token(self.OWNER_EMAIL, self.SESSION_SECRET, ttl_seconds=ttl_seconds)
+
+    def test_unauthenticated_root_surfaces_signin_link(self, auth_client: TestClient) -> None:
+        """AC1: an unauthenticated visitor gets a visible Sign in affordance."""
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK in response.text
+        assert self.SIGNIN_SLOT_PREFIX not in response.text
+
+    def test_signin_link_sits_in_the_identity_bar(self, auth_client: TestClient) -> None:
+        """The affordance renders inside the identity bar's actions group."""
+        html = auth_client.get("/").text
+
+        actions_at = html.index('<div class="identity-actions">')
+        link_at = html.index(self.INJECTED_SIGNIN_LINK)
+        actions_close = html.index("</div>", actions_at)
+        assert actions_at < link_at < actions_close
+
+    def test_authenticated_root_is_unchanged(self, auth_client: TestClient) -> None:
+        """A valid session serves the static file byte-for-byte (identity as today)."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie())
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK not in response.text
+        assert self.SIGNIN_SLOT_PREFIX in response.text
+        assert response.text == (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_auth_disabled_root_is_unchanged(self) -> None:
+        """AC3: AUTH_ENABLED=false lanes (dev/qa) render exactly as today."""
+        with TestClient(create_app()) as client:
+            response = client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK not in response.text
+        assert self.SIGNIN_SLOT_PREFIX in response.text
+        assert response.text == (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_invalid_session_cookie_fails_safe(self, auth_client: TestClient) -> None:
+        """A malformed cookie renders the unauthenticated variant — never a 500."""
+        auth_client.cookies.set(SESSION_COOKIE, "not-a-jwt")
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK in response.text
+
+    def test_expired_session_cookie_fails_safe(self, auth_client: TestClient) -> None:
+        """An expired session renders the unauthenticated variant."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie(ttl_seconds=-10))
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK in response.text
+
+    def test_signin_variant_keeps_the_page_contract(self, auth_client: TestClient) -> None:
+        """The injected variant is the same page: brand, identity bar, composer."""
+        response = auth_client.get("/")
+        html = response.text
+
+        assert "Coach Web" in html
+        assert 'class="identity-bar"' in html
+        assert '<form class="composer"' in html
+        # CSP untouched (#180 constraint): the ASGI wrapper stamps the exact
+        # policy on the injected variant too.
+        assert response.headers["content-security-policy"] == CSP_POLICY
 
 
 class TestLifespan:

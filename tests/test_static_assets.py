@@ -131,6 +131,15 @@ loop's ``index`` binding (renamed ``stepIndex``, behavior-identical), and
 the PLAN_CARD_TEMPLATE literal is collapsed to a single literal — the
 only black-stable readable form at line-length 100 — without changing
 assertions.
+
+Issue #180 adds the sign-in affordance for auth-enabled lanes: the public
+landing route injects a "Sign in" link into the identity bar for
+unauthenticated visitors (server-side, via the ``signin-slot`` marker
+comment — no JS logic), and the #84 error banner gains a sign-in action
+when a stream fails with 401 (expired-session defense-in-depth). Both are
+real keyboard-reachable links to /auth/login with tokenized styling; the
+banner stays non-blocking and the #84 error-separation contract is
+untouched.
 """
 
 import re
@@ -2594,3 +2603,119 @@ class TestWeeklyPlanCardContract:
         card = self._week_card()
 
         assert "plan-table-wrap" in card
+
+
+class TestSignInAffordanceContract:
+    """Sign-in affordance for auth-enabled lanes (#180).
+
+    Two surfaces lead an unauthenticated (or expired-session) visitor to
+    /auth/login:
+
+    1. Identity bar (server-side): the public landing route swaps the
+       ``signin-slot`` marker comment for a real sign-in link when it
+       renders an unauthenticated session — no JS logic, no new endpoint.
+       The raw static file keeps the inert marker, so /static/index.html
+       and auth-disabled lanes are byte-identical to today (AC3).
+    2. Error banner (defense-in-depth): a stream failure with status 401
+       surfaces a sign-in action next to the #84 banner message, covering
+       sessions that expire mid-conversation. The banner stays
+       non-blocking and the typed/transport error separation (#84) is
+       untouched.
+
+    app.js behavior is contracted through source assertions (ADR-006 §5 —
+    no Node toolchain), same as every stream/approval wiring test above.
+    """
+
+    SIGNIN_SLOT = "<!-- #180 signin-slot:"
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    # --- identity bar slot (server-injected link) ----------------------------
+
+    def test_identity_bar_declares_the_signin_slot(self) -> None:
+        """The marker comment lives inside the identity bar's actions group."""
+        html = self._html()
+        actions_at = html.index('<div class="identity-actions">')
+        slot_at = html.index(self.SIGNIN_SLOT)
+        actions_close = html.index("</div>", actions_at)
+
+        assert actions_at < slot_at < actions_close
+
+    def test_signin_link_styles_are_tokenized(self) -> None:
+        """The link rides the v0.7 tokens with a visible keyboard focus ring."""
+        css = self._css()
+        link = _rule_block(css, ".signin-link")
+
+        assert "var(--accent)" in link
+        assert "text-decoration: underline" in link
+
+        focus = _rule_block(css, ".signin-link:focus-visible")
+        assert "outline" in focus
+        assert "var(--accent)" in focus
+
+    # --- 401 banner sign-in action ---------------------------------------------
+
+    def test_error_banner_surfaces_signin_on_401(self) -> None:
+        """The banner carries a sign-in link gated on the 401 flag."""
+        html = self._html()
+        banner_at = html.index('class="error-banner"')
+        banner = html[banner_at : html.index("</p>", banner_at)]
+
+        assert 'x-show="errorBannerSignin"' in banner
+        assert 'href="/auth/login"' in banner
+        assert ">Sign in</a>" in banner
+
+    def test_component_declares_the_banner_signin_flag(self) -> None:
+        """The flag is explicit component state, defaulting to hidden."""
+        script = self._script()
+
+        assert "errorBannerSignin: false" in script
+
+    def test_stream_failure_carries_the_response_status(self) -> None:
+        """The !ok branch attaches the HTTP status to the thrown error."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "failure.status = response.status" in start
+
+    def test_401_failure_sets_the_banner_signin_flag(self) -> None:
+        """Only a 401 transport failure arms the banner sign-in action."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.errorBannerSignin = error.status === 401" in start
+
+    def test_banner_signin_flag_resets_with_the_banner(self) -> None:
+        """A stale sign-in action never survives into a new stream or a reset."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+        reset = _rule_block(script, "resetChat()")
+
+        assert "this.errorBannerSignin = false" in start
+        assert "this.errorBannerSignin = false" in reset
+
+    def test_non_401_banner_writers_clear_the_signin_flag(self) -> None:
+        """Every other banner writer keeps the flag off (no misleading action)."""
+        script = self._script()
+        typed = _rule_block(script, "error: (event) =>")
+        watchdog = _rule_block(script, "handleWatchdogTimeout()")
+
+        assert "this.errorBannerSignin = false" in typed
+        assert "this.errorBannerSignin = false" in watchdog
+
+    def test_banner_signin_keeps_the_84_contracts(self) -> None:
+        """The banner stays non-blocking: composer gating and clears unchanged."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+        reset = _rule_block(script, "resetChat()")
+
+        assert 'this.errorBanner = ""' in start
+        assert 'this.errorBanner = ""' in reset
+        # The typed handler still never ends the stream (#84 AC2).
+        typed = _rule_block(script, "error: (event) =>")
+        assert "this.finishStream()" not in typed

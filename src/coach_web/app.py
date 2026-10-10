@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,8 +23,13 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, CoachAgent, create_agent
-from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
+from coach_web.auth.middleware import (
+    SESSION_COOKIE,
+    AuthMiddleware,
+    validate_auth_config,
+)
 from coach_web.auth.router import router as auth_router
+from coach_web.auth.tokens import verify_session_token
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
@@ -71,6 +76,40 @@ GENERIC_VALIDATION_DETAIL = "Invalid request payload"
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
 """Static 503 detail for persistence outages — no internals echoed (nLPD)."""
+
+_SIGNIN_SLOT = (
+    "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
+    " when it renders an unauthenticated session (auth enabled). -->"
+)
+"""Inert marker comment in index.html's identity bar (the injection anchor).
+
+The raw static file keeps the comment, so /static/index.html and
+auth-disabled lanes stay byte-identical to the pre-#180 page (AC3).
+"""
+
+_SIGNIN_LINK_HTML = '<a class="signin-link" href="/auth/login">Sign in</a>'
+"""The unauthenticated identity-bar affordance (#180): a real link, no JS."""
+
+
+def _has_valid_session(request: Request, settings: Settings) -> bool:
+    """Return True when the request carries a verifiable session cookie (#180).
+
+    Verification reuses the auth session logic (HS256
+    :func:`coach_web.auth.tokens.verify_session_token` — the same check the
+    whitelist middleware applies). Fail-safe by contract: ANY error reading
+    or verifying the cookie (missing cookie, bad signature, expiry, malformed
+    header) resolves to False, so the public landing page renders the
+    unauthenticated variant instead of ever raising.
+    """
+    try:
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            return False
+        verify_session_token(token, settings.AUTH_SESSION_SECRET)
+    except Exception:  # noqa: BLE001 - fail-safe: the landing page must never 500
+        return False
+    return True
+
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
 # C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
@@ -240,8 +279,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(status_code=422, content={"detail": GENERIC_VALIDATION_DETAIL})
 
     @application.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        """Serve the single-page interface."""
+    async def index(request: Request) -> Response:
+        """Serve the single-page interface with a conditional sign-in affordance (#180).
+
+        The landing page is public (AC4 #65) but must not dead-end an
+        unauthenticated visitor (#180): with auth enabled and no valid
+        session cookie, the identity bar gains a visible "Sign in" link to
+        /auth/login. Authenticated sessions and AUTH_ENABLED=false lanes
+        (dev/qa) get the static file byte-for-byte as today. Fail-safe: any
+        cookie or validation error resolves to the unauthenticated variant —
+        the landing page can never 500. No auto-redirect: the public-landing
+        posture is preserved (rejected-by-default option 3, #180).
+        """
+        settings: Settings = request.app.state.settings
+        if settings.AUTH_ENABLED and not _has_valid_session(request, settings):
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            if _SIGNIN_SLOT in html:
+                return Response(
+                    content=html.replace(_SIGNIN_SLOT, _SIGNIN_LINK_HTML),
+                    media_type="text/html",
+                )
         return FileResponse(STATIC_DIR / "index.html")
 
     @application.get("/health", response_model=HealthResponse, tags=["ops"])

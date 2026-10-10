@@ -39,6 +39,7 @@
             <span class="product-name">Coach Web</span>
           </div>
           <div class="identity-actions">
+            <!-- #180 signin-slot: swapped for the sign-in link by the / route when it renders an unauthenticated session (auth enabled). -->
             <button
               class="button button--ghost settings-toggle"
               type="button"
@@ -389,8 +390,13 @@
                and the composer. It never overlays or disables anything —
                the only composer disable condition is the in-flight
                streaming flag, so the user can always retry by sending
-               again. -->
-          <p class="error-banner" x-show="errorBanner" x-text="errorBanner"></p>
+               again. The sign-in action (#180) appears only when the
+               failure status was 401 (expired/missing session) and links
+               to /auth/login — a real, keyboard-reachable anchor. -->
+          <p class="error-banner" x-show="errorBanner">
+            <span x-text="errorBanner"></span>
+            <a class="signin-link" x-show="errorBannerSignin" href="/auth/login">Sign in</a>
+          </p>
 
           <form class="composer" @submit.prevent="send()">
             <!-- Auto-growing composer (#83): rows="1" starts as a single
