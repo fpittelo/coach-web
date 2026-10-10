@@ -55,7 +55,10 @@
  * never auto-send (PO Q8). The whole-log aria-live is replaced by a
  * visually-hidden status region: a $watch("phase") speaks a short static
  * label per phase transition and the done handler speaks the completed
- * final message — never per token (AC3). finishStream() returns focus to
+ * final message — never per token (AC3). The final-message announcement is
+ * markdown-stripped plain text (#149 AC2): the status region reads natural
+ * prose while the visual x-html path (renderMarkdown → marked + DOMPurify)
+ * stays untouched. finishStream() returns focus to
  * the composer (disabling the textarea on send drops it to <body>)
  * without stealing it from a deliberate target such as a plan-card
  * button (AC4).
@@ -84,6 +87,32 @@ function parsePayload(event) {
   } catch (err) {
     return {};
   }
+}
+
+// Markdown → plain text for the live-region announcement (#149 AC2): the
+// done handler speaks the completed final message, and raw markdown source
+// ("**bold**", "- item", "```fences```") reads as syntax noise. The stripper
+// removes the common emphasis/list/heading/link/fence markers and keeps the
+// content, so the announcement reads as natural prose. KIS: a fixed regex
+// chain, no new dependency, NOT a markdown parser — the visual rendering
+// path (renderMarkdown → marked + DOMPurify) is untouched and remains the
+// sole on-screen source of truth. Known limits: table pipes and horizontal
+// rules pass through, paired intra-word underscores are read as emphasis,
+// and raw HTML tags are not stripped (the sanitizer handles those on
+// screen only).
+function stripMarkdown(text) {
+  return text
+    .replace(/```[a-z]*\n?/gi, "") // fenced code blocks: drop the fence lines
+    .replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1") // links/images: keep the label
+    .replace(/`([^`]*)`/g, "$1") // inline code: keep the content
+    .replace(/(\*\*|__)(.*?)\1/g, "$2") // strong: **bold** / __bold__
+    .replace(/(\*|_)(.*?)\1/g, "$2") // emphasis: *italic* / _italic_
+    .replace(/~~(.*?)~~/g, "$1") // strikethrough
+    .replace(/^[ \t]{0,3}#{1,6}[ \t]+/gm, "") // ATX headings
+    .replace(/^[ \t]{0,3}[-*+][ \t]+/gm, "") // bullet list markers
+    .replace(/^[ \t]{0,3}\d+\.[ \t]+/gm, "") // ordered list markers
+    .replace(/^[ \t]{0,3}>[ \t]?/gm, "") // blockquote markers
+    .trim();
 }
 
 function coachApp() {
@@ -247,7 +276,7 @@ function coachApp() {
     announce(text) {
       // Write the visually-hidden status region (#86 AC3). The only two
       // call sites are announcePhase (phase labels) and the done handler
-      // (the final message) — tokens never announce.
+      // (the final message, markdown-stripped #149) — tokens never announce.
       this.liveAnnouncement = text;
     },
 
@@ -556,9 +585,12 @@ function coachApp() {
             this.messages[index].content = data.message;
           }
           // Announce the completed FINAL message (AC3, #86): the full
-          // text, once — never per token.
+          // text, once — never per token. Markdown-stripped (#149 AC2):
+          // the status region speaks plain prose — raw markdown source
+          // ("**bold**", list markers) reads as syntax noise. The visual
+          // x-html path (renderMarkdown → marked + DOMPurify) is untouched.
           if (this.messages[index].content) {
-            this.announce(this.messages[index].content);
+            this.announce(stripMarkdown(this.messages[index].content));
           }
           this.finishStream();
         },
