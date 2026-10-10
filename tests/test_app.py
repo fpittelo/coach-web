@@ -1,11 +1,14 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
+from collections.abc import AsyncIterator
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from coach_web.agent import AgentEvent
 from coach_web.app import CSP_POLICY, STATIC_DIR, create_app
 from coach_web.config import Settings
 
@@ -17,6 +20,23 @@ EXPECTED_CSP_POLICY = (
     "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
     "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
 )
+
+
+class _CspProbeAgent:
+    """Minimal agent yielding one token event, for response-header pins (#148)."""
+
+    async def __aenter__(self) -> "_CspProbeAgent":
+        """Enter the agent context."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Exit the agent context."""
+
+    async def run(
+        self, message: str, *, history: list[Any] | None = None
+    ) -> AsyncIterator[AgentEvent]:
+        """Yield a single token event for the supplied message."""
+        yield AgentEvent(type="token", data={"text": "hello"})
 
 
 class TestCreateApp:
@@ -249,4 +269,55 @@ class TestCspMiddleware:
             response = client.get("/health")
 
         assert response.status_code == 400
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+    def test_unhandled_exception_500_carries_the_exact_policy(self) -> None:
+        """Even the ServerErrorMiddleware-rendered 500 carries the header (#148 AC1).
+
+        Starlette builds ``ServerErrorMiddleware`` as the true outermost layer
+        of its middleware stack, so a middleware registered via
+        ``add_middleware`` runs inside it and cannot stamp the 500 it renders
+        for an unhandled exception (the #127 review advisory). The CSP stamp
+        must wrap the whole ASGI app so EVERY response — including 500s —
+        carries the exact #87 policy.
+        """
+        app = create_app()
+
+        @app.get("/boom", include_in_schema=False)
+        async def boom() -> None:
+            raise RuntimeError("boom")
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            response = client.get("/boom")
+
+        assert response.status_code == 500
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+    def test_sse_stream_response_carries_the_exact_policy(self, settings: Settings) -> None:
+        """AC2 (#148): the SSE streaming response carries the exact #87 policy.
+
+        Regression pin for the #127 review advisory: the header must survive
+        any middleware reordering on the streaming path (no buffering).
+        """
+        app = create_app(settings)
+        app.state.agent_factory = MagicMock(return_value=_CspProbeAgent())
+
+        with TestClient(app) as client:
+            with client.stream(
+                "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+            ) as response:
+                response.read()
+
+        assert "text/event-stream" in response.headers["content-type"]
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+    def test_auth_401_response_carries_the_exact_policy(self, auth_client: TestClient) -> None:
+        """AC2 (#148): the auth 401 rejection carries the exact #87 policy.
+
+        Regression pin for the #127 review advisory: the whitelist boundary's
+        own JSON error response must stay stamped after any reordering.
+        """
+        response = auth_client.post("/api/agent/stream", json={"message": "hi"})
+
+        assert response.status_code == 401
         assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY

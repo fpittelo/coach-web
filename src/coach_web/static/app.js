@@ -468,6 +468,7 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.phase = "tooling"; // AC1: MCP tools running
+          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
           this.tools.push({
             id: data.id,
             name: data.name,
@@ -481,6 +482,7 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.phase = "tooling"; // AC1: MCP tools running
+          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
           const tool = this.tools.find((item) => item.id === data.id);
           if (tool) {
             tool.state = "running";
@@ -493,6 +495,7 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.phase = "tooling"; // AC1: tool events keep the tooling sub-state
+          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
           const tool = this.tools.find((item) => item.id === data.id);
           if (tool) {
             tool.state = "done";
