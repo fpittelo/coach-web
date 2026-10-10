@@ -120,6 +120,17 @@ while the visual x-html path (renderMarkdown → marked + DOMPurify) is
 untouched and stays the sole on-screen source of truth. The role="log"
 AT verification itself requires human screen-reader execution and is
 documented as a pending procedure in docs/accessibility.md.
+
+Issue #150 closes out the #83/#82 merge follow-ups. On viewports shorter
+than the 26rem masthead allowance (landscape phones), the .chat height
+calc clamps to 0 and the panel degenerates — a 14rem min-height floor
+keeps the panel and its pinned composer usable while staying below the
+computed height on typical portrait phones, so the #83 behavior is
+unchanged there. The plan card's step loop no longer shadows the message
+loop's ``index`` binding (renamed ``stepIndex``, behavior-identical), and
+the PLAN_CARD_TEMPLATE literal is collapsed to a single literal — the
+only black-stable readable form at line-length 100 — without changing
+assertions.
 """
 
 import re
@@ -131,9 +142,12 @@ from coach_web.app import STATIC_DIR, create_app
 VENDOR_DIR = STATIC_DIR / "vendor"
 
 # The inline plan card template (#82): pinned to the proposing assistant
-# message via planMessageIndex (AC4 — single active card).
+# message via planMessageIndex (AC4 — single active card). One literal
+# (#150): the v0.5 mid-attribute implicit concatenation was easy to
+# misread, and black collapses any concat of this literal onto a single
+# line anyway (line-length 100), so the readable form is the literal itself.
 PLAN_CARD_TEMPLATE = (
-    "<template x-if=\"message.role === 'assistant' && plan" ' && planMessageIndex === index">'
+    "<template x-if=\"message.role === 'assistant' && plan && planMessageIndex === index\">"
 )
 
 # v0.7 palette (ADR-006) plus one functional addition: --error (red-700). The
@@ -1300,6 +1314,21 @@ class TestInlinePlanCardContract:
         # assistant bubble it belongs to, and above the composer.
         assert log_at < loop_at < bubble_at < card_at < composer_at
 
+    def test_plan_step_loop_does_not_shadow_the_message_index(self) -> None:
+        """AC2 (#150): the step loop index no longer shadows the message index.
+
+        The plan card is nested inside the message loop, whose ``index``
+        pins the card via ``planMessageIndex === index``; the step loop's
+        own binding shadowed that name. Renaming it to ``stepIndex`` is
+        behavior-identical — the loop body only used it as the x-for key.
+        """
+        html = self._html()
+
+        assert (
+            '<template x-for="(step, stepIndex) in plan.steps" :key="stepIndex">' in html
+        ), "step loop must bind its own stepIndex"
+        assert "(step, index)" not in html, "shadowed step index still present"
+
     # --- AC4: single active card pinned to the proposing message ---------------
 
     def test_card_is_pinned_to_the_proposing_message_index(self) -> None:
@@ -1543,6 +1572,20 @@ class TestComposerErgonomicsContract:
         assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
         assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
         assert "max-height:" in chat, "tall-monitor cap missing"
+
+    def test_chat_has_a_short_viewport_height_floor(self) -> None:
+        """AC1 (#150): the panel keeps a usable floor on very short viewports.
+
+        On viewports shorter than the 26rem masthead allowance (landscape
+        phones), ``calc(100dvh - 26rem)`` clamps to 0 and the panel — log
+        AND composer — degenerates. A min-height floor resolves the used
+        height to ``max(calc(100dvh - 26rem), floor)``; at 14rem it stays
+        below the computed height on typical portrait phones (≥ 40rem
+        tall), so the #83 portrait behavior is unchanged there.
+        """
+        chat = _rule_block(self._css(), ".chat")
+
+        assert "min-height: 14rem" in chat, "short-viewport floor missing"
 
     # --- AC4: send-disabled bindings preserved ------------------------------------
 

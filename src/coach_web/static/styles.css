@@ -200,18 +200,24 @@ body {
    viewport minus the masthead chrome (26rem covers the worst case:
    narrow viewports where the lede wraps to five lines); the layout
    padding and footer sit below the panel and may scroll out of view
-   without affecting the composer. dvh tracks mobile browser chrome, with
-   the vh declaration as the fallback; max-height caps the panel on very
-   tall monitors. The v0.5 min-height: 32rem floor is superseded: on
-   phones it exceeds the space below the masthead, and a floor taller
-   than the computed height would win and un-pin the composer exactly
-   there. */
+    without affecting the composer. dvh tracks mobile browser chrome, with
+    the vh declaration as the fallback; max-height caps the panel on very
+    tall monitors. The v0.5 min-height: 32rem floor is superseded: on
+    phones it exceeds the space below the masthead, and a floor taller
+    than the computed height would win and un-pin the composer exactly
+    there. A 14rem floor (issue 150) guards only the degenerate case: on
+    viewports shorter than the 26rem masthead allowance (landscape
+    phones) the calc clamps to 0 and the panel vanishes — the floor
+    resolves the used height to max(calc(100dvh - 26rem), 14rem) and
+    stays below the computed height on typical portrait phones (≥ 40rem
+    tall), leaving the #83 behavior there unchanged. */
 
 .chat {
   display: flex;
   flex-direction: column;
   height: calc(100vh - 26rem);
   height: calc(100dvh - 26rem);
+  min-height: 14rem;
   max-height: 40rem;
 }
 
