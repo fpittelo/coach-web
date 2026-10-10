@@ -899,8 +899,12 @@ function coachApp() {
           const data = parsePayload(event);
           // Periodization card (#182): the validated plan arrives as
           // data.plan with the coach's rationale alongside; the card
-          // replaces any previous periodization card (#82 rule).
-          this.periodizationPlan = data.plan ? data : null;
+          // replaces any previous periodization card (#82 rule). BOTH are
+          // consumed into state — storing only the plan would silently
+          // drop the rationale line the card renders (PR #184 review).
+          this.periodizationPlan = data.plan
+            ? { plan: data.plan, rationale: data.rationale || "" }
+            : null;
           this.periodizationMessageIndex = index;
           this.periodizationApproval = { state: "idle", message: "" };
           this.scrollToBottom();
@@ -1257,18 +1261,29 @@ function coachApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ plan: this.periodizationPlan.plan }),
       })
-        .then(async (response) => {
-          const body = await response.json().catch(() => ({}));
+        .then((response) => {
           if (!response.ok) {
-            throw new Error(body.detail || "Approval failed");
+            // Static message only — the server's 422 detail is generic by
+            // design (nLPD #142) and never echoed here (mirrors the removed
+            // phases-editor save posture, PR #184 review).
+            this.periodizationApproval = {
+              state: "error",
+              message: "Could not save the phase plan. Try again.",
+            };
+            return;
           }
           this.periodizationApproval = {
             state: "approved",
             message: "Periodization approved.",
           };
         })
-        .catch((error) => {
-          this.periodizationApproval = { state: "error", message: error.message };
+        .catch(() => {
+          // Transport failure: the same static message — no server detail
+          // and no error text echoed (nLPD #142 posture).
+          this.periodizationApproval = {
+            state: "error",
+            message: "Could not save the phase plan. Try again.",
+          };
         });
     },
 

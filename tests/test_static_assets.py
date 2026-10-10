@@ -2490,6 +2490,20 @@ class TestWeeklyPlanCardContract:
         assert ".week-table" in media
         assert "display: block" in media
 
+    def test_periodization_table_stacks_on_narrow_viewports(self) -> None:
+        """At ≤375px the phase table stacks into per-phase blocks.
+
+        Mirrors the .week-table pattern (PR #184 review finding): the
+        data-label attributes in the markup become the per-cell labels, so
+        the phase table stays readable on narrow viewports.
+        """
+        css = self._css()
+        media = _media_block(css, "@media (max-width: 375px)")
+
+        assert ".periodization-table" in media
+        assert "display: block" in media
+        assert "attr(data-label)" in media
+
     def test_week_table_scrolls_in_an_overflow_wrapper(self) -> None:
         """The desktop day table rides the existing overflow-x wrapper."""
         card = self._week_card()
@@ -2544,11 +2558,19 @@ class TestPeriodizationCardContract:
         assert self.PERIODIZATION_CARD_TEMPLATE in html
 
     def test_periodization_plan_handler_pins_the_card(self) -> None:
-        """The periodization_plan handler pins the card (replacement rule)."""
+        """The periodization_plan handler pins the card with the FULL payload.
+
+        Replacement rule (#82): the card is re-pinned per proposal. The
+        handler must consume BOTH the plan and the coach's rationale into
+        state — storing only the plan would silently drop the rationale line
+        the card renders (PR #184 review finding).
+        """
         script = self._script()
         handler = _rule_block(script, "periodization_plan: (event) =>")
 
-        assert "this.periodizationPlan = data.plan" in handler
+        assert "this.periodizationPlan = " in handler
+        assert "data.plan" in handler
+        assert "data.rationale" in handler
         assert "this.periodizationMessageIndex = index" in handler
         assert "this.scrollToBottom()" in handler
 
@@ -2597,6 +2619,19 @@ class TestPeriodizationCardContract:
         approve = _rule_block(self._script(), "approvePeriodization()")
 
         assert 'this.periodizationApproval.state === "submitting"' in approve
+
+    def test_approve_periodization_surfaces_only_a_generic_error(self) -> None:
+        """Approval failures show a static message — no server detail echoed (nLPD).
+
+        Mirrors the removed savePhases pin (#167): the server's 422 detail is
+        generic by design (nLPD #142) and must never reach the UI note, not
+        even via an error.message round-trip (PR #184 review finding).
+        """
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert "Could not save the phase plan" in approve
+        assert "body.detail" not in approve
+        assert "error.message" not in approve
 
     # --- reject & reset ---------------------------------------------------------
 
