@@ -109,6 +109,28 @@ the composer when a stream ends (disabling the textarea on send drops
 focus to <body>), never stolen from a deliberate target, and the
 prefers-reduced-motion contract from #85 carries over with the chips
 introducing no animation of their own.
+
+Issue #149 polishes the #86 announcement posture. The visually-hidden
+``role="status"`` region announced the completed final message as RAW
+markdown source (``**bold**``, list markers, code fences) — syntax noise
+for screen readers. The done handler now announces a markdown-stripped
+plain-text rendering (stripMarkdown: emphasis/list/heading/fence/link
+markers removed, content kept — KIS regex chain, no new dependency),
+while the visual x-html path (renderMarkdown → marked + DOMPurify) is
+untouched and stays the sole on-screen source of truth. The role="log"
+AT verification itself requires human screen-reader execution and is
+documented as a pending procedure in docs/accessibility.md.
+
+Issue #150 closes out the #83/#82 merge follow-ups. On viewports shorter
+than the 26rem masthead allowance (landscape phones), the .chat height
+calc clamps to 0 and the panel degenerates — a 14rem min-height floor
+keeps the panel and its pinned composer usable while staying below the
+computed height on typical portrait phones, so the #83 behavior is
+unchanged there. The plan card's step loop no longer shadows the message
+loop's ``index`` binding (renamed ``stepIndex``, behavior-identical), and
+the PLAN_CARD_TEMPLATE literal is collapsed to a single literal — the
+only black-stable readable form at line-length 100 — without changing
+assertions.
 """
 
 import re
@@ -120,9 +142,12 @@ from coach_web.app import STATIC_DIR, create_app
 VENDOR_DIR = STATIC_DIR / "vendor"
 
 # The inline plan card template (#82): pinned to the proposing assistant
-# message via planMessageIndex (AC4 — single active card).
+# message via planMessageIndex (AC4 — single active card). One literal
+# (#150): the v0.5 mid-attribute implicit concatenation was easy to
+# misread, and black collapses any concat of this literal onto a single
+# line anyway (line-length 100), so the readable form is the literal itself.
 PLAN_CARD_TEMPLATE = (
-    "<template x-if=\"message.role === 'assistant' && plan" ' && planMessageIndex === index">'
+    "<template x-if=\"message.role === 'assistant' && plan && planMessageIndex === index\">"
 )
 
 # v0.7 palette (ADR-006) plus one functional addition: --error (red-700). The
@@ -961,6 +986,21 @@ class TestStreamPhaseContract:
             handler = _rule_block(script, f"{event}: (event) =>")
             assert 'this.phase = "tooling"' in handler, event
 
+    def test_tool_events_surface_the_running_tools_status_label(self) -> None:
+        """AC4 (#148): tool events surface a visible "Running tools…" label.
+
+        The tooling sub-state previously only changed the pulsing indicator —
+        the status line kept the stale "Thinking"/"Connecting" text. Every
+        tool event now writes the static tooling label so the visible status
+        matches the phase. The phase contract itself is unchanged (pinned by
+        test_tool_events_display_the_tooling_substate).
+        """
+        script = self._script()
+
+        for event in ("tool_call", "tool_start", "tool_result"):
+            handler = _rule_block(script, f"{event}: (event) =>")
+            assert 'this.statusText = "Running tools…"' in handler, event
+
     def test_finish_stream_idles_the_phase(self) -> None:
         """Stream end returns the phase to idle (the banner persists)."""
         finish = _rule_block(self._script(), "finishStream()")
@@ -1274,6 +1314,21 @@ class TestInlinePlanCardContract:
         # assistant bubble it belongs to, and above the composer.
         assert log_at < loop_at < bubble_at < card_at < composer_at
 
+    def test_plan_step_loop_does_not_shadow_the_message_index(self) -> None:
+        """AC2 (#150): the step loop index no longer shadows the message index.
+
+        The plan card is nested inside the message loop, whose ``index``
+        pins the card via ``planMessageIndex === index``; the step loop's
+        own binding shadowed that name. Renaming it to ``stepIndex`` is
+        behavior-identical — the loop body only used it as the x-for key.
+        """
+        html = self._html()
+
+        assert (
+            '<template x-for="(step, stepIndex) in plan.steps" :key="stepIndex">' in html
+        ), "step loop must bind its own stepIndex"
+        assert "(step, index)" not in html, "shadowed step index still present"
+
     # --- AC4: single active card pinned to the proposing message ---------------
 
     def test_card_is_pinned_to_the_proposing_message_index(self) -> None:
@@ -1517,6 +1572,20 @@ class TestComposerErgonomicsContract:
         assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
         assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
         assert "max-height:" in chat, "tall-monitor cap missing"
+
+    def test_chat_has_a_short_viewport_height_floor(self) -> None:
+        """AC1 (#150): the panel keeps a usable floor on very short viewports.
+
+        On viewports shorter than the 26rem masthead allowance (landscape
+        phones), ``calc(100dvh - 26rem)`` clamps to 0 and the panel — log
+        AND composer — degenerates. A min-height floor resolves the used
+        height to ``max(calc(100dvh - 26rem), floor)``; at 14rem it stays
+        below the computed height on typical portrait phones (≥ 40rem
+        tall), so the #83 portrait behavior is unchanged there.
+        """
+        chat = _rule_block(self._css(), ".chat")
+
+        assert "min-height: 14rem" in chat, "short-viewport floor missing"
 
     # --- AC4: send-disabled bindings preserved ------------------------------------
 
@@ -1786,3 +1855,71 @@ class TestOnboardingEmptyStateContract:
         assert "fetch" not in prefill
         assert "localStorage" not in empty
         assert "sessionStorage" not in empty
+
+
+class TestAnnouncementPlainTextContract:
+    """Markdown-stripped live-region announcement (#149 AC2).
+
+    The visually-hidden ``role="status"`` region announced the completed
+    final assistant message as RAW markdown source — ``**bold**``, list
+    markers, code fences — which screen readers read as syntax noise.
+    #149 strips the common markdown markers from the ANNOUNCED text only:
+    the visual rendering path (``renderMarkdown`` → marked + DOMPurify,
+    #81) is untouched and remains the sole on-screen source of truth.
+    Source-level assertions only (no Node toolchain, ADR-006 §5).
+    """
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_strip_markdown_helper_exists(self) -> None:
+        """A top-level stripMarkdown(text) helper exists beside parsePayload."""
+        helper = _rule_block(self._script(), "stripMarkdown(text)")
+
+        assert helper, "stripMarkdown(text) helper must exist"
+
+    def test_done_handler_announces_the_stripped_text(self) -> None:
+        """AC2: the done handler announces stripMarkdown(message.content)."""
+        done = _rule_block(self._script(), "done: (event) =>")
+
+        assert "this.announce(stripMarkdown(this.messages[index].content))" in done
+
+    def test_stripper_covers_the_common_markdown_markers(self) -> None:
+        """The stripper handles emphasis, lists, headings, fences and links."""
+        helper = _rule_block(self._script(), "stripMarkdown(text)")
+
+        # Marker families from #149 AC2: fenced/inline code, links,
+        # strong/emphasis, bullet + ordered list markers, headings.
+        assert "```" in helper, "fenced code markers"
+        assert "`" in helper, "inline code markers"
+        assert "\\]\\(" in helper, "link syntax"
+        assert "**" in helper, "strong emphasis markers"
+        assert "~~" in helper, "strikethrough markers"
+        assert "[-*+]" in helper, "bullet list markers"
+        assert "\\d" in helper, "ordered list markers"
+        assert "#{1,6}" in helper, "heading markers"
+
+    def test_exactly_two_announce_call_sites_are_preserved(self) -> None:
+        """AC3 (#149): still exactly two announce() call sites after #149."""
+        script = self._script()
+
+        assert script.count("this.announce(") == 2
+
+    def test_visual_rendering_path_is_untouched(self) -> None:
+        """AC2: the stripped text is announcement-only; x-html path unchanged."""
+        script = self._script()
+        html = self._html()
+        renderer = _rule_block(script, "renderMarkdown(text)")
+
+        # The visual path keeps its exact #81 composition...
+        assert "window.DOMPurify.sanitize(window.marked.parse(text))" in renderer
+        # ...and never routes through the announcement stripper.
+        assert "stripMarkdown" not in renderer
+        # The assistant x-html binding still renders the RAW content.
+        assert 'x-html="renderMarkdown(message.content)"' in html
+        assert "stripMarkdown" not in html
+        # Still exactly one sanitize call: the default-config helper.
+        assert script.count("DOMPurify.sanitize") == 1

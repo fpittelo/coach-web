@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -56,7 +57,10 @@ class ContentSecurityPolicyMiddleware:
     Pure ASGI middleware (no ``BaseHTTPMiddleware``) so the header is applied
     to every response — pages, static assets, API/SSE routes and
     middleware-generated error responses alike — without buffering or
-    otherwise touching the SSE stream.
+    otherwise touching the SSE stream. Registered by :class:`CoachWebApp`
+    around the ENTIRE ASGI stack (#148), so the 500 that Starlette's
+    ``ServerErrorMiddleware`` renders for an unhandled exception is stamped
+    too.
     """
 
     def __init__(self, app: ASGIApp, policy: str = CSP_POLICY) -> None:
@@ -71,6 +75,29 @@ class ContentSecurityPolicyMiddleware:
             await send(message)
 
         await self.app(scope, receive, send_with_csp)
+
+
+class CoachWebApp(FastAPI):
+    """FastAPI app with the CSP stamp outside the entire Starlette stack (#148).
+
+    Starlette always builds ``ServerErrorMiddleware`` as the outermost layer
+    of its middleware stack, so a middleware registered via ``add_middleware``
+    runs inside it and cannot stamp the response ``ServerErrorMiddleware``
+    renders for an unhandled exception — the bare 500 shipped without the CSP
+    header (#127 review advisory). Overriding the ASGI entrypoint wraps the
+    fully built stack with :class:`ContentSecurityPolicyMiddleware`, so every
+    response — 200, SSE stream, 401/403, TrustedHost 400 and the
+    unhandled-exception 500 — carries the exact #87 policy from a single
+    stamping point, and the pure-ASGI send wrapper keeps the SSE stream
+    unbuffered.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._csp_wrapped: ASGIApp = ContentSecurityPolicyMiddleware(super().__call__)
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        await self._csp_wrapped(scope, receive, send)
 
 
 def resolve_version() -> str:
@@ -114,7 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if resolved.AUTH_ENABLED:
         validate_auth_config(resolved)
 
-    application = FastAPI(
+    application = CoachWebApp(
         title="Coach Web",
         version=resolve_version(),
         lifespan=lifespan,
@@ -148,11 +175,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         www_redirect=False,
     )
 
-    # Content-Security-Policy (STRIDE #87 conditions C2/C5, #84): stamp the
-    # minimal v0.7 policy on every response. Added last => outermost, so even
-    # the TrustedHost 400 and auth 401/403 error responses carry the header.
-    application.add_middleware(ContentSecurityPolicyMiddleware)
-
+    # Content-Security-Policy (STRIDE #87 conditions C2/C5, #84; #148): the
+    # minimal v0.7 policy is stamped by the CoachWebApp ASGI wrapper, which
+    # sits OUTSIDE the entire Starlette stack — so every response, including
+    # the TrustedHost 400, the auth 401/403 and the ServerErrorMiddleware 500,
+    # carries the header from a single stamping point.
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @application.get("/", include_in_schema=False)
