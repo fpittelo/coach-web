@@ -109,6 +109,17 @@ the composer when a stream ends (disabling the textarea on send drops
 focus to <body>), never stolen from a deliberate target, and the
 prefers-reduced-motion contract from #85 carries over with the chips
 introducing no animation of their own.
+
+Issue #149 polishes the #86 announcement posture. The visually-hidden
+``role="status"`` region announced the completed final message as RAW
+markdown source (``**bold**``, list markers, code fences) — syntax noise
+for screen readers. The done handler now announces a markdown-stripped
+plain-text rendering (stripMarkdown: emphasis/list/heading/fence/link
+markers removed, content kept — KIS regex chain, no new dependency),
+while the visual x-html path (renderMarkdown → marked + DOMPurify) is
+untouched and stays the sole on-screen source of truth. The role="log"
+AT verification itself requires human screen-reader execution and is
+documented as a pending procedure in docs/accessibility.md.
 """
 
 import re
@@ -1801,3 +1812,71 @@ class TestOnboardingEmptyStateContract:
         assert "fetch" not in prefill
         assert "localStorage" not in empty
         assert "sessionStorage" not in empty
+
+
+class TestAnnouncementPlainTextContract:
+    """Markdown-stripped live-region announcement (#149 AC2).
+
+    The visually-hidden ``role="status"`` region announced the completed
+    final assistant message as RAW markdown source — ``**bold**``, list
+    markers, code fences — which screen readers read as syntax noise.
+    #149 strips the common markdown markers from the ANNOUNCED text only:
+    the visual rendering path (``renderMarkdown`` → marked + DOMPurify,
+    #81) is untouched and remains the sole on-screen source of truth.
+    Source-level assertions only (no Node toolchain, ADR-006 §5).
+    """
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_strip_markdown_helper_exists(self) -> None:
+        """A top-level stripMarkdown(text) helper exists beside parsePayload."""
+        helper = _rule_block(self._script(), "stripMarkdown(text)")
+
+        assert helper, "stripMarkdown(text) helper must exist"
+
+    def test_done_handler_announces_the_stripped_text(self) -> None:
+        """AC2: the done handler announces stripMarkdown(message.content)."""
+        done = _rule_block(self._script(), "done: (event) =>")
+
+        assert "this.announce(stripMarkdown(this.messages[index].content))" in done
+
+    def test_stripper_covers_the_common_markdown_markers(self) -> None:
+        """The stripper handles emphasis, lists, headings, fences and links."""
+        helper = _rule_block(self._script(), "stripMarkdown(text)")
+
+        # Marker families from #149 AC2: fenced/inline code, links,
+        # strong/emphasis, bullet + ordered list markers, headings.
+        assert "```" in helper, "fenced code markers"
+        assert "`" in helper, "inline code markers"
+        assert "\\]\\(" in helper, "link syntax"
+        assert "**" in helper, "strong emphasis markers"
+        assert "~~" in helper, "strikethrough markers"
+        assert "[-*+]" in helper, "bullet list markers"
+        assert "\\d" in helper, "ordered list markers"
+        assert "#{1,6}" in helper, "heading markers"
+
+    def test_exactly_two_announce_call_sites_are_preserved(self) -> None:
+        """AC3 (#149): still exactly two announce() call sites after #149."""
+        script = self._script()
+
+        assert script.count("this.announce(") == 2
+
+    def test_visual_rendering_path_is_untouched(self) -> None:
+        """AC2: the stripped text is announcement-only; x-html path unchanged."""
+        script = self._script()
+        html = self._html()
+        renderer = _rule_block(script, "renderMarkdown(text)")
+
+        # The visual path keeps its exact #81 composition...
+        assert "window.DOMPurify.sanitize(window.marked.parse(text))" in renderer
+        # ...and never routes through the announcement stripper.
+        assert "stripMarkdown" not in renderer
+        # The assistant x-html binding still renders the RAW content.
+        assert 'x-html="renderMarkdown(message.content)"' in html
+        assert "stripMarkdown" not in html
+        # Still exactly one sanitize call: the default-config helper.
+        assert script.count("DOMPurify.sanitize") == 1
