@@ -227,6 +227,119 @@
                     ></p>
                   </div>
                 </template>
+                <!-- Weekly plan card (#168): renders beneath the assistant
+                     message that proposed it. weekPlan/weekMessageIndex
+                     pins the single active card to the proposing message —
+                     a new week_plan replaces the previous one (#82 rule).
+                     Structured Pydantic→HTML only: x-text bindings, never
+                     markdown (ADR-006 §9, STRIDE #87). Per-day status
+                     chips are word + color, never color alone (#165); the
+                     approval note is a role="status" live region (WCAG
+                     4.1.3) and Adjust prefills the composer without
+                     auto-sending (PO Q8). -->
+                <template x-if="message.role === 'assistant' && weekPlan && weekMessageIndex === index">
+                  <div class="plan-card week-card" role="region" aria-label="Proposed weekly plan">
+                    <p class="plan-card-label">Weekly plan</p>
+                    <h3 class="plan-title" x-text="weekPlan.title"></h3>
+                    <p class="plan-summary" x-text="weekPlan.summary"></p>
+                    <p
+                      class="plan-rationale"
+                      x-show="weekPlan.rationale"
+                      x-text="weekPlan.rationale"
+                    ></p>
+                    <p class="week-summary" x-text="weekSummaryLine"></p>
+                    <!-- The 7-column day table scrolls inside this wrapper
+                         on narrow viewports; at ≤375px it stacks into
+                         per-day blocks (styles.css #168 media query). -->
+                    <div class="plan-table-wrap">
+                      <table class="interval-table week-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Day</th>
+                            <th scope="col">Session</th>
+                            <th scope="col">Focus/Zones</th>
+                            <th scope="col">TSS</th>
+                            <th scope="col">Dur</th>
+                            <th scope="col">Status</th>
+                            <th scope="col"><span class="visually-hidden">Adjust</span></th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template x-for="(day, dayIndex) in weekPlan.days" :key="day.date">
+                            <tr>
+                              <td data-label="Day" x-text="weekDayLabel(day)"></td>
+                              <td data-label="Session" x-text="day.session_title"></td>
+                              <td data-label="Focus" x-text="weekDayFocus(day)"></td>
+                              <td
+                                data-label="TSS"
+                                x-text="day.rest_day ? '—' : day.planned_tss"
+                              ></td>
+                              <td
+                                data-label="Duration"
+                                x-text="day.rest_day ? '—' : day.duration_minutes + ' min'"
+                              ></td>
+                              <td data-label="Status">
+                                <span
+                                  class="day-chip"
+                                  :class="weekDayChipClass(day)"
+                                  x-text="weekDayStatusText(day)"
+                                ></span>
+                              </td>
+                              <td class="week-day-actions">
+                                <button
+                                  class="button button--ghost week-adjust"
+                                  type="button"
+                                  x-show="!day.rest_day"
+                                  @click="adjustDay(day)"
+                                >
+                                  Adjust
+                                </button>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="plan-actions">
+                      <button
+                        class="button"
+                        type="button"
+                        @click="approveWeek()"
+                        :disabled="
+                          weekApproval.state === 'submitting' || weekApproval.state === 'approved'
+                        "
+                      >
+                        Approve all
+                      </button>
+                      <button
+                        class="button"
+                        type="button"
+                        x-show="weekApproval.state === 'partially_failed'"
+                        @click="retryFailedDays()"
+                      >
+                        Retry failed days
+                      </button>
+                      <button
+                        class="button button--ghost"
+                        type="button"
+                        @click="rejectWeek()"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                    <p
+                      class="approval-note"
+                      role="status"
+                      :class="{
+                        'approval-note--error':
+                          weekApproval.state === 'error' ||
+                          weekApproval.state === 'partially_failed',
+                      }"
+                      x-show="weekApproval.message"
+                      x-text="weekApproval.message"
+                    ></p>
+                  </div>
+                </template>
               </article>
             </template>
           </div>

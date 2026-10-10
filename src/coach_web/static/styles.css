@@ -774,15 +774,88 @@ body {
   color: var(--error);
 }
 
-/* --- Narrow viewports (#82 AC3) ------------------------------------------ */
+/* --- Weekly plan card (issue 168) --------------------------------------------- */
+
+/* The proposed 7-day microcycle renders as a conversation card beneath the
+   assistant message that proposed it (weekPlan/weekMessageIndex pair — a
+   new week_plan replaces the previous card). Structured Pydantic→HTML
+   only: x-text bindings, no markdown rendering (ADR-006 §9, STRIDE #87).
+   Per-day status chips are word + color, never color alone (issue 165). */
+
+.week-summary {
+  margin: 0 0 var(--space-4);
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.day-chip {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.day-chip--proposed,
+.day-chip--pushing {
+  color: var(--muted);
+}
+
+.day-chip--approved {
+  color: var(--accent);
+}
+
+.day-chip--failed {
+  color: var(--error);
+}
+
+/* --- Narrow viewports (#82 AC3, issue 168) ------------------------------------ */
 
 /* At ≤375px the plan card stacks: the meta grid collapses to one column so
    the date/duration fields never squeeze the interval table; the table
-   itself scrolls horizontally inside .plan-table-wrap. */
+   itself scrolls horizontally inside .plan-table-wrap. The weekly plan
+   card's day table (issue 168) stacks further: each day row becomes a block
+   with its own per-cell labels (data-label ::before), mirroring the issue-165
+   mobile wireframe. */
 
 @media (max-width: 375px) {
   .plan-meta {
     grid-template-columns: 1fr;
+  }
+
+  .week-table thead {
+    display: none;
+  }
+
+  .week-table tr {
+    display: block;
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .week-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .week-table td {
+    display: block;
+    border-bottom: none;
+    padding: var(--space-1) 0;
+  }
+
+  .week-table td::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .week-table td.week-day-actions::before {
+    content: none;
   }
 }
 
