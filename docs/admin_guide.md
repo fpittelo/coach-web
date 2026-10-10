@@ -1,7 +1,7 @@
 # 📘 Admin Guide — Coach Web
 
 **Audience:** @devops, @architect, @fpittelo  
-**Last updated:** 2026-10-03
+**Last updated:** 2026-10-10
 
 > **Deployment model: ADR-007 — Local-First** (`docs/architecture.md` §10). The local Docker host on the workstation is the deployment target for the dev, qa, and prod lanes. The GCP Cloud Run topology is retired (Sprint 08, #64–#68) and is decommissioned via #111.
 
@@ -46,6 +46,15 @@
 - **`github-mcp` is digest-pinned on the prod lane** (`ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a…cac6`, AC7 / #113); dev/qa stay tag-pinned. Refresh the digest with `docker buildx imagetools inspect ghcr.io/github/github-mcp-server:v1.12.2`.
 - Prod lane OIDC: register redirect URI `http://localhost:8000/auth/callback` (and the `127.0.0.1` variant, or set `AUTH_REDIRECT_URI` explicitly — the app derives different redirect URIs for the two hostnames).
 
+**Create a lane env file — `chmod 600` is mandatory (MADR-0008 C3):**
+
+```bash
+cp .env.dev.example .env.dev   # or .env.qa.example / .env.prod.example
+chmod 600 .env.dev             # owner read/write only — never 644
+```
+
+The lane file carries `OPENROUTER_API_KEY`, `GITHUB_TOKEN`, `INTERVALS_API_KEY` and `AUTH_SESSION_SECRET`; a group/world-readable file leaks them to every local user on the host. `scripts/e2e-preflight.sh` asserts that **every existing lane env file is mode 600** and fails the gate with an actionable message otherwise. MADR-0008 C3 extends the same requirement to the future `DATA_ENCRYPTION_KEY` env-file secret (dedicated per-lane Fernet key, `chmod 600`, gitignored).
+
 ---
 
 ## 🐳 Local Lane Operations
@@ -81,7 +90,7 @@ docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env
 ./scripts/e2e-preflight.sh dev   # or qa / prod
 ```
 
-The pre-flight asserts: the **exact service set** (`coach-web`, `coach-mcp`, `github-mcp`) is present and healthy — it uses `docker compose ps -a`, so a crashed/exited sidecar fails the gate instead of being silently absent — coach-web is published on `127.0.0.1` only, sidecars have no published ports, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
+The pre-flight asserts: every existing lane env file is **mode 600** (MADR-0008 C3, #170), the **exact service set** (`coach-web`, `coach-mcp`, `github-mcp`) is present and healthy — it uses `docker compose ps -a`, so a crashed/exited sidecar fails the gate instead of being silently absent — coach-web is published on `127.0.0.1` only, sidecars have no published ports, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
 
 > **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
@@ -235,4 +244,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-03 (issue #113 — release gate, trivy image scan, preflight service-set assertion, manual E2E checklist)_
+_Last updated: 2026-10-10 (issue #170 — lane env-file `chmod 600` enforcement: pre-flight permission assertion + creation docs, MADR-0008 C3)_
