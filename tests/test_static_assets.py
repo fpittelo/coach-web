@@ -961,6 +961,21 @@ class TestStreamPhaseContract:
             handler = _rule_block(script, f"{event}: (event) =>")
             assert 'this.phase = "tooling"' in handler, event
 
+    def test_tool_events_surface_the_running_tools_status_label(self) -> None:
+        """AC4 (#148): tool events surface a visible "Running tools…" label.
+
+        The tooling sub-state previously only changed the pulsing indicator —
+        the status line kept the stale "Thinking"/"Connecting" text. Every
+        tool event now writes the static tooling label so the visible status
+        matches the phase. The phase contract itself is unchanged (pinned by
+        test_tool_events_display_the_tooling_substate).
+        """
+        script = self._script()
+
+        for event in ("tool_call", "tool_start", "tool_result"):
+            handler = _rule_block(script, f"{event}: (event) =>")
+            assert 'this.statusText = "Running tools…"' in handler, event
+
     def test_finish_stream_idles_the_phase(self) -> None:
         """Stream end returns the phase to idle (the banner persists)."""
         finish = _rule_block(self._script(), "finishStream()")
