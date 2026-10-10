@@ -699,6 +699,7 @@ class TestIdentityBarContract:
             "tool_result",
             "plan_proposal",
             "plan",
+            "week_plan",
             "error",
             "done",
         ):
@@ -1923,3 +1924,673 @@ class TestAnnouncementPlainTextContract:
         assert "stripMarkdown" not in html
         # Still exactly one sanitize call: the default-config helper.
         assert script.count("DOMPurify.sanitize") == 1
+
+
+class TestObjectivesSettingsContract:
+    """Objectives settings panel toggled from the identity bar (#166, AC1).
+
+    The settings view is the AC1 delivery path for the Athletic Objective
+    Profile (KIS: the conversational onboarding flow is a recorded follow-up,
+    not part of this diff). The panel is a modal dialog toggled from the
+    header identity bar (#80 patterns): structured Pydantic→HTML bindings
+    only (x-text/x-model — the page keeps exactly ONE x-html binding, the
+    assistant message body), design tokens throughout, keyboard accessible
+    (Escape closes, focus moves into the dialog on open and returns to the
+    toggle on close), and it introduces no animation of its own so the
+    prefers-reduced-motion contract (#85) is respected trivially.
+
+    app.js behavior is contracted through source assertions (no Node
+    toolchain, ADR-006 §5).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- identity bar toggle ---------------------------------------------------
+
+    def test_settings_toggle_sits_in_the_identity_bar(self) -> None:
+        """The toggle lives in the header identity bar (#80 patterns)."""
+        header = _header_block(self._html())
+
+        assert 'aria-label="Open objectives settings"' in header
+        assert 'aria-controls="settings-panel"' in header
+        assert '@click="toggleSettings()"' in header
+
+    def test_settings_toggle_tracks_the_expanded_state(self) -> None:
+        """aria-expanded is bound to the open state for assistive tech."""
+        header = _header_block(self._html())
+
+        assert ":aria-expanded" in header
+        assert "settingsOpen" in header
+
+    def test_single_new_chat_button_is_preserved(self) -> None:
+        """Regression guard: the Settings toggle does not disturb #80's contract."""
+        html = self._html()
+
+        assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
+
+    def test_settings_form_root_identifier_is_consistent_across_files(self) -> None:
+        """The form-state root declared in app.js is the one bound in index.html.
+
+        B1/B2 regression pin (PR #171 review): the HTML bindings and the
+        Alpine component state must share ONE root identifier. A rename on
+        one side only leaves the panel runtime-dead (Alpine binds to
+        undefined) while per-file string assertions stay green — so the
+        declared root, every HTML binding root and every component reference
+        are pinned to the same identifier here.
+        """
+        script = self._script()
+        html = self._html()
+        form_roots = r"(objectivesForm|settingsForm)"
+
+        declared = re.findall(form_roots + r"\s*:\s*\{", script)
+        assert len(declared) == 1, "app.js must declare exactly one form-state root"
+        root = declared[0]
+
+        html_roots = set(re.findall(form_roots + r"\.", html))
+        assert html_roots, "index.html must bind the form state"
+        assert html_roots == {root}, f"HTML binds {html_roots}, app.js declares {root}"
+
+        js_refs = set(re.findall(r"this\." + form_roots, script))
+        assert js_refs == {root}, f"app.js references {js_refs}, declares {root}"
+
+    # --- dialog structure --------------------------------------------------------
+
+    def test_settings_panel_is_a_modal_dialog(self) -> None:
+        """The panel is a labelled modal dialog."""
+        html = self._html()
+
+        assert 'role="dialog"' in html
+        assert 'aria-modal="true"' in html
+        assert 'aria-labelledby="settings-title"' in html
+        assert 'id="settings-title"' in html
+
+    def test_settings_panel_is_hidden_until_toggled(self) -> None:
+        """The overlay is x-show-gated and x-cloak'd (no flash before Alpine)."""
+        html = self._html()
+        class_at = html.index('class="settings-overlay"')
+        tag_start = html.rindex("<div", 0, class_at)
+        overlay_tag = html[tag_start : html.index(">", class_at) + 1]
+
+        assert 'x-show="settingsOpen"' in overlay_tag
+        assert "x-cloak" in overlay_tag
+
+    def test_escape_closes_the_settings_panel(self) -> None:
+        """Keyboard users can dismiss the dialog with Escape."""
+        html = self._html()
+
+        assert '@keydown.escape.window="closeSettings()"' in html
+
+    # --- form bindings (structured Pydantic→HTML) ---------------------------------
+
+    def test_goal_fields_bind_with_x_model(self) -> None:
+        """Every goal field binds via x-model — no HTML construction."""
+        html = self._html()
+
+        assert 'x-model="goal.objective_type"' in html
+        assert 'x-model="goal.title"' in html
+        assert 'x-model="goal.description"' in html
+        assert 'x-model="goal.target_metric"' in html
+        assert 'x-model="goal.targetValue"' in html
+        assert 'x-model="goal.target_date"' in html
+
+    def test_profile_fields_bind_with_x_model(self) -> None:
+        """Availability hours and disciplines bind via x-model."""
+        html = self._html()
+
+        assert 'x-model="objectivesForm.weeklyAvailabilityHours"' in html
+        assert 'x-model="objectivesForm.priorityDisciplines"' in html
+
+    def test_settings_panel_introduces_no_x_html(self) -> None:
+        """The page keeps exactly one x-html binding (assistant messages)."""
+        html = self._html()
+
+        assert html.count("x-html") == 1
+
+    def test_goals_render_through_a_single_loop(self) -> None:
+        """Primary + secondary goals share one loop; the first entry is primary."""
+        html = self._html()
+
+        assert '<template x-for="(goal, goalIndex) in objectivesForm.goals"' in html
+        assert "goalIndex === 0" in html
+        assert "addGoal()" in html
+        assert "removeGoal(goalIndex)" in html
+
+    def test_settings_form_initializes_with_a_blank_primary_goal(self) -> None:
+        """N4: the form is never empty — a blank primary goal renders pre-load."""
+        script = self._script()
+
+        assert "goals: [blankGoalForm()]" in script
+        # The blank-goal factory is a top-level function so the state literal
+        # and the empty-profile load path share one definition.
+        assert "function blankGoalForm()" in script
+
+    def test_goal_type_select_offers_the_madr008_enum(self) -> None:
+        """The type select offers exactly the MADR-008 objective_type enum."""
+        html = self._html()
+
+        for value in ("outcome", "process", "milestone"):
+            assert f'value="{value}"' in html, value
+
+    # --- load/save wiring -----------------------------------------------------------
+
+    def test_settings_load_on_open(self) -> None:
+        """Opening the panel loads the persisted profile via GET."""
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        load = _rule_block(script, "loadObjectives()")
+
+        assert "this.loadObjectives()" in open_block
+        assert 'fetch("/api/objectives")' in load
+        assert 'method: "PUT"' not in load
+
+    def test_settings_save_via_put(self) -> None:
+        """Saving posts the form to PUT /api/objectives."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert 'fetch("/api/objectives"' in save
+        assert 'method: "PUT"' in save
+
+    def test_save_normalizes_empty_optionals_to_null(self) -> None:
+        """Empty optional numerics serialize as null, not empty strings."""
+        script = self._script()
+        payload = _rule_block(script, "payloadFromForm()")
+
+        assert 'goal.targetValue === ""' in payload
+        assert "Number(goal.targetValue)" in payload
+        # Disciplines: comma-separated input → trimmed, empties filtered.
+        assert '.split(",")' in payload
+        assert ".trim()" in payload
+        assert '.filter((item) => item !== "")' in payload
+
+    def test_save_surfaces_only_a_generic_error(self) -> None:
+        """Save failures show a static message — no server detail echoed (nLPD)."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert "Could not save objectives" in save
+        assert "body.detail" not in save
+
+    # --- focus management -------------------------------------------------------------
+
+    def test_focus_moves_into_the_panel_on_open(self) -> None:
+        """Opening the dialog moves focus into the panel (behavior contract)."""
+        open_block = _rule_block(self._script(), "openSettings()")
+
+        assert "this.$refs.settingsPanel" in open_block
+        assert ".focus()" in open_block
+
+    def test_focus_returns_to_the_toggle_on_close(self) -> None:
+        """Closing returns focus to the toggle, guarded against steal-when-closed."""
+        close_block = _rule_block(self._script(), "closeSettings()")
+
+        assert "this.$refs.settingsToggle" in close_block
+        assert ".focus()" in close_block
+        assert "if (!this.settingsOpen)" in close_block
+
+    def test_settings_panel_traps_tab_focus(self) -> None:
+        """Tab cycles within the dialog (N3: keyboard-only, motion-free trap)."""
+        html = self._html()
+        script = self._script()
+
+        assert '@keydown.tab="trapSettingsFocus($event)"' in html
+
+        trap = _rule_block(script, "trapSettingsFocus(event)")
+        assert trap, "trapSettingsFocus(event) must exist"
+        # Focusables are queried within the dialog only — never the page.
+        assert "this.$refs.settingsPanel" in trap
+        assert 'querySelectorAll("button, input, select, textarea, a[href]")' in trap
+        # Hidden controls (x-show, e.g. the primary goal's remove button) and
+        # disabled buttons are not Tab stops and never take the wrap.
+        assert "offsetParent" in trap
+        assert "disabled" in trap
+        # Shift+Tab on the first focusable wraps to the last; Tab on the last
+        # wraps to the first — preventDefault keeps focus inside the dialog.
+        assert "event.shiftKey" in trap
+        assert "event.preventDefault()" in trap
+
+    # --- styling contract ----------------------------------------------------------------
+
+    def test_settings_styles_use_tokens(self) -> None:
+        """Overlay and panel are token-driven; the overlay covers the viewport."""
+        css = self._css()
+        overlay = _rule_block(css, ".settings-overlay")
+        panel = _rule_block(css, ".settings-panel")
+
+        assert "position: fixed" in overlay
+        assert "var(--overlay)" in overlay
+        assert "var(--paper)" in panel
+        assert "var(--radius)" in panel
+        assert "box-shadow" in panel
+
+    def test_settings_introduce_no_animation(self) -> None:
+        """No transition/animation of its own — reduced-motion respected (#85)."""
+        css = self._css()
+        overlay = _rule_block(css, ".settings-overlay")
+        panel = _rule_block(css, ".settings-panel")
+
+        assert "transition" not in overlay
+        assert "animation" not in overlay
+        assert "transition" not in panel
+        assert "animation" not in panel
+
+    def test_settings_fields_are_labelled(self) -> None:
+        """Every form control sits inside a labelled .field wrapper."""
+        html = self._html()
+
+        # The chat UI uses no .field-label class; all occurrences belong to
+        # the settings form (8+ labelled controls: type, title, description,
+        # metric, value, date per goal template + availability + disciplines).
+        assert html.count('class="field-label"') >= 8
+        assert "x-text=\"goalIndex === 0 ? 'Primary goal' : 'Secondary goal'\"" in html
+
+
+class TestPeriodizationSettingsContract:
+    """Periodization phases section in the settings modal (#167, AC1).
+
+    The settings modal gains a phases section: the list of the active
+    objective's macrocycle phases (type, name, start/end dates, focus,
+    weekly hours, notes) with add/edit/remove. Same patterns as the #166
+    objectives form: structured Pydantic→HTML bindings only (x-text/x-model
+    — the page keeps exactly ONE x-html binding), the #166 focus trap
+    (reused verbatim — the trap queries the whole panel, so the new controls
+    are covered without changes), design tokens throughout, keyboard
+    accessible. The phases ride their own Alpine state root (``phasesForm``)
+    and their own GET/PUT endpoint — a separate concern from the objective
+    profile, with its own save action and failure surface.
+
+    app.js behavior is contracted through source assertions (no Node
+    toolchain, ADR-006 §5).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- structure --------------------------------------------------------------
+
+    def test_phases_section_sits_inside_the_settings_panel(self) -> None:
+        """The phases form lives inside the settings modal, after the goals."""
+        html = self._html()
+
+        panel_at = html.index('id="settings-panel"')
+        goals_at = html.index('@submit.prevent="saveObjectives()"')
+        phases_at = html.index('@submit.prevent="savePhases()"')
+        end_at = html.index("</body>")
+
+        assert panel_at < goals_at < phases_at < end_at
+
+    def test_phases_render_through_a_single_loop(self) -> None:
+        """The phases render through one loop with add/remove actions."""
+        html = self._html()
+
+        assert '<template x-for="(phase, phaseIndex) in phasesForm.phases"' in html
+        assert "addPhase()" in html
+        assert '@click="removePhase(phaseIndex)"' in html
+
+    def test_phase_fields_bind_with_x_model(self) -> None:
+        """Every phase field binds via x-model — no HTML construction."""
+        html = self._html()
+
+        assert 'x-model="phase.phase_type"' in html
+        assert 'x-model="phase.name"' in html
+        assert 'x-model="phase.start_date"' in html
+        assert 'x-model="phase.end_date"' in html
+        assert 'x-model="phase.focus"' in html
+        assert 'x-model="phase.weeklyHoursTarget"' in html
+        assert 'x-model="phase.notes"' in html
+
+    def test_phase_type_select_offers_the_madr008_enum(self) -> None:
+        """The phase type select offers exactly the MADR-008 phase_type enum."""
+        html = self._html()
+
+        for value in ("base", "build", "peak", "taper", "recovery", "competition"):
+            assert f'value="{value}"' in html, value
+
+    def test_phase_dates_use_date_inputs(self) -> None:
+        """The phase start/end fields are date inputs (ISO dates by construction)."""
+        html = self._html()
+        start_at = html.index('x-model="phase.start_date"')
+        input_tag = html[html.rindex("<input", 0, start_at) : html.index(">", start_at) + 1]
+
+        assert 'type="date"' in input_tag
+
+    def test_phases_section_reuses_the_settings_form_classes(self) -> None:
+        """The phase fieldsets reuse the #166 token-driven form classes."""
+        html = self._html()
+        phases_at = html.index('@submit.prevent="savePhases()"')
+        section = html[phases_at : html.index("</form>", phases_at)]
+
+        assert 'class="goal-fieldset"' in section
+        assert 'class="field-label"' in section
+        assert "button--ghost" in section
+
+    # --- state root consistency (B1/B2 mirror) ----------------------------------
+
+    def test_phases_form_state_root_is_consistent_across_files(self) -> None:
+        """The phases form root declared in app.js is the one bound in index.html.
+
+        B1/B2 mirror (PR #171 review): the HTML bindings and the Alpine
+        component state must share ONE root identifier — a rename on one
+        side only leaves the section runtime-dead while string assertions
+        stay green.
+        """
+        script = self._script()
+        html = self._html()
+
+        declared = re.findall(r"phasesForm\s*:\s*\{", script)
+        assert len(declared) == 1, "app.js must declare exactly one phasesForm root"
+
+        html_roots = set(re.findall(r"phasesForm\.\w+", html))
+        assert html_roots, "index.html must bind the phases form state"
+        assert html_roots == {"phasesForm.phases"}, html_roots
+
+        js_refs = set(re.findall(r"this\.phasesForm", script))
+        assert js_refs == {"this.phasesForm"}, js_refs
+
+    def test_phases_form_initializes_empty_with_a_blank_factory(self) -> None:
+        """The phases form starts empty; addPhase uses a blank-phase factory."""
+        script = self._script()
+
+        assert "phasesForm: { phases: [] }" in script
+        assert "function blankPhaseForm()" in script
+        add = _rule_block(script, "addPhase()")
+        assert "blankPhaseForm()" in add
+
+    # --- load/save wiring ---------------------------------------------------------
+
+    def test_settings_open_loads_the_phases(self) -> None:
+        """Opening the panel loads both the profile and the phases."""
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        load = _rule_block(script, "loadPhases()")
+
+        assert "this.loadPhases()" in open_block
+        assert 'fetch("/api/periodization")' in load
+        assert 'method: "PUT"' not in load
+
+    def test_phases_save_via_put(self) -> None:
+        """Saving posts the form to PUT /api/periodization."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert 'fetch("/api/periodization"' in save
+        assert 'method: "PUT"' in save
+
+    def test_phases_save_normalizes_empty_optionals_to_null(self) -> None:
+        """Empty optional numerics/text serialize as null, not empty strings."""
+        script = self._script()
+        payload = _rule_block(script, "payloadFromPhasesForm()")
+
+        assert 'phase.weeklyHoursTarget === ""' in payload
+        assert "Number(phase.weeklyHoursTarget)" in payload
+        assert ".trim()" in payload
+
+    def test_phases_save_surfaces_only_a_generic_error(self) -> None:
+        """Save failures show a static message — no server detail echoed (nLPD)."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert "Could not save phases" in save
+        assert "body.detail" not in save
+
+    def test_phases_save_guard_blocks_double_submit(self) -> None:
+        """savePhases guards on its own in-flight flag (mirrors saveObjectives)."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert "if (this.phasesSaving)" in save
+        assert "this.phasesSaving = true" in save
+        assert "this.phasesSaving = false" in save
+
+    # --- a11y & styling -------------------------------------------------------------
+
+    def test_phases_section_introduces_no_x_html(self) -> None:
+        """The page keeps exactly one x-html binding (assistant messages)."""
+        html = self._html()
+
+        assert html.count("x-html") == 1
+
+    def test_phases_title_is_labelled(self) -> None:
+        """The section carries a visible heading for structure."""
+        html = self._html()
+
+        assert "Periodization phases" in html
+
+    def test_phases_styles_use_tokens(self) -> None:
+        """Any new phase styling is token-driven (no color literals)."""
+        css = self._css()
+        title = _rule_block(css, ".phases-title")
+
+        assert title, ".phases-title rule missing"
+        assert "var(--" in title
+        assert "#" not in title
+
+
+class TestWeeklyPlanCardContract:
+    """Weekly plan card — state pair, chips, approval & adjust contract (#168).
+
+    The weekly microcycle (epic #161 story 2.1) renders as a single
+    conversation card pinned to the proposing assistant message via the
+    ``weekPlan`` / ``weekMessageIndex`` state pair (#82 replacement rule —
+    a new ``week_plan`` event replaces the card). Per-day status chips are
+    word + color, never color alone (#165); Adjust prefills the composer and
+    NEVER auto-sends (PO Q8); the approval POST carries the validated draft
+    plus the optional retry-failed-days dates subset (#163 non-atomic
+    writes). JS is contracted via source assertions (no Node toolchain,
+    ADR-006 §5).
+    """
+
+    WEEK_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && weekPlan && "
+        'weekMessageIndex === index">'
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _week_card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.WEEK_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    # --- state pair & card pinning -------------------------------------------
+
+    def test_week_state_pair_is_declared_once(self) -> None:
+        """The weekPlan/weekMessageIndex pair is declared exactly once."""
+        script = self._script()
+
+        assert script.count("weekPlan: null") == 1
+        assert script.count("weekMessageIndex: -1") == 1
+
+    def test_week_card_is_pinned_to_the_proposing_message(self) -> None:
+        """The card template binds the weekPlan/weekMessageIndex pair."""
+        html = self._html()
+
+        assert self.WEEK_CARD_TEMPLATE in html
+
+    def test_week_plan_handler_pins_and_resets_day_statuses(self) -> None:
+        """The week_plan handler pins the card and seeds per-day statuses."""
+        script = self._script()
+        handler = _rule_block(script, "week_plan: (event) =>")
+
+        assert "this.weekPlan = data.draft" in handler
+        assert "this.weekMessageIndex = index" in handler
+        assert '"proposed"' in handler
+        assert "this.scrollToBottom()" in handler
+
+    def test_week_card_is_a_labelled_region(self) -> None:
+        """The card is a role=region with the #165 aria-label."""
+        card = self._week_card()
+
+        assert 'role="region"' in card
+        assert 'aria-label="Proposed weekly plan"' in card
+
+    # --- structured rendering (no markdown) -----------------------------------
+
+    def test_week_card_is_structured_pydantic_to_html(self) -> None:
+        """The week card binds x-text only — never markdown/x-html."""
+        card = self._week_card()
+
+        assert "x-html" not in card
+        assert "renderMarkdown" not in card
+        assert "weekPlan.title" in card
+        assert "weekPlan.summary" in card
+        assert "day.session_title" in card
+        assert "day.planned_tss" in card
+
+    def test_week_card_renders_the_week_summary_line(self) -> None:
+        """The week summary (total TSS, hard/easy/rest) is rendered."""
+        card = self._week_card()
+
+        assert "weekSummaryLine" in card
+
+    # --- per-day status chips: word + color, never color alone -----------------
+
+    def test_day_status_words_are_pinned(self) -> None:
+        """Every chip state carries a word — color is never the sole carrier."""
+        script = self._script()
+
+        assert '"proposed"' in script
+        assert '"pushing…"' in script
+        assert '"approved ✓"' in script
+        assert '"write failed"' in script
+
+    def test_day_chip_classes_map_to_tokens(self) -> None:
+        """Chip color classes exist and resolve to design tokens only."""
+        css = self._css()
+
+        assert ".day-chip--proposed" in css
+        assert ".day-chip--pushing" in css
+        assert ".day-chip--approved" in css
+        assert ".day-chip--failed" in css
+        approved = _rule_block(css, ".day-chip--approved")
+        failed = _rule_block(css, ".day-chip--failed")
+        assert "var(--accent)" in approved
+        assert "var(--error)" in failed
+
+    # --- approval flow (#163 non-atomic writes) --------------------------------
+
+    def test_approve_week_posts_the_week_and_dates_contract(self) -> None:
+        """Approve All posts {week, dates} to /api/week/approve."""
+        script = self._script()
+        approve = _rule_block(script, "approveWeek(dates)")
+
+        assert 'fetch("/api/week/approve"' in approve
+        assert 'method: "POST"' in approve
+        assert "JSON.stringify({ week: this.weekPlan, dates: dates || null })" in approve
+
+    def test_approve_week_marks_target_days_pushing_before_the_post(self) -> None:
+        """Target days flip to pushing synchronously, before the fetch."""
+        approve = _rule_block(self._script(), "approveWeek(dates)")
+
+        pushing_at = approve.index('"pushing"')
+        fetch_at = approve.index('fetch("/api/week/approve"')
+        assert pushing_at < fetch_at
+
+    def test_partial_failure_surfaces_the_retry_affordance(self) -> None:
+        """A partial failure sets the partially_failed state and retry button."""
+        script = self._script()
+        approve = _rule_block(script, "approveWeek(dates)")
+
+        assert '"partially_failed"' in approve
+        retry = _rule_block(script, "retryFailedDays()")
+        assert "this.approveWeek(" in retry
+        assert '"failed"' in retry
+
+    def test_retry_posts_only_the_failed_dates(self) -> None:
+        """The retry affordance collects the failed dates as the subset."""
+        retry = _rule_block(self._script(), "retryFailedDays()")
+
+        assert '"failed"' in retry
+
+    def test_transport_error_returns_pushing_days_to_proposed(self) -> None:
+        """A failed request never leaves days stuck in pushing."""
+        approve = _rule_block(self._script(), "approveWeek(dates)")
+
+        assert '"proposed"' in approve
+
+    # --- Adjust: prefill, never auto-send (PO Q8) -------------------------------
+
+    def test_adjust_day_prefills_the_composer_without_sending(self) -> None:
+        """Adjust fills the composer and focuses it — never auto-send."""
+        adjust = _rule_block(self._script(), "adjustDay(day)")
+
+        assert "this.input = " in adjust
+        assert "this.$refs.composer.focus()" in adjust
+        assert "this.send()" not in adjust
+        assert "this.startStream(" not in adjust
+
+    def test_rest_days_offer_no_adjust_button(self) -> None:
+        """The Adjust button is hidden for rest days."""
+        card = self._week_card()
+
+        assert 'x-show="!day.rest_day"' in card
+
+    # --- reject & reset ---------------------------------------------------------
+
+    def test_reject_week_clears_the_card_state(self) -> None:
+        """Reject dismisses the card and clears every week state slice."""
+        reject = _rule_block(self._script(), "rejectWeek()")
+
+        assert "this.weekPlan = null" in reject
+        assert "this.weekMessageIndex = -1" in reject
+        assert "this.weekDayStatus = {}" in reject
+
+    def test_reset_chat_clears_the_week_state(self) -> None:
+        """New chat clears the weekly card state too."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.weekPlan = null" in reset
+        assert "this.weekMessageIndex = -1" in reset
+        assert "this.weekDayStatus = {}" in reset
+
+    def test_start_stream_clears_the_week_state(self) -> None:
+        """A new stream clears the weekly card (the #82 replacement posture)."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.weekPlan = null" in start
+        assert "this.weekMessageIndex = -1" in start
+
+    # --- accessibility -----------------------------------------------------------
+
+    def test_week_note_is_a_live_status_region(self) -> None:
+        """The approval note is a role=status region (WCAG 4.1.3, #165)."""
+        card = self._week_card()
+
+        assert 'role="status"' in card
+
+    def test_week_table_headers_are_scoped(self) -> None:
+        """The day table declares scope=col headers."""
+        card = self._week_card()
+
+        assert 'scope="col"' in card
+
+    # --- mobile stacking (≤375px, #165 wireframe) --------------------------------
+
+    def test_week_table_stacks_on_narrow_viewports(self) -> None:
+        """At ≤375px the day table stacks into per-day blocks."""
+        css = self._css()
+        media = _media_block(css, "@media (max-width: 375px)")
+
+        assert ".week-table" in media
+        assert "display: block" in media
+
+    def test_week_table_scrolls_in_an_overflow_wrapper(self) -> None:
+        """The desktop day table rides the existing overflow-x wrapper."""
+        card = self._week_card()
+
+        assert "plan-table-wrap" in card

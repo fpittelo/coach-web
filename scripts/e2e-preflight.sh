@@ -15,6 +15,8 @@
 #   6. coach-web is published on 127.0.0.1 ONLY and the sidecars publish no
 #      host ports at all (loopback binding is the primary boundary, ADR-007)
 #   7. (prod only) /api/* returns 401 without a session (auth boundary)
+#   8. every existing lane env file is mode 600 (MADR-0008 C3, #170) — a
+#      group/world-readable lane file exposes its secrets to every local user
 #
 # Usage:
 #   ./scripts/e2e-preflight.sh [dev|qa|prod]
@@ -86,6 +88,27 @@ if [[ ! -f "${ENV_FILE}" ]]; then
     error "Missing ${ENV_FILE}. Copy ${ENV_EXAMPLE} to ${ENV_FILE} and fill in your secrets."
     exit 1
 fi
+
+# Every existing lane env file must be mode 600 (MADR-0008 C3, #170). The
+# check covers all existing lane env files, not only the lane being validated:
+# the exposure is per-file (the 2026-10-10 review found .env.dev/.env.qa/
+# .env.prod all at 644), and a world-readable file leaks its secrets to every
+# local user regardless of which lane is under test.
+LANE_ENV_FILES=()
+for candidate_lane in dev qa prod; do
+    candidate_env="${PROJECT_DIR}/.env.${candidate_lane}"
+    if [[ -f "${candidate_env}" ]]; then
+        LANE_ENV_FILES+=("${candidate_env}")
+    fi
+done
+log "Asserting lane env file permissions (mode 600)..."
+if ! python3 "${PROJECT_DIR}/scripts/preflight_env_permissions_check.py" "${LANE_ENV_FILES[@]}"; then
+    error "Lane env file permissions are too permissive (must be mode 600)."
+    error "These files carry OPENROUTER_API_KEY, GITHUB_TOKEN, INTERVALS_API_KEY and AUTH_SESSION_SECRET."
+    error "Fix: chmod 600 .env.dev .env.qa .env.prod   # every lane env file listed above"
+    exit 1
+fi
+log "Lane env file permissions OK (mode 600)."
 
 log "Linting the ${LANE} lane compose configuration..."
 dc config --quiet

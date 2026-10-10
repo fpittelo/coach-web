@@ -22,6 +22,15 @@
  * approve/reject POST contract is unchanged: {plan: <PlanProposal>} to
  * POST /api/plan/approve; reject dismisses the card and clears plan state.
  *
+ * Weekly plan card (#168): the proposed 7-day microcycle renders as a
+ * second single-active conversation card pinned via the weekPlan /
+ * weekMessageIndex pair (one state pair per card type, so both cards can
+ * coexist). Approval posts {week, dates} to POST /api/week/approve — the
+ * write is NOT atomic (#163): per-day status chips track proposed →
+ * pushing… → approved ✓ / write failed, and a partial failure offers the
+ * retry-failed-days subset. Adjust prefills the composer and never
+ * auto-sends (PO Q8).
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -77,6 +86,41 @@ const WATCHDOG_TIMEOUT_MS = 90000;
 // back near the bottom re-arms following automatically (AC2).
 const STICK_THRESHOLD_PX = 60;
 
+// Week-card label vocabulary (#168): static client-side strings for the
+// per-day status chips (word + color, never color alone — #165) and the
+// compact day labels rendered in the day table.
+const WEEK_DAY_STATUS_WORDS = {
+  proposed: "proposed",
+  pushing: "pushing…",
+  approved: "approved ✓",
+  failed: "write failed",
+};
+
+const WEEK_DAY_LABELS = {
+  mon: "Mon",
+  tue: "Tue",
+  wed: "Wed",
+  thu: "Thu",
+  fri: "Fri",
+  sat: "Sat",
+  sun: "Sun",
+};
+
+const WEEK_DAY_FULL_NAMES = {
+  mon: "Monday",
+  tue: "Tuesday",
+  wed: "Wednesday",
+  thu: "Thursday",
+  fri: "Friday",
+  sat: "Saturday",
+  sun: "Sunday",
+};
+
+const MONTH_LABELS = [
+  "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 function parsePayload(event) {
   try {
     const raw = typeof event === "string" ? JSON.parse(event) : JSON.parse(event.data);
@@ -115,6 +159,35 @@ function stripMarkdown(text) {
     .trim();
 }
 
+function blankGoalForm() {
+  // Blank goal form factory (N4, PR #171): shared by the initial state, the
+  // add-goal action and the empty-profile load path — the settings form is
+  // never empty, so a blank primary goal renders before any load completes.
+  return {
+    objective_type: "outcome",
+    title: "",
+    description: "",
+    target_metric: "",
+    targetValue: null,
+    target_date: "",
+  };
+}
+
+function blankPhaseForm() {
+  // Blank phase form factory (#167): shared by the add-phase action — the
+  // phases list starts empty (no periodization is a legitimate state) and
+  // grows one blank phase per click.
+  return {
+    phase_type: "base",
+    name: "",
+    start_date: "",
+    end_date: "",
+    focus: "",
+    weeklyHoursTarget: null,
+    notes: "",
+  };
+}
+
 function coachApp() {
   return {
     messages: [],
@@ -148,6 +221,17 @@ function coachApp() {
     // plan is active; a new proposal overwrites both slots (AC4: one card).
     planMessageIndex: -1,
     approval: { state: "idle", message: "" },
+    // Weekly plan card (#168): the proposed 7-day microcycle renders as a
+    // single conversation card pinned to the proposing message via the
+    // weekPlan/weekMessageIndex pair (#82 replacement rule — a new
+    // week_plan event replaces the card). Per-day write statuses ride
+    // their own map keyed by ISO date (proposed | pushing | approved |
+    // failed — #165 chips, word + color never color alone); the card-level
+    // approval state mirrors the plan card's plain-string machine.
+    weekPlan: null,
+    weekMessageIndex: -1,
+    weekApproval: { state: "idle", message: "" },
+    weekDayStatus: {},
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -160,6 +244,27 @@ function coachApp() {
       "Review last week's training load",
     ],
     controller: null,
+    // Objectives settings panel (#166, AC1): toggled from the identity bar.
+    // The form mirrors the ObjectiveProfile API shape — goals[0] is the
+    // primary goal, goals[1:] the secondaries; optional numerics ride as
+    // strings in the inputs and normalize to null on save. All bindings are
+    // x-text/x-model (structured Pydantic→HTML, no x-html).
+    settingsOpen: false,
+    settingsSaving: false,
+    settingsMessage: "",
+    objectivesForm: {
+      goals: [blankGoalForm()],
+      weeklyAvailabilityHours: 0,
+      priorityDisciplines: "",
+    },
+    // Periodization phases panel (#167, AC1): the active objective's
+    // macrocycle phases, loaded on open and saved via PUT
+    // /api/periodization. Own state root and failure surface — a separate
+    // concern from the objective profile form above. All bindings are
+    // x-text/x-model (structured Pydantic→HTML, no x-html).
+    phasesForm: { phases: [] },
+    phasesSaving: false,
+    phasesMessage: "",
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -305,6 +410,288 @@ function coachApp() {
       this.$refs.composer.focus();
     },
 
+    // ------------------------------------------------------------------
+    // Objectives settings panel (#166, AC1). The panel loads the persisted
+    // ObjectiveProfile on open and saves it via PUT /api/objectives. All
+    // bindings are structured x-text/x-model; error surfaces are static
+    // strings only — server validation detail is never echoed (nLPD, #142).
+    // ------------------------------------------------------------------
+
+    toggleSettings() {
+      if (this.settingsOpen) {
+        this.closeSettings();
+      } else {
+        this.openSettings();
+      }
+    },
+
+    openSettings() {
+      this.settingsOpen = true;
+      this.settingsMessage = "";
+      this.loadObjectives();
+      this.loadPhases();
+      // Move focus into the dialog (keyboard accessibility): the panel is
+      // tabindex="-1" so it is programmatically focusable without entering
+      // the tab order.
+      this.$nextTick(() => {
+        const panel = this.$refs.settingsPanel;
+        if (panel) {
+          panel.focus();
+        }
+      });
+    },
+
+    closeSettings() {
+      // Guard: the window-level Escape binding fires even when the panel is
+      // closed — closing must never steal focus in that case.
+      if (!this.settingsOpen) {
+        return;
+      }
+      this.settingsOpen = false;
+      const toggle = this.$refs.settingsToggle;
+      if (toggle) {
+        toggle.focus();
+      }
+    },
+
+    trapSettingsFocus(event) {
+      // Focus trap (a11y, PR #171 N3): Tab cycles within the dialog —
+      // Shift+Tab on the first focusable wraps to the last, Tab on the last
+      // wraps to the first; preventDefault keeps focus from escaping to the
+      // page behind the modal. Keyboard-only logic, no motion involved.
+      // Hidden controls (x-show, e.g. the primary goal's remove button) and
+      // disabled buttons are not Tab stops and never take the wrap.
+      const panel = this.$refs.settingsPanel;
+      if (!panel) {
+        return;
+      }
+      const focusables = Array.from(
+        panel.querySelectorAll("button, input, select, textarea, a[href]")
+      ).filter((el) => el.offsetParent !== null && !el.disabled);
+      if (focusables.length === 0) {
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    },
+
+    formFromProfile(profile) {
+      // API → form: goals[0] is the primary goal, the rest are secondaries.
+      const toGoalForm = (goal) => ({
+        objective_type: (goal && goal.objective_type) || "outcome",
+        title: (goal && goal.title) || "",
+        description: (goal && goal.description) || "",
+        target_metric: (goal && goal.target_metric) || "",
+        targetValue: goal && goal.target_value !== null && goal.target_value !== undefined
+          ? goal.target_value
+          : null,
+        target_date: (goal && goal.target_date) || "",
+      });
+      if (!profile) {
+        return {
+          goals: [blankGoalForm()],
+          weeklyAvailabilityHours: 0,
+          priorityDisciplines: "",
+        };
+      }
+      return {
+        goals: [profile.primary_goal].concat(profile.secondary_goals || []).map(toGoalForm),
+        weeklyAvailabilityHours:
+          profile.weekly_availability_hours === null || profile.weekly_availability_hours === undefined
+            ? 0
+            : profile.weekly_availability_hours,
+        priorityDisciplines: (profile.priority_disciplines || []).join(", "),
+      };
+    },
+
+    loadObjectives() {
+      fetch("/api/objectives")
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Load failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.objectivesForm = this.formFromProfile(body.profile);
+        })
+        .catch(() => {
+          this.settingsMessage = "Could not load objectives.";
+        });
+    },
+
+    payloadFromForm() {
+      // Form → API: empty optional numerics/dates serialize as null (the API
+      // validates strict types — an empty string would be a 422); the
+      // comma-separated disciplines input becomes a trimmed, filtered list.
+      const fromGoalForm = (goal) => ({
+        objective_type: goal.objective_type,
+        title: goal.title,
+        description: goal.description.trim() === "" ? null : goal.description,
+        target_metric: goal.target_metric.trim() === "" ? null : goal.target_metric,
+        target_value:
+          goal.targetValue === "" || goal.targetValue === null
+            ? null
+            : Number(goal.targetValue),
+        target_date: goal.target_date === "" ? null : goal.target_date,
+      });
+      const goals = this.objectivesForm.goals.map(fromGoalForm);
+      const disciplines = this.objectivesForm.priorityDisciplines
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item !== "");
+      return {
+        primary_goal: goals[0],
+        secondary_goals: goals.slice(1),
+        weekly_availability_hours: Number(this.objectivesForm.weeklyAvailabilityHours) || 0,
+        priority_disciplines: disciplines,
+      };
+    },
+
+    saveObjectives() {
+      if (this.settingsSaving) {
+        return;
+      }
+      this.settingsSaving = true;
+      this.settingsMessage = "";
+      fetch("/api/objectives", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.payloadFromForm()),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Save failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.objectivesForm = this.formFromProfile(body.profile);
+          this.settingsMessage = "Objectives saved.";
+        })
+        .catch(() => {
+          // Static message only — the server's 422 detail is generic by
+          // design (nLPD #142) and never echoed here.
+          this.settingsMessage = "Could not save objectives. Check the values and retry.";
+        })
+        .finally(() => {
+          this.settingsSaving = false;
+        });
+    },
+
+    addGoal() {
+      this.objectivesForm.goals.push(blankGoalForm());
+    },
+
+    removeGoal(index) {
+      // The primary goal (index 0) is never removable — the profile requires
+      // exactly one primary goal; the remove button is hidden for it.
+      if (index > 0) {
+        this.objectivesForm.goals.splice(index, 1);
+      }
+    },
+
+    // ------------------------------------------------------------------
+    // Periodization phases panel (#167, AC1). The panel loads the active
+    // objective's persisted phases on open and saves them via PUT
+    // /api/periodization. All bindings are structured x-text/x-model;
+    // error surfaces are static strings only — server validation detail is
+    // never echoed (nLPD, #142).
+    // ------------------------------------------------------------------
+
+    formFromPlan(plan) {
+      // API → form: optional numerics ride as strings in the inputs and
+      // normalize to null on save (mirrors the goals form).
+      const toPhaseForm = (phase) => ({
+        phase_type: (phase && phase.phase_type) || "base",
+        name: (phase && phase.name) || "",
+        start_date: (phase && phase.start_date) || "",
+        end_date: (phase && phase.end_date) || "",
+        focus: (phase && phase.focus) || "",
+        weeklyHoursTarget:
+          phase && phase.weekly_hours_target !== null && phase.weekly_hours_target !== undefined
+            ? phase.weekly_hours_target
+            : null,
+        notes: (phase && phase.notes) || "",
+      });
+      if (!plan || !plan.phases) {
+        return { phases: [] };
+      }
+      return { phases: plan.phases.map(toPhaseForm) };
+    },
+
+    loadPhases() {
+      fetch("/api/periodization")
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Load failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.phasesForm = this.formFromPlan(body);
+        })
+        .catch(() => {
+          this.phasesMessage = "Could not load phases.";
+        });
+    },
+
+    payloadFromPhasesForm() {
+      // Form → API: empty optional numerics/text serialize as null (the API
+      // validates strict types — an empty string would be a 422).
+      const fromPhaseForm = (phase) => ({
+        phase_type: phase.phase_type,
+        name: phase.name,
+        start_date: phase.start_date,
+        end_date: phase.end_date,
+        focus: phase.focus.trim() === "" ? null : phase.focus,
+        weekly_hours_target:
+          phase.weeklyHoursTarget === "" || phase.weeklyHoursTarget === null
+            ? null
+            : Number(phase.weeklyHoursTarget),
+        notes: phase.notes.trim() === "" ? null : phase.notes,
+      });
+      return { phases: this.phasesForm.phases.map(fromPhaseForm) };
+    },
+
+    savePhases() {
+      if (this.phasesSaving) {
+        return;
+      }
+      this.phasesSaving = true;
+      this.phasesMessage = "";
+      fetch("/api/periodization", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.payloadFromPhasesForm()),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Save failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.phasesForm = this.formFromPlan(body);
+          this.phasesMessage = "Phases saved.";
+        })
+        .catch(() => {
+          // Static message only — the server's 422 detail is generic by
+          // design (nLPD #142) and never echoed here.
+          this.phasesMessage = "Could not save phases. Check the dates and retry.";
+        })
+        .finally(() => {
+          this.phasesSaving = false;
+        });
+    },
+
+    addPhase() {
+      this.phasesForm.phases.push(blankPhaseForm());
+    },
+
+    removePhase(index) {
+      this.phasesForm.phases.splice(index, 1);
+    },
+
     send() {
       const message = this.input.trim();
       if (!message || this.streaming) {
@@ -339,6 +726,13 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+      // The weekly card follows the same replacement posture (#82): a new
+      // stream clears the previous card; the agent's week_plan event (if
+      // any) re-pins a fresh one.
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -555,6 +949,27 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        week_plan: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Weekly plan card (#168): the validated draft arrives as
+          // data.draft; the card replaces any previous week card (#82
+          // rule) and every day chip starts as "proposed".
+          this.weekPlan = data.draft || null;
+          this.weekMessageIndex = index;
+          this.weekApproval = { state: "idle", message: "" };
+          const statuses = {};
+          (this.weekPlan && this.weekPlan.days ? this.weekPlan.days : []).forEach(
+            (day) => {
+              statuses[day.date] = "proposed";
+            }
+          );
+          this.weekDayStatus = statuses;
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -672,6 +1087,10 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
       this.input = "";
       this.errorBanner = "";
       this.liveAnnouncement = "";
@@ -722,6 +1141,155 @@ function coachApp() {
       this.plan = null;
       this.planMessageIndex = -1;
       this.approval = { state: "idle", message: "" };
+    },
+
+    // ------------------------------------------------------------------
+    // Weekly plan card (#168). The proposed 7-day microcycle is approved
+    // as one POST (/api/week/approve) that writes one Intervals.icu event
+    // per day — NOT atomic (#163): every day reports its own outcome, a
+    // partial failure stays retryable via the failed-days subset, and the
+    // card state mirrors the plan card's plain-string machine. Adjust
+    // prefills the composer and NEVER auto-sends (PO Q8).
+    // ------------------------------------------------------------------
+
+    setDayStatus(date, status) {
+      // Immutable update: reassign the map so Alpine's reactivity sees the
+      // per-day chip change (word + color, never color alone — #165).
+      this.weekDayStatus = Object.assign({}, this.weekDayStatus, { [date]: status });
+    },
+
+    weekDayStatusText(day) {
+      // Chip word per state (#165): proposed → pushing… → approved ✓ /
+      // write failed. Unknown days default to "proposed".
+      return WEEK_DAY_STATUS_WORDS[this.weekDayStatus[day.date] || "proposed"];
+    },
+
+    weekDayChipClass(day) {
+      // Chip color class per state — always rendered NEXT TO the word.
+      return "day-chip--" + (this.weekDayStatus[day.date] || "proposed");
+    },
+
+    weekDayLabel(day) {
+      // Compact day label, e.g. "Mon 06 Oct" (#165 wireframe). Built from
+      // the ISO parts — no Date parsing, no timezone drift.
+      const parts = day.date.split("-");
+      const month = MONTH_LABELS[Number(parts[1]) - 1] || "";
+      return (WEEK_DAY_LABELS[day.day_of_week] || "") + " " + parts[2] + " " + month;
+    },
+
+    weekDayFocus(day) {
+      // Focus/zones cell: zones joined, falling back to the focus line.
+      if (day.rest_day) {
+        return "—";
+      }
+      const zones = (day.zones || []).join("–");
+      return zones || day.focus || "—";
+    },
+
+    get weekSummaryLine() {
+      // Week summary (#165): "520 TSS · 2 hard · 4 easy · 1 rest". The
+      // rest count is derived from the day slots (the ground truth).
+      if (!this.weekPlan) {
+        return "";
+      }
+      const rest = this.weekPlan.days.filter((day) => day.rest_day).length;
+      return (
+        this.weekPlan.total_tss +
+        " TSS · " +
+        this.weekPlan.hard_days +
+        " hard · " +
+        this.weekPlan.easy_days +
+        " easy · " +
+        rest +
+        " rest"
+      );
+    },
+
+    approveWeek(dates) {
+      // Approve All (dates = null) or retry the failed-days subset. Target
+      // days flip to "pushing" synchronously — before the fetch — and a
+      // failed request returns them to "proposed" so no day is ever stuck.
+      if (!this.weekPlan || this.weekApproval.state === "submitting") {
+        return;
+      }
+      const targetDays = this.weekPlan.days.filter(
+        (day) => !dates || dates.indexOf(day.date) !== -1
+      );
+      if (targetDays.length === 0) {
+        return;
+      }
+      targetDays.forEach((day) => this.setDayStatus(day.date, "pushing"));
+      this.weekApproval = {
+        state: "submitting",
+        message: dates ? "Retrying failed days…" : "Pushing weekly plan…",
+      };
+
+      fetch("/api/week/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ week: this.weekPlan, dates: dates || null }),
+      })
+        .then(async (response) => {
+          const body = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            throw new Error(body.detail || "Approval failed");
+          }
+          let failed = 0;
+          body.results.forEach((result) => {
+            this.setDayStatus(result.date, result.success ? "approved" : "failed");
+            if (!result.success) {
+              failed += 1;
+            }
+          });
+          if (failed === 0) {
+            this.weekApproval = {
+              state: "approved",
+              message: "Weekly plan approved and pushed.",
+            };
+          } else {
+            this.weekApproval = {
+              state: "partially_failed",
+              message:
+                failed + " of " + body.results.length + " days failed to write. Retry the failed days.",
+            };
+          }
+        })
+        .catch((error) => {
+          targetDays.forEach((day) => {
+            if (this.weekDayStatus[day.date] === "pushing") {
+              this.setDayStatus(day.date, "proposed");
+            }
+          });
+          this.weekApproval = { state: "error", message: error.message };
+        });
+    },
+
+    retryFailedDays() {
+      // Retry affordance (#163): post ONLY the failed dates subset —
+      // succeeded days are never re-written (no duplicate calendar events).
+      if (!this.weekPlan) {
+        return;
+      }
+      const failedDates = this.weekPlan.days
+        .map((day) => day.date)
+        .filter((date) => this.weekDayStatus[date] === "failed");
+      this.approveWeek(failedDates);
+    },
+
+    adjustDay(day) {
+      // Per-day Adjust (PO Q8): prefill-and-focus — NEVER auto-send. The
+      // agent's next turn emits a fresh week_plan that replaces the card
+      // (#82 rule), keeping one approval contract.
+      this.input = "Adjust " + (WEEK_DAY_FULL_NAMES[day.day_of_week] || "that") + "'s session: ";
+      this.$refs.composer.focus();
+    },
+
+    rejectWeek() {
+      // Dismiss the weekly card and clear every week state slice.
+      this.weekPlan = null;
+      this.weekMessageIndex = -1;
+      this.weekApproval = { state: "idle", message: "" };
+      this.weekDayStatus = {};
     },
 
     get planDuration() {

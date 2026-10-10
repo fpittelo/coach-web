@@ -57,6 +57,13 @@ services:
       OPENROUTER_TIMEOUT_SECONDS: '${OPENROUTER_TIMEOUT_SECONDS:-60}'
       OPENROUTER_APP_TITLE: '${OPENROUTER_APP_TITLE:-Coach Web}'
       OPENROUTER_REFERER: '${OPENROUTER_REFERER:-https://github.com/fpittelo/coach-web}'
+      # Persistence (MADR-008, #166): SQLite file inside the lane volume.
+      COACH_DB_PATH: '${COACH_DB_PATH:-/data/coach.db}'
+    volumes:
+      # Lane volume for the SQLite database (WAL side files live alongside).
+      # The volume name derives from the compose project name, so concurrent
+      # lanes never share a database.
+      - coach-data:/data
     depends_on:
       coach-mcp:
         condition: service_healthy
@@ -157,3 +164,6 @@ services:
 networks:
   coach-net:
     driver: bridge
+
+volumes:
+  coach-data:
