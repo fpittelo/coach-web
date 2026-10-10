@@ -63,11 +63,6 @@ MAX_TEXT_LENGTH = 2000
 TOTAL_TSS_TOLERANCE = 0.05
 """Float-noise tolerance for the declared-vs-computed total TSS check."""
 
-DRAFT_STATUSES = ("draft", "submitted", "approved", "rejected", "superseded")
-"""MADR-008 ``plan_drafts.status`` CHECK enum."""
-
-DraftStatus = Literal["draft", "submitted", "approved", "rejected", "superseded"]
-
 ACTIVE_STATUSES: tuple[str, ...] = ("draft", "submitted")
 """Statuses of a draft that can still be reused by an approval request."""
 
@@ -75,12 +70,14 @@ ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "draft": frozenset({"submitted", "superseded"}),
     "submitted": frozenset({"approved", "rejected", "superseded"}),
     "approved": frozenset({"superseded"}),
-    "rejected": frozenset({"superseded"}),
+    "rejected": frozenset({"submitted", "superseded"}),
     "superseded": frozenset(),
 }
 """Draft state machine: draft → submitted → approved/rejected; superseded on
-replacement. ``superseded`` is terminal (retention pruning is operational,
-out of scope here)."""
+replacement; a REJECTED draft returns to ``submitted`` on re-approval (the
+athlete changed their mind — the write is allowed again, PR #174 F3).
+``superseded`` is terminal (retention pruning is operational, out of scope
+here)."""
 
 
 class DaySlot(BaseModel):
@@ -268,6 +265,10 @@ class PlanDraftRow(Base):
     """ORM model for the MADR-008 ``plan_drafts`` table (C3, plaintext)."""
 
     __tablename__ = "plan_drafts"
+    # The status CHECK enum below is the ORM mirror of migration 0003's
+    # CHECK (both hardcoded deliberately — migrations stay self-contained,
+    # never importing application symbols) and of the MADR-008 schema
+    # sketch; keep the three in sync when the lifecycle changes.
     __table_args__ = (
         CheckConstraint(
             "week_start_date <= week_end_date",
@@ -368,32 +369,6 @@ async def _supersede_rows(session: AsyncSession, rows: list[PlanDraftRow]) -> No
         row.updated_at = now
 
 
-async def create_draft(
-    session: AsyncSession, draft: WeeklyPlanDraft, *, status: str = "draft"
-) -> PlanDraftRow:
-    """Insert a new draft row for the week and supersede the previous drafts.
-
-    The replacement rule (#165: a new proposal replaces the previous card)
-    persists as status transitions: every non-superseded draft of the same
-    week becomes ``superseded`` when a new draft is created.
-    """
-    week_start, week_end = week_bounds(draft.week_id)
-    previous = await list_drafts_by_week(session, week_start)
-    await _supersede_rows(session, [row for row in previous if row.status != "superseded"])
-    now = _utc_now_iso()
-    row = PlanDraftRow(
-        week_start_date=week_start,
-        week_end_date=week_end,
-        content=build_week_markdown(draft),
-        status=status,
-        created_at=now,
-        updated_at=now,
-    )
-    session.add(row)
-    await session.commit()
-    return row
-
-
 async def transition_draft_status(
     session: AsyncSession,
     row: PlanDraftRow,
@@ -425,7 +400,9 @@ async def upsert_week_draft(session: AsyncSession, draft: WeeklyPlanDraft) -> Pl
     a new row is created and every previous non-superseded draft of the week
     becomes ``superseded`` (#165 replacement rule). The row lands in
     ``submitted``: the approval POST is the human-in-the-loop gate (#87 C7)
-    and the write is in flight.
+    and the write is in flight. An already-APPROVED matching row is left
+    untouched — the caller short-circuits before re-issuing calendar writes
+    (PR #174 F3); a REJECTED matching row is promoted back to ``submitted``.
     """
     week_start, week_end = week_bounds(draft.week_id)
     content = build_week_markdown(draft)
@@ -450,7 +427,10 @@ async def upsert_week_draft(session: AsyncSession, draft: WeeklyPlanDraft) -> Pl
             updated_at=now,
         )
         session.add(row)
-    if row.status == "draft":
+    if row.status in ("draft", "rejected"):
+        # A fresh draft lands in submitted (approval in flight); a REJECTED
+        # draft is promoted back to submitted on re-approval — the athlete
+        # changed their mind, so the write is allowed again (PR #174 F3).
         row.status = "submitted"
         row.updated_at = now
     await session.commit()

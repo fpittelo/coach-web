@@ -31,7 +31,13 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    """Create plan_drafts (C3 — plaintext per MADR-008)."""
+    """Create plan_drafts (C3 — plaintext per MADR-008).
+
+    The CHECK enums are hardcoded deliberately (migrations stay
+    self-contained, never importing application symbols); the ORM mirror
+    lives in ``coach_web.microcycle.PlanDraftRow.__table_args__`` — keep
+    the two in sync when the lifecycle changes.
+    """
     op.create_table(
         "plan_drafts",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),

@@ -29,6 +29,7 @@ from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.microcycle import (
+    DayWriteResult,
     PlanDraftRow,
     WeekApprovalRequest,
     WeekApprovalResponse,
@@ -375,6 +376,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Week draft persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+
+        # Terminal-state short-circuit (PR #174 F3): an already-APPROVED
+        # matching draft means the week was fully written to the calendar —
+        # re-issuing the events would create duplicates (intervals_create_event
+        # is not idempotent, #163). Report the existing success without any
+        # tool call. A REJECTED draft was promoted back to submitted by the
+        # upsert, so the write proceeds below.
+        if row.status == "approved":
+            requested = (
+                payload.week.days
+                if payload.dates is None
+                else [day for day in payload.week.days if day.date in set(payload.dates)]
+            )
+            return WeekApprovalResponse(
+                results=[DayWriteResult(date=day.date, success=True) for day in requested]
+            )
 
         # 2. Sequential per-day calendar writes (#163).
         try:

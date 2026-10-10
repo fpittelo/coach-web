@@ -265,7 +265,7 @@
                           </tr>
                         </thead>
                         <tbody>
-                          <template x-for="(day, dayIndex) in weekPlan.days" :key="dayIndex">
+                          <template x-for="(day, dayIndex) in weekPlan.days" :key="day.date">
                             <tr>
                               <td data-label="Day" x-text="weekDayLabel(day)"></td>
                               <td data-label="Session" x-text="day.session_title"></td>

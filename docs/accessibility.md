@@ -73,17 +73,17 @@ re-run this procedure, and record the remediation with the outcome.
 ## Inline card status notes (issue #168, per the #165 contract)
 
 Conversation cards surface user-action outcomes (approval results, per-day
-write status) through an inline, visually-hidden **`role="status"` note
-element** — the `approval-note` slot pattern, declared with `role="status"`
-so its `x-text` changes are announced programmatically (WCAG 4.1.3) without
-any JS announcement contract change. This is a DOM pattern, not an
-`announce()` call site: the frozen two-call-site `announce()` contract
-(#149) is untouched, and card insertion itself is still covered by the
-final-message announcement (the agent's final message prose-references the
-card it emitted). The weekly plan card (#168) ships its note as a
-`role="status"` region; its per-day status chips always pair the state word
-with the color — color is never the sole carrier. Pinned by
-`tests/test_static_assets.py` source assertions.
+write status) through an inline **`role="status"` note element** — the
+`approval-note` slot pattern, rendered VISIBLY beneath the card actions (as
+in #82) and declared with `role="status"` so its `x-text` changes are
+announced programmatically (WCAG 4.1.3) without any JS announcement contract
+change. This is a DOM pattern, not an `announce()` call site: the frozen
+two-call-site `announce()` contract (#149) is untouched, and card insertion
+itself is still covered by the final-message announcement (the agent's final
+message prose-references the card it emitted). The weekly plan card (#168)
+ships its note as a `role="status"` region; its per-day status chips always
+pair the state word with the color — color is never the sole carrier. Pinned
+by `tests/test_static_assets.py` source assertions.
 
 ---
 

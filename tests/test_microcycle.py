@@ -28,7 +28,6 @@ from coach_web.microcycle import (
     WeeklyPlanDraft,
     build_day_event_arguments,
     build_week_markdown,
-    create_draft,
     list_drafts_by_week,
     transition_draft_status,
     upsert_week_draft,
@@ -221,43 +220,46 @@ class TestDraftStateMachine:
     """draft → submitted → approved/rejected; superseded on replacement."""
 
     def test_transition_table_matches_the_madr008_machine(self) -> None:
-        """The allowed-transition table encodes the documented lifecycle."""
+        """The allowed-transition table encodes the documented lifecycle.
+
+        Superseded for PR #174 (F3): a REJECTED draft returns to
+        ``submitted`` on re-approval — the athlete changed their mind.
+        """
         assert ALLOWED_TRANSITIONS == {
             "draft": {"submitted", "superseded"},
             "submitted": {"approved", "rejected", "superseded"},
             "approved": {"superseded"},
-            "rejected": {"superseded"},
+            "rejected": {"submitted", "superseded"},
             "superseded": set(),
         }
 
     async def test_legal_transition_persists(self, db_session_factory: Any) -> None:
         """A legal transition updates the status and commits."""
         async with db_session_factory() as session:
-            row = await create_draft(session, _week())
-            assert row.status == "draft"
-
-            await transition_draft_status(session, row, "submitted")
+            row = await upsert_week_draft(session, _week())
             assert row.status == "submitted"
 
+            await transition_draft_status(session, row, "approved")
+            assert row.status == "approved"
+
             stored = await list_drafts_by_week(session, WEEK_START)
-        assert stored[0].status == "submitted"
+        assert stored[0].status == "approved"
 
     async def test_illegal_transition_is_rejected(self, db_session_factory: Any) -> None:
         """An out-of-machine transition raises and leaves the row untouched."""
         async with db_session_factory() as session:
-            row = await create_draft(session, _week())
+            row = await upsert_week_draft(session, _week())
 
-            with pytest.raises(ValueError, match="draft -> approved"):
-                await transition_draft_status(session, row, "approved")
+            with pytest.raises(ValueError, match="submitted -> draft"):
+                await transition_draft_status(session, row, "draft")
 
             stored = await list_drafts_by_week(session, WEEK_START)
-        assert stored[0].status == "draft"
+        assert stored[0].status == "submitted"
 
     async def test_approval_stamps_approved_at(self, db_session_factory: Any) -> None:
         """Transitioning to approved records the approval timestamp."""
         async with db_session_factory() as session:
-            row = await create_draft(session, _week())
-            await transition_draft_status(session, row, "submitted")
+            row = await upsert_week_draft(session, _week())
             await transition_draft_status(session, row, "approved")
 
             stored = await list_drafts_by_week(session, WEEK_START)
@@ -271,35 +273,33 @@ class TestDraftStateMachine:
 
 
 class TestPlanDraftRepository:
-    """Create / list / transition semantics over plan_drafts."""
+    """Upsert / list / transition semantics over plan_drafts."""
 
-    async def test_create_draft_persists_week_bounds_and_content(
-        self, db_session_factory: Any
-    ) -> None:
+    async def test_upsert_persists_week_bounds_and_content(self, db_session_factory: Any) -> None:
         """A created draft carries the ISO week bounds and markdown content."""
         async with db_session_factory() as session:
-            row = await create_draft(session, _week())
+            row = await upsert_week_draft(session, _week())
 
             stored = await list_drafts_by_week(session, WEEK_START)
-        assert row.status == "draft"
+        assert row.status == "submitted"
         assert row.week_start_date == WEEK_START
         assert row.week_end_date == WEEK_END
         assert stored[0].id == row.id
         assert "# Base week 41" in stored[0].content
         assert "| VO2 intervals |" in stored[0].content
 
-    async def test_create_draft_supersedes_previous_drafts_of_the_week(
+    async def test_upsert_supersedes_previous_drafts_of_the_week(
         self, db_session_factory: Any
     ) -> None:
-        """A new draft for the same week supersedes the previous one (replacement)."""
+        """A changed proposal for the same week supersedes the previous one."""
         async with db_session_factory() as session:
-            first = await create_draft(session, _week())
-            second = await create_draft(session, _week(title="Revised week 41"))
+            first = await upsert_week_draft(session, _week())
+            second = await upsert_week_draft(session, _week(title="Revised week 41"))
 
             stored = await list_drafts_by_week(session, WEEK_START)
         statuses = {row.id: row.status for row in stored}
         assert statuses[first.id] == "superseded"
-        assert statuses[second.id] == "draft"
+        assert statuses[second.id] == "submitted"
 
     async def test_list_drafts_by_week_is_scoped_to_the_week(self, db_session_factory: Any) -> None:
         """Drafts of other weeks never leak into the week listing."""
@@ -308,8 +308,8 @@ class TestPlanDraftRepository:
         ]
         other_week = _week(week_id="2026-W42", days=other_days)
         async with db_session_factory() as session:
-            await create_draft(session, _week())
-            await create_draft(session, other_week)
+            await upsert_week_draft(session, _week())
+            await upsert_week_draft(session, other_week)
 
             stored = await list_drafts_by_week(session, WEEK_START)
         assert len(stored) == 1
@@ -346,6 +346,21 @@ class TestPlanDraftRepository:
         statuses = {row.id: row.status for row in stored}
         assert statuses[approved.id] == "superseded"
         assert statuses[replacement.id] == "submitted"
+
+    async def test_upsert_promotes_a_rejected_draft_to_submitted(
+        self, db_session_factory: Any
+    ) -> None:
+        """Re-approval of a rejected week promotes it back to submitted (F3)."""
+        async with db_session_factory() as session:
+            rejected = await upsert_week_draft(session, _week())
+            await transition_draft_status(session, rejected, "rejected")
+
+            again = await upsert_week_draft(session, _week())
+
+            stored = await list_drafts_by_week(session, WEEK_START)
+        assert again.id == rejected.id
+        assert again.status == "submitted"
+        assert len(stored) == 1
 
 
 # ---------------------------------------------------------------------------

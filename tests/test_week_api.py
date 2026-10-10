@@ -23,6 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.app import create_app
 from coach_web.config import Settings
+from coach_web.microcycle import WeeklyPlanDraft, build_week_markdown, week_bounds
 from coach_web.plan_approval import EVENT_START_TIME
 
 WEEK_START = "2026-10-05"
@@ -255,6 +256,58 @@ class TestWeekApproveEndpoint:
 
         rows = _draft_rows(migrated_db)
         assert len(rows) == 1
+
+    def test_reapproval_of_an_approved_week_short_circuits_without_tool_calls(
+        self,
+        week_client: tuple[TestClient, WeekHub],
+        migrated_db: Path,
+    ) -> None:
+        """Re-approving an approved week reports success WITHOUT re-writing (F3).
+
+        ``intervals_create_event`` is not idempotent: re-issuing the events
+        would duplicate calendar entries, so the terminal state short-circuits
+        the endpoint before any tool call.
+        """
+        client, hub = week_client
+
+        _post_week(client)
+        assert len(hub.calls) == 7
+
+        again = _post_week(client)
+
+        assert again.status_code == 200
+        results = again.json()["results"]
+        assert len(results) == 7
+        assert all(result["success"] for result in results)
+        # No additional calendar writes: the tool-call count is unchanged.
+        assert len(hub.calls) == 7
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_reapproval_of_a_rejected_week_promotes_and_writes(
+        self, settings: Settings, migrated_db: Path
+    ) -> None:
+        """Re-approving a rejected week promotes it to submitted and writes (F3)."""
+        week = _raw_week()
+        content = build_week_markdown(WeeklyPlanDraft.model_validate(week))
+        week_start, week_end = week_bounds("2026-W41")
+        with sqlite3.connect(migrated_db) as conn:
+            conn.execute(
+                "INSERT INTO plan_drafts (week_start_date, week_end_date, content, "
+                "status, created_at, updated_at) VALUES (?, ?, ?, 'rejected', 't1', 't2')",
+                (week_start, week_end, content),
+            )
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+
+        response = client.post("/api/week/approve", json={"week": week})
+
+        assert response.status_code == 200
+        assert all(result["success"] for result in response.json()["results"])
+        assert len(hub.calls) == 7
+        rows = _draft_rows(migrated_db)
+        assert rows[0]["status"] == "approved"
 
     def test_a_new_proposal_supersedes_the_previous_draft(
         self, week_client: tuple[TestClient, WeekHub], migrated_db: Path
