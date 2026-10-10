@@ -56,7 +56,7 @@ from coach_web.objectives import (
     save_objective_profile,
 )
 from coach_web.periodization import (
-    PeriodizationPlan,
+    PeriodizationApprovalRequest,
     PeriodizationPlanResponse,
     list_phases,
     replace_phases,
@@ -508,43 +508,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             saved = await save_objective_profile(session, payload)
         return ObjectiveProfileResponse(profile=saved)
 
-    @application.get(
-        "/api/periodization",
+    @application.post(
+        "/api/periodization/approve",
         response_model=PeriodizationPlanResponse,
         tags=["objectives"],
     )
-    async def get_periodization_endpoint(request: Request) -> PeriodizationPlanResponse:
-        """Return the active objective's periodization phases (empty when absent).
-
-        Auth-gated by the whitelist middleware when AUTH_ENABLED; the phases
-        are the macrocycle plan anchored on the active objective (epic #161
-        story 1.2, MADR-008 C1).
-        """
-        session_factory = request.app.state.db_session_factory
-        async with session_factory() as session:
-            objective_row = await get_active_objective_row(session)
-            if objective_row is None:
-                return PeriodizationPlanResponse(objective_id=None, phases=[])
-            phases = await list_phases(session, objective_row.id)
-            return PeriodizationPlanResponse(objective_id=objective_row.id, phases=phases)
-
-    @application.put(
-        "/api/periodization",
-        response_model=PeriodizationPlanResponse,
-        tags=["objectives"],
-    )
-    async def put_periodization_endpoint(
+    async def approve_periodization_endpoint(
         request: Request,
-        payload: PeriodizationPlan,
+        payload: PeriodizationApprovalRequest,
     ) -> PeriodizationPlanResponse:
-        """Validate and persist the active objective's periodization phases.
+        """Approve the coach-proposed periodization plan and persist it (#182).
 
-        Strict Pydantic validation runs at the boundary (phase shape, enum,
-        ISO dates, monotonic non-overlapping ranges); the coverage
-        cross-check against the objective's target date runs here — it needs
-        the persisted parent row. Malformed plans are rejected 422 with a
-        generic detail (nLPD #142 precedent); the plan replaces the
-        objective's phase set wholesale (PUT semantics).
+        The explicit POST is the approval gate — human-in-the-loop preserved
+        (#87 C7): no phase reaches the database without the athlete's
+        explicit approval of the inline card. The plan is re-validated at the
+        boundary (strict Pydantic — the browser round-trip is as untrusted as
+        the agent) and the #167 coverage cross-check runs against the active
+        objective's target date before the repository replaces the phase set
+        wholesale. Malformed plans are rejected 422 with a generic detail
+        (nLPD #142 precedent).
+
+        The athlete-facing GET/PUT ``/api/periodization`` endpoints were
+        removed with the manual settings editor (#182 PO pivot): the coach
+        proposes, the athlete approves — there is no athlete write path.
         """
         session_factory = request.app.state.db_session_factory
         async with session_factory() as session:
@@ -554,12 +540,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # has nowhere to live. Generic 422 — no state echo (nLPD).
                 raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL)
             try:
-                validate_plan_coverage(payload, objective_row.target_date)
+                validate_plan_coverage(payload.plan, objective_row.target_date)
             except ValueError as exc:
-                logger.warning("Rejected periodization plan: %s", exc)
+                logger.warning("Rejected periodization approval: %s", exc)
                 raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL) from exc
             objective_id = objective_row.id
-            phases = await replace_phases(session, objective_id, payload)
+            phases = await replace_phases(session, objective_id, payload.plan)
         return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
 
     return application

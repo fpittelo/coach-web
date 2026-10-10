@@ -31,6 +31,16 @@
  * retry-failed-days subset. Adjust prefills the composer and never
  * auto-sends (PO Q8).
  *
+ * Periodization card (#182): the coach-proposed season phase plan renders
+ * as a third single-active conversation card pinned via the
+ * periodizationPlan / periodizationMessageIndex pair. The card shows the
+ * phases (type, name, dates, focus) plus the coach's rationale; Approve
+ * posts {plan} to POST /api/periodization/approve — the server re-validates
+ * and persists through the #167 repository, so no phase is ever stored
+ * without the athlete's explicit approval (#87 C7). Reject dismisses
+ * without persisting. The manual settings editor is gone (PO pivot):
+ * phases are coach output, not athlete input.
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -173,21 +183,6 @@ function blankGoalForm() {
   };
 }
 
-function blankPhaseForm() {
-  // Blank phase form factory (#167): shared by the add-phase action — the
-  // phases list starts empty (no periodization is a legitimate state) and
-  // grows one blank phase per click.
-  return {
-    phase_type: "base",
-    name: "",
-    start_date: "",
-    end_date: "",
-    focus: "",
-    weeklyHoursTarget: null,
-    notes: "",
-  };
-}
-
 function coachApp() {
   return {
     messages: [],
@@ -237,6 +232,18 @@ function coachApp() {
     weekMessageIndex: -1,
     weekApproval: { state: "idle", message: "" },
     weekDayStatus: {},
+    // Periodization card (#182): the coach-proposed season phase plan
+    // renders as a third single-active conversation card pinned via the
+    // periodizationPlan/periodizationMessageIndex pair (#82 replacement
+    // rule — a new periodization_plan event replaces the card). The payload
+    // carries the validated plan (its phases) plus the coach's rationale;
+    // Approve posts {plan} to POST /api/periodization/approve — the
+    // human-in-the-loop gate (#87 C7) — and Reject dismisses without
+    // persisting. The manual settings editor is gone (PO pivot): phases are
+    // coach output, not athlete input.
+    periodizationPlan: null,
+    periodizationMessageIndex: -1,
+    periodizationApproval: { state: "idle", message: "" },
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -262,14 +269,6 @@ function coachApp() {
       weeklyAvailabilityHours: 0,
       priorityDisciplines: "",
     },
-    // Periodization phases panel (#167, AC1): the active objective's
-    // macrocycle phases, loaded on open and saved via PUT
-    // /api/periodization. Own state root and failure surface — a separate
-    // concern from the objective profile form above. All bindings are
-    // x-text/x-model (structured Pydantic→HTML, no x-html).
-    phasesForm: { phases: [] },
-    phasesSaving: false,
-    phasesMessage: "",
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -434,7 +433,6 @@ function coachApp() {
       this.settingsOpen = true;
       this.settingsMessage = "";
       this.loadObjectives();
-      this.loadPhases();
       // Move focus into the dialog (keyboard accessibility): the panel is
       // tabindex="-1" so it is programmatically focusable without entering
       // the tab order.
@@ -599,104 +597,6 @@ function coachApp() {
       }
     },
 
-    // ------------------------------------------------------------------
-    // Periodization phases panel (#167, AC1). The panel loads the active
-    // objective's persisted phases on open and saves them via PUT
-    // /api/periodization. All bindings are structured x-text/x-model;
-    // error surfaces are static strings only — server validation detail is
-    // never echoed (nLPD, #142).
-    // ------------------------------------------------------------------
-
-    formFromPlan(plan) {
-      // API → form: optional numerics ride as strings in the inputs and
-      // normalize to null on save (mirrors the goals form).
-      const toPhaseForm = (phase) => ({
-        phase_type: (phase && phase.phase_type) || "base",
-        name: (phase && phase.name) || "",
-        start_date: (phase && phase.start_date) || "",
-        end_date: (phase && phase.end_date) || "",
-        focus: (phase && phase.focus) || "",
-        weeklyHoursTarget:
-          phase && phase.weekly_hours_target !== null && phase.weekly_hours_target !== undefined
-            ? phase.weekly_hours_target
-            : null,
-        notes: (phase && phase.notes) || "",
-      });
-      if (!plan || !plan.phases) {
-        return { phases: [] };
-      }
-      return { phases: plan.phases.map(toPhaseForm) };
-    },
-
-    loadPhases() {
-      fetch("/api/periodization")
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("Load failed (" + response.status + ")");
-          }
-          const body = await response.json();
-          this.phasesForm = this.formFromPlan(body);
-        })
-        .catch(() => {
-          this.phasesMessage = "Could not load phases.";
-        });
-    },
-
-    payloadFromPhasesForm() {
-      // Form → API: empty optional numerics/text serialize as null (the API
-      // validates strict types — an empty string would be a 422).
-      const fromPhaseForm = (phase) => ({
-        phase_type: phase.phase_type,
-        name: phase.name,
-        start_date: phase.start_date,
-        end_date: phase.end_date,
-        focus: phase.focus.trim() === "" ? null : phase.focus,
-        weekly_hours_target:
-          phase.weeklyHoursTarget === "" || phase.weeklyHoursTarget === null
-            ? null
-            : Number(phase.weeklyHoursTarget),
-        notes: phase.notes.trim() === "" ? null : phase.notes,
-      });
-      return { phases: this.phasesForm.phases.map(fromPhaseForm) };
-    },
-
-    savePhases() {
-      if (this.phasesSaving) {
-        return;
-      }
-      this.phasesSaving = true;
-      this.phasesMessage = "";
-      fetch("/api/periodization", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(this.payloadFromPhasesForm()),
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("Save failed (" + response.status + ")");
-          }
-          const body = await response.json();
-          this.phasesForm = this.formFromPlan(body);
-          this.phasesMessage = "Phases saved.";
-        })
-        .catch(() => {
-          // Static message only — the server's 422 detail is generic by
-          // design (nLPD #142) and never echoed here.
-          this.phasesMessage = "Could not save phases. Check the dates and retry.";
-        })
-        .finally(() => {
-          this.phasesSaving = false;
-        });
-    },
-
-    addPhase() {
-      this.phasesForm.phases.push(blankPhaseForm());
-    },
-
-    removePhase(index) {
-      this.phasesForm.phases.splice(index, 1);
-    },
-
     send() {
       const message = this.input.trim();
       if (!message || this.streaming) {
@@ -739,6 +639,12 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+      // The periodization card (#182) follows the same replacement posture:
+      // a new stream clears the previous card; the agent's periodization_plan
+      // event (if any) re-pins a fresh one.
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -986,6 +892,24 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        periodization_plan: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Periodization card (#182): the validated plan arrives as
+          // data.plan with the coach's rationale alongside; the card
+          // replaces any previous periodization card (#82 rule). BOTH are
+          // consumed into state — storing only the plan would silently
+          // drop the rationale line the card renders (PR #184 review).
+          this.periodizationPlan = data.plan
+            ? { plan: data.plan, rationale: data.rationale || "" }
+            : null;
+          this.periodizationMessageIndex = index;
+          this.periodizationApproval = { state: "idle", message: "" };
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -1112,6 +1036,9 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
       this.input = "";
       this.errorBanner = "";
       this.errorBannerSignin = false;
@@ -1312,6 +1239,60 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+    },
+
+    // ------------------------------------------------------------------
+    // Periodization card (#182). The coach-proposed season phase plan is
+    // approved as one POST (/api/periodization/approve) — the server
+    // re-validates the plan and persists it through the #167 repository
+    // (coverage-validated). The explicit approval is the human-in-the-loop
+    // gate (#87 C7): no phase persistence without the athlete's consent.
+    // Reject dismisses the card without persisting.
+    // ------------------------------------------------------------------
+
+    approvePeriodization() {
+      if (!this.periodizationPlan || this.periodizationApproval.state === "submitting") {
+        return;
+      }
+      this.periodizationApproval = { state: "submitting", message: "Saving phases…" };
+
+      fetch("/api/periodization/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: this.periodizationPlan.plan }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            // Static message only — the server's 422 detail is generic by
+            // design (nLPD #142) and never echoed here (mirrors the removed
+            // phases-editor save posture, PR #184 review).
+            this.periodizationApproval = {
+              state: "error",
+              message: "Could not save the phase plan. Try again.",
+            };
+            return;
+          }
+          this.periodizationApproval = {
+            state: "approved",
+            message: "Periodization approved.",
+          };
+        })
+        .catch(() => {
+          // Transport failure: the same static message — no server detail
+          // and no error text echoed (nLPD #142 posture).
+          this.periodizationApproval = {
+            state: "error",
+            message: "Could not save the phase plan. Try again.",
+          };
+        });
+    },
+
+    rejectPeriodization() {
+      // Dismiss the card and clear the periodization state (#82 AC2): the
+      // pin goes with it, and nothing is persisted.
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
     },
 
     get planDuration() {
