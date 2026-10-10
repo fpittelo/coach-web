@@ -64,6 +64,7 @@ ignore = []
 "tests/**/*.py" = ["S101"]
 "src/coach_web/config.py" = ["S104"]
 "tests/integration/test_compose_topology.py" = ["S104", "S108", "S404", "S603"]
+"tests/integration/test_harness_native_gate.py" = ["S603"]
 "tests/integration/test_lane_script.py" = ["S603"]
 "tests/integration/test_preflight_loopback.py" = ["S104", "S603"]
 
