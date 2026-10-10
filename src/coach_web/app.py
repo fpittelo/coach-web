@@ -14,7 +14,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.datastructures import MutableHeaders
@@ -257,12 +257,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Objectives digest (AC3, #166): the coach system prompt gains a
         # compact, token-budgeted digest of the persisted athlete objectives
         # when they exist. Absent objectives — or a persistence layer that is
-        # momentarily unreadable — degrade to no digest, so the chat never
-        # depends on the database's health (graceful empty state).
+        # momentarily unreadable, or a stored row tampered into a
+        # Pydantic-invalid shape (raw SQL bypasses the CHECK constraints) —
+        # degrade to no digest, so the chat never depends on the database's
+        # health (graceful empty state).
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
-        except (OSError, SQLAlchemyError) as exc:
+        except (OSError, SQLAlchemyError, ValidationError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
         if profile is not None:

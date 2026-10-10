@@ -28,7 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
-from coach_web.models import _validate_iso_date
+from coach_web.models import validate_iso_date
 
 OBJECTIVES_DIGEST_MAX_CHARS = 600
 """Hard character budget for the objectives digest (~150 tokens at ~4 chars/token)."""
@@ -91,7 +91,7 @@ class ObjectiveGoal(BaseModel):
     @classmethod
     def _validate_target_date(cls, value: str | None) -> str | None:
         """Validate the optional target date as a real ISO calendar date."""
-        return _validate_iso_date(value)
+        return validate_iso_date(value)
 
 
 class ObjectiveProfile(BaseModel):

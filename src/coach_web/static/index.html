@@ -331,6 +331,7 @@
           aria-labelledby="settings-title"
           tabindex="-1"
           x-ref="settingsPanel"
+          @keydown.tab="trapSettingsFocus($event)"
         >
           <div class="settings-head">
             <h2 id="settings-title" class="panel-title">Objectives</h2>

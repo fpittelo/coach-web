@@ -115,6 +115,20 @@ function stripMarkdown(text) {
     .trim();
 }
 
+function blankGoalForm() {
+  // Blank goal form factory (N4, PR #171): shared by the initial state, the
+  // add-goal action and the empty-profile load path — the settings form is
+  // never empty, so a blank primary goal renders before any load completes.
+  return {
+    objective_type: "outcome",
+    title: "",
+    description: "",
+    target_metric: "",
+    targetValue: null,
+    target_date: "",
+  };
+}
+
 function coachApp() {
   return {
     messages: [],
@@ -168,8 +182,8 @@ function coachApp() {
     settingsOpen: false,
     settingsSaving: false,
     settingsMessage: "",
-    settingsForm: {
-      goals: [],
+    objectivesForm: {
+      goals: [blankGoalForm()],
       weeklyAvailabilityHours: 0,
       priorityDisciplines: "",
     },
@@ -361,15 +375,32 @@ function coachApp() {
       }
     },
 
-    blankGoalForm() {
-      return {
-        objective_type: "outcome",
-        title: "",
-        description: "",
-        target_metric: "",
-        targetValue: null,
-        target_date: "",
-      };
+    trapSettingsFocus(event) {
+      // Focus trap (a11y, PR #171 N3): Tab cycles within the dialog —
+      // Shift+Tab on the first focusable wraps to the last, Tab on the last
+      // wraps to the first; preventDefault keeps focus from escaping to the
+      // page behind the modal. Keyboard-only logic, no motion involved.
+      // Hidden controls (x-show, e.g. the primary goal's remove button) and
+      // disabled buttons are not Tab stops and never take the wrap.
+      const panel = this.$refs.settingsPanel;
+      if (!panel) {
+        return;
+      }
+      const focusables = Array.from(
+        panel.querySelectorAll("button, input, select, textarea, a[href]")
+      ).filter((el) => el.offsetParent !== null && !el.disabled);
+      if (focusables.length === 0) {
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     },
 
     formFromProfile(profile) {
@@ -386,7 +417,7 @@ function coachApp() {
       });
       if (!profile) {
         return {
-          goals: [this.blankGoalForm()],
+          goals: [blankGoalForm()],
           weeklyAvailabilityHours: 0,
           priorityDisciplines: "",
         };
@@ -408,7 +439,7 @@ function coachApp() {
             throw new Error("Load failed (" + response.status + ")");
           }
           const body = await response.json();
-          this.settingsForm = this.formFromProfile(body.profile);
+          this.objectivesForm = this.formFromProfile(body.profile);
         })
         .catch(() => {
           this.settingsMessage = "Could not load objectives.";
@@ -430,15 +461,15 @@ function coachApp() {
             : Number(goal.targetValue),
         target_date: goal.target_date === "" ? null : goal.target_date,
       });
-      const goals = this.settingsForm.goals.map(fromGoalForm);
-      const disciplines = this.settingsForm.priorityDisciplines
+      const goals = this.objectivesForm.goals.map(fromGoalForm);
+      const disciplines = this.objectivesForm.priorityDisciplines
         .split(",")
         .map((item) => item.trim())
         .filter((item) => item !== "");
       return {
         primary_goal: goals[0],
         secondary_goals: goals.slice(1),
-        weekly_availability_hours: Number(this.settingsForm.weeklyAvailabilityHours) || 0,
+        weekly_availability_hours: Number(this.objectivesForm.weeklyAvailabilityHours) || 0,
         priority_disciplines: disciplines,
       };
     },
@@ -459,7 +490,7 @@ function coachApp() {
             throw new Error("Save failed (" + response.status + ")");
           }
           const body = await response.json();
-          this.settingsForm = this.formFromProfile(body.profile);
+          this.objectivesForm = this.formFromProfile(body.profile);
           this.settingsMessage = "Objectives saved.";
         })
         .catch(() => {
@@ -473,14 +504,14 @@ function coachApp() {
     },
 
     addGoal() {
-      this.settingsForm.goals.push(this.blankGoalForm());
+      this.objectivesForm.goals.push(blankGoalForm());
     },
 
     removeGoal(index) {
       // The primary goal (index 0) is never removable — the profile requires
       // exactly one primary goal; the remove button is hidden for it.
       if (index > 0) {
-        this.settingsForm.goals.splice(index, 1);
+        this.objectivesForm.goals.splice(index, 1);
       }
     },
 

@@ -1974,6 +1974,31 @@ class TestObjectivesSettingsContract:
 
         assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
 
+    def test_settings_form_root_identifier_is_consistent_across_files(self) -> None:
+        """The form-state root declared in app.js is the one bound in index.html.
+
+        B1/B2 regression pin (PR #171 review): the HTML bindings and the
+        Alpine component state must share ONE root identifier. A rename on
+        one side only leaves the panel runtime-dead (Alpine binds to
+        undefined) while per-file string assertions stay green — so the
+        declared root, every HTML binding root and every component reference
+        are pinned to the same identifier here.
+        """
+        script = self._script()
+        html = self._html()
+        form_roots = r"(objectivesForm|settingsForm)"
+
+        declared = re.findall(form_roots + r"\s*:\s*\{", script)
+        assert len(declared) == 1, "app.js must declare exactly one form-state root"
+        root = declared[0]
+
+        html_roots = set(re.findall(form_roots + r"\.", html))
+        assert html_roots, "index.html must bind the form state"
+        assert html_roots == {root}, f"HTML binds {html_roots}, app.js declares {root}"
+
+        js_refs = set(re.findall(r"this\." + form_roots, script))
+        assert js_refs == {root}, f"app.js references {js_refs}, declares {root}"
+
     # --- dialog structure --------------------------------------------------------
 
     def test_settings_panel_is_a_modal_dialog(self) -> None:
@@ -2036,6 +2061,15 @@ class TestObjectivesSettingsContract:
         assert "addGoal()" in html
         assert "removeGoal(goalIndex)" in html
 
+    def test_settings_form_initializes_with_a_blank_primary_goal(self) -> None:
+        """N4: the form is never empty — a blank primary goal renders pre-load."""
+        script = self._script()
+
+        assert "goals: [blankGoalForm()]" in script
+        # The blank-goal factory is a top-level function so the state literal
+        # and the empty-profile load path share one definition.
+        assert "function blankGoalForm()" in script
+
     def test_goal_type_select_offers_the_madr008_enum(self) -> None:
         """The type select offers exactly the MADR-008 objective_type enum."""
         html = self._html()
@@ -2097,6 +2131,27 @@ class TestObjectivesSettingsContract:
         assert "this.$refs.settingsToggle" in close_block
         assert ".focus()" in close_block
         assert "if (!this.settingsOpen)" in close_block
+
+    def test_settings_panel_traps_tab_focus(self) -> None:
+        """Tab cycles within the dialog (N3: keyboard-only, motion-free trap)."""
+        html = self._html()
+        script = self._script()
+
+        assert '@keydown.tab="trapSettingsFocus($event)"' in html
+
+        trap = _rule_block(script, "trapSettingsFocus(event)")
+        assert trap, "trapSettingsFocus(event) must exist"
+        # Focusables are queried within the dialog only — never the page.
+        assert "this.$refs.settingsPanel" in trap
+        assert 'querySelectorAll("button, input, select, textarea, a[href]")' in trap
+        # Hidden controls (x-show, e.g. the primary goal's remove button) and
+        # disabled buttons are not Tab stops and never take the wrap.
+        assert "offsetParent" in trap
+        assert "disabled" in trap
+        # Shift+Tab on the first focusable wraps to the last; Tab on the last
+        # wraps to the first — preventDefault keeps focus inside the dialog.
+        assert "event.shiftKey" in trap
+        assert "event.preventDefault()" in trap
 
     # --- styling contract ----------------------------------------------------------------
 

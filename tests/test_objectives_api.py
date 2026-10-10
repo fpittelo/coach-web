@@ -7,6 +7,7 @@ pinned here against the real app with a migrated per-test SQLite database.
 """
 
 import json
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -260,6 +261,25 @@ class TestSystemPromptDigestInjection:
         monkeypatch.setenv("COACH_DB_PATH", "/proc/definitely-not-writable/coach.db")
 
         with _probe_client() as client:
+            streamed = _streamed_text(client)
+
+        assert streamed == DEFAULT_SYSTEM_PROMPT
+
+    def test_digest_degrades_when_a_stored_row_is_corrupt(
+        self, migrated_db: Path, db_path: Path
+    ) -> None:
+        """A Pydantic-invalid stored row yields no digest; the stream survives.
+
+        N2 (PR #171 review): a row tampered outside the API (raw SQL bypasses
+        the CHECK constraints — e.g. an emptied title, which has no CHECK)
+        fails profile re-validation with ``pydantic.ValidationError``. The
+        digest boundary must degrade to no-digest like every other
+        persistence failure, never break the agent turn.
+        """
+        with _probe_client() as client:
+            client.put("/api/objectives", json=_profile_payload())
+            with sqlite3.connect(db_path) as conn:
+                conn.execute("UPDATE athlete_objectives SET title = ''")
             streamed = _streamed_text(client)
 
         assert streamed == DEFAULT_SYSTEM_PROMPT

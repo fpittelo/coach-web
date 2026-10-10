@@ -208,7 +208,7 @@ Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)
 
 - SQLAlchemy 2.0 models + Alembic (`render_as_batch=True` for the SQLite `ALTER TABLE` workaround); migrations are plain files under `alembic/versions/`, reviewed in PRs like any other code.
 - Dev lane: migrations run automatically at container start (entrypoint step). Prod lane: migrations run as an explicit entrypoint step with the lane stopped/idle (n=1, sub-second execution — no zero-downtime requirement); a failed migration aborts startup rather than half-applying.
-- Initial migration (0001) creates all six tables above; no backfill (no existing data to migrate).
+- Initial migration (0001) creates only `athlete_objectives` (amended 2026-10-10, PR #171 review: story #166 KIS scoping — the objective profile is the first persisted data class); the remaining tables arrive with their own stories as incremental migrations; no backfill (no existing data to migrate).
 - Down-migrations are authored but untested for data-destructive steps (documented per migration).
 
 ### Backup / restore
