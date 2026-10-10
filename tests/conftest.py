@@ -1,19 +1,24 @@
 """Shared pytest fixtures for coach-web tests."""
 
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import jwt
 import pytest
+from alembic import command
+from alembic.config import Config
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
 from pydantic_settings import SettingsConfigDict
 
+import coach_web
 from coach_web.app import create_app
 from coach_web.config import Settings, get_settings
+from coach_web.db import build_db_engine, build_session_factory
 from coach_web.models import ReadinessMetrics, TrainingPlan
 
 
@@ -165,3 +170,47 @@ def auth_client(auth_settings: Settings) -> Iterator[TestClient]:
     """Test client against an auth-enabled app (https base for Secure cookies)."""
     with TestClient(create_app(auth_settings), base_url="https://testserver") as client:
         yield client
+
+
+# ---------------------------------------------------------------------------
+# Persistence fixtures (issue #166 — MADR-008 SQLite/WAL + Alembic)
+# ---------------------------------------------------------------------------
+
+
+def alembic_config() -> Config:
+    """Build the packaged Alembic config (script_location resolves via %(here)s)."""
+    ini_path = Path(coach_web.__file__).parent / "alembic.ini"
+    return Config(str(ini_path))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_database(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point COACH_DB_PATH at a per-test SQLite file (never the container default).
+
+    The container default (``/data/coach.db``) is unwritable outside the lane
+    volume; every test gets its own database file so persistence tests are
+    hermetic and the pre-existing suites never touch the filesystem default.
+    """
+    monkeypatch.setenv("COACH_DB_PATH", str(tmp_path / "coach.db"))
+
+
+@pytest.fixture
+def db_path(tmp_path: Path) -> Path:
+    """The per-test SQLite database file path (the file _isolate_database sets)."""
+    return tmp_path / "coach.db"
+
+
+@pytest.fixture
+def migrated_db(db_path: Path) -> Path:
+    """Apply the Alembic migrations to the per-test database file."""
+    command.upgrade(alembic_config(), "head")
+    return db_path
+
+
+@pytest.fixture
+async def db_session_factory(migrated_db: Path) -> AsyncIterator[Any]:
+    """A session factory bound to a fresh engine over the migrated database."""
+    engine = build_db_engine(str(migrated_db))
+    factory = build_session_factory(engine)
+    yield factory
+    await engine.dispose()

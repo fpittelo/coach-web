@@ -35,9 +35,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_PORT=8000 \
     LOG_LEVEL=INFO
 
-# Create non-root user and group (UID/GID 10001)
+# Create non-root user and group (UID/GID 10001) and pre-create the
+# persistence mountpoint (MADR-008, #166): the lane volume mounts at /data,
+# and Docker copies image content into an empty named volume on first use —
+# pre-creating /data with the runtime ownership lets the volume inherit it,
+# so the non-root process can create coach.db and the WAL side files there.
 RUN groupadd -g 10001 coach-web && \
-    useradd -u 10001 -g coach-web -s /bin/false -m -d /home/coach-web coach-web
+    useradd -u 10001 -g coach-web -s /bin/false -m -d /home/coach-web coach-web && \
+    install -d -o coach-web -g coach-web /data
 
 WORKDIR /app
 
@@ -66,4 +71,12 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
 # flag in the same change (see docs/security.md, Boundary 3).
 #
 # exec keeps uvicorn as PID 1 so SIGTERM is delivered directly to the ASGI server.
-ENTRYPOINT ["sh", "-c", "exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips='127.0.0.1,::1'"]
+#
+# Migrations run at container start (MADR-008, #166): `alembic upgrade head`
+# against COACH_DB_PATH (default /data/coach.db in the lane volume) BEFORE
+# uvicorn boots — dev lane runs it automatically, prod lane treats it as the
+# explicit migration step with the lane stopped/idle. The `&&` chain aborts
+# startup on a failed migration rather than half-applying the schema. The
+# alembic.ini is packaged inside coach_web, so migrations always match the
+# installed code version.
+ENTRYPOINT ["sh", "-c", "alembic -c /app/src/coach_web/alembic.ini upgrade head && exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips='127.0.0.1,::1'"]

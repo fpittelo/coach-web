@@ -160,6 +160,19 @@ function coachApp() {
       "Review last week's training load",
     ],
     controller: null,
+    // Objectives settings panel (#166, AC1): toggled from the identity bar.
+    // The form mirrors the ObjectiveProfile API shape — goals[0] is the
+    // primary goal, goals[1:] the secondaries; optional numerics ride as
+    // strings in the inputs and normalize to null on save. All bindings are
+    // x-text/x-model (structured Pydantic→HTML, no x-html).
+    settingsOpen: false,
+    settingsSaving: false,
+    settingsMessage: "",
+    settingsForm: {
+      goals: [],
+      weeklyAvailabilityHours: 0,
+      priorityDisciplines: "",
+    },
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -303,6 +316,172 @@ function coachApp() {
       // textarea to fit the prefilled text.
       this.input = chip;
       this.$refs.composer.focus();
+    },
+
+    // ------------------------------------------------------------------
+    // Objectives settings panel (#166, AC1). The panel loads the persisted
+    // ObjectiveProfile on open and saves it via PUT /api/objectives. All
+    // bindings are structured x-text/x-model; error surfaces are static
+    // strings only — server validation detail is never echoed (nLPD, #142).
+    // ------------------------------------------------------------------
+
+    toggleSettings() {
+      if (this.settingsOpen) {
+        this.closeSettings();
+      } else {
+        this.openSettings();
+      }
+    },
+
+    openSettings() {
+      this.settingsOpen = true;
+      this.settingsMessage = "";
+      this.loadObjectives();
+      // Move focus into the dialog (keyboard accessibility): the panel is
+      // tabindex="-1" so it is programmatically focusable without entering
+      // the tab order.
+      this.$nextTick(() => {
+        const panel = this.$refs.settingsPanel;
+        if (panel) {
+          panel.focus();
+        }
+      });
+    },
+
+    closeSettings() {
+      // Guard: the window-level Escape binding fires even when the panel is
+      // closed — closing must never steal focus in that case.
+      if (!this.settingsOpen) {
+        return;
+      }
+      this.settingsOpen = false;
+      const toggle = this.$refs.settingsToggle;
+      if (toggle) {
+        toggle.focus();
+      }
+    },
+
+    blankGoalForm() {
+      return {
+        objective_type: "outcome",
+        title: "",
+        description: "",
+        target_metric: "",
+        targetValue: null,
+        target_date: "",
+      };
+    },
+
+    formFromProfile(profile) {
+      // API → form: goals[0] is the primary goal, the rest are secondaries.
+      const toGoalForm = (goal) => ({
+        objective_type: (goal && goal.objective_type) || "outcome",
+        title: (goal && goal.title) || "",
+        description: (goal && goal.description) || "",
+        target_metric: (goal && goal.target_metric) || "",
+        targetValue: goal && goal.target_value !== null && goal.target_value !== undefined
+          ? goal.target_value
+          : null,
+        target_date: (goal && goal.target_date) || "",
+      });
+      if (!profile) {
+        return {
+          goals: [this.blankGoalForm()],
+          weeklyAvailabilityHours: 0,
+          priorityDisciplines: "",
+        };
+      }
+      return {
+        goals: [profile.primary_goal].concat(profile.secondary_goals || []).map(toGoalForm),
+        weeklyAvailabilityHours:
+          profile.weekly_availability_hours === null || profile.weekly_availability_hours === undefined
+            ? 0
+            : profile.weekly_availability_hours,
+        priorityDisciplines: (profile.priority_disciplines || []).join(", "),
+      };
+    },
+
+    loadObjectives() {
+      fetch("/api/objectives")
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Load failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.settingsForm = this.formFromProfile(body.profile);
+        })
+        .catch(() => {
+          this.settingsMessage = "Could not load objectives.";
+        });
+    },
+
+    payloadFromForm() {
+      // Form → API: empty optional numerics/dates serialize as null (the API
+      // validates strict types — an empty string would be a 422); the
+      // comma-separated disciplines input becomes a trimmed, filtered list.
+      const fromGoalForm = (goal) => ({
+        objective_type: goal.objective_type,
+        title: goal.title,
+        description: goal.description.trim() === "" ? null : goal.description,
+        target_metric: goal.target_metric.trim() === "" ? null : goal.target_metric,
+        target_value:
+          goal.targetValue === "" || goal.targetValue === null
+            ? null
+            : Number(goal.targetValue),
+        target_date: goal.target_date === "" ? null : goal.target_date,
+      });
+      const goals = this.settingsForm.goals.map(fromGoalForm);
+      const disciplines = this.settingsForm.priorityDisciplines
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => item !== "");
+      return {
+        primary_goal: goals[0],
+        secondary_goals: goals.slice(1),
+        weekly_availability_hours: Number(this.settingsForm.weeklyAvailabilityHours) || 0,
+        priority_disciplines: disciplines,
+      };
+    },
+
+    saveObjectives() {
+      if (this.settingsSaving) {
+        return;
+      }
+      this.settingsSaving = true;
+      this.settingsMessage = "";
+      fetch("/api/objectives", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.payloadFromForm()),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Save failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.settingsForm = this.formFromProfile(body.profile);
+          this.settingsMessage = "Objectives saved.";
+        })
+        .catch(() => {
+          // Static message only — the server's 422 detail is generic by
+          // design (nLPD #142) and never echoed here.
+          this.settingsMessage = "Could not save objectives. Check the values and retry.";
+        })
+        .finally(() => {
+          this.settingsSaving = false;
+        });
+    },
+
+    addGoal() {
+      this.settingsForm.goals.push(this.blankGoalForm());
+    },
+
+    removeGoal(index) {
+      // The primary goal (index 0) is never removable — the profile requires
+      // exactly one primary goal; the remove button is hidden for it.
+      if (index > 0) {
+        this.settingsForm.goals.splice(index, 1);
+      }
     },
 
     send() {
