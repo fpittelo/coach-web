@@ -501,6 +501,19 @@ class TestE2EPreflightScript:
         assert "127.0.0.1" in text
         assert "publishes host ports but must publish none" in text
 
+    def test_script_asserts_lane_env_file_permissions(self, script: str) -> None:
+        """The script asserts every existing lane env file is mode 600 (MADR-0008 C3, #170)."""
+        assert "preflight_env_permissions_check.py" in script
+        assert "chmod 600" in script
+
+    def test_env_permissions_checker_module_enforces_mode_600(self) -> None:
+        """The extracted permission validator pins the 600 requirement (#170)."""
+        module = PROJECT_ROOT / "scripts" / "preflight_env_permissions_check.py"
+        assert module.is_file(), "scripts/preflight_env_permissions_check.py must exist"
+        text = module.read_text(encoding="utf-8")
+        assert "0o600" in text
+        assert "must be" in text
+
     def test_script_validates_compose_config(self, script: str) -> None:
         """The script runs docker compose config as a lint step."""
         assert "docker compose" in script
