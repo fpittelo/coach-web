@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.exc import SQLAlchemyError
@@ -23,10 +23,20 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, CoachAgent, create_agent
-from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
+from coach_web.auth.middleware import (
+    SESSION_COOKIE,
+    AuthMiddleware,
+    validate_auth_config,
+)
 from coach_web.auth.router import router as auth_router
+from coach_web.auth.tokens import verify_session_token
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
+from coach_web.errors import (
+    SettingsValidationError,
+    settings_reason_from_errors,
+    settings_reason_payload,
+)
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.microcycle import (
     DayWriteResult,
@@ -51,7 +61,7 @@ from coach_web.objectives import (
     save_objective_profile,
 )
 from coach_web.periodization import (
-    PeriodizationPlan,
+    PeriodizationApprovalRequest,
     PeriodizationPlanResponse,
     list_phases,
     replace_phases,
@@ -67,10 +77,58 @@ PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
 
 GENERIC_VALIDATION_DETAIL = "Invalid request payload"
-"""Static 422 detail — validation errors stay server-side (nLPD, #142)."""
+"""Static 422 detail — validation errors stay server-side (nLPD, #142).
+
+Chat/model-facing surfaces keep this strict posture UNCHANGED (#181 AC3);
+the owner-facing settings paths answer with the structured reason body.
+"""
+
+SETTINGS_REASON_PATHS = frozenset({"/api/objectives", "/api/periodization/approve"})
+"""The owner-facing settings endpoints whose 422s carry the reason body (#181).
+
+The #142 threat model is the LLM/prompt-injection surface — not the
+authenticated owner's own settings form, where the requester IS the data
+owner and a validation reason is not sensitive data. Only these paths get
+the structured ``{code, message}`` body; every other 422 (agent stream, plan
+approval, week approval) keeps the generic detail verbatim.
+"""
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
 """Static 503 detail for persistence outages — no internals echoed (nLPD)."""
+
+_SIGNIN_SLOT = (
+    "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
+    " when it renders an unauthenticated session (auth enabled). -->"
+)
+"""Inert marker comment in index.html's identity bar (the injection anchor).
+
+The raw static file keeps the comment, so /static/index.html and
+auth-disabled lanes stay byte-identical to the pre-#180 page (AC3).
+"""
+
+_SIGNIN_LINK_HTML = '<a class="signin-link" href="/auth/login">Sign in</a>'
+"""The unauthenticated identity-bar affordance (#180): a real link, no JS."""
+
+
+def _has_valid_session(request: Request, settings: Settings) -> bool:
+    """Return True when the request carries a verifiable session cookie (#180).
+
+    Verification reuses the auth session logic (HS256
+    :func:`coach_web.auth.tokens.verify_session_token` — the same check the
+    whitelist middleware applies). Fail-safe by contract: ANY error reading
+    or verifying the cookie (missing cookie, bad signature, expiry, malformed
+    header) resolves to False, so the public landing page renders the
+    unauthenticated variant instead of ever raising.
+    """
+    try:
+        token = request.cookies.get(SESSION_COOKIE)
+        if not token:
+            return False
+        verify_session_token(token, settings.AUTH_SESSION_SECRET)
+    except Exception:  # noqa: BLE001 - fail-safe: the landing page must never 500
+        return False
+    return True
+
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
 # C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
@@ -230,18 +288,45 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        """Reject malformed payloads with a generic 422 detail (nLPD, #142).
+        """Reject malformed payloads with a static 422 body (nLPD, #142 + #181).
 
         FastAPI's default validation handler echoes the rejected input back to
         the client; the nLPD posture keeps validation detail server-side only —
-        the full errors are logged, the response carries a static string.
+        the full errors are logged, the response carries a static string. On
+        the owner-facing settings paths (#181) the body is instead the
+        structured reason ``{code, message}``: the reason is threaded through
+        the validators as a typed exception attribute (never string-matched)
+        and unattributed errors map to the ``invalid_values`` catch-all, so
+        the body shape stays consistent for the UI contract.
         """
-        logger.warning("Rejected malformed request on %s: %s", request.url.path, exc.errors())
+        errors = exc.errors()
+        logger.warning("Rejected malformed request on %s: %s", request.url.path, errors)
+        if request.url.path in SETTINGS_REASON_PATHS:
+            reason = settings_reason_from_errors(errors)
+            return JSONResponse(status_code=422, content=settings_reason_payload(reason))
         return JSONResponse(status_code=422, content={"detail": GENERIC_VALIDATION_DETAIL})
 
     @application.get("/", include_in_schema=False)
-    async def index() -> FileResponse:
-        """Serve the single-page interface."""
+    async def index(request: Request) -> Response:
+        """Serve the single-page interface with a conditional sign-in affordance (#180).
+
+        The landing page is public (AC4 #65) but must not dead-end an
+        unauthenticated visitor (#180): with auth enabled and no valid
+        session cookie, the identity bar gains a visible "Sign in" link to
+        /auth/login. Authenticated sessions and AUTH_ENABLED=false lanes
+        (dev/qa) get the static file byte-for-byte as today. Fail-safe: any
+        cookie or validation error resolves to the unauthenticated variant —
+        the landing page can never 500. No auto-redirect: the public-landing
+        posture is preserved (rejected-by-default option 3, #180).
+        """
+        settings: Settings = request.app.state.settings
+        if settings.AUTH_ENABLED and not _has_valid_session(request, settings):
+            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+            if _SIGNIN_SLOT in html:
+                return Response(
+                    content=html.replace(_SIGNIN_SLOT, _SIGNIN_LINK_HTML),
+                    media_type="text/html",
+                )
         return FileResponse(STATIC_DIR / "index.html")
 
     @application.get("/health", response_model=HealthResponse, tags=["ops"])
@@ -451,58 +536,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             saved = await save_objective_profile(session, payload)
         return ObjectiveProfileResponse(profile=saved)
 
-    @application.get(
-        "/api/periodization",
+    @application.post(
+        "/api/periodization/approve",
         response_model=PeriodizationPlanResponse,
         tags=["objectives"],
     )
-    async def get_periodization_endpoint(request: Request) -> PeriodizationPlanResponse:
-        """Return the active objective's periodization phases (empty when absent).
-
-        Auth-gated by the whitelist middleware when AUTH_ENABLED; the phases
-        are the macrocycle plan anchored on the active objective (epic #161
-        story 1.2, MADR-008 C1).
-        """
-        session_factory = request.app.state.db_session_factory
-        async with session_factory() as session:
-            objective_row = await get_active_objective_row(session)
-            if objective_row is None:
-                return PeriodizationPlanResponse(objective_id=None, phases=[])
-            phases = await list_phases(session, objective_row.id)
-            return PeriodizationPlanResponse(objective_id=objective_row.id, phases=phases)
-
-    @application.put(
-        "/api/periodization",
-        response_model=PeriodizationPlanResponse,
-        tags=["objectives"],
-    )
-    async def put_periodization_endpoint(
+    async def approve_periodization_endpoint(
         request: Request,
-        payload: PeriodizationPlan,
-    ) -> PeriodizationPlanResponse:
-        """Validate and persist the active objective's periodization phases.
+        payload: PeriodizationApprovalRequest,
+    ) -> PeriodizationPlanResponse | JSONResponse:
+        """Approve the coach-proposed periodization plan and persist it (#182).
 
-        Strict Pydantic validation runs at the boundary (phase shape, enum,
-        ISO dates, monotonic non-overlapping ranges); the coverage
-        cross-check against the objective's target date runs here — it needs
-        the persisted parent row. Malformed plans are rejected 422 with a
-        generic detail (nLPD #142 precedent); the plan replaces the
-        objective's phase set wholesale (PUT semantics).
+        The explicit POST is the approval gate — human-in-the-loop preserved
+        (#87 C7): no phase reaches the database without the athlete's
+        explicit approval of the inline card. The plan is re-validated at the
+        boundary (strict Pydantic — the browser round-trip is as untrusted as
+        the agent) and the #167 coverage cross-check runs against the active
+        objective's target date before the repository replaces the phase set
+        wholesale. Validation failures answer the owner with the structured
+        reason body (#181): the threaded ``SettingsValidationError`` (coverage)
+        is caught in the endpoint and mapped to its fixed reason, while
+        unattributed boundary errors map to the ``invalid_values`` catch-all.
+
+        The athlete-facing GET/PUT ``/api/periodization`` endpoints were
+        removed with the manual settings editor (#182 PO pivot): the coach
+        proposes, the athlete approves — there is no athlete write path.
         """
         session_factory = request.app.state.db_session_factory
         async with session_factory() as session:
             objective_row = await get_active_objective_row(session)
             if objective_row is None:
                 # Phases hang off the active objective; without one the plan
-                # has nowhere to live. Generic 422 — no state echo (nLPD).
+                # has nowhere to live. No #181 reason fits (the plan is not
+                # invalid — there is nothing to attach it to), so this stays
+                # the generic detail; the UI's unknown-code fallback renders
+                # the generic text (fail-safe, no state echo — nLPD).
                 raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL)
             try:
-                validate_plan_coverage(payload, objective_row.target_date)
-            except ValueError as exc:
-                logger.warning("Rejected periodization plan: %s", exc)
-                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL) from exc
+                validate_plan_coverage(payload.plan, objective_row.target_date)
+            except SettingsValidationError as exc:
+                # The threaded coverage reason (#181): the typed condition
+                # becomes the owner-safe body — no string-matching, no
+                # exception text in the response (nLPD).
+                logger.warning("Rejected periodization approval: %s", exc)
+                return JSONResponse(status_code=422, content=settings_reason_payload(exc.reason))
             objective_id = objective_row.id
-            phases = await replace_phases(session, objective_id, payload)
+            phases = await replace_phases(session, objective_id, payload.plan)
         return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
 
     return application

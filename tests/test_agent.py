@@ -21,6 +21,7 @@ from pydantic import ValidationError
 from coach_web.agent import (
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
+    PROPOSE_PERIODIZATION_TOOL,
     PROPOSE_PLAN_TOOL,
     PROPOSE_WEEK_PLAN_TOOL,
     AgentEvent,
@@ -31,6 +32,7 @@ from coach_web.agent import (
     _first_choice,
     _parse_arguments,
     create_agent,
+    periodization_tool_schema,
     plan_tool_schema,
     week_plan_tool_schema,
 )
@@ -38,6 +40,7 @@ from coach_web.app import create_app
 from coach_web.config import Settings
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
+from coach_web.periodization import PeriodizationApprovalRequest
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -781,7 +784,8 @@ class TestCoachAgentPlanProposal:
 
         Superseded for #168: the weekly-plan tool schema is advertised
         alongside it (the coach can propose both single workouts and full
-        weeks).
+        weeks). Superseded for #182: the periodization tool joins them (the
+        coach can also propose the season phase plan).
         """
         streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
         hub = FakeHub(tools=[{"type": "function", "function": {"name": "mcp_tool"}}])
@@ -790,7 +794,12 @@ class TestCoachAgentPlanProposal:
         await _collect(agent, "hi")
 
         names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
-        assert names == ["mcp_tool", PROPOSE_PLAN_TOOL, PROPOSE_WEEK_PLAN_TOOL]
+        assert names == [
+            "mcp_tool",
+            PROPOSE_PLAN_TOOL,
+            PROPOSE_WEEK_PLAN_TOOL,
+            PROPOSE_PERIODIZATION_TOOL,
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1390,3 +1399,154 @@ class TestCoachAgentWeekPlanProposal:
         """The default system prompt tells the model it CAN propose a weekly plan."""
         assert PROPOSE_WEEK_PLAN_TOOL in DEFAULT_SYSTEM_PROMPT
         assert "7-day" in DEFAULT_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Periodization proposal (#182)
+# ---------------------------------------------------------------------------
+
+
+def _periodization_payload(**overrides: Any) -> dict[str, Any]:
+    """Build a valid periodization proposal payload: two contiguous phases."""
+    payload: dict[str, Any] = {
+        "phases": [
+            {
+                "phase_type": "base",
+                "name": "Aerobic base",
+                "start_date": "2026-10-01",
+                "end_date": "2026-12-15",
+                "focus": "Long rides, endurance",
+                "weekly_hours_target": 8.0,
+                "notes": None,
+            },
+            {
+                "phase_type": "build",
+                "name": "Threshold build",
+                "start_date": "2026-12-16",
+                "end_date": "2027-09-11",
+                "focus": None,
+                "weekly_hours_target": None,
+                "notes": None,
+            },
+        ],
+        "rationale": "Aerobic base into threshold build, reaching the target date.",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _periodization_call_streamer(
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "periodization_1",
+) -> FakeStreamer:
+    """Build a streamer emitting a single propose_periodization call, then a close."""
+    return FakeStreamer(
+        [
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=call_id,
+                            name=PROPOSE_PERIODIZATION_TOOL,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [_chunk(content="Here is the season plan."), _chunk(finish_reason="stop")],
+        ]
+    )
+
+
+class TestCoachAgentPeriodizationProposal:
+    """Season phase-plan proposal emission (#182)."""
+
+    async def test_propose_periodization_emits_a_validated_periodization_plan_event(self) -> None:
+        """A propose_periodization call emits the periodization_plan SSE event."""
+        streamer = _periodization_call_streamer(_periodization_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my season")
+
+        plan_event = next(e for e in events if e.type == "periodization_plan")
+        assert plan_event.data["plan"]["phases"][0]["name"] == "Aerobic base"
+        assert len(plan_event.data["plan"]["phases"]) == 2
+        assert plan_event.data["rationale"] == (
+            "Aerobic base into threshold build, reaching the target date."
+        )
+        result = next(e for e in events if e.type == "tool_result")
+        assert "periodization_plan_emitted" in result.data["result"]
+
+    async def test_invalid_periodization_is_reported_without_an_event(self) -> None:
+        """An overlapping plan is rejected: rule detail for the model, generic UI message."""
+        overlapping = _periodization_payload()
+        overlapping["phases"][1]["start_date"] = "2026-12-15"  # shared day
+        streamer = _periodization_call_streamer(overlapping, call_id="periodization_bad")
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my season")
+
+        assert all(e.type != "periodization_plan" for e in events)
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid periodization plan — the coach will retry with corrected arguments."
+        )
+        result = next(e for e in events if e.type == "tool_result")
+        assert "Invalid periodization proposal" in result.data["result"]
+        # Value-free posture (#168): the plan-level invariant's static rule
+        # description reaches the model so it can self-correct; the rejected
+        # dates never do (nLPD).
+        assert "monotonic" in result.data["result"]
+        assert "2026-12-15" not in result.data["result"]
+
+    async def test_params_wrapped_periodization_arguments_are_unwrapped(self) -> None:
+        """A payload nested under a single ``params`` key is unwrapped."""
+        streamer = _periodization_call_streamer(
+            {"params": _periodization_payload()}, call_id="periodization_params"
+        )
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my season")
+
+        assert any(e.type == "periodization_plan" for e in events)
+
+    async def test_periodization_schema_is_advertised_with_plan_rules(self) -> None:
+        """The periodization tool schema documents the top-level args and invariants."""
+        schema = periodization_tool_schema()
+
+        assert schema["function"]["name"] == PROPOSE_PERIODIZATION_TOOL
+        description = schema["function"]["description"]
+        assert "top-level" in description
+        assert "params" in description
+        assert "monotonic" in description
+        assert "target date" in description
+
+    async def test_system_prompt_advertises_the_periodization_capability(self) -> None:
+        """The default system prompt tells the model it CAN propose a phase plan."""
+        assert PROPOSE_PERIODIZATION_TOOL in DEFAULT_SYSTEM_PROMPT
+        assert "phase" in DEFAULT_SYSTEM_PROMPT
+
+    async def test_periodization_plan_event_payload_fits_the_approval_request(self) -> None:
+        """The card→POST contract: the event's plan validates as the approval payload.
+
+        The browser posts the card's plan object verbatim to
+        ``POST /api/periodization/approve``; this pin guarantees the
+        ``periodization_plan`` event's ``plan`` payload is byte-compatible
+        with :class:`~coach_web.periodization.PeriodizationApprovalRequest` —
+        a shape drift on either side fails here instead of breaking the
+        approval flow at runtime.
+        """
+        streamer = _periodization_call_streamer(_periodization_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my season")
+        plan_event = next(e for e in events if e.type == "periodization_plan")
+
+        request = PeriodizationApprovalRequest.model_validate({"plan": plan_event.data["plan"]})
+        assert len(request.plan.phases) == 2
+        # The rationale travels beside the plan, never inside it.
+        assert "rationale" not in plan_event.data["plan"]
+        assert plan_event.data["rationale"]
