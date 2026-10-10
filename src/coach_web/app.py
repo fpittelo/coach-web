@@ -4,30 +4,58 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from coach_web.agent import AgentEvent, CoachAgent, create_agent
+from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, CoachAgent, create_agent
 from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
 from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
+from coach_web.db import build_db_engine, build_session_factory
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
+from coach_web.microcycle import (
+    DayWriteResult,
+    PlanDraftRow,
+    WeekApprovalRequest,
+    WeekApprovalResponse,
+    transition_draft_status,
+    upsert_week_draft,
+    write_week_days,
+)
 from coach_web.models import (
     AgentStreamRequest,
     PlanApprovalRequest,
     PlanApprovalResponse,
+)
+from coach_web.objectives import (
+    ObjectiveProfile,
+    ObjectiveProfileResponse,
+    apply_objectives_digest,
+    get_active_objective_row,
+    get_objective_profile,
+    save_objective_profile,
+)
+from coach_web.periodization import (
+    PeriodizationPlan,
+    PeriodizationPlanResponse,
+    list_phases,
+    replace_phases,
+    validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
 
@@ -37,6 +65,12 @@ STATIC_DIR = Path(__file__).parent / "static"
 SERVICE_NAME = "coach-web"
 PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
+
+GENERIC_VALIDATION_DETAIL = "Invalid request payload"
+"""Static 422 detail — validation errors stay server-side (nLPD, #142)."""
+
+GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
+"""Static 503 detail for persistence outages — no internals echoed (nLPD)."""
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
 # C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
@@ -131,6 +165,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     yield
     logger.info("Stopping %s", SERVICE_NAME)
+    # Release the persistence engine's connection pool (MADR-008, #166).
+    await app.state.db_engine.dispose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -150,6 +186,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.started_at = time.monotonic()
     application.state.agent_factory = create_agent
     application.state.hub_factory = MCPClientHub.from_settings
+
+    # Persistence (MADR-008, #166): one async engine per app instance over the
+    # configured SQLite file. Engine construction is lazy — no filesystem
+    # access happens until a connection is opened — and the lifespan disposes
+    # the pool on shutdown.
+    db_engine = build_db_engine(resolved.COACH_DB_PATH)
+    application.state.db_engine = db_engine
+    application.state.db_session_factory = build_session_factory(db_engine)
 
     application.add_middleware(
         CORSMiddleware,
@@ -181,6 +225,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # the TrustedHost 400, the auth 401/403 and the ServerErrorMiddleware 500,
     # carries the header from a single stamping point.
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """Reject malformed payloads with a generic 422 detail (nLPD, #142).
+
+        FastAPI's default validation handler echoes the rejected input back to
+        the client; the nLPD posture keeps validation detail server-side only —
+        the full errors are logged, the response carries a static string.
+        """
+        logger.warning("Rejected malformed request on %s: %s", request.url.path, exc.errors())
+        return JSONResponse(status_code=422, content={"detail": GENERIC_VALIDATION_DETAIL})
 
     @application.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -218,6 +275,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         factory = getattr(request.app.state, "agent_factory", create_agent)
         agent: CoachAgent = factory(settings)
 
+        # Objectives digest (AC3, #166; phase extension #167): the coach
+        # system prompt gains a compact, token-budgeted digest of the
+        # persisted athlete objectives when they exist, plus the calendar-
+        # computed periodization state (current phase, target countdown,
+        # load hint) when phases exist. Absent objectives — or a persistence
+        # layer that is momentarily unreadable, or a stored row tampered into
+        # a Pydantic-invalid shape (raw SQL bypasses the CHECK constraints) —
+        # degrade to no digest, so the chat never depends on the database's
+        # health (graceful empty state). Both reads share one boundary: any
+        # failure yields no digest at all.
+        try:
+            async with request.app.state.db_session_factory() as session:
+                profile = await get_objective_profile(session)
+                objective_row = await get_active_objective_row(session)
+                phases = (
+                    await list_phases(session, objective_row.id)
+                    if objective_row is not None
+                    else []
+                )
+        except (OSError, SQLAlchemyError, ValidationError) as exc:
+            logger.warning("Objectives digest unavailable: %s", exc)
+            profile = None
+            phases = []
+        if profile is not None:
+            # Duck-typed agents (test stubs) may not carry the attribute; the
+            # default prompt is the base every real agent is built with.
+            base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
+            # The clock is resolved once here (N3, PR #173): the digest's
+            # phase resolution takes an explicit ``today`` so the call site
+            # owns the clock boundary instead of the domain default.
+            agent.system_prompt = apply_objectives_digest(
+                base_prompt, profile, phases=phases, today=date.today()
+            )
+
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
@@ -254,6 +345,165 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         except MCPHubError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @application.post("/api/week/approve", response_model=WeekApprovalResponse, tags=["plan"])
+    async def approve_week_endpoint(
+        request: Request,
+        payload: WeekApprovalRequest,
+    ) -> WeekApprovalResponse:
+        """Approve a weekly plan and write one Intervals.icu event per day.
+
+        The draft is persisted first (MADR-008 ``plan_drafts``: create-or-reuse
+        per week, replacement rule, ``submitted`` while the write is in
+        flight), then the days are written SEQUENTIALLY through ``coach-mcp``
+        (#163: no batch tool — the write is not atomic). Every day yields its
+        own :class:`~coach_web.microcycle.DayWriteResult`; the draft only
+        transitions to ``approved`` when every requested day succeeded, so a
+        partial failure stays ``submitted`` for the retry-failed-days
+        affordance (AC5: no silent partial calendar). The explicit POST is
+        the approval gate — human-in-the-loop preserved (#87 C7).
+        """
+        settings: Settings = request.app.state.settings
+        factory = getattr(request.app.state, "hub_factory", MCPClientHub.from_settings)
+        hub = factory(settings)
+        session_factory = request.app.state.db_session_factory
+
+        # 1. Persist the draft before any side effect (MADR-008, AC4).
+        try:
+            async with session_factory() as session:
+                row = await upsert_week_draft(session, payload.week)
+                draft_id = row.id
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Week draft persistence failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+
+        # Terminal-state short-circuit (PR #174 F3): an already-APPROVED
+        # matching draft means the week was fully written to the calendar —
+        # re-issuing the events would create duplicates (intervals_create_event
+        # is not idempotent, #163). Report the existing success without any
+        # tool call. A REJECTED draft was promoted back to submitted by the
+        # upsert, so the write proceeds below.
+        if row.status == "approved":
+            requested = (
+                payload.week.days
+                if payload.dates is None
+                else [day for day in payload.week.days if day.date in set(payload.dates)]
+            )
+            return WeekApprovalResponse(
+                results=[DayWriteResult(date=day.date, success=True) for day in requested]
+            )
+
+        # 2. Sequential per-day calendar writes (#163).
+        try:
+            async with hub:
+                results = await write_week_days(hub, payload.week, payload.dates)
+        except MCPHubError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+        # 3. Transition on outcome: approved only when EVERY requested day
+        # succeeded; a partial failure stays submitted for retry. A
+        # transition failure after successful writes must not mask the
+        # per-day results — it is logged and the response still reports them.
+        if all(result.success for result in results):
+            try:
+                async with session_factory() as session:
+                    stored = await session.get(PlanDraftRow, draft_id)
+                    if stored is not None and stored.status == "submitted":
+                        await transition_draft_status(session, stored, "approved")
+            except (OSError, SQLAlchemyError) as exc:
+                logger.warning("Week draft approval transition failed: %s", exc)
+
+        return WeekApprovalResponse(results=results)
+
+    @application.get(
+        "/api/objectives",
+        response_model=ObjectiveProfileResponse,
+        tags=["objectives"],
+    )
+    async def get_objectives_endpoint(request: Request) -> ObjectiveProfileResponse:
+        """Return the persisted athlete objective profile (null when absent).
+
+        Auth-gated by the whitelist middleware when AUTH_ENABLED; the profile
+        is the coach's strategic anchor (epic #161 story 1.1, MADR-008 C1).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            profile = await get_objective_profile(session)
+        return ObjectiveProfileResponse(profile=profile)
+
+    @application.put(
+        "/api/objectives",
+        response_model=ObjectiveProfileResponse,
+        tags=["objectives"],
+    )
+    async def put_objectives_endpoint(
+        request: Request,
+        payload: ObjectiveProfile,
+    ) -> ObjectiveProfileResponse:
+        """Validate and persist the athlete objective profile (PUT replaces).
+
+        Strict Pydantic validation runs at the boundary; malformed payloads
+        are rejected 422 with a generic detail (nLPD #142 precedent). The
+        profile upserts the single active ``athlete_objectives`` row.
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            saved = await save_objective_profile(session, payload)
+        return ObjectiveProfileResponse(profile=saved)
+
+    @application.get(
+        "/api/periodization",
+        response_model=PeriodizationPlanResponse,
+        tags=["objectives"],
+    )
+    async def get_periodization_endpoint(request: Request) -> PeriodizationPlanResponse:
+        """Return the active objective's periodization phases (empty when absent).
+
+        Auth-gated by the whitelist middleware when AUTH_ENABLED; the phases
+        are the macrocycle plan anchored on the active objective (epic #161
+        story 1.2, MADR-008 C1).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            objective_row = await get_active_objective_row(session)
+            if objective_row is None:
+                return PeriodizationPlanResponse(objective_id=None, phases=[])
+            phases = await list_phases(session, objective_row.id)
+            return PeriodizationPlanResponse(objective_id=objective_row.id, phases=phases)
+
+    @application.put(
+        "/api/periodization",
+        response_model=PeriodizationPlanResponse,
+        tags=["objectives"],
+    )
+    async def put_periodization_endpoint(
+        request: Request,
+        payload: PeriodizationPlan,
+    ) -> PeriodizationPlanResponse:
+        """Validate and persist the active objective's periodization phases.
+
+        Strict Pydantic validation runs at the boundary (phase shape, enum,
+        ISO dates, monotonic non-overlapping ranges); the coverage
+        cross-check against the objective's target date runs here — it needs
+        the persisted parent row. Malformed plans are rejected 422 with a
+        generic detail (nLPD #142 precedent); the plan replaces the
+        objective's phase set wholesale (PUT semantics).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            objective_row = await get_active_objective_row(session)
+            if objective_row is None:
+                # Phases hang off the active objective; without one the plan
+                # has nowhere to live. Generic 422 — no state echo (nLPD).
+                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL)
+            try:
+                validate_plan_coverage(payload, objective_row.target_date)
+            except ValueError as exc:
+                logger.warning("Rejected periodization plan: %s", exc)
+                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL) from exc
+            objective_id = objective_row.id
+            phases = await replace_phases(session, objective_id, payload)
+        return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
 
     return application
 

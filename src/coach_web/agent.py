@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from coach_web.config import Settings
 from coach_web.mcp_hub import MCPClientHub
+from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,18 @@ OPENROUTER_CHAT_COMPLETIONS_PATH = "/chat/completions"
 PROPOSE_PLAN_TOOL = "propose_plan"
 """Name of the synthetic tool the model calls to submit a structured plan."""
 
+PROPOSE_WEEK_PLAN_TOOL = "propose_week_plan"
+"""Name of the synthetic tool the model calls to submit a weekly microcycle (#168)."""
+
 PLAN_VALIDATION_UI_MESSAGE = (
     "Invalid plan proposal — the coach will retry with corrected arguments."
 )
 """Generic UI-facing validation failure message (nLPD: no plan data echoed)."""
+
+WEEK_PLAN_VALIDATION_UI_MESSAGE = (
+    "Invalid weekly plan — the coach will retry with corrected arguments."
+)
+"""Generic UI-facing weekly-plan validation failure message (nLPD posture)."""
 
 AgentEventType = Literal[
     "status",
@@ -46,6 +55,7 @@ AgentEventType = Literal[
     "tool_result",
     "plan",
     "plan_proposal",
+    "week_plan",
     "done",
     "error",
 ]
@@ -58,7 +68,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "GitHub training-plan issues) before making recommendations. Explain your "
     "reasoning concisely and use explicit wattage and durations. When you are ready "
     f"to prescribe a workout block, call the `{PROPOSE_PLAN_TOOL}` tool so the athlete "
-    "can review and approve the structured plan, then summarise it in your answer."
+    "can review and approve the structured plan, then summarise it in your answer. "
+    "When the athlete asks for a full training week — or a weekly microcycle is the "
+    f"right deliverable — call the `{PROPOSE_WEEK_PLAN_TOOL}` tool with the complete "
+    "7-day plan grounded in the athlete's objectives, current phase and weekly "
+    "availability, then summarise it in your answer."
 )
 
 
@@ -253,7 +267,7 @@ class CoachAgent:
         is reached.
         """
         messages = self._build_messages(message, history)
-        tools = [*self.hub.list_all_tools(), plan_tool_schema()]
+        tools = [*self.hub.list_all_tools(), plan_tool_schema(), week_plan_tool_schema()]
 
         for iteration in range(1, self.max_tool_iterations + 1):
             yield AgentEvent(type="status", data={"phase": "thinking", "iteration": iteration})
@@ -306,6 +320,10 @@ class CoachAgent:
                 if call["name"] == PROPOSE_PLAN_TOOL:
                     result, plan_events = self._handle_plan_proposal(arguments)
                     for event in plan_events:
+                        yield event
+                elif call["name"] == PROPOSE_WEEK_PLAN_TOOL:
+                    result, week_events = self._handle_week_plan_proposal(arguments)
+                    for event in week_events:
                         yield event
                 else:
                     result = await self.hub.execute_tool(call["name"], arguments)
@@ -379,6 +397,39 @@ class CoachAgent:
         result = json.dumps({"status": "plan_proposal_emitted", "title": plan.title})
         return result, events
 
+    @staticmethod
+    def _handle_week_plan_proposal(arguments: dict[str, Any]) -> tuple[str, list[AgentEvent]]:
+        """Validate a weekly plan draft and build its ``week_plan`` event.
+
+        Mirrors the plan-proposal posture: a ``params``-nested payload is
+        unwrapped, the draft is validated server-side (summary counts are
+        re-verified — never trust agent-computed totals, #165), the model
+        receives field-level detail without the rejected values, and the UI
+        only receives a generic error message (nLPD).
+        """
+        candidate = arguments
+        if set(arguments) == {"params"} and isinstance(arguments["params"], dict):
+            candidate = arguments["params"]
+        try:
+            draft = WeeklyPlanDraft.model_validate(candidate)
+        except ValidationError as exc:
+            logger.warning("Rejected weekly plan arguments: %s", exc.errors())
+            detail = [
+                _week_error_detail(err)
+                for err in exc.errors(include_url=False, include_input=False)
+            ]
+            return json.dumps({"error": f"Invalid weekly plan: {detail}"}), [
+                AgentEvent(
+                    type="error",
+                    data={"message": WEEK_PLAN_VALIDATION_UI_MESSAGE},
+                ),
+            ]
+
+        payload = draft.model_dump()
+        events = [AgentEvent(type="week_plan", data={"draft": payload})]
+        result = json.dumps({"status": "week_plan_emitted", "week_id": draft.week_id})
+        return result, events
+
     async def aclose(self) -> None:
         """Close the tool hub and the streaming backend."""
         await self.hub.close()
@@ -403,6 +454,20 @@ class CoachAgent:
         await self.aclose()
 
 
+def _week_error_detail(err: Any) -> dict[str, Any]:
+    """Project one validation error down to a value-free model-facing detail.
+
+    Field-level errors keep the ``loc``/``type`` projection (their messages
+    may embed rejected values — nLPD). Model-level invariant errors (empty
+    ``loc``, e.g. the summary-count checks) carry a static, value-free rule
+    description in ``msg`` — included so the model can self-correct.
+    """
+    entry: dict[str, Any] = {"loc": err.get("loc"), "type": err.get("type")}
+    if not err.get("loc"):
+        entry["msg"] = err.get("msg")
+    return entry
+
+
 def plan_tool_schema() -> dict[str, Any]:
     """Return the synthetic ``propose_plan`` tool schema for the model."""
     return {
@@ -416,6 +481,27 @@ def plan_tool_schema() -> dict[str, Any]:
                 "them under a params key."
             ),
             "parameters": PlanProposal.model_json_schema(),
+        },
+    }
+
+
+def week_plan_tool_schema() -> dict[str, Any]:
+    """Return the synthetic ``propose_week_plan`` tool schema for the model (#168)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": PROPOSE_WEEK_PLAN_TOOL,
+            "description": (
+                "Propose a complete 7-day weekly microcycle for the athlete to "
+                "review and approve as one weekly card. Pass every field (week_id, "
+                "title, summary, days, total_tss, hard_days, easy_days, ...) as "
+                "top-level tool arguments; never nest them under a params key. "
+                "Each day carries an ISO date inside week_id's ISO week and a "
+                "matching day_of_week; total_tss must equal the sum of the days' "
+                "planned_tss and hard_days + easy_days + rest days must equal the "
+                "day count."
+            ),
+            "parameters": WeeklyPlanDraft.model_json_schema(),
         },
     }
 

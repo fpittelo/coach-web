@@ -501,6 +501,19 @@ class TestE2EPreflightScript:
         assert "127.0.0.1" in text
         assert "publishes host ports but must publish none" in text
 
+    def test_script_asserts_lane_env_file_permissions(self, script: str) -> None:
+        """The script asserts every existing lane env file is mode 600 (MADR-0008 C3, #170)."""
+        assert "preflight_env_permissions_check.py" in script
+        assert "chmod 600" in script
+
+    def test_env_permissions_checker_module_enforces_mode_600(self) -> None:
+        """The extracted permission validator pins the 600 requirement (#170)."""
+        module = PROJECT_ROOT / "scripts" / "preflight_env_permissions_check.py"
+        assert module.is_file(), "scripts/preflight_env_permissions_check.py must exist"
+        text = module.read_text(encoding="utf-8")
+        assert "0o600" in text
+        assert "must be" in text
+
     def test_script_validates_compose_config(self, script: str) -> None:
         """The script runs docker compose config as a lint step."""
         assert "docker compose" in script
@@ -726,3 +739,90 @@ class TestDockerfileHardening:
         """uvicorn trusts X-Forwarded-* from loopback peers only (AC7, #112)."""
         assert "--forwarded-allow-ips='127.0.0.1,::1'" in dockerfile
         assert "--forwarded-allow-ips='*'" not in dockerfile
+
+
+class TestPersistenceTopology:
+    """Lane volume + DB path wiring for the persistence layer (#166, MADR-008).
+
+    The SQLite database file lives in a lane volume mounted at /data (WAL side
+    files alongside); the volume name derives from the compose project name so
+    concurrent lanes never share a database. COACH_DB_PATH is scoped to
+    coach-web with the container default interpolated.
+    """
+
+    def test_coach_web_mounts_the_lane_volume_at_data(self, base_compose: dict[str, Any]) -> None:
+        """coach-web mounts the coach-data volume at /data."""
+        volumes = base_compose["services"]["coach-web"].get("volumes", [])
+
+        assert "coach-data:/data" in volumes
+
+    def test_sidecars_mount_no_volumes(self, base_compose: dict[str, Any]) -> None:
+        """The MCP sidecars stay stateless — no volume mounts."""
+        for service in ("coach-mcp", "github-mcp"):
+            assert "volumes" not in base_compose["services"][service], service
+
+    def test_volume_is_declared_without_pinned_name(self, base_compose: dict[str, Any]) -> None:
+        """coach-data is declared top-level; its name derives from the project."""
+        volumes = base_compose.get("volumes", {})
+
+        assert "coach-data" in volumes
+        # `coach-data:` with no properties parses as None — equivalent to an
+        # empty mapping with no pinned name.
+        assert "name" not in (volumes["coach-data"] or {})
+
+    def test_coach_db_path_env_scoped_with_container_default(
+        self, base_compose: dict[str, Any]
+    ) -> None:
+        """COACH_DB_PATH is scoped to coach-web with the /data default."""
+        env = base_compose["services"]["coach-web"].get("environment", {})
+
+        assert env.get("COACH_DB_PATH") == "${COACH_DB_PATH:-/data/coach.db}"
+
+    def test_sidecars_do_not_receive_coach_db_path(self, base_compose: dict[str, Any]) -> None:
+        """The DB path is coach-web's concern only."""
+        for service in ("coach-mcp", "github-mcp"):
+            env = base_compose["services"][service].get("environment", {})
+            assert "COACH_DB_PATH" not in env, service
+
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_lane_env_templates_document_the_db_path_default(self, lane: str) -> None:
+        """Every lane template documents the COACH_DB_PATH default (no secrets)."""
+        text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
+
+        assert "COACH_DB_PATH=/data/coach.db" in text
+
+
+class TestDockerfilePersistenceEntrypoint:
+    """The container entrypoint runs migrations before uvicorn (#166, MADR-008).
+
+    Migrations run at container start (dev lane: automatic; prod lane: explicit
+    step with the lane stopped/idle — same entrypoint command, operational
+    discipline differs). A failed migration aborts startup rather than
+    half-applying: the ``&&`` chain never reaches uvicorn.
+    """
+
+    @pytest.fixture
+    def dockerfile(self) -> str:
+        """Return the Dockerfile contents."""
+        path = PROJECT_ROOT / "Dockerfile"
+        assert path.is_file(), "Dockerfile must exist"
+        return path.read_text(encoding="utf-8")
+
+    def test_entrypoint_runs_migrations_before_uvicorn(self, dockerfile: str) -> None:
+        """alembic upgrade head precedes uvicorn in the entrypoint chain."""
+        entrypoint = dockerfile[dockerfile.index("ENTRYPOINT") :]
+
+        assert "alembic" in entrypoint
+        assert "upgrade head" in entrypoint
+        assert "&&" in entrypoint
+        assert entrypoint.index("alembic") < entrypoint.index("uvicorn")
+
+    def test_entrypoint_targets_the_packaged_alembic_ini(self, dockerfile: str) -> None:
+        """The entrypoint pins the alembic.ini shipped inside the package."""
+        entrypoint = dockerfile[dockerfile.index("ENTRYPOINT") :]
+
+        assert "/app/src/coach_web/alembic.ini" in entrypoint
+
+    def test_data_mountpoint_pre_created_with_runtime_ownership(self, dockerfile: str) -> None:
+        """/data exists with coach-web ownership so the named volume inherits it."""
+        assert "install -d -o coach-web -g coach-web /data" in dockerfile

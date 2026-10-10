@@ -22,8 +22,12 @@ def _validate_iso_week(value: str) -> str:
     return value
 
 
-def _validate_iso_date(value: str | None) -> str | None:
-    """Validate an optional ISO calendar date (``YYYY-MM-DD``)."""
+def validate_iso_date(value: str | None) -> str | None:
+    """Validate an optional ISO calendar date (``YYYY-MM-DD``).
+
+    Public (PR #171 N5): shared across domain modules — the objectives
+    profile validates its target dates with the same rule as plan proposals.
+    """
     if value is None:
         return None
     if not re.match(_DATE_PATTERN, value):
@@ -201,7 +205,7 @@ class PlanProposal(BaseModel):
     @field_validator("date")
     @classmethod
     def _validate_date(cls, value: str | None) -> str | None:
-        return _validate_iso_date(value)
+        return validate_iso_date(value)
 
 
 class PlanApprovalRequest(BaseModel):

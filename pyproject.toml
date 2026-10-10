@@ -27,6 +27,12 @@ dependencies = [
     "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",
     "sse-starlette>=2.1.0",
+    # Internal persistence (MADR-008, #166): SQLite (WAL) via SQLAlchemy 2.0
+    # async engine (aiosqlite driver) + Alembic migrations (render_as_batch).
+    # The [asyncio] extra pulls greenlet, required by sqlalchemy.ext.asyncio.
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "alembic>=1.13.0",
 ]
 
 [project.optional-dependencies]
@@ -52,6 +58,14 @@ packages = ["src/coach_web"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+# The async engine's connect-event listener (db.py) executes inside
+# SQLAlchemy's greenlet bridge (await → greenlet switch to sync pool code);
+# without greenlet support coverage cannot trace it. "thread" must stay
+# listed alongside: aiosqlite executes SQL on background threads, and naming
+# any concurrency switches off coverage's default thread tracing.
+concurrency = ["thread", "greenlet"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
@@ -67,6 +81,7 @@ ignore = []
 "tests/integration/test_harness_native_gate.py" = ["S603"]
 "tests/integration/test_lane_script.py" = ["S603"]
 "tests/integration/test_preflight_loopback.py" = ["S104", "S603"]
+"tests/integration/test_preflight_env_permissions.py" = ["S603"]
 
 [tool.isort]
 profile = "black"
