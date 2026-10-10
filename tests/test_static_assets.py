@@ -2100,6 +2100,13 @@ class TestObjectivesSettingsContract:
         assert 'fetch("/api/objectives")' in load
         assert 'method: "PUT"' not in load
 
+    def test_load_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 load surfaces "Please sign in." in the settings note (#181 AC2)."""
+        load = _rule_block(self._script(), "loadObjectives()")
+
+        assert "Please sign in." in load
+        assert "this.settingsSignin = true" in load
+
     def test_settings_save_via_put(self) -> None:
         """Saving posts the form to PUT /api/objectives."""
         save = _rule_block(self._script(), "saveObjectives()")
@@ -2119,12 +2126,63 @@ class TestObjectivesSettingsContract:
         assert ".trim()" in payload
         assert '.filter((item) => item !== "")' in payload
 
-    def test_save_surfaces_only_a_generic_error(self) -> None:
-        """Save failures show a static message — no server detail echoed (nLPD)."""
+    def test_save_surfaces_the_server_reason_for_known_codes(self) -> None:
+        """422 saves render the server's structured reason message (#181).
+
+        The owner-safe reason body {code, message} reaches the settings note:
+        the shared helper gates the server message on the client's fixed code
+        vocabulary, and the generic text stays as the fallback.
+        """
         save = _rule_block(self._script(), "saveObjectives()")
 
-        assert "Could not save objectives" in save
+        assert "settingsReasonMessage(" in save
+        assert "Could not save objectives. Check the values and retry." in save
+        # The generic detail body is never read — the structured body replaced it.
         assert "body.detail" not in save
+
+    def test_save_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 save surfaces "Please sign in." — never "check the values" (#181 AC2)."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert "Please sign in." in save
+        assert "this.settingsSignin = true" in save
+
+    def test_settings_signin_flag_is_declared_once(self) -> None:
+        """The sign-in flag is component state, defaulting off."""
+        script = self._script()
+
+        assert "settingsSignin: false" in script
+        assert script.count("settingsSignin: ") == 1
+
+    def test_settings_signin_flag_resets_with_the_message(self) -> None:
+        """Opening the panel and saving clear the sign-in action (#180 posture).
+
+        The action never outlives its 401 cause: every writer that clears the
+        settings message clears the flag with it.
+        """
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        save = _rule_block(script, "saveObjectives()")
+
+        assert "this.settingsSignin = false" in open_block
+        assert "this.settingsSignin = false" in save
+
+    def test_settings_modal_renders_the_signin_link(self) -> None:
+        """The settings message area carries a real /auth/login link (#181 AC2).
+
+        Pairs with the #180 affordance: the link is a sibling anchor gated on
+        the flag — never x-html inside the x-text note — and it sits in the
+        message area, before the form's action row.
+        """
+        html = self._html()
+        panel_at = html.index('id="settings-panel"')
+        panel = html[panel_at:]
+        link_at = panel.index('x-show="settingsSignin"')
+
+        assert 'class="signin-link" x-show="settingsSignin" href="/auth/login"' in panel
+        assert ">Sign in</a>" in panel
+        # The affordance lives in the message area, above the action row.
+        assert link_at < panel.index('class="settings-actions"')
 
     # --- focus management -------------------------------------------------------------
 
@@ -2620,18 +2678,27 @@ class TestPeriodizationCardContract:
 
         assert 'this.periodizationApproval.state === "submitting"' in approve
 
-    def test_approve_periodization_surfaces_only_a_generic_error(self) -> None:
-        """Approval failures show a static message — no server detail echoed (nLPD).
+    def test_approve_periodization_surfaces_the_server_reason(self) -> None:
+        """Approval failures render the structured reason, generic fallback kept (#181).
 
-        Mirrors the removed savePhases pin (#167): the server's 422 detail is
-        generic by design (nLPD #142) and must never reach the UI note, not
-        even via an error.message round-trip (PR #184 review finding).
+        Extends the #167/PR #184 pin: the server's structured {code, message}
+        reason body reaches the card note for known codes (the live case —
+        the coverage rule), while the generic text stays the fallback and the
+        generic detail body is never read, not even via an error.message
+        round-trip (nLPD posture for everything but the fixed reason body).
         """
         approve = _rule_block(self._script(), "approvePeriodization()")
 
-        assert "Could not save the phase plan" in approve
+        assert "settingsReasonMessage(" in approve
+        assert "Could not save the phase plan. Try again." in approve
         assert "body.detail" not in approve
         assert "error.message" not in approve
+
+    def test_approve_periodization_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 approval surfaces "Please sign in." — not "try again" (#181 AC2)."""
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert "Please sign in." in approve
 
     # --- reject & reset ---------------------------------------------------------
 
@@ -2663,6 +2730,63 @@ class TestPeriodizationCardContract:
         card = self._card()
 
         assert 'role="status"' in card
+
+
+class TestSettingsReasonRenderingContract:
+    """Owner-safe reason rendering — the client side of the #181 vocabulary.
+
+    The server answers settings 422s with ``{code, message}`` from a fixed
+    enum (:mod:`coach_web.errors`). The client mirrors that vocabulary and
+    renders the server-provided message ONLY when the code is known — an
+    unknown or missing code (a future server vocabulary drift, a non-settings
+    error shape) falls back to the current generic text (fail-safe). The
+    message is bound with x-text — structured data, never x-html (nLPD).
+    """
+
+    REASON_CODES = (
+        "coverage_target_date",
+        "overlap",
+        "invalid_dates",
+        "invalid_values",
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_reason_vocabulary_is_pinned(self) -> None:
+        """The client vocabulary mirrors the server enum exactly — four codes."""
+        script = self._script()
+        vocabulary = _rule_block(script, "SETTINGS_REASON_CODES = ")
+
+        for code in self.REASON_CODES:
+            assert code in vocabulary
+        # The vocabulary is a plain frozen map — no dynamic construction.
+        assert "Object.keys" not in vocabulary
+
+    def test_reason_helper_renders_only_known_codes(self) -> None:
+        """The helper gates the server message on the vocabulary (fail-safe)."""
+        helper = _rule_block(self._script(), "settingsReasonMessage(body, fallback)")
+
+        assert "hasOwnProperty" in helper
+        assert "typeof body.message" in helper
+
+    def test_reason_helper_takes_the_generic_fallback(self) -> None:
+        """Unknown/missing codes return the caller's generic text, unchanged."""
+        helper = _rule_block(self._script(), "settingsReasonMessage(body, fallback)")
+
+        assert "return fallback" in helper
+
+    def test_reason_message_is_bound_with_x_text_only(self) -> None:
+        """The settings note keeps x-text — the reason body is structured data."""
+        html = self._html()
+        note_at = html.index('class="settings-note"')
+        note = html[note_at : html.index("</p>", note_at)]
+
+        assert 'x-text="settingsMessage"' in note
+        assert "x-html" not in note
 
 
 class TestSignInAffordanceContract:
