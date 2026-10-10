@@ -1,6 +1,6 @@
 # MADR-0008: Persist Coaching Lifecycle Data in SQLite (WAL) with App-Level Field Encryption
 
-- **Status:** accepted (2026-10-10 — security conditions C1–C6 embedded; see Security review outcome)
+- **Status:** Accepted (2026-10-10 — security conditions C1–C6 embedded; see Security review outcome)
 - **Date:** 2026-10-10
 - **Deciders:** @architect, @fpittelo (PO approval: epic #161 grooming decisions + Sprint 12 go-ahead, 2026-10-10); security routing: @cyber-security (review completed 2026-10-10 — conditional approval, conditions C1–C6 embedded below)
 
@@ -97,7 +97,7 @@ Key-loss consequence: an unrecoverable `DATA_ENCRYPTION_KEY` means unrecoverable
 
 #### Option B1: nightly online `sqlite3 .backup` / `VACUUM INTO` (chosen)
 
-- Pros: WAL-safe online backup (never copies a torn file; [SQLite backup API](https://www.sqlite.org/backup.html)) — a host-side cron can snapshot the volume file without stopping the lane; with health fields app-encrypted, the backup archive is safe to move even to an unencrypted target; restore is "stop lane → replace file → start lane".
+- Pros: WAL-safe online backup (never copies a torn file; [SQLite backup API](https://www.sqlite.org/backup.html)) — a host-side cron can snapshot the volume file without stopping the lane; with health fields app-encrypted, the C2/C4 fields are ciphertext-safe in backups (C1/C3 remain plaintext — see the C1 qualification in Backup/restore); restore is "stop lane → replace file → start lane".
 - Cons: full-copy each night (size is trivial at this data volume); backup dir placement is a host decision; the encryption key must be recoverable separately from the backup or backups of encrypted fields are unreadable.
 
 #### Option B2: Litestream streaming replication
@@ -220,7 +220,7 @@ Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)
 
 ## Consequences
 
-- **Positive:** the coaching loop gains durable, offline-capable state with zero new services; health data is ciphertext in every location it exists outside the running process; backups are portable without a backup-encryption scheme; the dependency cost is SQLAlchemy + Alembic + reusing the already-present `cryptography` package.
+- **Positive:** the coaching loop gains durable, offline-capable state with zero new services; health data is ciphertext in every location it exists outside the running process; C2/C4 fields are ciphertext-safe in backups; C1/C3 require an encrypted backup medium (C1); the dependency cost is SQLAlchemy + Alembic + reusing the already-present `cryptography` package.
 - **Negative:** app code gains an encryption helper and an encryption-key dependency (a lost key destroys C2/C4 summary data); encrypted columns are unqueryable; SQLAlchemy/Alembic are new dependency surface and new review targets; SQLite enforces single-writer discipline that would need re-architecture if the n=1 assumption ever falls; column-level encryption leaves table metadata (dates, status) in plaintext.
 - **Mitigations:** key stored and backed up per the backup/restore section; all debrief queries routed by unencrypted `session_date`/`id`; dependency additions reviewed under the zero-warning CI gate; n=1 assumption recorded in this ADR and revisited on any scope change; retention pruning scripts make data-minimization explicit and auditable.
 
@@ -237,7 +237,7 @@ Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)
 
 Companion verdict (spike #163): the Intervals.icu least-privilege scope set `ACTIVITY:READ, CALENDAR:WRITE, WELLNESS:READ, CHATS:WRITE` is **approved as the target**; for MVP the personal API key is acceptable for the single-user loopback topology **iff** write tools are confirmation-gated, reads are `oldest`-bounded (≤90 days/call), write operations are audit-logged, comment content is server-generated from validated data, and the greeting check is cached/budgeted. These conditions are binding on the Epic-3/microcycle story specs and the `coach-mcp` tool specs (tracked in #163).
 
-On acceptance: index in arc42 §9 and update arc42 §3/§5 for the new persistence component (follow-up docs task).
+On acceptance: index in §11 of docs/architecture.md and update arc42 §3/§5 for the new persistence component (follow-up docs task).
 
 ### Open questions — resolved 2026-10-10
 
