@@ -21,6 +21,7 @@ from coach_web.config import Settings
 from coach_web.mcp_hub import MCPClientHub
 from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
+from coach_web.periodization import PeriodizationProposal
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,9 @@ PROPOSE_PLAN_TOOL = "propose_plan"
 PROPOSE_WEEK_PLAN_TOOL = "propose_week_plan"
 """Name of the synthetic tool the model calls to submit a weekly microcycle (#168)."""
 
+PROPOSE_PERIODIZATION_TOOL = "propose_periodization"
+"""Name of the synthetic tool the model calls to submit a season phase plan (#182)."""
+
 PLAN_VALIDATION_UI_MESSAGE = (
     "Invalid plan proposal — the coach will retry with corrected arguments."
 )
@@ -45,6 +49,11 @@ WEEK_PLAN_VALIDATION_UI_MESSAGE = (
     "Invalid weekly plan — the coach will retry with corrected arguments."
 )
 """Generic UI-facing weekly-plan validation failure message (nLPD posture)."""
+
+PERIODIZATION_VALIDATION_UI_MESSAGE = (
+    "Invalid periodization plan — the coach will retry with corrected arguments."
+)
+"""Generic UI-facing periodization validation failure message (nLPD posture)."""
 
 AgentEventType = Literal[
     "status",
@@ -56,6 +65,7 @@ AgentEventType = Literal[
     "plan",
     "plan_proposal",
     "week_plan",
+    "periodization_plan",
     "done",
     "error",
 ]
@@ -72,7 +82,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "When the athlete asks for a full training week — or a weekly microcycle is the "
     f"right deliverable — call the `{PROPOSE_WEEK_PLAN_TOOL}` tool with the complete "
     "7-day plan grounded in the athlete's objectives, current phase and weekly "
-    "availability, then summarise it in your answer."
+    "availability, then summarise it in your answer. "
+    "When the athlete asks you to structure their season — or a macrocycle phase "
+    f"plan is the right deliverable — call the `{PROPOSE_PERIODIZATION_TOOL}` tool "
+    "with the complete phase sequence grounded in the objective's target date and "
+    "weekly availability, then summarise it in your answer."
 )
 
 
@@ -267,7 +281,12 @@ class CoachAgent:
         is reached.
         """
         messages = self._build_messages(message, history)
-        tools = [*self.hub.list_all_tools(), plan_tool_schema(), week_plan_tool_schema()]
+        tools = [
+            *self.hub.list_all_tools(),
+            plan_tool_schema(),
+            week_plan_tool_schema(),
+            periodization_tool_schema(),
+        ]
 
         for iteration in range(1, self.max_tool_iterations + 1):
             yield AgentEvent(type="status", data={"phase": "thinking", "iteration": iteration})
@@ -324,6 +343,10 @@ class CoachAgent:
                 elif call["name"] == PROPOSE_WEEK_PLAN_TOOL:
                     result, week_events = self._handle_week_plan_proposal(arguments)
                     for event in week_events:
+                        yield event
+                elif call["name"] == PROPOSE_PERIODIZATION_TOOL:
+                    result, periodization_events = self._handle_periodization_proposal(arguments)
+                    for event in periodization_events:
                         yield event
                 else:
                     result = await self.hub.execute_tool(call["name"], arguments)
@@ -415,7 +438,7 @@ class CoachAgent:
         except ValidationError as exc:
             logger.warning("Rejected weekly plan arguments: %s", exc.errors())
             detail = [
-                _week_error_detail(err)
+                _value_free_detail(err)
                 for err in exc.errors(include_url=False, include_input=False)
             ]
             return json.dumps({"error": f"Invalid weekly plan: {detail}"}), [
@@ -428,6 +451,54 @@ class CoachAgent:
         payload = draft.model_dump()
         events = [AgentEvent(type="week_plan", data={"draft": payload})]
         result = json.dumps({"status": "week_plan_emitted", "week_id": draft.week_id})
+        return result, events
+
+    @staticmethod
+    def _handle_periodization_proposal(arguments: dict[str, Any]) -> tuple[str, list[AgentEvent]]:
+        """Validate a periodization proposal and build its ``periodization_plan`` event.
+
+        Mirrors the week-plan posture (#182): a ``params``-nested payload is
+        unwrapped, the proposal is validated server-side through the #167
+        domain models (per-phase date order, plan-level monotonic
+        non-overlap — never trust agent numbers), the model receives
+        field-level detail without the rejected values, and the UI only
+        receives a generic error message (nLPD). Coverage of the objective's
+        target date is cross-checked at the approval endpoint, where the
+        persisted objective row is authoritative.
+        """
+        candidate = arguments
+        if set(arguments) == {"params"} and isinstance(arguments["params"], dict):
+            candidate = arguments["params"]
+        try:
+            proposal = PeriodizationProposal.model_validate(candidate)
+        except ValidationError as exc:
+            logger.warning("Rejected periodization proposal arguments: %s", exc.errors())
+            detail = [
+                _value_free_detail(err)
+                for err in exc.errors(include_url=False, include_input=False)
+            ]
+            return json.dumps({"error": f"Invalid periodization proposal: {detail}"}), [
+                AgentEvent(
+                    type="error",
+                    data={"message": PERIODIZATION_VALIDATION_UI_MESSAGE},
+                ),
+            ]
+
+        events = [
+            AgentEvent(
+                type="periodization_plan",
+                data={
+                    "plan": {"phases": [phase.model_dump() for phase in proposal.phases]},
+                    "rationale": proposal.rationale,
+                },
+            )
+        ]
+        result = json.dumps(
+            {
+                "status": "periodization_plan_emitted",
+                "phases": len(proposal.phases),
+            }
+        )
         return result, events
 
     async def aclose(self) -> None:
@@ -454,13 +525,14 @@ class CoachAgent:
         await self.aclose()
 
 
-def _week_error_detail(err: Any) -> dict[str, Any]:
+def _value_free_detail(err: Any) -> dict[str, Any]:
     """Project one validation error down to a value-free model-facing detail.
 
     Field-level errors keep the ``loc``/``type`` projection (their messages
     may embed rejected values — nLPD). Model-level invariant errors (empty
-    ``loc``, e.g. the summary-count checks) carry a static, value-free rule
-    description in ``msg`` — included so the model can self-correct.
+    ``loc``, e.g. the summary-count or monotonicity checks) carry a static,
+    value-free rule description in ``msg`` — included so the model can
+    self-correct.
     """
     entry: dict[str, Any] = {"loc": err.get("loc"), "type": err.get("type")}
     if not err.get("loc"):
@@ -502,6 +574,29 @@ def week_plan_tool_schema() -> dict[str, Any]:
                 "day count."
             ),
             "parameters": WeeklyPlanDraft.model_json_schema(),
+        },
+    }
+
+
+def periodization_tool_schema() -> dict[str, Any]:
+    """Return the synthetic ``propose_periodization`` tool schema for the model (#182)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": PROPOSE_PERIODIZATION_TOOL,
+            "description": (
+                "Propose a season phase plan (macrocycle periodization) for the "
+                "athlete to review and approve as one card. Pass every field "
+                "(phases, rationale) as top-level tool arguments; never nest "
+                "them under a params key. Each phase carries a phase_type "
+                "(base|build|peak|taper|recovery|competition), a name and ISO "
+                "start/end dates (start_date must not be after end_date); the "
+                "phases must be monotonic and non-overlapping — a phase starts "
+                "strictly after the previous one ends (contiguous encoding: "
+                "next.start = prev.end + 1, shared days are rejected) — and the "
+                "sequence must cover the window to the objective's target date."
+            ),
+            "parameters": PeriodizationProposal.model_json_schema(),
         },
     }
 

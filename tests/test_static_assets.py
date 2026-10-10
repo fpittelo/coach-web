@@ -709,6 +709,7 @@ class TestIdentityBarContract:
             "plan_proposal",
             "plan",
             "week_plan",
+            "periodization_plan",
             "error",
             "done",
         ):
@@ -2199,19 +2200,17 @@ class TestObjectivesSettingsContract:
         assert "x-text=\"goalIndex === 0 ? 'Primary goal' : 'Secondary goal'\"" in html
 
 
-class TestPeriodizationSettingsContract:
-    """Periodization phases section in the settings modal (#167, AC1).
+class TestPhasesEditorRemoval:
+    """The manual phases editor is removed from the settings modal (#182).
 
-    The settings modal gains a phases section: the list of the active
-    objective's macrocycle phases (type, name, start/end dates, focus,
-    weekly hours, notes) with add/edit/remove. Same patterns as the #166
-    objectives form: structured Pydantic→HTML bindings only (x-text/x-model
-    — the page keeps exactly ONE x-html binding), the #166 focus trap
-    (reused verbatim — the trap queries the whole panel, so the new controls
-    are covered without changes), design tokens throughout, keyboard
-    accessible. The phases ride their own Alpine state root (``phasesForm``)
-    and their own GET/PUT endpoint — a separate concern from the objective
-    profile, with its own save action and failure surface.
+    PO design pivot on #167: phase ownership moved from the athlete to the
+    coach — *"I'm the athlete, not the coach."* Phases are coach output (the
+    ``propose_periodization`` approval card), not athlete input. The settings
+    modal returns to the #166 state (objectives only): the ``phasesForm``
+    state root, the section markup and the ``.phases-title`` style are all
+    gone, while the #166 objectives form and its binding-consistency contract
+    stay intact (the mirror test above keeps passing with the remaining
+    roots).
 
     app.js behavior is contracted through source assertions (no Node
     toolchain, ADR-006 §5).
@@ -2228,159 +2227,52 @@ class TestPeriodizationSettingsContract:
 
     # --- structure --------------------------------------------------------------
 
-    def test_phases_section_sits_inside_the_settings_panel(self) -> None:
-        """The phases form lives inside the settings modal, after the goals."""
+    def test_settings_modal_has_no_phases_editor(self) -> None:
+        """No phases form, heading or add/remove actions remain in the modal."""
         html = self._html()
 
-        panel_at = html.index('id="settings-panel"')
-        goals_at = html.index('@submit.prevent="saveObjectives()"')
-        phases_at = html.index('@submit.prevent="savePhases()"')
-        end_at = html.index("</body>")
+        assert "savePhases" not in html
+        assert "phasesForm" not in html
+        assert "addPhase" not in html
+        assert "removePhase" not in html
+        assert "Periodization phases" not in html
 
-        assert panel_at < goals_at < phases_at < end_at
-
-    def test_phases_render_through_a_single_loop(self) -> None:
-        """The phases render through one loop with add/remove actions."""
-        html = self._html()
-
-        assert '<template x-for="(phase, phaseIndex) in phasesForm.phases"' in html
-        assert "addPhase()" in html
-        assert '@click="removePhase(phaseIndex)"' in html
-
-    def test_phase_fields_bind_with_x_model(self) -> None:
-        """Every phase field binds via x-model — no HTML construction."""
-        html = self._html()
-
-        assert 'x-model="phase.phase_type"' in html
-        assert 'x-model="phase.name"' in html
-        assert 'x-model="phase.start_date"' in html
-        assert 'x-model="phase.end_date"' in html
-        assert 'x-model="phase.focus"' in html
-        assert 'x-model="phase.weeklyHoursTarget"' in html
-        assert 'x-model="phase.notes"' in html
-
-    def test_phase_type_select_offers_the_madr008_enum(self) -> None:
-        """The phase type select offers exactly the MADR-008 phase_type enum."""
-        html = self._html()
-
-        for value in ("base", "build", "peak", "taper", "recovery", "competition"):
-            assert f'value="{value}"' in html, value
-
-    def test_phase_dates_use_date_inputs(self) -> None:
-        """The phase start/end fields are date inputs (ISO dates by construction)."""
-        html = self._html()
-        start_at = html.index('x-model="phase.start_date"')
-        input_tag = html[html.rindex("<input", 0, start_at) : html.index(">", start_at) + 1]
-
-        assert 'type="date"' in input_tag
-
-    def test_phases_section_reuses_the_settings_form_classes(self) -> None:
-        """The phase fieldsets reuse the #166 token-driven form classes."""
-        html = self._html()
-        phases_at = html.index('@submit.prevent="savePhases()"')
-        section = html[phases_at : html.index("</form>", phases_at)]
-
-        assert 'class="goal-fieldset"' in section
-        assert 'class="field-label"' in section
-        assert "button--ghost" in section
-
-    # --- state root consistency (B1/B2 mirror) ----------------------------------
-
-    def test_phases_form_state_root_is_consistent_across_files(self) -> None:
-        """The phases form root declared in app.js is the one bound in index.html.
-
-        B1/B2 mirror (PR #171 review): the HTML bindings and the Alpine
-        component state must share ONE root identifier — a rename on one
-        side only leaves the section runtime-dead while string assertions
-        stay green.
-        """
-        script = self._script()
-        html = self._html()
-
-        declared = re.findall(r"phasesForm\s*:\s*\{", script)
-        assert len(declared) == 1, "app.js must declare exactly one phasesForm root"
-
-        html_roots = set(re.findall(r"phasesForm\.\w+", html))
-        assert html_roots, "index.html must bind the phases form state"
-        assert html_roots == {"phasesForm.phases"}, html_roots
-
-        js_refs = set(re.findall(r"this\.phasesForm", script))
-        assert js_refs == {"this.phasesForm"}, js_refs
-
-    def test_phases_form_initializes_empty_with_a_blank_factory(self) -> None:
-        """The phases form starts empty; addPhase uses a blank-phase factory."""
+    def test_app_js_has_no_phases_editor_state_or_methods(self) -> None:
+        """The phasesForm root and its load/save/normalize methods are gone."""
         script = self._script()
 
-        assert "phasesForm: { phases: [] }" in script
-        assert "function blankPhaseForm()" in script
-        add = _rule_block(script, "addPhase()")
-        assert "blankPhaseForm()" in add
+        assert "phasesForm" not in script
+        assert "phasesSaving" not in script
+        assert "phasesMessage" not in script
+        assert "blankPhaseForm" not in script
+        assert "loadPhases" not in script
+        assert "savePhases" not in script
+        assert "payloadFromPhasesForm" not in script
+        assert "formFromPlan" not in script
+        assert "addPhase" not in script
+        assert "removePhase" not in script
 
-    # --- load/save wiring ---------------------------------------------------------
+    def test_open_settings_loads_only_the_objectives(self) -> None:
+        """Opening the panel loads the profile — no phases fetch remains."""
+        open_block = _rule_block(self._script(), "openSettings()")
 
-    def test_settings_open_loads_the_phases(self) -> None:
-        """Opening the panel loads both the profile and the phases."""
+        assert "this.loadObjectives()" in open_block
+        assert "loadPhases" not in open_block
+
+    def test_no_athlete_periodization_fetch_remains_in_app_js(self) -> None:
+        """The only periodization HTTP call left in app.js is the approval POST."""
         script = self._script()
-        open_block = _rule_block(script, "openSettings()")
-        load = _rule_block(script, "loadPhases()")
 
-        assert "this.loadPhases()" in open_block
-        assert 'fetch("/api/periodization")' in load
-        assert 'method: "PUT"' not in load
+        assert script.count('"/api/periodization') == 1
+        assert 'fetch("/api/periodization/approve"' in script
 
-    def test_phases_save_via_put(self) -> None:
-        """Saving posts the form to PUT /api/periodization."""
-        save = _rule_block(self._script(), "savePhases()")
+    # --- styling ------------------------------------------------------------------
 
-        assert 'fetch("/api/periodization"' in save
-        assert 'method: "PUT"' in save
-
-    def test_phases_save_normalizes_empty_optionals_to_null(self) -> None:
-        """Empty optional numerics/text serialize as null, not empty strings."""
-        script = self._script()
-        payload = _rule_block(script, "payloadFromPhasesForm()")
-
-        assert 'phase.weeklyHoursTarget === ""' in payload
-        assert "Number(phase.weeklyHoursTarget)" in payload
-        assert ".trim()" in payload
-
-    def test_phases_save_surfaces_only_a_generic_error(self) -> None:
-        """Save failures show a static message — no server detail echoed (nLPD)."""
-        save = _rule_block(self._script(), "savePhases()")
-
-        assert "Could not save phases" in save
-        assert "body.detail" not in save
-
-    def test_phases_save_guard_blocks_double_submit(self) -> None:
-        """savePhases guards on its own in-flight flag (mirrors saveObjectives)."""
-        save = _rule_block(self._script(), "savePhases()")
-
-        assert "if (this.phasesSaving)" in save
-        assert "this.phasesSaving = true" in save
-        assert "this.phasesSaving = false" in save
-
-    # --- a11y & styling -------------------------------------------------------------
-
-    def test_phases_section_introduces_no_x_html(self) -> None:
-        """The page keeps exactly one x-html binding (assistant messages)."""
-        html = self._html()
-
-        assert html.count("x-html") == 1
-
-    def test_phases_title_is_labelled(self) -> None:
-        """The section carries a visible heading for structure."""
-        html = self._html()
-
-        assert "Periodization phases" in html
-
-    def test_phases_styles_use_tokens(self) -> None:
-        """Any new phase styling is token-driven (no color literals)."""
+    def test_phases_title_style_is_gone(self) -> None:
+        """The .phases-title rule is removed from the stylesheet."""
         css = self._css()
-        title = _rule_block(css, ".phases-title")
 
-        assert title, ".phases-title rule missing"
-        assert "var(--" in title
-        assert "#" not in title
+        assert ".phases-title" not in css
 
 
 class TestWeeklyPlanCardContract:
@@ -2603,6 +2495,139 @@ class TestWeeklyPlanCardContract:
         card = self._week_card()
 
         assert "plan-table-wrap" in card
+
+
+class TestPeriodizationCardContract:
+    """Periodization approval card — state pair, rendering & approval contract (#182).
+
+    The coach-proposed season phase plan renders as a single conversation
+    card pinned to the proposing assistant message via the
+    ``periodizationPlan`` / ``periodizationMessageIndex`` state pair (#82
+    replacement rule — a new ``periodization_plan`` event replaces the card).
+    The card shows the phases (type, name, dates, focus) plus the coach's
+    rationale; Approve posts ``{plan}`` to POST /api/periodization/approve —
+    the server re-validates and persists through the #167 repository, so the
+    human-in-the-loop gate is preserved (#87 C7: no phase persistence without
+    explicit athlete approval); Reject dismisses without persisting. JS is
+    contracted via source assertions (no Node toolchain, ADR-006 §5).
+    """
+
+    PERIODIZATION_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && periodizationPlan && "
+        'periodizationMessageIndex === index">'
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.PERIODIZATION_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    # --- state pair & card pinning -------------------------------------------
+
+    def test_periodization_state_pair_is_declared_once(self) -> None:
+        """The periodizationPlan/periodizationMessageIndex pair is declared exactly once."""
+        script = self._script()
+
+        assert script.count("periodizationPlan: null") == 1
+        assert script.count("periodizationMessageIndex: -1") == 1
+
+    def test_periodization_card_is_pinned_to_the_proposing_message(self) -> None:
+        """The card template binds the periodizationPlan/periodizationMessageIndex pair."""
+        html = self._html()
+
+        assert self.PERIODIZATION_CARD_TEMPLATE in html
+
+    def test_periodization_plan_handler_pins_the_card(self) -> None:
+        """The periodization_plan handler pins the card (replacement rule)."""
+        script = self._script()
+        handler = _rule_block(script, "periodization_plan: (event) =>")
+
+        assert "this.periodizationPlan = data.plan" in handler
+        assert "this.periodizationMessageIndex = index" in handler
+        assert "this.scrollToBottom()" in handler
+
+    def test_periodization_card_is_a_labelled_region(self) -> None:
+        """The card is a role=region with a static aria-label."""
+        card = self._card()
+
+        assert 'role="region"' in card
+        assert 'aria-label="Proposed periodization plan"' in card
+
+    # --- structured rendering (no markdown) -----------------------------------
+
+    def test_periodization_card_is_structured_pydantic_to_html(self) -> None:
+        """The card binds x-text only — never markdown/x-html."""
+        card = self._card()
+
+        assert "x-html" not in card
+        assert "renderMarkdown" not in card
+        assert "phase.phase_type" in card
+        assert "phase.name" in card
+        assert "phase.start_date" in card
+        assert "phase.end_date" in card
+        assert "phase.focus" in card
+        assert "periodizationPlan.rationale" in card
+
+    def test_periodization_card_loop_does_not_shadow_the_message_index(self) -> None:
+        """The phases loop binds phaseIndex — the message index stays intact."""
+        card = self._card()
+
+        assert 'x-for="(phase, phaseIndex)' in card
+        assert ':key="phaseIndex"' in card
+
+    # --- approval flow (#87 C7 human-in-the-loop gate) --------------------------
+
+    def test_approve_periodization_posts_the_plan_contract(self) -> None:
+        """Approve posts {plan} to /api/periodization/approve."""
+        script = self._script()
+        approve = _rule_block(script, "approvePeriodization()")
+
+        assert 'fetch("/api/periodization/approve"' in approve
+        assert 'method: "POST"' in approve
+        assert "JSON.stringify({ plan: this.periodizationPlan.plan })" in approve
+
+    def test_approve_periodization_guard_blocks_double_submit(self) -> None:
+        """approvePeriodization guards on its own in-flight state."""
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert 'this.periodizationApproval.state === "submitting"' in approve
+
+    # --- reject & reset ---------------------------------------------------------
+
+    def test_reject_periodization_clears_the_card_state(self) -> None:
+        """Reject dismisses the card without persisting."""
+        reject = _rule_block(self._script(), "rejectPeriodization()")
+
+        assert "this.periodizationPlan = null" in reject
+        assert "this.periodizationMessageIndex = -1" in reject
+
+    def test_reset_chat_clears_the_periodization_state(self) -> None:
+        """New chat clears the periodization card state too."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.periodizationPlan = null" in reset
+        assert "this.periodizationMessageIndex = -1" in reset
+
+    def test_start_stream_clears_the_periodization_state(self) -> None:
+        """A new stream clears the periodization card (the #82 replacement posture)."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.periodizationPlan = null" in start
+        assert "this.periodizationMessageIndex = -1" in start
+
+    # --- accessibility -----------------------------------------------------------
+
+    def test_periodization_note_is_a_live_status_region(self) -> None:
+        """The approval note is a role=status region (WCAG 4.1.3)."""
+        card = self._card()
+
+        assert 'role="status"' in card
 
 
 class TestSignInAffordanceContract:
