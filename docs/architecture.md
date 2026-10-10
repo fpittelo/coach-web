@@ -453,4 +453,17 @@ On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely*
 
 ---
 
-_Last updated: 2026-10-03_
+## 12. MADR-0010: Proactivity Model — Session-Greeting Pull + Passive Pending-Debrief Banner
+
+| Field | Value |
+|:---|:---|
+| **Status** | Accepted (2026-10-10) |
+| **Date** | 2026-10-10 |
+| **Deciders** | @architect, @fpittelo (PO approval: epic #161 grooming decision + PO decisions recorded in #163, 2026-10-10) |
+| **Reviewed by** | @fpittelo |
+| **Tracked in** | Epic #161 — Sprint 12 (v0.9), Epic 3 (debrief loop); spike #164 |
+| **Record** | [docs/adr/0010-proactivity-model.md](adr/0010-proactivity-model.md) |
+
+---
+
+_Last updated: 2026-10-10 (MADR-0010 proactivity model — session-greeting pull + pending-debrief banner, #164)_
