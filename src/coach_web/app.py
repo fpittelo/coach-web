@@ -10,24 +10,34 @@ from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 from sse_starlette import EventSourceResponse, ServerSentEvent
 from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from coach_web.agent import AgentEvent, CoachAgent, create_agent
+from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, CoachAgent, create_agent
 from coach_web.auth.middleware import AuthMiddleware, validate_auth_config
 from coach_web.auth.router import router as auth_router
 from coach_web.config import Settings, get_settings
+from coach_web.db import build_db_engine, build_session_factory
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.models import (
     AgentStreamRequest,
     PlanApprovalRequest,
     PlanApprovalResponse,
+)
+from coach_web.objectives import (
+    ObjectiveProfile,
+    ObjectiveProfileResponse,
+    apply_objectives_digest,
+    get_objective_profile,
+    save_objective_profile,
 )
 from coach_web.plan_approval import approve_plan
 
@@ -37,6 +47,9 @@ STATIC_DIR = Path(__file__).parent / "static"
 SERVICE_NAME = "coach-web"
 PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
+
+GENERIC_VALIDATION_DETAIL = "Invalid request payload"
+"""Static 422 detail — validation errors stay server-side (nLPD, #142)."""
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
 # C2/C5 — shipped as middleware in #84). 'unsafe-eval' is required by the
@@ -131,6 +144,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     yield
     logger.info("Stopping %s", SERVICE_NAME)
+    # Release the persistence engine's connection pool (MADR-008, #166).
+    await app.state.db_engine.dispose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -150,6 +165,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.started_at = time.monotonic()
     application.state.agent_factory = create_agent
     application.state.hub_factory = MCPClientHub.from_settings
+
+    # Persistence (MADR-008, #166): one async engine per app instance over the
+    # configured SQLite file. Engine construction is lazy — no filesystem
+    # access happens until a connection is opened — and the lifespan disposes
+    # the pool on shutdown.
+    db_engine = build_db_engine(resolved.COACH_DB_PATH)
+    application.state.db_engine = db_engine
+    application.state.db_session_factory = build_session_factory(db_engine)
 
     application.add_middleware(
         CORSMiddleware,
@@ -181,6 +204,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # the TrustedHost 400, the auth 401/403 and the ServerErrorMiddleware 500,
     # carries the header from a single stamping point.
     application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+    @application.exception_handler(RequestValidationError)
+    async def validation_error_handler(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        """Reject malformed payloads with a generic 422 detail (nLPD, #142).
+
+        FastAPI's default validation handler echoes the rejected input back to
+        the client; the nLPD posture keeps validation detail server-side only —
+        the full errors are logged, the response carries a static string.
+        """
+        logger.warning("Rejected malformed request on %s: %s", request.url.path, exc.errors())
+        return JSONResponse(status_code=422, content={"detail": GENERIC_VALIDATION_DETAIL})
 
     @application.get("/", include_in_schema=False)
     async def index() -> FileResponse:
@@ -218,6 +254,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         factory = getattr(request.app.state, "agent_factory", create_agent)
         agent: CoachAgent = factory(settings)
 
+        # Objectives digest (AC3, #166): the coach system prompt gains a
+        # compact, token-budgeted digest of the persisted athlete objectives
+        # when they exist. Absent objectives — or a persistence layer that is
+        # momentarily unreadable, or a stored row tampered into a
+        # Pydantic-invalid shape (raw SQL bypasses the CHECK constraints) —
+        # degrade to no digest, so the chat never depends on the database's
+        # health (graceful empty state).
+        try:
+            async with request.app.state.db_session_factory() as session:
+                profile = await get_objective_profile(session)
+        except (OSError, SQLAlchemyError, ValidationError) as exc:
+            logger.warning("Objectives digest unavailable: %s", exc)
+            profile = None
+        if profile is not None:
+            # Duck-typed agents (test stubs) may not carry the attribute; the
+            # default prompt is the base every real agent is built with.
+            base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
+            agent.system_prompt = apply_objectives_digest(base_prompt, profile)
+
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
@@ -254,6 +309,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         except MCPHubError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @application.get(
+        "/api/objectives",
+        response_model=ObjectiveProfileResponse,
+        tags=["objectives"],
+    )
+    async def get_objectives_endpoint(request: Request) -> ObjectiveProfileResponse:
+        """Return the persisted athlete objective profile (null when absent).
+
+        Auth-gated by the whitelist middleware when AUTH_ENABLED; the profile
+        is the coach's strategic anchor (epic #161 story 1.1, MADR-008 C1).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            profile = await get_objective_profile(session)
+        return ObjectiveProfileResponse(profile=profile)
+
+    @application.put(
+        "/api/objectives",
+        response_model=ObjectiveProfileResponse,
+        tags=["objectives"],
+    )
+    async def put_objectives_endpoint(
+        request: Request,
+        payload: ObjectiveProfile,
+    ) -> ObjectiveProfileResponse:
+        """Validate and persist the athlete objective profile (PUT replaces).
+
+        Strict Pydantic validation runs at the boundary; malformed payloads
+        are rejected 422 with a generic detail (nLPD #142 precedent). The
+        profile upserts the single active ``athlete_objectives`` row.
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            saved = await save_objective_profile(session, payload)
+        return ObjectiveProfileResponse(profile=saved)
 
     return application
 

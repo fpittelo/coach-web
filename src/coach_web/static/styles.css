@@ -37,6 +37,8 @@
   --accent: #0f766e;
   --accent-ink: #ffffff;
   --error: #b91c1c;
+  /* Modal overlay scrim (issue 166): translucent slate over the page. */
+  --overlay: rgba(15, 23, 42, 0.55);
   /* Soft geometry: 10px radius band, elevation replaces harsh borders. */
   --radius: 10px;
   --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
@@ -799,6 +801,147 @@ body {
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--muted);
+}
+
+/* --- Objectives settings modal (issue 166, AC1) --------------------------- */
+
+/* Modal overlay + panel, toggled from the identity bar. Token-driven only;
+   no transition/animation of its own, so the prefers-reduced-motion
+   contract (#85) is respected trivially. */
+
+.identity-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  z-index: 50;
+}
+
+.settings-panel {
+  background: var(--paper);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  width: 100%;
+  max-width: 760px;
+  max-height: calc(100vh - 2 * var(--space-6));
+  overflow-y: auto;
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.settings-panel:focus {
+  outline: none;
+}
+
+.settings-panel:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.settings-lede {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.goal-fieldset {
+  margin: 0;
+  padding: var(--space-4) 0 0;
+  border: none;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.goal-legend {
+  padding: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 8rem;
+}
+
+.field--grow {
+  flex: 1;
+}
+
+.field-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.settings-form input,
+.settings-form select,
+.settings-form textarea {
+  font: inherit;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: var(--space-2) var(--space-3);
+  width: 100%;
+}
+
+.settings-form input:focus-visible,
+.settings-form select:focus-visible,
+.settings-form textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.goal-remove {
+  align-self: flex-start;
+}
+
+.settings-note {
+  margin: 0;
+  font-size: 0.85rem;
+  color: var(--accent);
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 /* --- Reduced motion (AC3, #85) ------------------------------------------ */

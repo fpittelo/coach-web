@@ -38,14 +38,27 @@
             </svg>
             <span class="product-name">Coach Web</span>
           </div>
-          <button
-            class="button button--ghost new-chat"
-            type="button"
-            aria-label="New chat: clear the conversation and reset the session"
-            @click="resetChat()"
-          >
-            New chat
-          </button>
+          <div class="identity-actions">
+            <button
+              class="button button--ghost settings-toggle"
+              type="button"
+              aria-label="Open objectives settings"
+              aria-controls="settings-panel"
+              :aria-expanded="settingsOpen ? 'true' : 'false'"
+              x-ref="settingsToggle"
+              @click="toggleSettings()"
+            >
+              Settings
+            </button>
+            <button
+              class="button button--ghost new-chat"
+              type="button"
+              aria-label="New chat: clear the conversation and reset the session"
+              @click="resetChat()"
+            >
+              New chat
+            </button>
+          </div>
         </div>
         <div class="rule"></div>
         <p class="kicker">Endurance Cockpit · Local VIDAR</p>
@@ -295,6 +308,150 @@
         <span>Alpine.js · self-hosted</span>
         <span>Data stays on VIDAR</span>
       </footer>
+
+      <!-- Objectives settings modal (#166, AC1): toggled from the identity
+           bar. Structured Pydantic→HTML only — x-text/x-model bindings, no
+           raw-HTML binding anywhere in the panel (the assistant message
+           body keeps the page's single sanitized renderer). Design tokens
+           throughout, keyboard accessible: Escape closes, focus moves into
+           the dialog on open and returns to the toggle on close. No
+           animation of its own, so the prefers-reduced-motion contract
+           (#85) is respected trivially. -->
+      <div
+        class="settings-overlay"
+        x-show="settingsOpen"
+        x-cloak
+        @keydown.escape.window="closeSettings()"
+      >
+        <div
+          class="settings-panel"
+          id="settings-panel"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="settings-title"
+          tabindex="-1"
+          x-ref="settingsPanel"
+          @keydown.tab="trapSettingsFocus($event)"
+        >
+          <div class="settings-head">
+            <h2 id="settings-title" class="panel-title">Objectives</h2>
+            <button
+              class="button button--ghost settings-close"
+              type="button"
+              aria-label="Close objectives settings"
+              @click="closeSettings()"
+            >
+              Close
+            </button>
+          </div>
+          <p class="settings-lede">
+            Your goals anchor every training recommendation. They are stored
+            locally on VIDAR and injected into the coach's context.
+          </p>
+          <form class="settings-form" @submit.prevent="saveObjectives()">
+            <template x-for="(goal, goalIndex) in objectivesForm.goals" :key="goalIndex">
+              <fieldset class="goal-fieldset">
+                <legend
+                  class="goal-legend"
+                  x-text="goalIndex === 0 ? 'Primary goal' : 'Secondary goal'"
+                ></legend>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">Type</span>
+                    <select x-model="goal.objective_type">
+                      <option value="outcome">Outcome</option>
+                      <option value="process">Process</option>
+                      <option value="milestone">Milestone</option>
+                    </select>
+                  </label>
+                  <label class="field field--grow">
+                    <span class="field-label">Title</span>
+                    <input
+                      type="text"
+                      x-model="goal.title"
+                      maxlength="200"
+                      required
+                    />
+                  </label>
+                </div>
+                <label class="field">
+                  <span class="field-label">Description</span>
+                  <textarea
+                    x-model="goal.description"
+                    rows="2"
+                    maxlength="2000"
+                  ></textarea>
+                </label>
+                <div class="field-row">
+                  <label class="field field--grow">
+                    <span class="field-label">Target metric</span>
+                    <input
+                      type="text"
+                      x-model="goal.target_metric"
+                      maxlength="100"
+                      placeholder="ftp, 20min_watts, event_time"
+                    />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Target value</span>
+                    <input
+                      type="number"
+                      x-model="goal.targetValue"
+                      min="0"
+                      step="any"
+                    />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Target date</span>
+                    <input type="date" x-model="goal.target_date" />
+                  </label>
+                </div>
+                <button
+                  class="button button--ghost goal-remove"
+                  type="button"
+                  x-show="goalIndex > 0"
+                  @click="removeGoal(goalIndex)"
+                >
+                  Remove goal
+                </button>
+              </fieldset>
+            </template>
+            <button class="button button--ghost" type="button" @click="addGoal()">
+              Add secondary goal
+            </button>
+            <div class="field-row">
+              <label class="field">
+                <span class="field-label">Weekly availability (hours)</span>
+                <input
+                  type="number"
+                  x-model="objectivesForm.weeklyAvailabilityHours"
+                  min="0"
+                  max="168"
+                  step="0.5"
+                />
+              </label>
+              <label class="field field--grow">
+                <span class="field-label">Priority disciplines (comma-separated)</span>
+                <input
+                  type="text"
+                  x-model="objectivesForm.priorityDisciplines"
+                  placeholder="road, crit, time trial"
+                />
+              </label>
+            </div>
+            <p
+              class="settings-note"
+              x-show="settingsMessage"
+              x-text="settingsMessage"
+            ></p>
+            <div class="settings-actions">
+              <button class="button" type="submit" :disabled="settingsSaving">
+                Save objectives
+              </button>
+            </div>
+          </form>
+        </div>
+      </div>
     </div>
   </body>
 </html>

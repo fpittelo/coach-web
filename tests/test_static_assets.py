@@ -1923,3 +1923,267 @@ class TestAnnouncementPlainTextContract:
         assert "stripMarkdown" not in html
         # Still exactly one sanitize call: the default-config helper.
         assert script.count("DOMPurify.sanitize") == 1
+
+
+class TestObjectivesSettingsContract:
+    """Objectives settings panel toggled from the identity bar (#166, AC1).
+
+    The settings view is the AC1 delivery path for the Athletic Objective
+    Profile (KIS: the conversational onboarding flow is a recorded follow-up,
+    not part of this diff). The panel is a modal dialog toggled from the
+    header identity bar (#80 patterns): structured Pydantic→HTML bindings
+    only (x-text/x-model — the page keeps exactly ONE x-html binding, the
+    assistant message body), design tokens throughout, keyboard accessible
+    (Escape closes, focus moves into the dialog on open and returns to the
+    toggle on close), and it introduces no animation of its own so the
+    prefers-reduced-motion contract (#85) is respected trivially.
+
+    app.js behavior is contracted through source assertions (no Node
+    toolchain, ADR-006 §5).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- identity bar toggle ---------------------------------------------------
+
+    def test_settings_toggle_sits_in_the_identity_bar(self) -> None:
+        """The toggle lives in the header identity bar (#80 patterns)."""
+        header = _header_block(self._html())
+
+        assert 'aria-label="Open objectives settings"' in header
+        assert 'aria-controls="settings-panel"' in header
+        assert '@click="toggleSettings()"' in header
+
+    def test_settings_toggle_tracks_the_expanded_state(self) -> None:
+        """aria-expanded is bound to the open state for assistive tech."""
+        header = _header_block(self._html())
+
+        assert ":aria-expanded" in header
+        assert "settingsOpen" in header
+
+    def test_single_new_chat_button_is_preserved(self) -> None:
+        """Regression guard: the Settings toggle does not disturb #80's contract."""
+        html = self._html()
+
+        assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
+
+    def test_settings_form_root_identifier_is_consistent_across_files(self) -> None:
+        """The form-state root declared in app.js is the one bound in index.html.
+
+        B1/B2 regression pin (PR #171 review): the HTML bindings and the
+        Alpine component state must share ONE root identifier. A rename on
+        one side only leaves the panel runtime-dead (Alpine binds to
+        undefined) while per-file string assertions stay green — so the
+        declared root, every HTML binding root and every component reference
+        are pinned to the same identifier here.
+        """
+        script = self._script()
+        html = self._html()
+        form_roots = r"(objectivesForm|settingsForm)"
+
+        declared = re.findall(form_roots + r"\s*:\s*\{", script)
+        assert len(declared) == 1, "app.js must declare exactly one form-state root"
+        root = declared[0]
+
+        html_roots = set(re.findall(form_roots + r"\.", html))
+        assert html_roots, "index.html must bind the form state"
+        assert html_roots == {root}, f"HTML binds {html_roots}, app.js declares {root}"
+
+        js_refs = set(re.findall(r"this\." + form_roots, script))
+        assert js_refs == {root}, f"app.js references {js_refs}, declares {root}"
+
+    # --- dialog structure --------------------------------------------------------
+
+    def test_settings_panel_is_a_modal_dialog(self) -> None:
+        """The panel is a labelled modal dialog."""
+        html = self._html()
+
+        assert 'role="dialog"' in html
+        assert 'aria-modal="true"' in html
+        assert 'aria-labelledby="settings-title"' in html
+        assert 'id="settings-title"' in html
+
+    def test_settings_panel_is_hidden_until_toggled(self) -> None:
+        """The overlay is x-show-gated and x-cloak'd (no flash before Alpine)."""
+        html = self._html()
+        class_at = html.index('class="settings-overlay"')
+        tag_start = html.rindex("<div", 0, class_at)
+        overlay_tag = html[tag_start : html.index(">", class_at) + 1]
+
+        assert 'x-show="settingsOpen"' in overlay_tag
+        assert "x-cloak" in overlay_tag
+
+    def test_escape_closes_the_settings_panel(self) -> None:
+        """Keyboard users can dismiss the dialog with Escape."""
+        html = self._html()
+
+        assert '@keydown.escape.window="closeSettings()"' in html
+
+    # --- form bindings (structured Pydantic→HTML) ---------------------------------
+
+    def test_goal_fields_bind_with_x_model(self) -> None:
+        """Every goal field binds via x-model — no HTML construction."""
+        html = self._html()
+
+        assert 'x-model="goal.objective_type"' in html
+        assert 'x-model="goal.title"' in html
+        assert 'x-model="goal.description"' in html
+        assert 'x-model="goal.target_metric"' in html
+        assert 'x-model="goal.targetValue"' in html
+        assert 'x-model="goal.target_date"' in html
+
+    def test_profile_fields_bind_with_x_model(self) -> None:
+        """Availability hours and disciplines bind via x-model."""
+        html = self._html()
+
+        assert 'x-model="objectivesForm.weeklyAvailabilityHours"' in html
+        assert 'x-model="objectivesForm.priorityDisciplines"' in html
+
+    def test_settings_panel_introduces_no_x_html(self) -> None:
+        """The page keeps exactly one x-html binding (assistant messages)."""
+        html = self._html()
+
+        assert html.count("x-html") == 1
+
+    def test_goals_render_through_a_single_loop(self) -> None:
+        """Primary + secondary goals share one loop; the first entry is primary."""
+        html = self._html()
+
+        assert '<template x-for="(goal, goalIndex) in objectivesForm.goals"' in html
+        assert "goalIndex === 0" in html
+        assert "addGoal()" in html
+        assert "removeGoal(goalIndex)" in html
+
+    def test_settings_form_initializes_with_a_blank_primary_goal(self) -> None:
+        """N4: the form is never empty — a blank primary goal renders pre-load."""
+        script = self._script()
+
+        assert "goals: [blankGoalForm()]" in script
+        # The blank-goal factory is a top-level function so the state literal
+        # and the empty-profile load path share one definition.
+        assert "function blankGoalForm()" in script
+
+    def test_goal_type_select_offers_the_madr008_enum(self) -> None:
+        """The type select offers exactly the MADR-008 objective_type enum."""
+        html = self._html()
+
+        for value in ("outcome", "process", "milestone"):
+            assert f'value="{value}"' in html, value
+
+    # --- load/save wiring -----------------------------------------------------------
+
+    def test_settings_load_on_open(self) -> None:
+        """Opening the panel loads the persisted profile via GET."""
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        load = _rule_block(script, "loadObjectives()")
+
+        assert "this.loadObjectives()" in open_block
+        assert 'fetch("/api/objectives")' in load
+        assert 'method: "PUT"' not in load
+
+    def test_settings_save_via_put(self) -> None:
+        """Saving posts the form to PUT /api/objectives."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert 'fetch("/api/objectives"' in save
+        assert 'method: "PUT"' in save
+
+    def test_save_normalizes_empty_optionals_to_null(self) -> None:
+        """Empty optional numerics serialize as null, not empty strings."""
+        script = self._script()
+        payload = _rule_block(script, "payloadFromForm()")
+
+        assert 'goal.targetValue === ""' in payload
+        assert "Number(goal.targetValue)" in payload
+        # Disciplines: comma-separated input → trimmed, empties filtered.
+        assert '.split(",")' in payload
+        assert ".trim()" in payload
+        assert '.filter((item) => item !== "")' in payload
+
+    def test_save_surfaces_only_a_generic_error(self) -> None:
+        """Save failures show a static message — no server detail echoed (nLPD)."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert "Could not save objectives" in save
+        assert "body.detail" not in save
+
+    # --- focus management -------------------------------------------------------------
+
+    def test_focus_moves_into_the_panel_on_open(self) -> None:
+        """Opening the dialog moves focus into the panel (behavior contract)."""
+        open_block = _rule_block(self._script(), "openSettings()")
+
+        assert "this.$refs.settingsPanel" in open_block
+        assert ".focus()" in open_block
+
+    def test_focus_returns_to_the_toggle_on_close(self) -> None:
+        """Closing returns focus to the toggle, guarded against steal-when-closed."""
+        close_block = _rule_block(self._script(), "closeSettings()")
+
+        assert "this.$refs.settingsToggle" in close_block
+        assert ".focus()" in close_block
+        assert "if (!this.settingsOpen)" in close_block
+
+    def test_settings_panel_traps_tab_focus(self) -> None:
+        """Tab cycles within the dialog (N3: keyboard-only, motion-free trap)."""
+        html = self._html()
+        script = self._script()
+
+        assert '@keydown.tab="trapSettingsFocus($event)"' in html
+
+        trap = _rule_block(script, "trapSettingsFocus(event)")
+        assert trap, "trapSettingsFocus(event) must exist"
+        # Focusables are queried within the dialog only — never the page.
+        assert "this.$refs.settingsPanel" in trap
+        assert 'querySelectorAll("button, input, select, textarea, a[href]")' in trap
+        # Hidden controls (x-show, e.g. the primary goal's remove button) and
+        # disabled buttons are not Tab stops and never take the wrap.
+        assert "offsetParent" in trap
+        assert "disabled" in trap
+        # Shift+Tab on the first focusable wraps to the last; Tab on the last
+        # wraps to the first — preventDefault keeps focus inside the dialog.
+        assert "event.shiftKey" in trap
+        assert "event.preventDefault()" in trap
+
+    # --- styling contract ----------------------------------------------------------------
+
+    def test_settings_styles_use_tokens(self) -> None:
+        """Overlay and panel are token-driven; the overlay covers the viewport."""
+        css = self._css()
+        overlay = _rule_block(css, ".settings-overlay")
+        panel = _rule_block(css, ".settings-panel")
+
+        assert "position: fixed" in overlay
+        assert "var(--overlay)" in overlay
+        assert "var(--paper)" in panel
+        assert "var(--radius)" in panel
+        assert "box-shadow" in panel
+
+    def test_settings_introduce_no_animation(self) -> None:
+        """No transition/animation of its own — reduced-motion respected (#85)."""
+        css = self._css()
+        overlay = _rule_block(css, ".settings-overlay")
+        panel = _rule_block(css, ".settings-panel")
+
+        assert "transition" not in overlay
+        assert "animation" not in overlay
+        assert "transition" not in panel
+        assert "animation" not in panel
+
+    def test_settings_fields_are_labelled(self) -> None:
+        """Every form control sits inside a labelled .field wrapper."""
+        html = self._html()
+
+        # The chat UI uses no .field-label class; all occurrences belong to
+        # the settings form (8+ labelled controls: type, title, description,
+        # metric, value, date per goal template + availability + disciplines).
+        assert html.count('class="field-label"') >= 8
+        assert "x-text=\"goalIndex === 0 ? 'Primary goal' : 'Secondary goal'\"" in html

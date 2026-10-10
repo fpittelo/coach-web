@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     TRUSTED_HOSTS: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
     """Host header allowlist enforced by TrustedHostMiddleware (DNS rebinding)."""
 
+    COACH_DB_PATH: str = "/data/coach.db"
+    """SQLite database file (MADR-008, #166).
+
+    Defaults inside the container to the lane volume mountpoint /data; the
+    WAL side files live alongside. Override per lane via the env files only
+    when a different volume path is chosen — no secret material.
+    """
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""
