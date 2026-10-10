@@ -276,7 +276,7 @@ Because a single whitelisted identity is admitted, any approval is attributable 
 
 ### Boundary B9 — Untrusted content → DOM (v0.7 markdown rendering, #81 — IMPLEMENTED)
 
-**Status:** implemented and merged in #81 — assistant messages render `DOMPurify.sanitize(marked.parse(text))` via assistant-only `x-html` (user messages stay `x-text`; the plan card stays structured Pydantic→HTML), with `static/vendor/{marked.min.js, DOMPurify.min.js}` vendored and self-hosted. The controls below are the **conditions C1–C7** from the #87 sign-off (the former merge gate) — now **implemented and verified**, pinned by contract tests in `tests/test_static_assets.py` (`TestMarkdownRenderingContract` and the rewritten `test_index_uses_text_interpolation_only`).
+**Status:** implemented and merged in #81 — assistant messages render `DOMPurify.sanitize(marked.parse(text))` via assistant-only `x-html` (user messages stay `x-text`; the plan card stays structured Pydantic→HTML), with `static/vendor/{marked.min.js, DOMPurify.min.js}` vendored and self-hosted. The controls below are the **conditions C1–C7** from the #87 sign-off (the former merge gate) — now **implemented and verified**, pinned by contract tests in `tests/test_static_assets.py` (`TestMarkdownRenderingContract` and the rewritten `test_index_uses_text_interpolation_only`) and `tests/test_security_docs.py` (the C6/C7 records in B10 below).
 
 **Threat sources:** **LLM output** and **MCP tool payloads** (e.g. GitHub issue bodies) that flow through the agent into assistant tokens.
 
@@ -303,6 +303,11 @@ The conversation is client-owned: the browser replays the last ≤ 10 turns in t
 | **Information Disclosure** | Forged history exfiltrates biometric data to a third party | Single-tenant; the only recipient is the owner's own browser; no attacker-controlled outbound channel. OpenRouter processing is already assessed (B8). |
 
 **Residual-risk acceptance:** prompt injection via forged assistant turns cannot be eliminated without server-side session state, which contradicts the nLPD ephemeral posture. Accepted for a single-tenant personal app where the only user is the owner and every state-changing action is gated by explicit human approval.
+
+**#87 conditions C6/C7 — IMPLEMENTED and verified in code (#148):**
+
+- **C6** — `ChatMessage.role` remains `Literal["user", "assistant"]` (never widened to `system`/`tool`): `src/coach_web/models.py`, pinned by `tests/test_models.py` (`TestChatMessage` rejects a forged `system` role).
+- **C7** — The history entry/length caps (`AgentStreamRequest`: 10 entries × 8,000 chars per entry, `src/coach_web/models.py`) and the human approval gate (`POST /api/plan/approve` re-validates the exact `PlanProposal`; `AGENT_MAX_TOOL_ITERATIONS` bounds tool loops) remain, pinned by `tests/test_models.py` and `tests/test_plan_approval.py`; any future server-side persistence requires a new STRIDE review.
 
 ### CSP Posture (v0.7)
 
@@ -544,4 +549,4 @@ Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in 
 
 ---
 
-_Last updated: 2026-10-03 (issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
+_Last updated: 2026-10-10 (issue #148 — CSP stamped outside the whole ASGI stack incl. unhandled-exception 500s, SSE/401 CSP regression pins, B10 C6/C7 recorded IMPLEMENTED; prior: issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_

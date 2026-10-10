@@ -50,8 +50,52 @@ class TestB9ImplementedState:
         """The C1–C7 condition references stay, now implemented-and-verified."""
         doc = self._doc()
 
-        for condition in ("C1", "C3", "C4"):
+        for condition in ("C1", "C2", "C3", "C4", "C5", "C6", "C7"):
             assert condition in doc, condition
+
+
+class TestC6C7ImplementedState:
+    """B10 records the #87 replayed-history conditions as implemented (#148).
+
+    The #87 sign-off gated Surface 3 (replayed history, #79) on two
+    conditions: C6 — ``ChatMessage.role`` must remain
+    ``Literal["user", "assistant"]`` (never widen to ``system``/``tool``) —
+    and C7 — the history entry/length caps and the human approval gate must
+    remain; any future server-side persistence requires a new STRIDE review.
+    Both are verified in code but were not pinned in ``docs/security.md``;
+    these tests lock the IMPLEMENTED records with their evidence anchors.
+    """
+
+    def _doc(self) -> str:
+        return SECURITY_DOC.read_text(encoding="utf-8")
+
+    def _b10_section(self) -> str:
+        """Return the B10 boundary section of the security doc."""
+        doc = self._doc()
+        start = doc.index("### Boundary B10")
+        end = doc.index("### ", start + 1)
+        return doc[start:end]
+
+    def test_b10_records_c6_as_implemented_with_evidence(self) -> None:
+        """C6 (role Literal) is recorded IMPLEMENTED with its code anchor."""
+        b10 = self._b10_section()
+
+        assert "C6" in b10
+        assert "IMPLEMENTED" in b10
+        assert 'Literal["user", "assistant"]' in b10
+        assert "models.py" in b10
+        assert "test_models.py" in b10
+
+    def test_b10_records_c7_as_implemented_with_evidence(self) -> None:
+        """C7 (caps + human approval gate) is recorded IMPLEMENTED."""
+        b10 = self._b10_section()
+
+        assert "C7" in b10
+        assert "IMPLEMENTED" in b10
+        assert "AgentStreamRequest" in b10
+        assert "approval gate" in b10
+        assert "STRIDE review" in b10
+        assert "test_plan_approval.py" in b10
 
 
 class TestCspPostureShipped:
