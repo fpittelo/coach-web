@@ -440,4 +440,17 @@ On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely*
 
 ---
 
+## 11. MADR-0008: Persist Coaching Lifecycle Data in SQLite (WAL) with App-Level Field Encryption
+
+| Field | Value |
+|:---|:---|
+| **Status** | Accepted (2026-10-10) |
+| **Date** | 2026-10-10 |
+| **Deciders** | @architect, @fpittelo (PO approval: epic #161 grooming decisions + Sprint 12 go-ahead, 2026-10-10); security routing: @cyber-security (conditional approval — conditions C1–C6 embedded) |
+| **Reviewed by** | @fpittelo |
+| **Tracked in** | Epic #161 — Sprint 12 (v0.9), issue #162 |
+| **Record** | [docs/adr/0008-persistence-data-classification.md](adr/0008-persistence-data-classification.md) |
+
+---
+
 _Last updated: 2026-10-03_
