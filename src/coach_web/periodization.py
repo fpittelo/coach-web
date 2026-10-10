@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
+from coach_web.errors import SettingsReason, SettingsValidationError
 from coach_web.models import validate_iso_date
 
 PHASE_TYPES = ("base", "build", "peak", "taper", "recovery", "competition")
@@ -116,9 +117,16 @@ class PeriodizationPhase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_date_order(self) -> "PeriodizationPhase":
-        """Reject an inverted range (mirrors the DB CHECK constraint)."""
+        """Reject an inverted range (mirrors the DB CHECK constraint).
+
+        Threaded with the ``invalid_dates`` reason (#181): the settings
+        boundary maps the typed condition to the owner-safe body without
+        string-matching the message.
+        """
         if date.fromisoformat(self.start_date) > date.fromisoformat(self.end_date):
-            raise ValueError("start_date must not be after end_date")
+            raise SettingsValidationError(
+                SettingsReason.INVALID_DATES, "start_date must not be after end_date"
+            )
         return self
 
 
@@ -135,10 +143,15 @@ def ensure_monotonic_non_overlapping(phases: Sequence[PeriodizationPhase]) -> No
     The rule is shared by :class:`PeriodizationPlan` (the persisted plan) and
     :class:`PeriodizationProposal` (the coach's tool payload, #182) so both
     surfaces enforce exactly one invariant.
+
+    Threaded with the ``overlap`` reason (#181): the settings boundary maps
+    the typed condition to the owner-safe body without string-matching.
     """
     for previous, following in zip(phases, phases[1:], strict=False):
         if date.fromisoformat(following.start_date) <= date.fromisoformat(previous.end_date):
-            raise ValueError("phases must be monotonic and non-overlapping")
+            raise SettingsValidationError(
+                SettingsReason.OVERLAP, "phases must be monotonic and non-overlapping"
+            )
 
 
 class PeriodizationPlan(BaseModel):
@@ -252,6 +265,11 @@ def validate_plan_coverage(plan: PeriodizationPlan, target_date: str | None) -> 
     target must fall within ``[first start, last end]``. An empty plan (no
     periodization) or an objective without a target date skips the check —
     clearing the phases is always legitimate.
+
+    Threaded with the ``coverage_target_date`` reason (#181): the approval
+    endpoint catches the typed condition and answers the owner with the
+    structured reason body — the live case from the issue (a 422 whose
+    "phases must cover the window…" truth was masked as "check the dates").
     """
     if target_date is None or not plan.phases:
         return
@@ -261,7 +279,10 @@ def validate_plan_coverage(plan: PeriodizationPlan, target_date: str | None) -> 
     )
     last_end = date.fromisoformat(max(plan.phases, key=lambda phase: phase.end_date).end_date)
     if first_start > target or last_end < target:
-        raise ValueError("phases must cover the window to the objective target date")
+        raise SettingsValidationError(
+            SettingsReason.COVERAGE_TARGET_DATE,
+            "phases must cover the window to the objective target date",
+        )
 
 
 def resolve_phase_status(

@@ -41,6 +41,14 @@
  * without persisting. The manual settings editor is gone (PO pivot):
  * phases are coach output, not athlete input.
  *
+ * Settings error reasons (#181): the owner-facing settings saves (objectives
+ * PUT, periodization approval) surface the server's structured, owner-safe
+ * 422 body {code, message} — the message renders only when its code is in
+ * the client's fixed SETTINGS_REASON_CODES vocabulary, else the generic
+ * text (fail-safe). A 401 surfaces "Please sign in." with a real /auth/login
+ * link in the settings modal (pairs with #180). Every other surface keeps
+ * the strict #142 posture: no exception text, no input echo (nLPD).
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -130,6 +138,36 @@ const MONTH_LABELS = [
   "Jan", "Feb", "Mar", "Apr", "May", "Jun",
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+// Settings reason vocabulary (#181): the client mirror of the server's fixed
+// enum (coach_web.errors.SettingsReason). The settings 422 body is
+// {code, message}; the server-provided message renders ONLY when its code is
+// in this vocabulary — an unknown or missing code (vocabulary drift, a
+// non-settings error shape) falls back to the current generic text
+// (fail-safe). Fixed vocabulary only: no exception text, no input echo (nLPD).
+const SETTINGS_REASON_CODES = {
+  coverage_target_date: true,
+  overlap: true,
+  invalid_dates: true,
+  invalid_values: true,
+};
+
+function settingsReasonMessage(body, fallback) {
+  // Owner-safe 422 rendering (#181): return the server-provided message when
+  // the body carries a KNOWN reason code and a non-empty string message;
+  // anything else returns the caller's generic fallback unchanged. The
+  // hasOwnProperty guard keeps prototype keys out of the vocabulary check.
+  if (
+    body &&
+    typeof body.code === "string" &&
+    Object.prototype.hasOwnProperty.call(SETTINGS_REASON_CODES, body.code) &&
+    typeof body.message === "string" &&
+    body.message
+  ) {
+    return body.message;
+  }
+  return fallback;
+}
 
 function parsePayload(event) {
   try {
@@ -264,6 +302,11 @@ function coachApp() {
     settingsOpen: false,
     settingsSaving: false,
     settingsMessage: "",
+    // Sign-in action for the settings note (#181 AC2): armed only when a
+    // settings API call fails with 401 — the note then carries a real
+    // /auth/login link next to "Please sign in." (pairs with #180). Every
+    // other writer keeps it off, so the action never outlives its 401 cause.
+    settingsSignin: false,
     objectivesForm: {
       goals: [blankGoalForm()],
       weeklyAvailabilityHours: 0,
@@ -417,8 +460,11 @@ function coachApp() {
     // ------------------------------------------------------------------
     // Objectives settings panel (#166, AC1). The panel loads the persisted
     // ObjectiveProfile on open and saves it via PUT /api/objectives. All
-    // bindings are structured x-text/x-model; error surfaces are static
-    // strings only — server validation detail is never echoed (nLPD, #142).
+    // bindings are structured x-text/x-model. Error surfaces (#181): the
+    // owner-safe structured reason message renders for known codes, the
+    // generic text is the fallback, and a 401 surfaces the sign-in prompt
+    // with a real /auth/login link — no other server detail is echoed
+    // (nLPD, #142 posture unchanged for everything else).
     // ------------------------------------------------------------------
 
     toggleSettings() {
@@ -432,6 +478,7 @@ function coachApp() {
     openSettings() {
       this.settingsOpen = true;
       this.settingsMessage = "";
+      this.settingsSignin = false;
       this.loadObjectives();
       // Move focus into the dialog (keyboard accessibility): the panel is
       // tabindex="-1" so it is programmatically focusable without entering
@@ -518,7 +565,16 @@ function coachApp() {
       fetch("/api/objectives")
         .then(async (response) => {
           if (!response.ok) {
-            throw new Error("Load failed (" + response.status + ")");
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a data problem — surface the prompt and arm the
+            // /auth/login link. Any other failure keeps the generic text.
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            this.settingsMessage = "Could not load objectives.";
+            return;
           }
           const body = await response.json();
           this.objectivesForm = this.formFromProfile(body.profile);
@@ -562,6 +618,7 @@ function coachApp() {
       }
       this.settingsSaving = true;
       this.settingsMessage = "";
+      this.settingsSignin = false;
       fetch("/api/objectives", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -569,15 +626,30 @@ function coachApp() {
       })
         .then(async (response) => {
           if (!response.ok) {
-            throw new Error("Save failed (" + response.status + ")");
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a data problem — never "check the values".
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            // 422 (#181 AC1): the owner-safe structured reason body
+            // {code, message} renders for known codes; unknown/missing codes
+            // fall back to the generic text (fail-safe). The generic detail
+            // body is never read (nLPD #142 posture for everything else).
+            const body = await response.json().catch(() => ({}));
+            this.settingsMessage = settingsReasonMessage(
+              body,
+              "Could not save objectives. Check the values and retry."
+            );
+            return;
           }
           const body = await response.json();
           this.objectivesForm = this.formFromProfile(body.profile);
           this.settingsMessage = "Objectives saved.";
         })
         .catch(() => {
-          // Static message only — the server's 422 detail is generic by
-          // design (nLPD #142) and never echoed here.
+          // Transport failure: the generic text — no server detail echoed.
           this.settingsMessage = "Could not save objectives. Check the values and retry.";
         })
         .finally(() => {
@@ -1261,14 +1333,26 @@ function coachApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ plan: this.periodizationPlan.plan }),
       })
-        .then((response) => {
+        .then(async (response) => {
           if (!response.ok) {
-            // Static message only — the server's 422 detail is generic by
-            // design (nLPD #142) and never echoed here (mirrors the removed
-            // phases-editor save posture, PR #184 review).
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a plan problem — never "try again".
+            if (response.status === 401) {
+              this.periodizationApproval = {
+                state: "error",
+                message: "Please sign in.",
+              };
+              return;
+            }
+            // 422 (#181 AC1): the owner-safe structured reason body
+            // {code, message} renders for known codes (the live coverage
+            // case); unknown/missing codes fall back to the generic text
+            // (fail-safe). The generic detail body is never read and no
+            // error text is echoed (nLPD #142 posture for everything else).
+            const body = await response.json().catch(() => ({}));
             this.periodizationApproval = {
               state: "error",
-              message: "Could not save the phase plan. Try again.",
+              message: settingsReasonMessage(body, "Could not save the phase plan. Try again."),
             };
             return;
           }
@@ -1278,7 +1362,7 @@ function coachApp() {
           };
         })
         .catch(() => {
-          // Transport failure: the same static message — no server detail
+          // Transport failure: the same generic message — no server detail
           // and no error text echoed (nLPD #142 posture).
           this.periodizationApproval = {
             state: "error",

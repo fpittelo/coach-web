@@ -7,12 +7,15 @@ is now the approval gate ``POST /api/periodization/approve`` — the browser
 posts the coach-proposed plan from the inline card, the server re-validates
 it (strict Pydantic boundary + the #167 coverage cross-check against the
 active objective's target date) and persists through the existing repository.
-Malformed plans are rejected 422 with a generic detail (nLPD #142 precedent —
-validation detail stays server-side). The coach digest gains the current
-phase, the countdown and the load hint when phases exist, and the #166
-graceful-degradation boundary is preserved: any persistence failure —
-including a phase row tampered into a Pydantic-invalid shape — yields no
-digest at all and never breaks the agent turn.
+Malformed plans are rejected 422. Since #181 the settings approval endpoint
+answers with the owner-safe structured reason body ``{code, message}`` from
+the fixed vocabulary (:mod:`coach_web.errors`) — the authenticated owner
+learns WHY the approval failed (overlap, coverage, dates, values) — while
+the chat/model-facing surfaces keep the strict #142 generic detail. The
+coach digest gains the current phase, the countdown and the load hint when
+phases exist, and the #166 graceful-degradation boundary is preserved: any
+persistence failure — including a phase row tampered into a Pydantic-invalid
+shape — yields no digest at all and never breaks the agent turn.
 """
 
 import asyncio
@@ -202,7 +205,13 @@ class TestPeriodizationApprovalEndpoint:
     """POST /api/periodization/approve contract — the single write path (#182)."""
 
     def test_approve_without_an_objective_is_rejected_generically(self, migrated_db: Path) -> None:
-        """Phases hang off the active objective; without one the approval is 422."""
+        """Phases hang off the active objective; without one the approval is 422.
+
+        The no-objective case has no home in the #181 reason vocabulary (the
+        plan is not invalid — there is nothing to attach it to), so it keeps
+        the generic ``detail`` body; the UI's unknown/missing-code fallback
+        renders the generic text (fail-safe).
+        """
         with TestClient(create_app()) as client:
             response = client.post("/api/periodization/approve", json={"plan": _plan_payload()})
 
@@ -274,10 +283,10 @@ class TestPeriodizationApprovalEndpoint:
 
         assert response.status_code == 200
 
-    def test_approve_rejects_overlapping_phases_with_generic_detail(
+    def test_approve_rejects_overlapping_phases_with_the_overlap_reason(
         self, migrated_db: Path
     ) -> None:
-        """AC4: overlapping phases (a shared day) are rejected 422 generically."""
+        """AC1 #181: overlapping phases (a shared day) carry the overlap reason."""
         overlapping = _plan_payload(
             phases=[
                 _phase_payload(end_date="2026-12-15"),
@@ -297,12 +306,20 @@ class TestPeriodizationApprovalEndpoint:
             response = client.post("/api/periodization/approve", json={"plan": overlapping})
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
-        # nLPD (#142 precedent): the rejected input is never echoed.
+        assert response.json() == {
+            "code": "overlap",
+            "message": "Phases must not overlap — each phase starts the day after the "
+            "previous one ends.",
+        }
+        # nLPD: the rejected input is never echoed — not even in the reason body.
         assert "2026-12-15" not in response.text
 
     def test_approve_rejects_a_plan_not_covering_the_target_date(self, migrated_db: Path) -> None:
-        """AC4: a plan ending before the objective target date is rejected."""
+        """AC1 #181: a plan ending before the target date carries the coverage reason.
+
+        This is the live case from the issue: the coverage cross-check's reason
+        reaches the owner instead of the generic "check the dates" mask.
+        """
         short_plan = _plan_payload(
             phases=[
                 _phase_payload(
@@ -319,21 +336,37 @@ class TestPeriodizationApprovalEndpoint:
             response = client.post("/api/periodization/approve", json={"plan": short_plan})
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "coverage_target_date",
+            "message": "Phases must span your objective's target date — extend the last "
+            "phase to reach it.",
+        }
+        # nLPD: neither the dates nor the raw validator text are echoed — the
+        # fixed friendly message is the only "target date" occurrence.
+        assert "2026-12-15" not in response.text
+        assert "must cover the window" not in response.text
+        assert response.text.count("target date") == 1
 
-    def test_approve_rejects_malformed_phase_payload_generically(self, migrated_db: Path) -> None:
-        """AC4: a phase_type outside the enum is rejected generically."""
+    def test_approve_rejects_malformed_phase_payload_with_a_reason_code(
+        self, migrated_db: Path
+    ) -> None:
+        """AC1 #181: a phase_type outside the enum carries the invalid_values reason."""
         malformed = _plan_payload(phases=[_phase_payload(phase_type="fantasy", notes=None)])
         with TestClient(create_app()) as client:
             client.put("/api/objectives", json=_profile_payload())
             response = client.post("/api/periodization/approve", json={"plan": malformed})
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
         assert "fantasy" not in response.text
 
-    def test_approve_rejects_an_inverted_date_range_generically(self, migrated_db: Path) -> None:
-        """AC4: start_date after end_date is rejected generically."""
+    def test_approve_rejects_an_inverted_date_range_with_the_dates_reason(
+        self, migrated_db: Path
+    ) -> None:
+        """AC1 #181: start_date after end_date carries the invalid_dates reason."""
         inverted = _plan_payload(
             phases=[
                 _phase_payload(
@@ -350,7 +383,10 @@ class TestPeriodizationApprovalEndpoint:
             response = client.post("/api/periodization/approve", json={"plan": inverted})
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_dates",
+            "message": "One or more dates are invalid.",
+        }
 
     def test_removed_athlete_endpoints_return_404(self, migrated_db: Path) -> None:
         """The #182 pivot removed the athlete-facing GET/PUT periodization paths."""

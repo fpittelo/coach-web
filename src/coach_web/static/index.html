@@ -642,6 +642,10 @@
               x-show="settingsMessage"
               x-text="settingsMessage"
             ></p>
+            <!-- #181 AC2: the 401 sign-in affordance — a real link next to
+                 the "Please sign in." note, gated on the flag so the action
+                 never outlives its 401 cause (pairs with #180). -->
+            <a class="signin-link" x-show="settingsSignin" href="/auth/login">Sign in</a>
             <div class="settings-actions">
               <button class="button" type="submit" :disabled="settingsSaving">
                 Save objectives

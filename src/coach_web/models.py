@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from coach_web.errors import SettingsReason, SettingsValidationError
+
 _WEEK_ID_PATTERN: str = r"^\d{4}-W\d{2}$"
 _DATE_PATTERN: str = r"^\d{4}-\d{2}-\d{2}$"
 
@@ -27,15 +29,25 @@ def validate_iso_date(value: str | None) -> str | None:
 
     Public (PR #171 N5): shared across domain modules — the objectives
     profile validates its target dates with the same rule as plan proposals.
+
+    Raises :class:`~coach_web.errors.SettingsValidationError` threaded with
+    the ``invalid_dates`` reason (#181): the exception stays a ``ValueError``
+    (Pydantic wraps it exactly as before), but the settings boundary can map
+    it to the owner-safe reason body without string-matching. The technical
+    message is unchanged and stays server-side (nLPD).
     """
     if value is None:
         return None
     if not re.match(_DATE_PATTERN, value):
-        raise ValueError(f"date must match ISO date pattern {_DATE_PATTERN!r}")
+        raise SettingsValidationError(
+            SettingsReason.INVALID_DATES, f"date must match ISO date pattern {_DATE_PATTERN!r}"
+        )
     try:
         date_type.fromisoformat(value)
     except ValueError as exc:
-        raise ValueError(f"date {value!r} is not a valid calendar date") from exc
+        raise SettingsValidationError(
+            SettingsReason.INVALID_DATES, f"date {value!r} is not a valid calendar date"
+        ) from exc
     return value
 
 

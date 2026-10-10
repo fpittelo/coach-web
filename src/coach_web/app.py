@@ -32,6 +32,11 @@ from coach_web.auth.router import router as auth_router
 from coach_web.auth.tokens import verify_session_token
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
+from coach_web.errors import (
+    SettingsValidationError,
+    settings_reason_from_errors,
+    settings_reason_payload,
+)
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.microcycle import (
     DayWriteResult,
@@ -72,7 +77,21 @@ PACKAGE_NAME = "coach-web"
 FALLBACK_VERSION = "0.0.0"
 
 GENERIC_VALIDATION_DETAIL = "Invalid request payload"
-"""Static 422 detail — validation errors stay server-side (nLPD, #142)."""
+"""Static 422 detail — validation errors stay server-side (nLPD, #142).
+
+Chat/model-facing surfaces keep this strict posture UNCHANGED (#181 AC3);
+the owner-facing settings paths answer with the structured reason body.
+"""
+
+SETTINGS_REASON_PATHS = frozenset({"/api/objectives", "/api/periodization/approve"})
+"""The owner-facing settings endpoints whose 422s carry the reason body (#181).
+
+The #142 threat model is the LLM/prompt-injection surface — not the
+authenticated owner's own settings form, where the requester IS the data
+owner and a validation reason is not sensitive data. Only these paths get
+the structured ``{code, message}`` body; every other 422 (agent stream, plan
+approval, week approval) keeps the generic detail verbatim.
+"""
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
 """Static 503 detail for persistence outages — no internals echoed (nLPD)."""
@@ -269,13 +288,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def validation_error_handler(
         request: Request, exc: RequestValidationError
     ) -> JSONResponse:
-        """Reject malformed payloads with a generic 422 detail (nLPD, #142).
+        """Reject malformed payloads with a static 422 body (nLPD, #142 + #181).
 
         FastAPI's default validation handler echoes the rejected input back to
         the client; the nLPD posture keeps validation detail server-side only —
-        the full errors are logged, the response carries a static string.
+        the full errors are logged, the response carries a static string. On
+        the owner-facing settings paths (#181) the body is instead the
+        structured reason ``{code, message}``: the reason is threaded through
+        the validators as a typed exception attribute (never string-matched)
+        and unattributed errors map to the ``invalid_values`` catch-all, so
+        the body shape stays consistent for the UI contract.
         """
-        logger.warning("Rejected malformed request on %s: %s", request.url.path, exc.errors())
+        errors = exc.errors()
+        logger.warning("Rejected malformed request on %s: %s", request.url.path, errors)
+        if request.url.path in SETTINGS_REASON_PATHS:
+            reason = settings_reason_from_errors(errors)
+            return JSONResponse(status_code=422, content=settings_reason_payload(reason))
         return JSONResponse(status_code=422, content={"detail": GENERIC_VALIDATION_DETAIL})
 
     @application.get("/", include_in_schema=False)
@@ -516,7 +544,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def approve_periodization_endpoint(
         request: Request,
         payload: PeriodizationApprovalRequest,
-    ) -> PeriodizationPlanResponse:
+    ) -> PeriodizationPlanResponse | JSONResponse:
         """Approve the coach-proposed periodization plan and persist it (#182).
 
         The explicit POST is the approval gate — human-in-the-loop preserved
@@ -525,8 +553,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         boundary (strict Pydantic — the browser round-trip is as untrusted as
         the agent) and the #167 coverage cross-check runs against the active
         objective's target date before the repository replaces the phase set
-        wholesale. Malformed plans are rejected 422 with a generic detail
-        (nLPD #142 precedent).
+        wholesale. Validation failures answer the owner with the structured
+        reason body (#181): the threaded ``SettingsValidationError`` (coverage)
+        is caught in the endpoint and mapped to its fixed reason, while
+        unattributed boundary errors map to the ``invalid_values`` catch-all.
 
         The athlete-facing GET/PUT ``/api/periodization`` endpoints were
         removed with the manual settings editor (#182 PO pivot): the coach
@@ -537,13 +567,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             objective_row = await get_active_objective_row(session)
             if objective_row is None:
                 # Phases hang off the active objective; without one the plan
-                # has nowhere to live. Generic 422 — no state echo (nLPD).
+                # has nowhere to live. No #181 reason fits (the plan is not
+                # invalid — there is nothing to attach it to), so this stays
+                # the generic detail; the UI's unknown-code fallback renders
+                # the generic text (fail-safe, no state echo — nLPD).
                 raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL)
             try:
                 validate_plan_coverage(payload.plan, objective_row.target_date)
-            except ValueError as exc:
+            except SettingsValidationError as exc:
+                # The threaded coverage reason (#181): the typed condition
+                # becomes the owner-safe body — no string-matching, no
+                # exception text in the response (nLPD).
                 logger.warning("Rejected periodization approval: %s", exc)
-                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL) from exc
+                return JSONResponse(status_code=422, content=settings_reason_payload(exc.reason))
             objective_id = objective_row.id
             phases = await replace_phases(session, objective_id, payload.plan)
         return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
