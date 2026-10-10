@@ -944,6 +944,19 @@ body {
   justify-content: flex-end;
 }
 
+/* Periodization phases section (issue 167, AC1): reuses the issue-166 form
+   classes (goal-fieldset/field/field-row/field-label/goal-remove); only
+   the section heading is new — token-driven, no animation of its own. */
+
+.phases-title {
+  margin: 0;
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
 /* --- Reduced motion (AC3, #85) ------------------------------------------ */
 
 /* Users who prefer reduced motion get no looping animations (status pulse

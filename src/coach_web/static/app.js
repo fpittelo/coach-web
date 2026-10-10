@@ -129,6 +129,21 @@ function blankGoalForm() {
   };
 }
 
+function blankPhaseForm() {
+  // Blank phase form factory (#167): shared by the add-phase action — the
+  // phases list starts empty (no periodization is a legitimate state) and
+  // grows one blank phase per click.
+  return {
+    phase_type: "base",
+    name: "",
+    start_date: "",
+    end_date: "",
+    focus: "",
+    weeklyHoursTarget: null,
+    notes: "",
+  };
+}
+
 function coachApp() {
   return {
     messages: [],
@@ -187,6 +202,14 @@ function coachApp() {
       weeklyAvailabilityHours: 0,
       priorityDisciplines: "",
     },
+    // Periodization phases panel (#167, AC1): the active objective's
+    // macrocycle phases, loaded on open and saved via PUT
+    // /api/periodization. Own state root and failure surface — a separate
+    // concern from the objective profile form above. All bindings are
+    // x-text/x-model (structured Pydantic→HTML, no x-html).
+    phasesForm: { phases: [] },
+    phasesSaving: false,
+    phasesMessage: "",
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -351,6 +374,7 @@ function coachApp() {
       this.settingsOpen = true;
       this.settingsMessage = "";
       this.loadObjectives();
+      this.loadPhases();
       // Move focus into the dialog (keyboard accessibility): the panel is
       // tabindex="-1" so it is programmatically focusable without entering
       // the tab order.
@@ -513,6 +537,104 @@ function coachApp() {
       if (index > 0) {
         this.objectivesForm.goals.splice(index, 1);
       }
+    },
+
+    // ------------------------------------------------------------------
+    // Periodization phases panel (#167, AC1). The panel loads the active
+    // objective's persisted phases on open and saves them via PUT
+    // /api/periodization. All bindings are structured x-text/x-model;
+    // error surfaces are static strings only — server validation detail is
+    // never echoed (nLPD, #142).
+    // ------------------------------------------------------------------
+
+    formFromPlan(plan) {
+      // API → form: optional numerics ride as strings in the inputs and
+      // normalize to null on save (mirrors the goals form).
+      const toPhaseForm = (phase) => ({
+        phase_type: (phase && phase.phase_type) || "base",
+        name: (phase && phase.name) || "",
+        start_date: (phase && phase.start_date) || "",
+        end_date: (phase && phase.end_date) || "",
+        focus: (phase && phase.focus) || "",
+        weeklyHoursTarget:
+          phase && phase.weekly_hours_target !== null && phase.weekly_hours_target !== undefined
+            ? phase.weekly_hours_target
+            : null,
+        notes: (phase && phase.notes) || "",
+      });
+      if (!plan || !plan.phases) {
+        return { phases: [] };
+      }
+      return { phases: plan.phases.map(toPhaseForm) };
+    },
+
+    loadPhases() {
+      fetch("/api/periodization")
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Load failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.phasesForm = this.formFromPlan(body);
+        })
+        .catch(() => {
+          this.phasesMessage = "Could not load phases.";
+        });
+    },
+
+    payloadFromPhasesForm() {
+      // Form → API: empty optional numerics/text serialize as null (the API
+      // validates strict types — an empty string would be a 422).
+      const fromPhaseForm = (phase) => ({
+        phase_type: phase.phase_type,
+        name: phase.name,
+        start_date: phase.start_date,
+        end_date: phase.end_date,
+        focus: phase.focus.trim() === "" ? null : phase.focus,
+        weekly_hours_target:
+          phase.weeklyHoursTarget === "" || phase.weeklyHoursTarget === null
+            ? null
+            : Number(phase.weeklyHoursTarget),
+        notes: phase.notes.trim() === "" ? null : phase.notes,
+      });
+      return { phases: this.phasesForm.phases.map(fromPhaseForm) };
+    },
+
+    savePhases() {
+      if (this.phasesSaving) {
+        return;
+      }
+      this.phasesSaving = true;
+      this.phasesMessage = "";
+      fetch("/api/periodization", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.payloadFromPhasesForm()),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error("Save failed (" + response.status + ")");
+          }
+          const body = await response.json();
+          this.phasesForm = this.formFromPlan(body);
+          this.phasesMessage = "Phases saved.";
+        })
+        .catch(() => {
+          // Static message only — the server's 422 detail is generic by
+          // design (nLPD #142) and never echoed here.
+          this.phasesMessage = "Could not save phases. Check the dates and retry.";
+        })
+        .finally(() => {
+          this.phasesSaving = false;
+        });
+    },
+
+    addPhase() {
+      this.phasesForm.phases.push(blankPhaseForm());
+    },
+
+    removePhase(index) {
+      this.phasesForm.phases.splice(index, 1);
     },
 
     send() {

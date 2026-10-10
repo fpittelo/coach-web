@@ -2187,3 +2187,187 @@ class TestObjectivesSettingsContract:
         # metric, value, date per goal template + availability + disciplines).
         assert html.count('class="field-label"') >= 8
         assert "x-text=\"goalIndex === 0 ? 'Primary goal' : 'Secondary goal'\"" in html
+
+
+class TestPeriodizationSettingsContract:
+    """Periodization phases section in the settings modal (#167, AC1).
+
+    The settings modal gains a phases section: the list of the active
+    objective's macrocycle phases (type, name, start/end dates, focus,
+    weekly hours, notes) with add/edit/remove. Same patterns as the #166
+    objectives form: structured Pydantic→HTML bindings only (x-text/x-model
+    — the page keeps exactly ONE x-html binding), the #166 focus trap
+    (reused verbatim — the trap queries the whole panel, so the new controls
+    are covered without changes), design tokens throughout, keyboard
+    accessible. The phases ride their own Alpine state root (``phasesForm``)
+    and their own GET/PUT endpoint — a separate concern from the objective
+    profile, with its own save action and failure surface.
+
+    app.js behavior is contracted through source assertions (no Node
+    toolchain, ADR-006 §5).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- structure --------------------------------------------------------------
+
+    def test_phases_section_sits_inside_the_settings_panel(self) -> None:
+        """The phases form lives inside the settings modal, after the goals."""
+        html = self._html()
+
+        panel_at = html.index('id="settings-panel"')
+        goals_at = html.index('@submit.prevent="saveObjectives()"')
+        phases_at = html.index('@submit.prevent="savePhases()"')
+        end_at = html.index("</body>")
+
+        assert panel_at < goals_at < phases_at < end_at
+
+    def test_phases_render_through_a_single_loop(self) -> None:
+        """The phases render through one loop with add/remove actions."""
+        html = self._html()
+
+        assert '<template x-for="(phase, phaseIndex) in phasesForm.phases"' in html
+        assert "addPhase()" in html
+        assert '@click="removePhase(phaseIndex)"' in html
+
+    def test_phase_fields_bind_with_x_model(self) -> None:
+        """Every phase field binds via x-model — no HTML construction."""
+        html = self._html()
+
+        assert 'x-model="phase.phase_type"' in html
+        assert 'x-model="phase.name"' in html
+        assert 'x-model="phase.start_date"' in html
+        assert 'x-model="phase.end_date"' in html
+        assert 'x-model="phase.focus"' in html
+        assert 'x-model="phase.weeklyHoursTarget"' in html
+        assert 'x-model="phase.notes"' in html
+
+    def test_phase_type_select_offers_the_madr008_enum(self) -> None:
+        """The phase type select offers exactly the MADR-008 phase_type enum."""
+        html = self._html()
+
+        for value in ("base", "build", "peak", "taper", "recovery", "competition"):
+            assert f'value="{value}"' in html, value
+
+    def test_phase_dates_use_date_inputs(self) -> None:
+        """The phase start/end fields are date inputs (ISO dates by construction)."""
+        html = self._html()
+        start_at = html.index('x-model="phase.start_date"')
+        input_tag = html[html.rindex("<input", 0, start_at) : html.index(">", start_at) + 1]
+
+        assert 'type="date"' in input_tag
+
+    def test_phases_section_reuses_the_settings_form_classes(self) -> None:
+        """The phase fieldsets reuse the #166 token-driven form classes."""
+        html = self._html()
+        phases_at = html.index('@submit.prevent="savePhases()"')
+        section = html[phases_at : html.index("</form>", phases_at)]
+
+        assert 'class="goal-fieldset"' in section
+        assert 'class="field-label"' in section
+        assert "button--ghost" in section
+
+    # --- state root consistency (B1/B2 mirror) ----------------------------------
+
+    def test_phases_form_state_root_is_consistent_across_files(self) -> None:
+        """The phases form root declared in app.js is the one bound in index.html.
+
+        B1/B2 mirror (PR #171 review): the HTML bindings and the Alpine
+        component state must share ONE root identifier — a rename on one
+        side only leaves the section runtime-dead while string assertions
+        stay green.
+        """
+        script = self._script()
+        html = self._html()
+
+        declared = re.findall(r"phasesForm\s*:\s*\{", script)
+        assert len(declared) == 1, "app.js must declare exactly one phasesForm root"
+
+        html_roots = set(re.findall(r"phasesForm\.\w+", html))
+        assert html_roots, "index.html must bind the phases form state"
+        assert html_roots == {"phasesForm.phases"}, html_roots
+
+        js_refs = set(re.findall(r"this\.phasesForm", script))
+        assert js_refs == {"this.phasesForm"}, js_refs
+
+    def test_phases_form_initializes_empty_with_a_blank_factory(self) -> None:
+        """The phases form starts empty; addPhase uses a blank-phase factory."""
+        script = self._script()
+
+        assert "phasesForm: { phases: [] }" in script
+        assert "function blankPhaseForm()" in script
+        add = _rule_block(script, "addPhase()")
+        assert "blankPhaseForm()" in add
+
+    # --- load/save wiring ---------------------------------------------------------
+
+    def test_settings_open_loads_the_phases(self) -> None:
+        """Opening the panel loads both the profile and the phases."""
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        load = _rule_block(script, "loadPhases()")
+
+        assert "this.loadPhases()" in open_block
+        assert 'fetch("/api/periodization")' in load
+        assert 'method: "PUT"' not in load
+
+    def test_phases_save_via_put(self) -> None:
+        """Saving posts the form to PUT /api/periodization."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert 'fetch("/api/periodization"' in save
+        assert 'method: "PUT"' in save
+
+    def test_phases_save_normalizes_empty_optionals_to_null(self) -> None:
+        """Empty optional numerics/text serialize as null, not empty strings."""
+        script = self._script()
+        payload = _rule_block(script, "payloadFromPhasesForm()")
+
+        assert 'phase.weeklyHoursTarget === ""' in payload
+        assert "Number(phase.weeklyHoursTarget)" in payload
+        assert ".trim()" in payload
+
+    def test_phases_save_surfaces_only_a_generic_error(self) -> None:
+        """Save failures show a static message — no server detail echoed (nLPD)."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert "Could not save phases" in save
+        assert "body.detail" not in save
+
+    def test_phases_save_guard_blocks_double_submit(self) -> None:
+        """savePhases guards on its own in-flight flag (mirrors saveObjectives)."""
+        save = _rule_block(self._script(), "savePhases()")
+
+        assert "if (this.phasesSaving)" in save
+        assert "this.phasesSaving = true" in save
+        assert "this.phasesSaving = false" in save
+
+    # --- a11y & styling -------------------------------------------------------------
+
+    def test_phases_section_introduces_no_x_html(self) -> None:
+        """The page keeps exactly one x-html binding (assistant messages)."""
+        html = self._html()
+
+        assert html.count("x-html") == 1
+
+    def test_phases_title_is_labelled(self) -> None:
+        """The section carries a visible heading for structure."""
+        html = self._html()
+
+        assert "Periodization phases" in html
+
+    def test_phases_styles_use_tokens(self) -> None:
+        """Any new phase styling is token-driven (no color literals)."""
+        css = self._css()
+        title = _rule_block(css, ".phases-title")
+
+        assert title, ".phases-title rule missing"
+        assert "var(--" in title
+        assert "#" not in title
