@@ -128,8 +128,9 @@ keeps the panel and its pinned composer usable while staying below the
 computed height on typical portrait phones, so the #83 behavior is
 unchanged there. The plan card's step loop no longer shadows the message
 loop's ``index`` binding (renamed ``stepIndex``, behavior-identical), and
-the PLAN_CARD_TEMPLATE literal is split at the condition boundary for
-readability without changing assertions.
+the PLAN_CARD_TEMPLATE literal is collapsed to a single literal — the
+only black-stable readable form at line-length 100 — without changing
+assertions.
 """
 
 import re
