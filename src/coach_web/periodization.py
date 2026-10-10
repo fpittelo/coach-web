@@ -140,6 +140,10 @@ class PeriodizationPlan(BaseModel):
         starts (monotonic), so even disjoint out-of-order ranges are caught.
         """
         for previous, following in zip(self.phases, self.phases[1:], strict=False):
+            # Shared-boundary days are rejected deliberately: with inclusive
+            # resolution (start <= today <= end) two phases sharing a day
+            # would both contain "today"; the valid encoding is contiguous
+            # (next.start = prev.end + 1).
             if date.fromisoformat(following.start_date) <= date.fromisoformat(previous.end_date):
                 raise ValueError("phases must be monotonic and non-overlapping")
         return self
@@ -306,15 +310,3 @@ async def replace_phases(
         )
     await session.commit()
     return list(plan.phases)
-
-
-async def delete_phases(session: AsyncSession, objective_id: int) -> int:
-    """Remove every phase of the objective; returns the number removed."""
-    existing = await list_phases(session, objective_id)
-    if not existing:
-        return 0
-    await session.execute(
-        delete(PeriodizationPhaseRow).where(PeriodizationPhaseRow.objective_id == objective_id)
-    )
-    await session.commit()
-    return len(existing)

@@ -30,7 +30,6 @@ from coach_web.periodization import (
     PHASE_TYPES,
     PeriodizationPhase,
     PeriodizationPlan,
-    delete_phases,
     list_phases,
     replace_phases,
     resolve_phase_status,
@@ -642,22 +641,6 @@ class TestPeriodizationRepository:
             loaded = await list_phases(session, objective_id)
 
         assert [phase.start_date for phase in loaded] == ["2026-09-01", "2026-12-16"]
-
-    async def test_delete_phases_removes_and_counts(self, db_session_factory: Any) -> None:
-        """delete_phases removes every phase and reports the count."""
-        plan = PeriodizationPlan.model_validate(_plan_payload())
-
-        async with db_session_factory() as session:
-            objective_id = await self._seed_objective(session)
-            await replace_phases(session, objective_id, plan)
-
-            removed = await delete_phases(session, objective_id)
-            remaining = await list_phases(session, objective_id)
-            removed_again = await delete_phases(session, objective_id)
-
-        assert removed == 2
-        assert remaining == []
-        assert removed_again == 0
 
     async def test_deleting_the_objective_cascades(self, db_session_factory: Any) -> None:
         """Removing the parent objective removes its phases (MADR-008 CASCADE)."""

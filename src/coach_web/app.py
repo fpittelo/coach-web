@@ -4,6 +4,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
@@ -289,7 +290,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Duck-typed agents (test stubs) may not carry the attribute; the
             # default prompt is the base every real agent is built with.
             base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
-            agent.system_prompt = apply_objectives_digest(base_prompt, profile, phases=phases)
+            # The clock is resolved once here (N3, PR #173): the digest's
+            # phase resolution takes an explicit ``today`` so the call site
+            # owns the clock boundary instead of the domain default.
+            agent.system_prompt = apply_objectives_digest(
+                base_prompt, profile, phases=phases, today=date.today()
+            )
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
