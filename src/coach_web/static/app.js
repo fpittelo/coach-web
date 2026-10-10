@@ -204,6 +204,11 @@ function coachApp() {
     // Survives finishStream so a failure stays visible; cleared on the next
     // send or reset.
     errorBanner: "",
+    // Sign-in action for the banner (#180): armed only when a stream fails
+    // with 401 (expired/missing session) — the banner then carries a real
+    // /auth/login link next to the message. Every other banner writer keeps
+    // it off, so the action never outlives its 401 cause.
+    errorBannerSignin: false,
     // 90 s no-event watchdog (#84): timer id plus the epoch and assistant
     // bubble index of the stream that armed it.
     watchdog: null,
@@ -719,8 +724,9 @@ function coachApp() {
       this.phase = "waiting";
       this.statusText = "Connecting";
       // A new attempt clears the previous failure banner (AC3: retry by
-      // sending again, no reload).
+      // sending again, no reload) and any sign-in action armed by it (#180).
       this.errorBanner = "";
+      this.errorBannerSignin = false;
       this.thoughts = [];
       this.tools = [];
       this.plan = null;
@@ -760,7 +766,11 @@ function coachApp() {
       })
         .then(async (response) => {
           if (!response.ok || !response.body) {
-            throw new Error("Stream unavailable (" + response.status + ")");
+            // The status rides the error (#180): a 401 arms the banner's
+            // sign-in action in the catch below.
+            const failure = new Error("Stream unavailable (" + response.status + ")");
+            failure.status = response.status;
+            throw failure;
           }
           await this.consumeSse(response.body, handlers);
           this.finishStream();
@@ -784,6 +794,12 @@ function coachApp() {
               this.statusText = error.message || "Connection failed";
               this.errorBanner =
                 error.message || "Connection failed. You can send another message.";
+              // 401 sign-in action (#180): an expired or missing session
+              // surfaces a real /auth/login link next to the banner message
+              // (defense-in-depth for the server-injected identity-bar
+              // link). Any other failure keeps the action hidden. The
+              // banner stays non-blocking (#84): the composer is untouched.
+              this.errorBannerSignin = error.status === 401;
               if (!this.messages[index].content) {
                 this.messages[index].content = "⚠️ " + this.statusText;
               }
@@ -986,6 +1002,9 @@ function coachApp() {
           this.statusText = data.message || "Error";
           this.errorBanner =
             data.message || "The coach hit an error. You can send another message.";
+          // A typed agent error is never a 401 (the middleware rejects those
+          // before the stream exists) — keep the sign-in action off (#180).
+          this.errorBannerSignin = false;
           if (!this.messages[index].content) {
             this.messages[index].content = "⚠️ " + this.statusText;
           }
@@ -1053,6 +1072,8 @@ function coachApp() {
       this.statusText = "Timed out";
       this.errorBanner =
         "The coach stopped responding (no updates for 90 s). You can send another message.";
+      // A timeout is not a 401 — keep the sign-in action off (#180).
+      this.errorBannerSignin = false;
       if (!this.messages[this.watchdogIndex].content) {
         this.messages[this.watchdogIndex].content = "⚠️ " + this.statusText;
       }
@@ -1093,6 +1114,7 @@ function coachApp() {
       this.weekDayStatus = {};
       this.input = "";
       this.errorBanner = "";
+      this.errorBannerSignin = false;
       this.liveAnnouncement = "";
       this.phase = "idle";
       // Re-arm following (#85): the emptied log cannot fire a scroll event

@@ -521,6 +521,27 @@ body {
   font-size: 0.85rem;
 }
 
+/* Sign-in affordance (issue 180): real /auth/login links — the
+   server-injected identity-bar link for unauthenticated visitors and the
+   401 banner action (expired-session path). Token-driven;
+   keyboard-reachable anchors with the button contract's visible focus
+   ring. */
+
+.signin-link {
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.signin-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .thought {
   margin: 0;
   padding-left: var(--space-4);
