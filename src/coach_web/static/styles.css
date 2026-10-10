@@ -521,6 +521,27 @@ body {
   font-size: 0.85rem;
 }
 
+/* Sign-in affordance (issue 180): real /auth/login links — the
+   server-injected identity-bar link for unauthenticated visitors and the
+   401 banner action (expired-session path). Token-driven;
+   keyboard-reachable anchors with the button contract's visible focus
+   ring. */
+
+.signin-link {
+  color: var(--accent);
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.signin-link:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
 .thought {
   margin: 0;
   padding-left: var(--space-4);
@@ -857,6 +878,40 @@ body {
   .week-table td.week-day-actions::before {
     content: none;
   }
+
+  /* Periodization phase table (issue 182) stacks with the same pattern —
+     the data-label attributes in the card markup become the per-cell labels
+     (no actions column, so no extra ::before suppression). */
+
+  .periodization-table thead {
+    display: none;
+  }
+
+  .periodization-table tr {
+    display: block;
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .periodization-table tr:last-child {
+    border-bottom: none;
+  }
+
+  .periodization-table td {
+    display: block;
+    border-bottom: none;
+    padding: var(--space-1) 0;
+  }
+
+  .periodization-table td::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
 }
 
 /* --- Footer ------------------------------------------------------------ */
@@ -1015,19 +1070,6 @@ body {
 .settings-actions {
   display: flex;
   justify-content: flex-end;
-}
-
-/* Periodization phases section (issue 167, AC1): reuses the issue-166 form
-   classes (goal-fieldset/field/field-row/field-label/goal-remove); only
-   the section heading is new — token-driven, no animation of its own. */
-
-.phases-title {
-  margin: 0;
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--accent);
 }
 
 /* --- Reduced motion (AC3, #85) ------------------------------------------ */

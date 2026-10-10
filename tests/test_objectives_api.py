@@ -1,9 +1,14 @@
 """Objectives API contract: GET/PUT /api/objectives + system-prompt digest (#166).
 
 AC1 (settings view path), AC2 (persistence), AC3 (digest injection with a
-stubbed agent), AC4 (strict validation, generic 422 detail — nLPD #142
-precedent: validation detail stays server-side) and the auth-gating AC are
-pinned here against the real app with a migrated per-test SQLite database.
+stubbed agent), AC4 (strict validation) and the auth-gating AC are pinned
+here against the real app with a migrated per-test SQLite database.
+
+Since #181 the settings PUT answers 422 with the owner-safe structured
+reason body ``{code, message}`` from the fixed vocabulary
+(:mod:`coach_web.errors`) — the authenticated owner may learn WHY their save
+failed. The chat/model-facing endpoints keep the strict #142 generic detail
+(``TestGenericValidationHandler`` pins that posture unchanged).
 """
 
 import json
@@ -160,10 +165,8 @@ class TestObjectivesEndpoints:
         assert profile["primary_goal"]["title"] == "Updated goal"
         assert profile["weekly_availability_hours"] == 12.0
 
-    def test_put_rejects_unknown_objective_type_with_generic_detail(
-        self, migrated_db: Path
-    ) -> None:
-        """AC4: malformed updates are rejected 422 with a generic detail."""
+    def test_put_rejects_unknown_objective_type_with_a_reason_code(self, migrated_db: Path) -> None:
+        """AC1 #181: malformed updates carry the owner-safe invalid_values reason."""
         with TestClient(create_app()) as client:
             response = client.put(
                 "/api/objectives",
@@ -171,20 +174,26 @@ class TestObjectivesEndpoints:
             )
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
-        # nLPD (#142 precedent): the rejected input is never echoed.
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
+        # nLPD: the rejected input is never echoed — not even in the reason body.
         assert "fantasy" not in response.text
 
-    def test_put_rejects_missing_primary_goal_with_generic_detail(self, migrated_db: Path) -> None:
-        """AC4: a payload without the primary goal is rejected generically."""
+    def test_put_rejects_missing_primary_goal_with_a_reason_code(self, migrated_db: Path) -> None:
+        """AC1 #181: a payload without the primary goal carries the reason body."""
         with TestClient(create_app()) as client:
             response = client.put("/api/objectives", json={"weekly_availability_hours": 8})
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
 
     def test_put_rejects_negative_target_value(self, migrated_db: Path) -> None:
-        """AC4: target_value below zero is rejected."""
+        """AC4: target_value below zero is rejected with the reason body."""
         with TestClient(create_app()) as client:
             response = client.put(
                 "/api/objectives",
@@ -192,10 +201,13 @@ class TestObjectivesEndpoints:
             )
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
 
     def test_put_rejects_availability_hours_above_168(self, migrated_db: Path) -> None:
-        """AC4: weekly availability beyond 168 hours is rejected."""
+        """AC4: weekly availability beyond 168 hours is rejected with the reason body."""
         with TestClient(create_app()) as client:
             response = client.put(
                 "/api/objectives",
@@ -203,10 +215,15 @@ class TestObjectivesEndpoints:
             )
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
 
-    def test_put_rejects_malformed_target_date(self, migrated_db: Path) -> None:
-        """AC4: a non-ISO target date is rejected."""
+    def test_put_rejects_malformed_target_date_with_the_dates_reason(
+        self, migrated_db: Path
+    ) -> None:
+        """AC1 #181: a non-ISO target date carries the invalid_dates reason."""
         with TestClient(create_app()) as client:
             response = client.put(
                 "/api/objectives",
@@ -214,7 +231,32 @@ class TestObjectivesEndpoints:
             )
 
         assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.json() == {
+            "code": "invalid_dates",
+            "message": "One or more dates are invalid.",
+        }
+        # nLPD: the rejected input is never echoed.
+        assert "09/2027" not in response.text
+
+    def test_put_rejects_a_malformed_json_body_with_a_reason_code(self, migrated_db: Path) -> None:
+        """AC1 #181: even a JSON decode failure yields the structured reason body.
+
+        The catch-all mapping keeps the settings 422 shape consistent: the UI
+        contract (known code → server message, else generic fallback) never
+        meets a bare ``detail`` body on a settings path.
+        """
+        with TestClient(create_app()) as client:
+            response = client.put(
+                "/api/objectives",
+                content=b"{not json",
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 422
+        assert response.json() == {
+            "code": "invalid_values",
+            "message": "One or more values are out of range.",
+        }
 
 
 class TestObjectivesAuthGating:

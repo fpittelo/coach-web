@@ -39,6 +39,7 @@
             <span class="product-name">Coach Web</span>
           </div>
           <div class="identity-actions">
+            <!-- #180 signin-slot: swapped for the sign-in link by the / route when it renders an unauthenticated session (auth enabled). -->
             <button
               class="button button--ghost settings-toggle"
               type="button"
@@ -340,6 +341,85 @@
                     ></p>
                   </div>
                 </template>
+                <!-- Periodization card (#182): renders beneath the assistant
+                     message that proposed it. periodizationPlan/
+                     periodizationMessageIndex pins the single active card to
+                     the proposing message — a new periodization_plan replaces
+                     the previous one (#82 rule). Structured Pydantic→HTML
+                     only: x-text bindings, never markdown (ADR-006 §9,
+                     STRIDE #87). The approval note is a role="status" live
+                     region (WCAG 4.1.3); Approve posts the plan to POST
+                     /api/periodization/approve — the human-in-the-loop gate
+                     (#87 C7) — and Reject dismisses without persisting. -->
+                <template x-if="message.role === 'assistant' && periodizationPlan && periodizationMessageIndex === index">
+                  <div
+                    class="plan-card periodization-card"
+                    role="region"
+                    aria-label="Proposed periodization plan"
+                  >
+                    <p class="plan-card-label">Season plan</p>
+                    <p
+                      class="plan-rationale"
+                      x-show="periodizationPlan.rationale"
+                      x-text="periodizationPlan.rationale"
+                    ></p>
+                    <div class="plan-table-wrap">
+                      <table class="interval-table periodization-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Phase</th>
+                            <th scope="col">Type</th>
+                            <th scope="col">Dates</th>
+                            <th scope="col">Focus</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template
+                            x-for="(phase, phaseIndex) in periodizationPlan.plan.phases"
+                            :key="phaseIndex"
+                          >
+                            <tr>
+                              <td data-label="Phase" x-text="phase.name"></td>
+                              <td data-label="Type" x-text="phase.phase_type"></td>
+                              <td
+                                data-label="Dates"
+                                x-text="phase.start_date + ' → ' + phase.end_date"
+                              ></td>
+                              <td data-label="Focus" x-text="phase.focus || '—'"></td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                    <div class="plan-actions">
+                      <button
+                        class="button"
+                        type="button"
+                        @click="approvePeriodization()"
+                        :disabled="
+                          periodizationApproval.state === 'submitting' ||
+                          periodizationApproval.state === 'approved'
+                        "
+                      >
+                        Approve
+                      </button>
+                      <button
+                        class="button button--ghost"
+                        type="button"
+                        @click="rejectPeriodization()"
+                      >
+                        Reject
+                      </button>
+                    </div>
+                    <p
+                      class="approval-note"
+                      role="status"
+                      :class="{ 'approval-note--error': periodizationApproval.state === 'error' }"
+                      x-show="periodizationApproval.message"
+                      x-text="periodizationApproval.message"
+                    ></p>
+                  </div>
+                </template>
               </article>
             </template>
           </div>
@@ -389,8 +469,13 @@
                and the composer. It never overlays or disables anything —
                the only composer disable condition is the in-flight
                streaming flag, so the user can always retry by sending
-               again. -->
-          <p class="error-banner" x-show="errorBanner" x-text="errorBanner"></p>
+               again. The sign-in action (#180) appears only when the
+               failure status was 401 (expired/missing session) and links
+               to /auth/login — a real, keyboard-reachable anchor. -->
+          <p class="error-banner" x-show="errorBanner">
+            <span x-text="errorBanner"></span>
+            <a class="signin-link" x-show="errorBannerSignin" href="/auth/login">Sign in</a>
+          </p>
 
           <form class="composer" @submit.prevent="send()">
             <!-- Auto-growing composer (#83): rows="1" starts as a single
@@ -557,107 +642,13 @@
               x-show="settingsMessage"
               x-text="settingsMessage"
             ></p>
+            <!-- #181 AC2: the 401 sign-in affordance — a real link next to
+                 the "Please sign in." note, gated on the flag so the action
+                 never outlives its 401 cause (pairs with #180). -->
+            <a class="signin-link" x-show="settingsSignin" href="/auth/login">Sign in</a>
             <div class="settings-actions">
               <button class="button" type="submit" :disabled="settingsSaving">
                 Save objectives
-              </button>
-            </div>
-          </form>
-          <!-- Periodization phases section (#167, AC1): the active
-               objective's macrocycle phases, edited with the same
-               structured-Pydantic→HTML patterns as the goals form above —
-               x-text/x-model bindings, no raw-HTML binding anywhere, the
-               issue-166 focus trap covers the new controls (it queries the
-               whole panel), and the save action rides its own form and
-               failure surface. -->
-          <form class="settings-form" @submit.prevent="savePhases()">
-            <h3 class="phases-title">Periodization phases</h3>
-            <p class="settings-lede">
-              Season phases scale the coach's weekly load recommendations.
-              They must not overlap and must reach your target date.
-            </p>
-            <template x-for="(phase, phaseIndex) in phasesForm.phases" :key="phaseIndex">
-              <fieldset class="goal-fieldset">
-                <legend class="goal-legend" x-text="phase.phase_type"></legend>
-                <div class="field-row">
-                  <label class="field">
-                    <span class="field-label">Type</span>
-                    <select x-model="phase.phase_type">
-                      <option value="base">Base</option>
-                      <option value="build">Build</option>
-                      <option value="peak">Peak</option>
-                      <option value="taper">Taper</option>
-                      <option value="recovery">Recovery</option>
-                      <option value="competition">Competition</option>
-                    </select>
-                  </label>
-                  <label class="field field--grow">
-                    <span class="field-label">Name</span>
-                    <input
-                      type="text"
-                      x-model="phase.name"
-                      maxlength="200"
-                      required
-                    />
-                  </label>
-                </div>
-                <div class="field-row">
-                  <label class="field">
-                    <span class="field-label">Start date</span>
-                    <input type="date" x-model="phase.start_date" required />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">End date</span>
-                    <input type="date" x-model="phase.end_date" required />
-                  </label>
-                  <label class="field">
-                    <span class="field-label">Weekly hours</span>
-                    <input
-                      type="number"
-                      x-model="phase.weeklyHoursTarget"
-                      min="0"
-                      max="168"
-                      step="0.5"
-                    />
-                  </label>
-                </div>
-                <label class="field field--grow">
-                  <span class="field-label">Focus</span>
-                  <input
-                    type="text"
-                    x-model="phase.focus"
-                    maxlength="200"
-                    placeholder="Aerobic base, long rides"
-                  />
-                </label>
-                <label class="field">
-                  <span class="field-label">Notes</span>
-                  <textarea
-                    x-model="phase.notes"
-                    rows="2"
-                    maxlength="2000"
-                  ></textarea>
-                </label>
-                <button
-                  class="button button--ghost goal-remove"
-                  type="button"
-                  @click="removePhase(phaseIndex)"
-                >
-                  Remove phase
-                </button>
-              </fieldset>
-            </template>
-            <button class="button button--ghost" type="button" @click="addPhase()">
-              Add phase
-            </button>
-            <p
-              class="settings-note"
-              x-show="phasesMessage"
-              x-text="phasesMessage"
-            ></p>
-            <div class="settings-actions">
-              <button class="button" type="submit" :disabled="phasesSaving">
-                Save phases
               </button>
             </div>
           </form>

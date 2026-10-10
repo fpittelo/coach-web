@@ -31,6 +31,24 @@
  * retry-failed-days subset. Adjust prefills the composer and never
  * auto-sends (PO Q8).
  *
+ * Periodization card (#182): the coach-proposed season phase plan renders
+ * as a third single-active conversation card pinned via the
+ * periodizationPlan / periodizationMessageIndex pair. The card shows the
+ * phases (type, name, dates, focus) plus the coach's rationale; Approve
+ * posts {plan} to POST /api/periodization/approve — the server re-validates
+ * and persists through the #167 repository, so no phase is ever stored
+ * without the athlete's explicit approval (#87 C7). Reject dismisses
+ * without persisting. The manual settings editor is gone (PO pivot):
+ * phases are coach output, not athlete input.
+ *
+ * Settings error reasons (#181): the owner-facing settings saves (objectives
+ * PUT, periodization approval) surface the server's structured, owner-safe
+ * 422 body {code, message} — the message renders only when its code is in
+ * the client's fixed SETTINGS_REASON_CODES vocabulary, else the generic
+ * text (fail-safe). A 401 surfaces "Please sign in." with a real /auth/login
+ * link in the settings modal (pairs with #180). Every other surface keeps
+ * the strict #142 posture: no exception text, no input echo (nLPD).
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -121,6 +139,36 @@ const MONTH_LABELS = [
   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
 
+// Settings reason vocabulary (#181): the client mirror of the server's fixed
+// enum (coach_web.errors.SettingsReason). The settings 422 body is
+// {code, message}; the server-provided message renders ONLY when its code is
+// in this vocabulary — an unknown or missing code (vocabulary drift, a
+// non-settings error shape) falls back to the current generic text
+// (fail-safe). Fixed vocabulary only: no exception text, no input echo (nLPD).
+const SETTINGS_REASON_CODES = {
+  coverage_target_date: true,
+  overlap: true,
+  invalid_dates: true,
+  invalid_values: true,
+};
+
+function settingsReasonMessage(body, fallback) {
+  // Owner-safe 422 rendering (#181): return the server-provided message when
+  // the body carries a KNOWN reason code and a non-empty string message;
+  // anything else returns the caller's generic fallback unchanged. The
+  // hasOwnProperty guard keeps prototype keys out of the vocabulary check.
+  if (
+    body &&
+    typeof body.code === "string" &&
+    Object.prototype.hasOwnProperty.call(SETTINGS_REASON_CODES, body.code) &&
+    typeof body.message === "string" &&
+    body.message
+  ) {
+    return body.message;
+  }
+  return fallback;
+}
+
 function parsePayload(event) {
   try {
     const raw = typeof event === "string" ? JSON.parse(event) : JSON.parse(event.data);
@@ -173,21 +221,6 @@ function blankGoalForm() {
   };
 }
 
-function blankPhaseForm() {
-  // Blank phase form factory (#167): shared by the add-phase action — the
-  // phases list starts empty (no periodization is a legitimate state) and
-  // grows one blank phase per click.
-  return {
-    phase_type: "base",
-    name: "",
-    start_date: "",
-    end_date: "",
-    focus: "",
-    weeklyHoursTarget: null,
-    notes: "",
-  };
-}
-
 function coachApp() {
   return {
     messages: [],
@@ -204,6 +237,11 @@ function coachApp() {
     // Survives finishStream so a failure stays visible; cleared on the next
     // send or reset.
     errorBanner: "",
+    // Sign-in action for the banner (#180): armed only when a stream fails
+    // with 401 (expired/missing session) — the banner then carries a real
+    // /auth/login link next to the message. Every other banner writer keeps
+    // it off, so the action never outlives its 401 cause.
+    errorBannerSignin: false,
     // 90 s no-event watchdog (#84): timer id plus the epoch and assistant
     // bubble index of the stream that armed it.
     watchdog: null,
@@ -232,6 +270,18 @@ function coachApp() {
     weekMessageIndex: -1,
     weekApproval: { state: "idle", message: "" },
     weekDayStatus: {},
+    // Periodization card (#182): the coach-proposed season phase plan
+    // renders as a third single-active conversation card pinned via the
+    // periodizationPlan/periodizationMessageIndex pair (#82 replacement
+    // rule — a new periodization_plan event replaces the card). The payload
+    // carries the validated plan (its phases) plus the coach's rationale;
+    // Approve posts {plan} to POST /api/periodization/approve — the
+    // human-in-the-loop gate (#87 C7) — and Reject dismisses without
+    // persisting. The manual settings editor is gone (PO pivot): phases are
+    // coach output, not athlete input.
+    periodizationPlan: null,
+    periodizationMessageIndex: -1,
+    periodizationApproval: { state: "idle", message: "" },
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -252,19 +302,16 @@ function coachApp() {
     settingsOpen: false,
     settingsSaving: false,
     settingsMessage: "",
+    // Sign-in action for the settings note (#181 AC2): armed only when a
+    // settings API call fails with 401 — the note then carries a real
+    // /auth/login link next to "Please sign in." (pairs with #180). Every
+    // other writer keeps it off, so the action never outlives its 401 cause.
+    settingsSignin: false,
     objectivesForm: {
       goals: [blankGoalForm()],
       weeklyAvailabilityHours: 0,
       priorityDisciplines: "",
     },
-    // Periodization phases panel (#167, AC1): the active objective's
-    // macrocycle phases, loaded on open and saved via PUT
-    // /api/periodization. Own state root and failure surface — a separate
-    // concern from the objective profile form above. All bindings are
-    // x-text/x-model (structured Pydantic→HTML, no x-html).
-    phasesForm: { phases: [] },
-    phasesSaving: false,
-    phasesMessage: "",
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -413,8 +460,11 @@ function coachApp() {
     // ------------------------------------------------------------------
     // Objectives settings panel (#166, AC1). The panel loads the persisted
     // ObjectiveProfile on open and saves it via PUT /api/objectives. All
-    // bindings are structured x-text/x-model; error surfaces are static
-    // strings only — server validation detail is never echoed (nLPD, #142).
+    // bindings are structured x-text/x-model. Error surfaces (#181): the
+    // owner-safe structured reason message renders for known codes, the
+    // generic text is the fallback, and a 401 surfaces the sign-in prompt
+    // with a real /auth/login link — no other server detail is echoed
+    // (nLPD, #142 posture unchanged for everything else).
     // ------------------------------------------------------------------
 
     toggleSettings() {
@@ -428,8 +478,8 @@ function coachApp() {
     openSettings() {
       this.settingsOpen = true;
       this.settingsMessage = "";
+      this.settingsSignin = false;
       this.loadObjectives();
-      this.loadPhases();
       // Move focus into the dialog (keyboard accessibility): the panel is
       // tabindex="-1" so it is programmatically focusable without entering
       // the tab order.
@@ -515,7 +565,16 @@ function coachApp() {
       fetch("/api/objectives")
         .then(async (response) => {
           if (!response.ok) {
-            throw new Error("Load failed (" + response.status + ")");
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a data problem — surface the prompt and arm the
+            // /auth/login link. Any other failure keeps the generic text.
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            this.settingsMessage = "Could not load objectives.";
+            return;
           }
           const body = await response.json();
           this.objectivesForm = this.formFromProfile(body.profile);
@@ -559,6 +618,7 @@ function coachApp() {
       }
       this.settingsSaving = true;
       this.settingsMessage = "";
+      this.settingsSignin = false;
       fetch("/api/objectives", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
@@ -566,15 +626,30 @@ function coachApp() {
       })
         .then(async (response) => {
           if (!response.ok) {
-            throw new Error("Save failed (" + response.status + ")");
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a data problem — never "check the values".
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            // 422 (#181 AC1): the owner-safe structured reason body
+            // {code, message} renders for known codes; unknown/missing codes
+            // fall back to the generic text (fail-safe). The generic detail
+            // body is never read (nLPD #142 posture for everything else).
+            const body = await response.json().catch(() => ({}));
+            this.settingsMessage = settingsReasonMessage(
+              body,
+              "Could not save objectives. Check the values and retry."
+            );
+            return;
           }
           const body = await response.json();
           this.objectivesForm = this.formFromProfile(body.profile);
           this.settingsMessage = "Objectives saved.";
         })
         .catch(() => {
-          // Static message only — the server's 422 detail is generic by
-          // design (nLPD #142) and never echoed here.
+          // Transport failure: the generic text — no server detail echoed.
           this.settingsMessage = "Could not save objectives. Check the values and retry.";
         })
         .finally(() => {
@@ -592,104 +667,6 @@ function coachApp() {
       if (index > 0) {
         this.objectivesForm.goals.splice(index, 1);
       }
-    },
-
-    // ------------------------------------------------------------------
-    // Periodization phases panel (#167, AC1). The panel loads the active
-    // objective's persisted phases on open and saves them via PUT
-    // /api/periodization. All bindings are structured x-text/x-model;
-    // error surfaces are static strings only — server validation detail is
-    // never echoed (nLPD, #142).
-    // ------------------------------------------------------------------
-
-    formFromPlan(plan) {
-      // API → form: optional numerics ride as strings in the inputs and
-      // normalize to null on save (mirrors the goals form).
-      const toPhaseForm = (phase) => ({
-        phase_type: (phase && phase.phase_type) || "base",
-        name: (phase && phase.name) || "",
-        start_date: (phase && phase.start_date) || "",
-        end_date: (phase && phase.end_date) || "",
-        focus: (phase && phase.focus) || "",
-        weeklyHoursTarget:
-          phase && phase.weekly_hours_target !== null && phase.weekly_hours_target !== undefined
-            ? phase.weekly_hours_target
-            : null,
-        notes: (phase && phase.notes) || "",
-      });
-      if (!plan || !plan.phases) {
-        return { phases: [] };
-      }
-      return { phases: plan.phases.map(toPhaseForm) };
-    },
-
-    loadPhases() {
-      fetch("/api/periodization")
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("Load failed (" + response.status + ")");
-          }
-          const body = await response.json();
-          this.phasesForm = this.formFromPlan(body);
-        })
-        .catch(() => {
-          this.phasesMessage = "Could not load phases.";
-        });
-    },
-
-    payloadFromPhasesForm() {
-      // Form → API: empty optional numerics/text serialize as null (the API
-      // validates strict types — an empty string would be a 422).
-      const fromPhaseForm = (phase) => ({
-        phase_type: phase.phase_type,
-        name: phase.name,
-        start_date: phase.start_date,
-        end_date: phase.end_date,
-        focus: phase.focus.trim() === "" ? null : phase.focus,
-        weekly_hours_target:
-          phase.weeklyHoursTarget === "" || phase.weeklyHoursTarget === null
-            ? null
-            : Number(phase.weeklyHoursTarget),
-        notes: phase.notes.trim() === "" ? null : phase.notes,
-      });
-      return { phases: this.phasesForm.phases.map(fromPhaseForm) };
-    },
-
-    savePhases() {
-      if (this.phasesSaving) {
-        return;
-      }
-      this.phasesSaving = true;
-      this.phasesMessage = "";
-      fetch("/api/periodization", {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(this.payloadFromPhasesForm()),
-      })
-        .then(async (response) => {
-          if (!response.ok) {
-            throw new Error("Save failed (" + response.status + ")");
-          }
-          const body = await response.json();
-          this.phasesForm = this.formFromPlan(body);
-          this.phasesMessage = "Phases saved.";
-        })
-        .catch(() => {
-          // Static message only — the server's 422 detail is generic by
-          // design (nLPD #142) and never echoed here.
-          this.phasesMessage = "Could not save phases. Check the dates and retry.";
-        })
-        .finally(() => {
-          this.phasesSaving = false;
-        });
-    },
-
-    addPhase() {
-      this.phasesForm.phases.push(blankPhaseForm());
-    },
-
-    removePhase(index) {
-      this.phasesForm.phases.splice(index, 1);
     },
 
     send() {
@@ -719,8 +696,9 @@ function coachApp() {
       this.phase = "waiting";
       this.statusText = "Connecting";
       // A new attempt clears the previous failure banner (AC3: retry by
-      // sending again, no reload).
+      // sending again, no reload) and any sign-in action armed by it (#180).
       this.errorBanner = "";
+      this.errorBannerSignin = false;
       this.thoughts = [];
       this.tools = [];
       this.plan = null;
@@ -733,6 +711,12 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+      // The periodization card (#182) follows the same replacement posture:
+      // a new stream clears the previous card; the agent's periodization_plan
+      // event (if any) re-pins a fresh one.
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -760,7 +744,11 @@ function coachApp() {
       })
         .then(async (response) => {
           if (!response.ok || !response.body) {
-            throw new Error("Stream unavailable (" + response.status + ")");
+            // The status rides the error (#180): a 401 arms the banner's
+            // sign-in action in the catch below.
+            const failure = new Error("Stream unavailable (" + response.status + ")");
+            failure.status = response.status;
+            throw failure;
           }
           await this.consumeSse(response.body, handlers);
           this.finishStream();
@@ -784,6 +772,12 @@ function coachApp() {
               this.statusText = error.message || "Connection failed";
               this.errorBanner =
                 error.message || "Connection failed. You can send another message.";
+              // 401 sign-in action (#180): an expired or missing session
+              // surfaces a real /auth/login link next to the banner message
+              // (defense-in-depth for the server-injected identity-bar
+              // link). Any other failure keeps the action hidden. The
+              // banner stays non-blocking (#84): the composer is untouched.
+              this.errorBannerSignin = error.status === 401;
               if (!this.messages[index].content) {
                 this.messages[index].content = "⚠️ " + this.statusText;
               }
@@ -970,6 +964,24 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        periodization_plan: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Periodization card (#182): the validated plan arrives as
+          // data.plan with the coach's rationale alongside; the card
+          // replaces any previous periodization card (#82 rule). BOTH are
+          // consumed into state — storing only the plan would silently
+          // drop the rationale line the card renders (PR #184 review).
+          this.periodizationPlan = data.plan
+            ? { plan: data.plan, rationale: data.rationale || "" }
+            : null;
+          this.periodizationMessageIndex = index;
+          this.periodizationApproval = { state: "idle", message: "" };
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -986,6 +998,9 @@ function coachApp() {
           this.statusText = data.message || "Error";
           this.errorBanner =
             data.message || "The coach hit an error. You can send another message.";
+          // A typed agent error is never a 401 (the middleware rejects those
+          // before the stream exists) — keep the sign-in action off (#180).
+          this.errorBannerSignin = false;
           if (!this.messages[index].content) {
             this.messages[index].content = "⚠️ " + this.statusText;
           }
@@ -1053,6 +1068,8 @@ function coachApp() {
       this.statusText = "Timed out";
       this.errorBanner =
         "The coach stopped responding (no updates for 90 s). You can send another message.";
+      // A timeout is not a 401 — keep the sign-in action off (#180).
+      this.errorBannerSignin = false;
       if (!this.messages[this.watchdogIndex].content) {
         this.messages[this.watchdogIndex].content = "⚠️ " + this.statusText;
       }
@@ -1091,8 +1108,12 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
       this.input = "";
       this.errorBanner = "";
+      this.errorBannerSignin = false;
       this.liveAnnouncement = "";
       this.phase = "idle";
       // Re-arm following (#85): the emptied log cannot fire a scroll event
@@ -1290,6 +1311,72 @@ function coachApp() {
       this.weekMessageIndex = -1;
       this.weekApproval = { state: "idle", message: "" };
       this.weekDayStatus = {};
+    },
+
+    // ------------------------------------------------------------------
+    // Periodization card (#182). The coach-proposed season phase plan is
+    // approved as one POST (/api/periodization/approve) — the server
+    // re-validates the plan and persists it through the #167 repository
+    // (coverage-validated). The explicit approval is the human-in-the-loop
+    // gate (#87 C7): no phase persistence without the athlete's consent.
+    // Reject dismisses the card without persisting.
+    // ------------------------------------------------------------------
+
+    approvePeriodization() {
+      if (!this.periodizationPlan || this.periodizationApproval.state === "submitting") {
+        return;
+      }
+      this.periodizationApproval = { state: "submitting", message: "Saving phases…" };
+
+      fetch("/api/periodization/approve", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ plan: this.periodizationPlan.plan }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            // 401 (#181 AC2): an expired or missing session is a sign-in
+            // problem, not a plan problem — never "try again".
+            if (response.status === 401) {
+              this.periodizationApproval = {
+                state: "error",
+                message: "Please sign in.",
+              };
+              return;
+            }
+            // 422 (#181 AC1): the owner-safe structured reason body
+            // {code, message} renders for known codes (the live coverage
+            // case); unknown/missing codes fall back to the generic text
+            // (fail-safe). The generic detail body is never read and no
+            // error text is echoed (nLPD #142 posture for everything else).
+            const body = await response.json().catch(() => ({}));
+            this.periodizationApproval = {
+              state: "error",
+              message: settingsReasonMessage(body, "Could not save the phase plan. Try again."),
+            };
+            return;
+          }
+          this.periodizationApproval = {
+            state: "approved",
+            message: "Periodization approved.",
+          };
+        })
+        .catch(() => {
+          // Transport failure: the same generic message — no server detail
+          // and no error text echoed (nLPD #142 posture).
+          this.periodizationApproval = {
+            state: "error",
+            message: "Could not save the phase plan. Try again.",
+          };
+        });
+    },
+
+    rejectPeriodization() {
+      // Dismiss the card and clear the periodization state (#82 AC2): the
+      // pin goes with it, and nothing is persisted.
+      this.periodizationPlan = null;
+      this.periodizationMessageIndex = -1;
+      this.periodizationApproval = { state: "idle", message: "" };
     },
 
     get planDuration() {

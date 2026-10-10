@@ -12,6 +12,10 @@ Persistence follows MADR-008: the phases live in the ``periodization_phases``
 table (C1 — plaintext, tactical coaching state), FK-cascaded onto their
 parent ``athlete_objectives`` row (a phase is meaningless without its
 objective). The plan is replaced wholesale per objective (PUT semantics).
+Since #182 the write path is coach-driven: the agent proposes the plan via
+the ``propose_periodization`` tool and the athlete approves it through
+``POST /api/periodization/approve`` — the manual athlete-facing editor is
+gone (PO design pivot: the athlete is not the coach).
 """
 
 from collections.abc import Sequence
@@ -24,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
+from coach_web.errors import SettingsReason, SettingsValidationError
 from coach_web.models import validate_iso_date
 
 PHASE_TYPES = ("base", "build", "peak", "taper", "recovery", "competition")
@@ -42,6 +47,9 @@ MAX_PHASE_FOCUS_LENGTH = 200
 
 MAX_PHASE_NOTES_LENGTH = 2000
 """Cap on the optional free-form notes."""
+
+MAX_PROPOSAL_RATIONALE_LENGTH = 2000
+"""Cap on the coach's proposal rationale shown on the approval card (#182)."""
 
 PHASE_LOAD_HINTS: dict[PhaseType, str] = {
     "base": "aerobic base, high volume, low intensity",
@@ -109,10 +117,41 @@ class PeriodizationPhase(BaseModel):
 
     @model_validator(mode="after")
     def _validate_date_order(self) -> "PeriodizationPhase":
-        """Reject an inverted range (mirrors the DB CHECK constraint)."""
+        """Reject an inverted range (mirrors the DB CHECK constraint).
+
+        Threaded with the ``invalid_dates`` reason (#181): the settings
+        boundary maps the typed condition to the owner-safe body without
+        string-matching the message.
+        """
         if date.fromisoformat(self.start_date) > date.fromisoformat(self.end_date):
-            raise ValueError("start_date must not be after end_date")
+            raise SettingsValidationError(
+                SettingsReason.INVALID_DATES, "start_date must not be after end_date"
+            )
         return self
+
+
+def ensure_monotonic_non_overlapping(phases: Sequence[PeriodizationPhase]) -> None:
+    """Raise ValueError unless the phases are monotonic and non-overlapping.
+
+    ``next.start > prev.end`` enforces both properties at once: it forbids
+    shared days (non-overlapping) and implies strictly increasing starts
+    (monotonic), so even disjoint out-of-order ranges are caught. Shared
+    boundary days are rejected deliberately: with inclusive resolution
+    (start <= today <= end) two phases sharing a day would both contain
+    "today"; the valid encoding is contiguous (next.start = prev.end + 1).
+
+    The rule is shared by :class:`PeriodizationPlan` (the persisted plan) and
+    :class:`PeriodizationProposal` (the coach's tool payload, #182) so both
+    surfaces enforce exactly one invariant.
+
+    Threaded with the ``overlap`` reason (#181): the settings boundary maps
+    the typed condition to the owner-safe body without string-matching.
+    """
+    for previous, following in zip(phases, phases[1:], strict=False):
+        if date.fromisoformat(following.start_date) <= date.fromisoformat(previous.end_date):
+            raise SettingsValidationError(
+                SettingsReason.OVERLAP, "phases must be monotonic and non-overlapping"
+            )
 
 
 class PeriodizationPlan(BaseModel):
@@ -133,19 +172,8 @@ class PeriodizationPlan(BaseModel):
 
     @model_validator(mode="after")
     def _validate_monotonic_non_overlapping(self) -> "PeriodizationPlan":
-        """Reject overlapping or out-of-order phases.
-
-        ``next.start > prev.end`` enforces both properties at once: it
-        forbids shared days (non-overlapping) and implies strictly increasing
-        starts (monotonic), so even disjoint out-of-order ranges are caught.
-        """
-        for previous, following in zip(self.phases, self.phases[1:], strict=False):
-            # Shared-boundary days are rejected deliberately: with inclusive
-            # resolution (start <= today <= end) two phases sharing a day
-            # would both contain "today"; the valid encoding is contiguous
-            # (next.start = prev.end + 1).
-            if date.fromisoformat(following.start_date) <= date.fromisoformat(previous.end_date):
-                raise ValueError("phases must be monotonic and non-overlapping")
+        """Reject overlapping or out-of-order phases (shared rule, #182)."""
+        ensure_monotonic_non_overlapping(self.phases)
         return self
 
 
@@ -159,6 +187,55 @@ class PeriodizationPlanResponse(BaseModel):
     phases: list[PeriodizationPhase] = Field(
         default_factory=list,
         description="Ordered macrocycle phases of the active objective",
+    )
+
+
+class PeriodizationProposal(BaseModel):
+    """The coach's periodization proposal — phases plus rationale (#182).
+
+    Flat tool-argument shape (mirrors the #168 weekly draft): the phases
+    re-use the strict :class:`PeriodizationPhase` models and the plan-level
+    monotonic/non-overlap invariant through
+    :func:`ensure_monotonic_non_overlapping`, so the coach is held to exactly
+    the rules the manual editor enforced — server re-validation, never
+    trusting agent numbers. Keeping the phases at the proposal's top level
+    (instead of nesting a ``PeriodizationPlan``) also keeps the plan-level
+    invariant a model-level error with an empty ``loc``, so its static rule
+    message reaches the model value-free and the agent can self-correct.
+    The ``rationale`` is display-only (the approval card's explanation line)
+    and is not persisted.
+    """
+
+    phases: list[PeriodizationPhase] = Field(
+        default_factory=list,
+        max_length=MAX_PHASES,
+        description="Ordered macrocycle phases (earliest first)",
+    )
+    rationale: str = Field(
+        ...,
+        min_length=1,
+        max_length=MAX_PROPOSAL_RATIONALE_LENGTH,
+        description="Why this phase sequence fits the objective and availability",
+    )
+
+    @model_validator(mode="after")
+    def _validate_monotonic_non_overlapping(self) -> "PeriodizationProposal":
+        """Reject overlapping or out-of-order phases (shared rule, #182)."""
+        ensure_monotonic_non_overlapping(self.phases)
+        return self
+
+
+class PeriodizationApprovalRequest(BaseModel):
+    """Approve-periodization request payload (#182).
+
+    The browser posts the card's plan verbatim; the endpoint re-validates it
+    at the boundary and cross-checks coverage against the active objective's
+    target date before persisting (human-in-the-loop gate, #87 C7).
+    """
+
+    plan: PeriodizationPlan = Field(
+        ...,
+        description="The approved periodization plan to persist",
     )
 
 
@@ -188,6 +265,11 @@ def validate_plan_coverage(plan: PeriodizationPlan, target_date: str | None) -> 
     target must fall within ``[first start, last end]``. An empty plan (no
     periodization) or an objective without a target date skips the check —
     clearing the phases is always legitimate.
+
+    Threaded with the ``coverage_target_date`` reason (#181): the approval
+    endpoint catches the typed condition and answers the owner with the
+    structured reason body — the live case from the issue (a 422 whose
+    "phases must cover the window…" truth was masked as "check the dates").
     """
     if target_date is None or not plan.phases:
         return
@@ -197,7 +279,10 @@ def validate_plan_coverage(plan: PeriodizationPlan, target_date: str | None) -> 
     )
     last_end = date.fromisoformat(max(plan.phases, key=lambda phase: phase.end_date).end_date)
     if first_start > target or last_end < target:
-        raise ValueError("phases must cover the window to the objective target date")
+        raise SettingsValidationError(
+            SettingsReason.COVERAGE_TARGET_DATE,
+            "phases must cover the window to the objective target date",
+        )
 
 
 def resolve_phase_status(

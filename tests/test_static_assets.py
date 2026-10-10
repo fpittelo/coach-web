@@ -131,6 +131,15 @@ loop's ``index`` binding (renamed ``stepIndex``, behavior-identical), and
 the PLAN_CARD_TEMPLATE literal is collapsed to a single literal — the
 only black-stable readable form at line-length 100 — without changing
 assertions.
+
+Issue #180 adds the sign-in affordance for auth-enabled lanes: the public
+landing route injects a "Sign in" link into the identity bar for
+unauthenticated visitors (server-side, via the ``signin-slot`` marker
+comment — no JS logic), and the #84 error banner gains a sign-in action
+when a stream fails with 401 (expired-session defense-in-depth). Both are
+real keyboard-reachable links to /auth/login with tokenized styling; the
+banner stays non-blocking and the #84 error-separation contract is
+untouched.
 """
 
 import re
@@ -700,6 +709,7 @@ class TestIdentityBarContract:
             "plan_proposal",
             "plan",
             "week_plan",
+            "periodization_plan",
             "error",
             "done",
         ):
@@ -2090,6 +2100,13 @@ class TestObjectivesSettingsContract:
         assert 'fetch("/api/objectives")' in load
         assert 'method: "PUT"' not in load
 
+    def test_load_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 load surfaces "Please sign in." in the settings note (#181 AC2)."""
+        load = _rule_block(self._script(), "loadObjectives()")
+
+        assert "Please sign in." in load
+        assert "this.settingsSignin = true" in load
+
     def test_settings_save_via_put(self) -> None:
         """Saving posts the form to PUT /api/objectives."""
         save = _rule_block(self._script(), "saveObjectives()")
@@ -2109,12 +2126,63 @@ class TestObjectivesSettingsContract:
         assert ".trim()" in payload
         assert '.filter((item) => item !== "")' in payload
 
-    def test_save_surfaces_only_a_generic_error(self) -> None:
-        """Save failures show a static message — no server detail echoed (nLPD)."""
+    def test_save_surfaces_the_server_reason_for_known_codes(self) -> None:
+        """422 saves render the server's structured reason message (#181).
+
+        The owner-safe reason body {code, message} reaches the settings note:
+        the shared helper gates the server message on the client's fixed code
+        vocabulary, and the generic text stays as the fallback.
+        """
         save = _rule_block(self._script(), "saveObjectives()")
 
-        assert "Could not save objectives" in save
+        assert "settingsReasonMessage(" in save
+        assert "Could not save objectives. Check the values and retry." in save
+        # The generic detail body is never read — the structured body replaced it.
         assert "body.detail" not in save
+
+    def test_save_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 save surfaces "Please sign in." — never "check the values" (#181 AC2)."""
+        save = _rule_block(self._script(), "saveObjectives()")
+
+        assert "Please sign in." in save
+        assert "this.settingsSignin = true" in save
+
+    def test_settings_signin_flag_is_declared_once(self) -> None:
+        """The sign-in flag is component state, defaulting off."""
+        script = self._script()
+
+        assert "settingsSignin: false" in script
+        assert script.count("settingsSignin: ") == 1
+
+    def test_settings_signin_flag_resets_with_the_message(self) -> None:
+        """Opening the panel and saving clear the sign-in action (#180 posture).
+
+        The action never outlives its 401 cause: every writer that clears the
+        settings message clears the flag with it.
+        """
+        script = self._script()
+        open_block = _rule_block(script, "openSettings()")
+        save = _rule_block(script, "saveObjectives()")
+
+        assert "this.settingsSignin = false" in open_block
+        assert "this.settingsSignin = false" in save
+
+    def test_settings_modal_renders_the_signin_link(self) -> None:
+        """The settings message area carries a real /auth/login link (#181 AC2).
+
+        Pairs with the #180 affordance: the link is a sibling anchor gated on
+        the flag — never x-html inside the x-text note — and it sits in the
+        message area, before the form's action row.
+        """
+        html = self._html()
+        panel_at = html.index('id="settings-panel"')
+        panel = html[panel_at:]
+        link_at = panel.index('x-show="settingsSignin"')
+
+        assert 'class="signin-link" x-show="settingsSignin" href="/auth/login"' in panel
+        assert ">Sign in</a>" in panel
+        # The affordance lives in the message area, above the action row.
+        assert link_at < panel.index('class="settings-actions"')
 
     # --- focus management -------------------------------------------------------------
 
@@ -2190,19 +2258,17 @@ class TestObjectivesSettingsContract:
         assert "x-text=\"goalIndex === 0 ? 'Primary goal' : 'Secondary goal'\"" in html
 
 
-class TestPeriodizationSettingsContract:
-    """Periodization phases section in the settings modal (#167, AC1).
+class TestPhasesEditorRemoval:
+    """The manual phases editor is removed from the settings modal (#182).
 
-    The settings modal gains a phases section: the list of the active
-    objective's macrocycle phases (type, name, start/end dates, focus,
-    weekly hours, notes) with add/edit/remove. Same patterns as the #166
-    objectives form: structured Pydantic→HTML bindings only (x-text/x-model
-    — the page keeps exactly ONE x-html binding), the #166 focus trap
-    (reused verbatim — the trap queries the whole panel, so the new controls
-    are covered without changes), design tokens throughout, keyboard
-    accessible. The phases ride their own Alpine state root (``phasesForm``)
-    and their own GET/PUT endpoint — a separate concern from the objective
-    profile, with its own save action and failure surface.
+    PO design pivot on #167: phase ownership moved from the athlete to the
+    coach — *"I'm the athlete, not the coach."* Phases are coach output (the
+    ``propose_periodization`` approval card), not athlete input. The settings
+    modal returns to the #166 state (objectives only): the ``phasesForm``
+    state root, the section markup and the ``.phases-title`` style are all
+    gone, while the #166 objectives form and its binding-consistency contract
+    stay intact (the mirror test above keeps passing with the remaining
+    roots).
 
     app.js behavior is contracted through source assertions (no Node
     toolchain, ADR-006 §5).
@@ -2219,159 +2285,52 @@ class TestPeriodizationSettingsContract:
 
     # --- structure --------------------------------------------------------------
 
-    def test_phases_section_sits_inside_the_settings_panel(self) -> None:
-        """The phases form lives inside the settings modal, after the goals."""
+    def test_settings_modal_has_no_phases_editor(self) -> None:
+        """No phases form, heading or add/remove actions remain in the modal."""
         html = self._html()
 
-        panel_at = html.index('id="settings-panel"')
-        goals_at = html.index('@submit.prevent="saveObjectives()"')
-        phases_at = html.index('@submit.prevent="savePhases()"')
-        end_at = html.index("</body>")
+        assert "savePhases" not in html
+        assert "phasesForm" not in html
+        assert "addPhase" not in html
+        assert "removePhase" not in html
+        assert "Periodization phases" not in html
 
-        assert panel_at < goals_at < phases_at < end_at
-
-    def test_phases_render_through_a_single_loop(self) -> None:
-        """The phases render through one loop with add/remove actions."""
-        html = self._html()
-
-        assert '<template x-for="(phase, phaseIndex) in phasesForm.phases"' in html
-        assert "addPhase()" in html
-        assert '@click="removePhase(phaseIndex)"' in html
-
-    def test_phase_fields_bind_with_x_model(self) -> None:
-        """Every phase field binds via x-model — no HTML construction."""
-        html = self._html()
-
-        assert 'x-model="phase.phase_type"' in html
-        assert 'x-model="phase.name"' in html
-        assert 'x-model="phase.start_date"' in html
-        assert 'x-model="phase.end_date"' in html
-        assert 'x-model="phase.focus"' in html
-        assert 'x-model="phase.weeklyHoursTarget"' in html
-        assert 'x-model="phase.notes"' in html
-
-    def test_phase_type_select_offers_the_madr008_enum(self) -> None:
-        """The phase type select offers exactly the MADR-008 phase_type enum."""
-        html = self._html()
-
-        for value in ("base", "build", "peak", "taper", "recovery", "competition"):
-            assert f'value="{value}"' in html, value
-
-    def test_phase_dates_use_date_inputs(self) -> None:
-        """The phase start/end fields are date inputs (ISO dates by construction)."""
-        html = self._html()
-        start_at = html.index('x-model="phase.start_date"')
-        input_tag = html[html.rindex("<input", 0, start_at) : html.index(">", start_at) + 1]
-
-        assert 'type="date"' in input_tag
-
-    def test_phases_section_reuses_the_settings_form_classes(self) -> None:
-        """The phase fieldsets reuse the #166 token-driven form classes."""
-        html = self._html()
-        phases_at = html.index('@submit.prevent="savePhases()"')
-        section = html[phases_at : html.index("</form>", phases_at)]
-
-        assert 'class="goal-fieldset"' in section
-        assert 'class="field-label"' in section
-        assert "button--ghost" in section
-
-    # --- state root consistency (B1/B2 mirror) ----------------------------------
-
-    def test_phases_form_state_root_is_consistent_across_files(self) -> None:
-        """The phases form root declared in app.js is the one bound in index.html.
-
-        B1/B2 mirror (PR #171 review): the HTML bindings and the Alpine
-        component state must share ONE root identifier — a rename on one
-        side only leaves the section runtime-dead while string assertions
-        stay green.
-        """
-        script = self._script()
-        html = self._html()
-
-        declared = re.findall(r"phasesForm\s*:\s*\{", script)
-        assert len(declared) == 1, "app.js must declare exactly one phasesForm root"
-
-        html_roots = set(re.findall(r"phasesForm\.\w+", html))
-        assert html_roots, "index.html must bind the phases form state"
-        assert html_roots == {"phasesForm.phases"}, html_roots
-
-        js_refs = set(re.findall(r"this\.phasesForm", script))
-        assert js_refs == {"this.phasesForm"}, js_refs
-
-    def test_phases_form_initializes_empty_with_a_blank_factory(self) -> None:
-        """The phases form starts empty; addPhase uses a blank-phase factory."""
+    def test_app_js_has_no_phases_editor_state_or_methods(self) -> None:
+        """The phasesForm root and its load/save/normalize methods are gone."""
         script = self._script()
 
-        assert "phasesForm: { phases: [] }" in script
-        assert "function blankPhaseForm()" in script
-        add = _rule_block(script, "addPhase()")
-        assert "blankPhaseForm()" in add
+        assert "phasesForm" not in script
+        assert "phasesSaving" not in script
+        assert "phasesMessage" not in script
+        assert "blankPhaseForm" not in script
+        assert "loadPhases" not in script
+        assert "savePhases" not in script
+        assert "payloadFromPhasesForm" not in script
+        assert "formFromPlan" not in script
+        assert "addPhase" not in script
+        assert "removePhase" not in script
 
-    # --- load/save wiring ---------------------------------------------------------
+    def test_open_settings_loads_only_the_objectives(self) -> None:
+        """Opening the panel loads the profile — no phases fetch remains."""
+        open_block = _rule_block(self._script(), "openSettings()")
 
-    def test_settings_open_loads_the_phases(self) -> None:
-        """Opening the panel loads both the profile and the phases."""
+        assert "this.loadObjectives()" in open_block
+        assert "loadPhases" not in open_block
+
+    def test_no_athlete_periodization_fetch_remains_in_app_js(self) -> None:
+        """The only periodization HTTP call left in app.js is the approval POST."""
         script = self._script()
-        open_block = _rule_block(script, "openSettings()")
-        load = _rule_block(script, "loadPhases()")
 
-        assert "this.loadPhases()" in open_block
-        assert 'fetch("/api/periodization")' in load
-        assert 'method: "PUT"' not in load
+        assert script.count('"/api/periodization') == 1
+        assert 'fetch("/api/periodization/approve"' in script
 
-    def test_phases_save_via_put(self) -> None:
-        """Saving posts the form to PUT /api/periodization."""
-        save = _rule_block(self._script(), "savePhases()")
+    # --- styling ------------------------------------------------------------------
 
-        assert 'fetch("/api/periodization"' in save
-        assert 'method: "PUT"' in save
-
-    def test_phases_save_normalizes_empty_optionals_to_null(self) -> None:
-        """Empty optional numerics/text serialize as null, not empty strings."""
-        script = self._script()
-        payload = _rule_block(script, "payloadFromPhasesForm()")
-
-        assert 'phase.weeklyHoursTarget === ""' in payload
-        assert "Number(phase.weeklyHoursTarget)" in payload
-        assert ".trim()" in payload
-
-    def test_phases_save_surfaces_only_a_generic_error(self) -> None:
-        """Save failures show a static message — no server detail echoed (nLPD)."""
-        save = _rule_block(self._script(), "savePhases()")
-
-        assert "Could not save phases" in save
-        assert "body.detail" not in save
-
-    def test_phases_save_guard_blocks_double_submit(self) -> None:
-        """savePhases guards on its own in-flight flag (mirrors saveObjectives)."""
-        save = _rule_block(self._script(), "savePhases()")
-
-        assert "if (this.phasesSaving)" in save
-        assert "this.phasesSaving = true" in save
-        assert "this.phasesSaving = false" in save
-
-    # --- a11y & styling -------------------------------------------------------------
-
-    def test_phases_section_introduces_no_x_html(self) -> None:
-        """The page keeps exactly one x-html binding (assistant messages)."""
-        html = self._html()
-
-        assert html.count("x-html") == 1
-
-    def test_phases_title_is_labelled(self) -> None:
-        """The section carries a visible heading for structure."""
-        html = self._html()
-
-        assert "Periodization phases" in html
-
-    def test_phases_styles_use_tokens(self) -> None:
-        """Any new phase styling is token-driven (no color literals)."""
+    def test_phases_title_style_is_gone(self) -> None:
+        """The .phases-title rule is removed from the stylesheet."""
         css = self._css()
-        title = _rule_block(css, ".phases-title")
 
-        assert title, ".phases-title rule missing"
-        assert "var(--" in title
-        assert "#" not in title
+        assert ".phases-title" not in css
 
 
 class TestWeeklyPlanCardContract:
@@ -2589,8 +2548,358 @@ class TestWeeklyPlanCardContract:
         assert ".week-table" in media
         assert "display: block" in media
 
+    def test_periodization_table_stacks_on_narrow_viewports(self) -> None:
+        """At ≤375px the phase table stacks into per-phase blocks.
+
+        Mirrors the .week-table pattern (PR #184 review finding): the
+        data-label attributes in the markup become the per-cell labels, so
+        the phase table stays readable on narrow viewports.
+        """
+        css = self._css()
+        media = _media_block(css, "@media (max-width: 375px)")
+
+        assert ".periodization-table" in media
+        assert "display: block" in media
+        assert "attr(data-label)" in media
+
     def test_week_table_scrolls_in_an_overflow_wrapper(self) -> None:
         """The desktop day table rides the existing overflow-x wrapper."""
         card = self._week_card()
 
         assert "plan-table-wrap" in card
+
+
+class TestPeriodizationCardContract:
+    """Periodization approval card — state pair, rendering & approval contract (#182).
+
+    The coach-proposed season phase plan renders as a single conversation
+    card pinned to the proposing assistant message via the
+    ``periodizationPlan`` / ``periodizationMessageIndex`` state pair (#82
+    replacement rule — a new ``periodization_plan`` event replaces the card).
+    The card shows the phases (type, name, dates, focus) plus the coach's
+    rationale; Approve posts ``{plan}`` to POST /api/periodization/approve —
+    the server re-validates and persists through the #167 repository, so the
+    human-in-the-loop gate is preserved (#87 C7: no phase persistence without
+    explicit athlete approval); Reject dismisses without persisting. JS is
+    contracted via source assertions (no Node toolchain, ADR-006 §5).
+    """
+
+    PERIODIZATION_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && periodizationPlan && "
+        'periodizationMessageIndex === index">'
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.PERIODIZATION_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    # --- state pair & card pinning -------------------------------------------
+
+    def test_periodization_state_pair_is_declared_once(self) -> None:
+        """The periodizationPlan/periodizationMessageIndex pair is declared exactly once."""
+        script = self._script()
+
+        assert script.count("periodizationPlan: null") == 1
+        assert script.count("periodizationMessageIndex: -1") == 1
+
+    def test_periodization_card_is_pinned_to_the_proposing_message(self) -> None:
+        """The card template binds the periodizationPlan/periodizationMessageIndex pair."""
+        html = self._html()
+
+        assert self.PERIODIZATION_CARD_TEMPLATE in html
+
+    def test_periodization_plan_handler_pins_the_card(self) -> None:
+        """The periodization_plan handler pins the card with the FULL payload.
+
+        Replacement rule (#82): the card is re-pinned per proposal. The
+        handler must consume BOTH the plan and the coach's rationale into
+        state — storing only the plan would silently drop the rationale line
+        the card renders (PR #184 review finding).
+        """
+        script = self._script()
+        handler = _rule_block(script, "periodization_plan: (event) =>")
+
+        assert "this.periodizationPlan = " in handler
+        assert "data.plan" in handler
+        assert "data.rationale" in handler
+        assert "this.periodizationMessageIndex = index" in handler
+        assert "this.scrollToBottom()" in handler
+
+    def test_periodization_card_is_a_labelled_region(self) -> None:
+        """The card is a role=region with a static aria-label."""
+        card = self._card()
+
+        assert 'role="region"' in card
+        assert 'aria-label="Proposed periodization plan"' in card
+
+    # --- structured rendering (no markdown) -----------------------------------
+
+    def test_periodization_card_is_structured_pydantic_to_html(self) -> None:
+        """The card binds x-text only — never markdown/x-html."""
+        card = self._card()
+
+        assert "x-html" not in card
+        assert "renderMarkdown" not in card
+        assert "phase.phase_type" in card
+        assert "phase.name" in card
+        assert "phase.start_date" in card
+        assert "phase.end_date" in card
+        assert "phase.focus" in card
+        assert "periodizationPlan.rationale" in card
+
+    def test_periodization_card_loop_does_not_shadow_the_message_index(self) -> None:
+        """The phases loop binds phaseIndex — the message index stays intact."""
+        card = self._card()
+
+        assert 'x-for="(phase, phaseIndex)' in card
+        assert ':key="phaseIndex"' in card
+
+    # --- approval flow (#87 C7 human-in-the-loop gate) --------------------------
+
+    def test_approve_periodization_posts_the_plan_contract(self) -> None:
+        """Approve posts {plan} to /api/periodization/approve."""
+        script = self._script()
+        approve = _rule_block(script, "approvePeriodization()")
+
+        assert 'fetch("/api/periodization/approve"' in approve
+        assert 'method: "POST"' in approve
+        assert "JSON.stringify({ plan: this.periodizationPlan.plan })" in approve
+
+    def test_approve_periodization_guard_blocks_double_submit(self) -> None:
+        """approvePeriodization guards on its own in-flight state."""
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert 'this.periodizationApproval.state === "submitting"' in approve
+
+    def test_approve_periodization_surfaces_the_server_reason(self) -> None:
+        """Approval failures render the structured reason, generic fallback kept (#181).
+
+        Extends the #167/PR #184 pin: the server's structured {code, message}
+        reason body reaches the card note for known codes (the live case —
+        the coverage rule), while the generic text stays the fallback and the
+        generic detail body is never read, not even via an error.message
+        round-trip (nLPD posture for everything but the fixed reason body).
+        """
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert "settingsReasonMessage(" in approve
+        assert "Could not save the phase plan. Try again." in approve
+        assert "body.detail" not in approve
+        assert "error.message" not in approve
+
+    def test_approve_periodization_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 approval surfaces "Please sign in." — not "try again" (#181 AC2)."""
+        approve = _rule_block(self._script(), "approvePeriodization()")
+
+        assert "Please sign in." in approve
+
+    # --- reject & reset ---------------------------------------------------------
+
+    def test_reject_periodization_clears_the_card_state(self) -> None:
+        """Reject dismisses the card without persisting."""
+        reject = _rule_block(self._script(), "rejectPeriodization()")
+
+        assert "this.periodizationPlan = null" in reject
+        assert "this.periodizationMessageIndex = -1" in reject
+
+    def test_reset_chat_clears_the_periodization_state(self) -> None:
+        """New chat clears the periodization card state too."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.periodizationPlan = null" in reset
+        assert "this.periodizationMessageIndex = -1" in reset
+
+    def test_start_stream_clears_the_periodization_state(self) -> None:
+        """A new stream clears the periodization card (the #82 replacement posture)."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.periodizationPlan = null" in start
+        assert "this.periodizationMessageIndex = -1" in start
+
+    # --- accessibility -----------------------------------------------------------
+
+    def test_periodization_note_is_a_live_status_region(self) -> None:
+        """The approval note is a role=status region (WCAG 4.1.3)."""
+        card = self._card()
+
+        assert 'role="status"' in card
+
+
+class TestSettingsReasonRenderingContract:
+    """Owner-safe reason rendering — the client side of the #181 vocabulary.
+
+    The server answers settings 422s with ``{code, message}`` from a fixed
+    enum (:mod:`coach_web.errors`). The client mirrors that vocabulary and
+    renders the server-provided message ONLY when the code is known — an
+    unknown or missing code (a future server vocabulary drift, a non-settings
+    error shape) falls back to the current generic text (fail-safe). The
+    message is bound with x-text — structured data, never x-html (nLPD).
+    """
+
+    REASON_CODES = (
+        "coverage_target_date",
+        "overlap",
+        "invalid_dates",
+        "invalid_values",
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_reason_vocabulary_is_pinned(self) -> None:
+        """The client vocabulary mirrors the server enum exactly — four codes."""
+        script = self._script()
+        vocabulary = _rule_block(script, "SETTINGS_REASON_CODES = ")
+
+        for code in self.REASON_CODES:
+            assert code in vocabulary
+        # The vocabulary is a plain frozen map — no dynamic construction.
+        assert "Object.keys" not in vocabulary
+
+    def test_reason_helper_renders_only_known_codes(self) -> None:
+        """The helper gates the server message on the vocabulary (fail-safe)."""
+        helper = _rule_block(self._script(), "settingsReasonMessage(body, fallback)")
+
+        assert "hasOwnProperty" in helper
+        assert "typeof body.message" in helper
+
+    def test_reason_helper_takes_the_generic_fallback(self) -> None:
+        """Unknown/missing codes return the caller's generic text, unchanged."""
+        helper = _rule_block(self._script(), "settingsReasonMessage(body, fallback)")
+
+        assert "return fallback" in helper
+
+    def test_reason_message_is_bound_with_x_text_only(self) -> None:
+        """The settings note keeps x-text — the reason body is structured data."""
+        html = self._html()
+        note_at = html.index('class="settings-note"')
+        note = html[note_at : html.index("</p>", note_at)]
+
+        assert 'x-text="settingsMessage"' in note
+        assert "x-html" not in note
+
+
+class TestSignInAffordanceContract:
+    """Sign-in affordance for auth-enabled lanes (#180).
+
+    Two surfaces lead an unauthenticated (or expired-session) visitor to
+    /auth/login:
+
+    1. Identity bar (server-side): the public landing route swaps the
+       ``signin-slot`` marker comment for a real sign-in link when it
+       renders an unauthenticated session — no JS logic, no new endpoint.
+       The raw static file keeps the inert marker, so /static/index.html
+       and auth-disabled lanes are byte-identical to today (AC3).
+    2. Error banner (defense-in-depth): a stream failure with status 401
+       surfaces a sign-in action next to the #84 banner message, covering
+       sessions that expire mid-conversation. The banner stays
+       non-blocking and the typed/transport error separation (#84) is
+       untouched.
+
+    app.js behavior is contracted through source assertions (ADR-006 §5 —
+    no Node toolchain), same as every stream/approval wiring test above.
+    """
+
+    SIGNIN_SLOT = "<!-- #180 signin-slot:"
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    # --- identity bar slot (server-injected link) ----------------------------
+
+    def test_identity_bar_declares_the_signin_slot(self) -> None:
+        """The marker comment lives inside the identity bar's actions group."""
+        html = self._html()
+        actions_at = html.index('<div class="identity-actions">')
+        slot_at = html.index(self.SIGNIN_SLOT)
+        actions_close = html.index("</div>", actions_at)
+
+        assert actions_at < slot_at < actions_close
+
+    def test_signin_link_styles_are_tokenized(self) -> None:
+        """The link rides the v0.7 tokens with a visible keyboard focus ring."""
+        css = self._css()
+        link = _rule_block(css, ".signin-link")
+
+        assert "var(--accent)" in link
+        assert "text-decoration: underline" in link
+
+        focus = _rule_block(css, ".signin-link:focus-visible")
+        assert "outline" in focus
+        assert "var(--accent)" in focus
+
+    # --- 401 banner sign-in action ---------------------------------------------
+
+    def test_error_banner_surfaces_signin_on_401(self) -> None:
+        """The banner carries a sign-in link gated on the 401 flag."""
+        html = self._html()
+        banner_at = html.index('class="error-banner"')
+        banner = html[banner_at : html.index("</p>", banner_at)]
+
+        assert 'x-show="errorBannerSignin"' in banner
+        assert 'href="/auth/login"' in banner
+        assert ">Sign in</a>" in banner
+
+    def test_component_declares_the_banner_signin_flag(self) -> None:
+        """The flag is explicit component state, defaulting to hidden."""
+        script = self._script()
+
+        assert "errorBannerSignin: false" in script
+
+    def test_stream_failure_carries_the_response_status(self) -> None:
+        """The !ok branch attaches the HTTP status to the thrown error."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "failure.status = response.status" in start
+
+    def test_401_failure_sets_the_banner_signin_flag(self) -> None:
+        """Only a 401 transport failure arms the banner sign-in action."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.errorBannerSignin = error.status === 401" in start
+
+    def test_banner_signin_flag_resets_with_the_banner(self) -> None:
+        """A stale sign-in action never survives into a new stream or a reset."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+        reset = _rule_block(script, "resetChat()")
+
+        assert "this.errorBannerSignin = false" in start
+        assert "this.errorBannerSignin = false" in reset
+
+    def test_non_401_banner_writers_clear_the_signin_flag(self) -> None:
+        """Every other banner writer keeps the flag off (no misleading action)."""
+        script = self._script()
+        typed = _rule_block(script, "error: (event) =>")
+        watchdog = _rule_block(script, "handleWatchdogTimeout()")
+
+        assert "this.errorBannerSignin = false" in typed
+        assert "this.errorBannerSignin = false" in watchdog
+
+    def test_banner_signin_keeps_the_84_contracts(self) -> None:
+        """The banner stays non-blocking: composer gating and clears unchanged."""
+        script = self._script()
+        start = _rule_block(script, "startStream(message)")
+        reset = _rule_block(script, "resetChat()")
+
+        assert 'this.errorBanner = ""' in start
+        assert 'this.errorBanner = ""' in reset
+        # The typed handler still never ends the stream (#84 AC2).
+        typed = _rule_block(script, "error: (event) =>")
+        assert "this.finishStream()" not in typed
