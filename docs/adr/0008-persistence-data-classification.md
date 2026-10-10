@@ -1,8 +1,8 @@
 # MADR-0008: Persist Coaching Lifecycle Data in SQLite (WAL) with App-Level Field Encryption
 
-- **Status:** proposed
+- **Status:** accepted (2026-10-10 — security conditions C1–C6 embedded; see Security review outcome)
 - **Date:** 2026-10-10
-- **Deciders:** @architect, @fpittelo (Product Owner acceptance pending); security routing: @cyber-security (review pending, blocking acceptance)
+- **Deciders:** @architect, @fpittelo (PO approval: epic #161 grooming decisions + Sprint 12 go-ahead, 2026-10-10); security routing: @cyber-security (review completed 2026-10-10 — conditional approval, conditions C1–C6 embedded below)
 
 ## Context
 
@@ -23,7 +23,7 @@ This spike (#162) blocks Stories 1.1, 1.2 and 2.1 of epic #161. Implementation i
 - **SSOT discipline:** telemetry/workouts/wellness already live in Intervals.icu; duplicating large time-series locally would create a second source of truth and a reconciliation burden.
 - **Backup story:** "lose the machine" must not mean losing coaching history; backups must not leak health data even unencrypted at the backup target.
 - **Secrets discipline (#112):** per-lane, per-service env files (`chmod 600`, gitignored); no shared `.env`; secrets never logged or in the repository.
-- **Existing dependency tree:** `pyjwt[crypto]` already resolves `cryptography` transitively (pyproject.toml:25) — app-level crypto is nearly free to introduce.
+- **Existing dependency tree:** `pyjwt[crypto]` already resolves `cryptography` transitively (pyproject.toml:25) — app-level crypto is nearly free to introduce. *(Security condition C6: `cryptography` must be declared as a direct dependency with a version floor at implementation — transitive resolution via pyjwt is fragile.)*
 
 ## Considered Options
 
@@ -71,7 +71,15 @@ A dedicated, per-lane `DATA_ENCRYPTION_KEY` env-file secret (32-byte urlsafe-bas
 2. **Blast radius / compartmentalization:** `AUTH_SESSION_SECRET` signs HS256 session tokens and lives in the transmitted authentication path. Compromise of the auth secret should not automatically expose the entire health-data archive; a derived key makes one compromise compound into both.
 3. **Lane semantics differ:** dev/qa run `AUTH_ENABLED=false` (ADR-007) yet still hold debrief data in the lane volume; a data key tied to an auth secret is semantically wrong for lanes that authenticate nobody.
 
-Key-loss consequence: an unrecoverable `DATA_ENCRYPTION_KEY` means unrecoverable encrypted fields (plaintext tables survive). Mitigation in the backup/restore story below. Key rotation on compromise: supported by a re-encrypt-at-rest maintenance step (decrypt with old key, rewrite with new key, in a migration-style script), to be specified at implementation time.
+Key-loss consequence: an unrecoverable `DATA_ENCRYPTION_KEY` means unrecoverable encrypted fields (plaintext tables survive). Mitigation in the backup/restore story below.
+
+**Key lifecycle (security conditions C2/C4/C5, from the 2026-10-10 @cyber-security review):**
+
+- **Escrow mechanism (C2):** the per-lane `DATA_ENCRYPTION_KEY` is escrowed in a password manager **plus** one offline copy on a separate encrypted medium; the key backup is **never co-located** with the DB backup. Key recovery is an explicit step in the restore runbook and is exercised in every restore rehearsal.
+- **Rotation (C4):** rotation uses `cryptography.fernet.MultiFernet` with a key list (or an equivalent `key_version` column) so rotation is online, idempotent, and reversible — a crash mid-rotation must never leave mixed ciphertext that cannot be attributed to a key. The rotation runbook (add new key as first MultiFernet entry → re-encrypt pass → drop old key) is specified at implementation.
+- **In-process handling (C5):** the key is loaded as `pydantic.SecretStr` (via pydantic-settings), never logged, never `repr`'d; a redaction regression test pins this. Known residual: env-var injection means the key is visible to `docker inspect` and `/proc/<pid>/environ` on the host — accepted under the threat model below.
+
+**Threat-model boundary (explicit, per security review):** Fernet + dedicated key addresses disk theft (LUKS primary, Fernet defense-in-depth), backup leakage (for encrypted classes), and container-volume compromise (ciphertext on the volume). It provides **no protection against full host compromise**: the key (env file) and the ciphertext (lane volume) are co-located on the same host filesystem, both under the FDE boundary. This exclusion is accepted for the single-user local-first topology; the boundary that actually matters is the **backup boundary**, where key and DB backups must never be co-located.
 
 ### Migration tooling
 
@@ -106,9 +114,9 @@ Chosen option: **E1 + X3 + M1 + B1** — *SQLite (WAL) as the internal store; se
 | # | Data class | Examples | Store | Protection at rest | Retention | Rationale |
 |:--|:---|:---|:---|:---|:---|:---|
 | C1 | Athlete objectives & targets | goals, availability notes, FTP/watts targets, milestone dates | SQLite (WAL), table `athlete_objectives` + `periodization_phases` | plaintext | until achieved/abandoned, then archived rows retained 1 season, then purged | tactical coaching state; derived personal data, low sensitivity; needed unencrypted for plan generation queries |
-| C2 | Debrief entries | RPE 1–10, sensation ratings, qualitative notes | SQLite (WAL), table `debrief_entries` | **Fernet field encryption** (all debrief body fields: `rpe`, `sensation_ratings`, `qualitative_notes_enc`) | indefinite (longitudinal athlete memory) — purge on explicit owner request | **Health data, nLPD Art. 5(c)**; ciphertext in volume and backups; never queried (fetch by unencrypted date/id only) |
+| C2 | Debrief entries | RPE 1–10, sensation ratings, qualitative notes | SQLite (WAL), table `debrief_entries` | **Fernet field encryption** (all debrief body fields: `rpe`, `sensation_ratings`, `qualitative_notes_enc`) | indefinite (longitudinal athlete memory) — purge on explicit owner request, **plus a configurable hard cap (default 5 years) with a documented purge path** | **Health data, nLPD Art. 5(c)**; ciphertext in volume and backups; never queried (fetch by unencrypted date/id only). Storage-limitation rationale (nLPD Art. 5(c) proportionality): the longitudinal memory is the data's *purpose* — the athlete's own coaching history — with owner-purge + cap as the limitation control. Known residual (security review F9): plaintext `session_date` + `intervals_workout_id` leak debrief existence/timing metadata; RPE encryption is classification consistency, not meaningful protection against metadata analysis |
 | C3 | Weekly plan drafts & approval states | plan markdown, draft/approved/rejected status, approval timestamps | SQLite (WAL), table `plan_drafts` | plaintext | active drafts kept; superseded drafts pruned after 4 weeks | operational workflow state; plan text already exists in the GitHub plan branch (same sensitivity) |
-| C4 | Weekly review snapshots | point-in-time CTL/ATL/TSB snapshot, review summary, adherence score | SQLite (WAL), table `weekly_reviews` | snapshot payload plaintext (already resides in Intervals.icu); **summary fields Fernet-encrypted** (`summary_enc`) | rolling 52 weeks, older rows purged | snapshots duplicate Intervals SSOT data deliberately (point-in-time, offline availability); review narrative is personal/health context → encrypted |
+| C4 | Weekly review snapshots | point-in-time CTL/ATL/TSB snapshot, review summary, adherence score | SQLite (WAL), table `weekly_reviews` | snapshot payload plaintext (already resides in Intervals.icu); **summary fields Fernet-encrypted** (`summary_enc`) | rolling 52 weeks, older rows purged | snapshots duplicate Intervals SSOT data deliberately (point-in-time, offline availability); review narrative is personal/health context → encrypted. Classification rationale (security review F7): the snapshot duplicates data Intervals.icu already holds under the same athlete identity — the local copy adds *availability*, not *exposure*; the newly-created narrative is the sensitive part and is encrypted |
 | C5 | Telemetry, workouts, wellness records | HR/power/pace streams, wellness scores, activity details | **Intervals.icu (SSOT)** — on-demand fetch via `coach-mcp`, never persisted by Coach Web | n/a (platform-managed) | platform-managed | avoids duplicating large time-series and a second SSOT; the Intervals.icu transfer is already assessed in docs/security.md (#112) |
 
 No `user_id` column anywhere: the application is single-tenant by construction (whitelist admits exactly one Google account, docs/security.md) — a per-row user dimension would be dead weight. This is revisited only if multi-athlete support ever enters scope.
@@ -191,7 +199,7 @@ All timestamps are UTC ISO-8601 TEXT (SQLite convention); JSON payloads use the 
 | `id` | INTEGER | PK AUTOINCREMENT |
 | `session_date` | TEXT (date) | NOT NULL — the dismissed debrief target |
 | `dismissed_at` | TEXT | NOT NULL |
-| `reason` | TEXT | nullable |
+| `reason` | TEXT | nullable — **bounded to a fixed enum** (`done`, `not-today`, `injury`) per security review F10; free-text health context must not land here |
 | `expires_at` | TEXT | nullable — flag auto-ignorable after this point (banner may re-surface) |
 
 Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)`, `plan_drafts(week_start_date)`, `periodization_phases(objective_id)`, `weekly_reviews(week_start_date)` (unique).
@@ -205,8 +213,8 @@ Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)
 
 ### Backup / restore
 
-- **Backup:** host-side cron (outside the container — the container stays `read_only`-hardened and unprivileged) runs a nightly `sqlite3 .backup` (online, WAL-safe) of the lane volume file into a versioned backup directory. Because C2/C4 sensitive fields are Fernet ciphertext, the archive is safe to move off-host even to an unencrypted target.
-- **Key recovery:** `DATA_ENCRYPTION_KEY` must be recoverable independently of the machine or the encrypted data is lost — the per-lane env file is backed up to an offline, encrypted medium separate from the DB backups (open question for the PO below). Never co-locate key and DB backup unprotected.
+- **Backup:** host-side cron (outside the container — the container stays `read_only`-hardened and unprivileged) runs a nightly `sqlite3 .backup` (online, WAL-safe) of the lane volume file into a versioned backup directory. **Backup-claim qualification (security condition C1):** only the C2/C4 encrypted fields are ciphertext-safe; **C1 (objectives, availability notes, FTP/watts targets) and C3 (plan drafts) travel in the archive as plaintext** — the archive is therefore NOT safe on an unencrypted target. The backup medium itself must be encrypted (e.g. an encrypted disk image or `age`/`gpg`-encrypted archive), or the claim is limited to "C2/C4 protected, C1/C3 exposed".
+- **Key recovery:** `DATA_ENCRYPTION_KEY` must be recoverable independently of the machine or the encrypted data is lost — escrow per the key-lifecycle section (password manager + offline encrypted copy, never co-located with the DB backup). Key recovery is exercised in every restore rehearsal (security condition C2).
 - **Restore:** stop lane → replace volume file with the backup → start lane → verify (health-check + a spot check of a recent debrief decryption). Restore is rehearsed before the first prod release of the persistence story; re-rehearsed quarterly.
 - **Purge path:** C1/C3/C4 retention pruning and C2 owner-request purge are documented maintenance scripts, not silent background jobs.
 
@@ -216,23 +224,28 @@ Indexes: `debrief_entries(session_date)`, `debrief_entries(intervals_workout_id)
 - **Negative:** app code gains an encryption helper and an encryption-key dependency (a lost key destroys C2/C4 summary data); encrypted columns are unqueryable; SQLAlchemy/Alembic are new dependency surface and new review targets; SQLite enforces single-writer discipline that would need re-architecture if the n=1 assumption ever falls; column-level encryption leaves table metadata (dates, status) in plaintext.
 - **Mitigations:** key stored and backed up per the backup/restore section; all debrief queries routed by unencrypted `session_date`/`id`; dependency additions reviewed under the zero-warning CI gate; n=1 assumption recorded in this ADR and revisited on any scope change; retention pruning scripts make data-minimization explicit and auditable.
 
-### Security routing (MADR-0008 — mandatory, from #162)
+### Security routing (MADR-0008 — completed 2026-10-10)
 
-`@cyber-security` must review this draft against arc42 §8 (cross-cutting security) and §11 (technical risks) **before** PO acceptance, specifically:
+`@cyber-security` reviewed this draft against arc42 §8 and §11 plus `docs/security.md` (B1–B10) on 2026-10-10. **Verdict: conditional approval — the decision (E1 + X3 + M1 + B1) is sound and proportionate; acceptance conditioned on amendments C1–C6, all of which are now embedded in this document:**
 
-1. Threat-model the SQLite file in the lane volume (at-rest exposure, backup leakage, container-volume access).
-2. The decryption key lifecycle: `DATA_ENCRYPTION_KEY` placement, backup-of-key discipline, rotation-on-compromise procedure (re-encrypt-at-rest step to be specified at implementation).
-3. The Intervals.icu token scope expansion implied by epic #161 write capabilities (session comments, event scheduling) — tracked in #163 but adjacent to this decision.
+- **C1** — backup claim qualified: C1/C3 travel plaintext in the archive; encrypted backup medium required (backup/restore section).
+- **C2** — key-escrow mechanism specified (password manager + offline copy, never co-located with DB backup); key recovery exercised in restore rehearsals (key lifecycle section).
+- **C3** — `chmod 600` enforcement for the `DATA_ENCRYPTION_KEY` env file + a pre-flight permission assertion required at implementation. **Repo finding (F3): the live lane env files are currently mode 644 — remediation tracked as a follow-up issue; the persistence implementation must enforce 600 for the new key file.**
+- **C4** — rotation via `MultiFernet`/key-versioning, online and reversible (key lifecycle section).
+- **C5** — key loaded as `SecretStr`, never logged, redaction regression test required (key lifecycle section).
+- **C6** — `cryptography` declared as a direct dependency with a version floor; C4 snapshot classification rationale and C2 storage-limitation rationale + configurable cap recorded (classification table).
 
-Acceptance may only flip `Status` to `accepted` after that sign-off is recorded here. On acceptance: index in arc42 §9 and update arc42 §3/§5 for the new persistence component (not done in this spike — docs-only, proposed state).
+Companion verdict (spike #163): the Intervals.icu least-privilege scope set `ACTIVITY:READ, CALENDAR:WRITE, WELLNESS:READ, CHATS:WRITE` is **approved as the target**; for MVP the personal API key is acceptable for the single-user loopback topology **iff** write tools are confirmation-gated, reads are `oldest`-bounded (≤90 days/call), write operations are audit-logged, comment content is server-generated from validated data, and the greeting check is cached/budgeted. These conditions are binding on the Epic-3/microcycle story specs and the `coach-mcp` tool specs (tracked in #163).
 
-### Open questions for @cyber-security / PO
+On acceptance: index in arc42 §9 and update arc42 §3/§5 for the new persistence component (follow-up docs task).
 
-1. **Key escrow:** where exactly does the `DATA_ENCRYPTION_KEY` backup live (offline encrypted medium, password manager, printed envelope)? PO decision needed before the first prod release of the persistence stories.
-2. **C2 retention vs nLPD proportionality:** is "indefinite (owner-purgeable)" acceptable for debrief history, or should a hard cap (e.g. 5 years) apply?
-3. **`rpe` encryption depth:** RPE is a single 1–10 integer; encrypting it prevents SQL aggregation on a queryable metric. Current draft encrypts it for classification consistency (C2) — confirm this trade is wanted, or restrict encryption to `sensation_ratings` + `qualitative_notes_enc` and reclassify scalar RPE as derived-low-sensitivity.
-4. **MADR sequence gap:** files 0001–0007 exist as ADR sections in `docs/architecture.md` (and MADR-0009 in `docs/e2e-checklist.md`), not as `docs/adr/` files, while the madr-adr lint rule requires a gap-free sequence from 0001 — reconcile the lint rule with the inherited numbering (pure convention question, does not affect this decision).
-5. **Backup target placement:** which host path / medium hosts the nightly backups, and is that medium itself encrypted (defense-in-depth on top of field encryption)?
+### Open questions — resolved 2026-10-10
+
+1. **Key escrow:** resolved by C2 — password manager + offline encrypted copy, never co-located with the DB backup; recovery rehearsed.
+2. **C2 retention:** resolved by C6 — indefinite owner-purgeable **plus** configurable hard cap (default 5 years) with documented purge path.
+3. **`rpe` encryption depth:** resolved by F9 — keep RPE encrypted for classification consistency (cheap at n=1); the plaintext-metadata leak is documented in the C2 row and accepted.
+4. **MADR sequence gap:** convention question deferred — 0001–0007 remain sections of `docs/architecture.md`; the madr-adr lint reconciliation is tracked as a docs follow-up, not a security item.
+5. **Backup target placement:** resolved by C1 — the medium must be encrypted; exact host path is a PO implementation-time decision recorded in the persistence story.
 
 ### References
 
