@@ -14,12 +14,13 @@ primary goal maps onto the dedicated columns; the profile-level fields
 a JSON envelope inside the ``availability_notes`` TEXT column — JSON-in-TEXT
 is the MADR-008 convention ("JSON payloads use the built-in JSON1 type
 affinity (TEXT)"). This keeps a 1:1 profile↔row mapping without inventing
-columns outside the ADR schema; the mapping is revisited when
-``periodization_phases`` lands with its own story.
+columns outside the ADR schema; ``periodization_phases`` landed with its own
+story (#167, :mod:`coach_web.periodization`) and hangs off this row.
 """
 
 import json
-from datetime import UTC, datetime
+from collections.abc import Sequence
+from datetime import UTC, date, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -29,6 +30,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
 from coach_web.models import validate_iso_date
+from coach_web.periodization import (
+    PHASE_LOAD_HINTS,
+    PeriodizationPhase,
+    resolve_phase_status,
+)
 
 OBJECTIVES_DIGEST_MAX_CHARS = 600
 """Hard character budget for the objectives digest (~150 tokens at ~4 chars/token)."""
@@ -255,6 +261,16 @@ async def get_objective_profile(session: AsyncSession) -> ObjectiveProfile | Non
     return _profile_from_row(row)
 
 
+async def get_active_objective_row(session: AsyncSession) -> AthleteObjective | None:
+    """Return the single active objective row (lowest id), or None.
+
+    Public (issue #167): the periodization endpoints resolve the parent
+    objective — its id for the phase FK and its ``target_date`` for the
+    coverage cross-check — through this accessor.
+    """
+    return await _active_row(session)
+
+
 async def save_objective_profile(
     session: AsyncSession, profile: ObjectiveProfile
 ) -> ObjectiveProfile:
@@ -281,13 +297,51 @@ async def save_objective_profile(
     return profile
 
 
-def objectives_digest(profile: ObjectiveProfile) -> str:
+def _phase_digest_candidates(
+    profile: ObjectiveProfile,
+    phases: Sequence[PeriodizationPhase],
+    today: date,
+) -> list[str]:
+    """Build the phase-state digest lines (current phase, hint, countdown).
+
+    The countdown comes from the parent objective's target date — the
+    primary goal's ``target_date``, which is the ``athlete_objectives``
+    column the phases' FK parent carries. Phases are expected ordered by
+    start date (repository ORDER BY / plan invariant); the span line uses
+    min/max over the ISO strings, which sort chronologically.
+    """
+    status = resolve_phase_status(phases, profile.primary_goal.target_date, today)
+    candidates: list[str] = []
+    if status.phase is not None:
+        phase = status.phase
+        candidates.append(
+            f"Current phase: {phase.name} ({phase.phase_type}), "
+            f"{phase.start_date} to {phase.end_date}"
+        )
+        candidates.append(f"Phase load focus: {PHASE_LOAD_HINTS[phase.phase_type]}")
+    else:
+        first = min(phases, key=lambda item: item.start_date)
+        last = max(phases, key=lambda item: item.end_date)
+        candidates.append(f"Current phase: none (plan spans {first.start_date} to {last.end_date})")
+    if status.days_to_target is not None:
+        candidates.append(f"Days to target: {status.days_to_target}")
+    return candidates
+
+
+def objectives_digest(
+    profile: ObjectiveProfile,
+    phases: Sequence[PeriodizationPhase] = (),
+    today: date | None = None,
+) -> str:
     """Build the token-budgeted objectives digest for the coach system prompt.
 
-    The primary-goal line is always included; every optional line (weekly
-    availability, priority disciplines, each secondary goal) is appended only
-    while the digest stays within ``OBJECTIVES_DIGEST_MAX_CHARS`` (~150 tokens
-    at ~4 chars/token).
+    The primary-goal line is always included; every optional line (phase
+    state #167, weekly availability, priority disciplines, each secondary
+    goal) is appended only while the digest stays within
+    ``OBJECTIVES_DIGEST_MAX_CHARS`` (~150 tokens at ~4 chars/token). The
+    phase-state lines lead the candidates — the current phase and its load
+    hint are the time-critical planning context — and the default path
+    (``phases=()``) is byte-identical to the #166 output.
     """
     primary = profile.primary_goal
     head = f"Primary {primary.objective_type} goal: {primary.title}"
@@ -300,7 +354,10 @@ def objectives_digest(profile: ObjectiveProfile) -> str:
         head = f"{head} ({', '.join(target_bits)})"
 
     lines = [head]
-    candidates = [f"Weekly availability: {profile.weekly_availability_hours:g} h"]
+    candidates: list[str] = []
+    if phases:
+        candidates.extend(_phase_digest_candidates(profile, phases, today or date.today()))
+    candidates.append(f"Weekly availability: {profile.weekly_availability_hours:g} h")
     if profile.priority_disciplines:
         candidates.append("Priority disciplines: " + ", ".join(profile.priority_disciplines))
     candidates.extend(
@@ -313,6 +370,11 @@ def objectives_digest(profile: ObjectiveProfile) -> str:
     return "\n".join([_DIGEST_HEADER, *lines])
 
 
-def apply_objectives_digest(system_prompt: str, profile: ObjectiveProfile) -> str:
+def apply_objectives_digest(
+    system_prompt: str,
+    profile: ObjectiveProfile,
+    phases: Sequence[PeriodizationPhase] = (),
+    today: date | None = None,
+) -> str:
     """Append the objectives digest to a base system prompt."""
-    return f"{system_prompt}\n\n{objectives_digest(profile)}"
+    return f"{system_prompt}\n\n{objectives_digest(profile, phases=phases, today=today)}"

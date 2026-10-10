@@ -450,6 +450,104 @@
               </button>
             </div>
           </form>
+          <!-- Periodization phases section (#167, AC1): the active
+               objective's macrocycle phases, edited with the same
+               structured-Pydantic→HTML patterns as the goals form above —
+               x-text/x-model bindings, no raw-HTML binding anywhere, the
+               issue-166 focus trap covers the new controls (it queries the
+               whole panel), and the save action rides its own form and
+               failure surface. -->
+          <form class="settings-form" @submit.prevent="savePhases()">
+            <h3 class="phases-title">Periodization phases</h3>
+            <p class="settings-lede">
+              Season phases scale the coach's weekly load recommendations.
+              They must not overlap and must reach your target date.
+            </p>
+            <template x-for="(phase, phaseIndex) in phasesForm.phases" :key="phaseIndex">
+              <fieldset class="goal-fieldset">
+                <legend class="goal-legend" x-text="phase.phase_type"></legend>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">Type</span>
+                    <select x-model="phase.phase_type">
+                      <option value="base">Base</option>
+                      <option value="build">Build</option>
+                      <option value="peak">Peak</option>
+                      <option value="taper">Taper</option>
+                      <option value="recovery">Recovery</option>
+                      <option value="competition">Competition</option>
+                    </select>
+                  </label>
+                  <label class="field field--grow">
+                    <span class="field-label">Name</span>
+                    <input
+                      type="text"
+                      x-model="phase.name"
+                      maxlength="200"
+                      required
+                    />
+                  </label>
+                </div>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field-label">Start date</span>
+                    <input type="date" x-model="phase.start_date" required />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">End date</span>
+                    <input type="date" x-model="phase.end_date" required />
+                  </label>
+                  <label class="field">
+                    <span class="field-label">Weekly hours</span>
+                    <input
+                      type="number"
+                      x-model="phase.weeklyHoursTarget"
+                      min="0"
+                      max="168"
+                      step="0.5"
+                    />
+                  </label>
+                </div>
+                <label class="field field--grow">
+                  <span class="field-label">Focus</span>
+                  <input
+                    type="text"
+                    x-model="phase.focus"
+                    maxlength="200"
+                    placeholder="Aerobic base, long rides"
+                  />
+                </label>
+                <label class="field">
+                  <span class="field-label">Notes</span>
+                  <textarea
+                    x-model="phase.notes"
+                    rows="2"
+                    maxlength="2000"
+                  ></textarea>
+                </label>
+                <button
+                  class="button button--ghost goal-remove"
+                  type="button"
+                  @click="removePhase(phaseIndex)"
+                >
+                  Remove phase
+                </button>
+              </fieldset>
+            </template>
+            <button class="button button--ghost" type="button" @click="addPhase()">
+              Add phase
+            </button>
+            <p
+              class="settings-note"
+              x-show="phasesMessage"
+              x-text="phasesMessage"
+            ></p>
+            <div class="settings-actions">
+              <button class="button" type="submit" :disabled="phasesSaving">
+                Save phases
+              </button>
+            </div>
+          </form>
         </div>
       </div>
     </div>

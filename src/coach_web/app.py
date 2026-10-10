@@ -36,8 +36,16 @@ from coach_web.objectives import (
     ObjectiveProfile,
     ObjectiveProfileResponse,
     apply_objectives_digest,
+    get_active_objective_row,
     get_objective_profile,
     save_objective_profile,
+)
+from coach_web.periodization import (
+    PeriodizationPlan,
+    PeriodizationPlanResponse,
+    list_phases,
+    replace_phases,
+    validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
 
@@ -254,24 +262,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         factory = getattr(request.app.state, "agent_factory", create_agent)
         agent: CoachAgent = factory(settings)
 
-        # Objectives digest (AC3, #166): the coach system prompt gains a
-        # compact, token-budgeted digest of the persisted athlete objectives
-        # when they exist. Absent objectives — or a persistence layer that is
-        # momentarily unreadable, or a stored row tampered into a
-        # Pydantic-invalid shape (raw SQL bypasses the CHECK constraints) —
+        # Objectives digest (AC3, #166; phase extension #167): the coach
+        # system prompt gains a compact, token-budgeted digest of the
+        # persisted athlete objectives when they exist, plus the calendar-
+        # computed periodization state (current phase, target countdown,
+        # load hint) when phases exist. Absent objectives — or a persistence
+        # layer that is momentarily unreadable, or a stored row tampered into
+        # a Pydantic-invalid shape (raw SQL bypasses the CHECK constraints) —
         # degrade to no digest, so the chat never depends on the database's
-        # health (graceful empty state).
+        # health (graceful empty state). Both reads share one boundary: any
+        # failure yields no digest at all.
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
+                objective_row = await get_active_objective_row(session)
+                phases = (
+                    await list_phases(session, objective_row.id)
+                    if objective_row is not None
+                    else []
+                )
         except (OSError, SQLAlchemyError, ValidationError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
+            phases = []
         if profile is not None:
             # Duck-typed agents (test stubs) may not carry the attribute; the
             # default prompt is the base every real agent is built with.
             base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
-            agent.system_prompt = apply_objectives_digest(base_prompt, profile)
+            agent.system_prompt = apply_objectives_digest(base_prompt, profile, phases=phases)
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
@@ -345,6 +363,60 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         async with session_factory() as session:
             saved = await save_objective_profile(session, payload)
         return ObjectiveProfileResponse(profile=saved)
+
+    @application.get(
+        "/api/periodization",
+        response_model=PeriodizationPlanResponse,
+        tags=["objectives"],
+    )
+    async def get_periodization_endpoint(request: Request) -> PeriodizationPlanResponse:
+        """Return the active objective's periodization phases (empty when absent).
+
+        Auth-gated by the whitelist middleware when AUTH_ENABLED; the phases
+        are the macrocycle plan anchored on the active objective (epic #161
+        story 1.2, MADR-008 C1).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            objective_row = await get_active_objective_row(session)
+            if objective_row is None:
+                return PeriodizationPlanResponse(objective_id=None, phases=[])
+            phases = await list_phases(session, objective_row.id)
+            return PeriodizationPlanResponse(objective_id=objective_row.id, phases=phases)
+
+    @application.put(
+        "/api/periodization",
+        response_model=PeriodizationPlanResponse,
+        tags=["objectives"],
+    )
+    async def put_periodization_endpoint(
+        request: Request,
+        payload: PeriodizationPlan,
+    ) -> PeriodizationPlanResponse:
+        """Validate and persist the active objective's periodization phases.
+
+        Strict Pydantic validation runs at the boundary (phase shape, enum,
+        ISO dates, monotonic non-overlapping ranges); the coverage
+        cross-check against the objective's target date runs here — it needs
+        the persisted parent row. Malformed plans are rejected 422 with a
+        generic detail (nLPD #142 precedent); the plan replaces the
+        objective's phase set wholesale (PUT semantics).
+        """
+        session_factory = request.app.state.db_session_factory
+        async with session_factory() as session:
+            objective_row = await get_active_objective_row(session)
+            if objective_row is None:
+                # Phases hang off the active objective; without one the plan
+                # has nowhere to live. Generic 422 — no state echo (nLPD).
+                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL)
+            try:
+                validate_plan_coverage(payload, objective_row.target_date)
+            except ValueError as exc:
+                logger.warning("Rejected periodization plan: %s", exc)
+                raise HTTPException(status_code=422, detail=GENERIC_VALIDATION_DETAIL) from exc
+            objective_id = objective_row.id
+            phases = await replace_phases(session, objective_id, payload)
+        return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
 
     return application
 
