@@ -26,9 +26,9 @@ import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from cryptography.fernet import Fernet
 import pytest
-from pydantic import SecretStr, ValidationError
+from cryptography.fernet import Fernet
+from pydantic import ValidationError
 
 from coach_web.config import get_settings
 from coach_web.debrief import (
@@ -37,8 +37,8 @@ from coach_web.debrief import (
     DebriefSaveRequest,
     PendingDebrief,
     RpeRequest,
-    athlete_id_from_email,
     apply_pending_debrief_digest,
+    athlete_id_from_email,
     build_debrief_cipher,
     list_pending_debriefs,
     parse_plan_day_rows,
@@ -46,7 +46,13 @@ from coach_web.debrief import (
     save_debrief,
 )
 from coach_web.errors import EncryptionReason, EncryptionUnavailableError
-from coach_web.microcycle import DaySlot, PlanDraftRow, WeeklyPlanDraft, build_week_markdown, week_bounds
+from coach_web.microcycle import (
+    DaySlot,
+    PlanDraftRow,
+    WeeklyPlanDraft,
+    build_week_markdown,
+    week_bounds,
+)
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key()
 """Per-module Fernet key — generated, never a committed literal (gitleaks)."""
@@ -203,11 +209,9 @@ class TestBuildDebriefCipher:
 
         assert excinfo.value.reason is EncryptionReason.KEY_UNAVAILABLE
 
-    def test_error_text_never_carries_the_key_value(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_error_text_never_carries_the_key_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The technical message names the env var, never its value (nLPD)."""
-        secret_value = "super-secret-key-material-abc"
+        secret_value = "super-secret-key-material-abc"  # noqa: S105 - test fixture value
         monkeypatch.setenv("DATA_ENCRYPTION_KEY", secret_value)
         get_settings.cache_clear()
 
@@ -237,9 +241,9 @@ class TestDebriefSaveRequest:
     def test_rpe_must_be_an_integer(self) -> None:
         """A float or string RPE is rejected (strict type)."""
         with pytest.raises(ValidationError):
-            _save_payload(rpe="7")  # type: ignore[arg-type]
+            _save_payload(rpe="7")
         with pytest.raises(ValidationError):
-            _save_payload(rpe=7.5)  # type: ignore[arg-type]
+            _save_payload(rpe=7.5)
 
     def test_plan_session_key_must_be_a_real_iso_date(self) -> None:
         """The key is validated as a calendar date (shared rule)."""
@@ -263,9 +267,7 @@ class TestDebriefSaveRequest:
 class TestSaveDebrief:
     """The encrypted persistence path (#189 AC1/AC2/AC4)."""
 
-    async def test_save_persists_an_encrypted_row(
-        self, db_session_factory, db_path: Path
-    ) -> None:
+    async def test_save_persists_an_encrypted_row(self, db_session_factory, db_path: Path) -> None:
         """The debrief row lands with Fernet ciphertext, never plaintext notes."""
         payload = _save_payload(notes="SECRET-NOTE-CONTENT-XYZ")
 
@@ -284,9 +286,7 @@ class TestSaveDebrief:
             if candidate.exists():
                 assert b"SECRET-NOTE-CONTENT-XYZ" not in candidate.read_bytes()
 
-    async def test_saved_notes_decrypt_round_trip(
-        self, db_session_factory, db_path: Path
-    ) -> None:
+    async def test_saved_notes_decrypt_round_trip(self, db_session_factory, db_path: Path) -> None:
         """The stored ciphertext decrypts to the original notes with the same key."""
         payload = _save_payload(notes="Round-trip note content")
 
@@ -318,6 +318,7 @@ class TestSaveDebrief:
             row = await save_debrief(session, athlete_id=1, payload=second, cipher=TEST_CIPHER)
 
         assert row.rpe == 8
+        assert row.notes_encrypted is not None
         assert TEST_CIPHER.decrypt(row.notes_encrypted.encode("ascii")).decode("utf-8") == (
             "Re-rated after reflection"
         )
@@ -340,6 +341,7 @@ class TestSaveDebrief:
         assert row_a.id != row_b.id
         assert row_b.athlete_id == athlete_id_from_email("other@example.com")
         # Athlete A's row is untouched by B's save.
+        assert row_a.notes_encrypted is not None
         assert TEST_CIPHER.decrypt(row_a.notes_encrypted.encode("ascii")).decode("utf-8") == (
             "Athlete A private note"
         )
@@ -395,9 +397,7 @@ class TestListPendingDebriefs:
         async with db_session_factory() as session:
             return await list_pending_debriefs(session, athlete_id=athlete_id, today=today)
 
-    async def test_completed_undebriefed_sessions_are_pending(
-        self, db_session_factory
-    ) -> None:
+    async def test_completed_undebriefed_sessions_are_pending(self, db_session_factory) -> None:
         """Approved-draft day slots strictly before today with no debrief are pending."""
         async with db_session_factory() as session:
             await _seed_approved_draft(session, _week_draft())

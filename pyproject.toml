@@ -23,6 +23,11 @@ dependencies = [
     # Google OIDC auth (#65): RS256 ID-token verification via Google JWKS and
     # HS256 stateless session tokens. Already resolved transitively via mcp.
     "pyjwt[crypto]>=2.8.0",
+    # C2 health-data field encryption (MADR-0008 X3 + security condition C6,
+    # #189): Fernet for the debrief notes at rest. Declared DIRECTLY per C6 —
+    # transitive resolution via pyjwt[crypto] is fragile; the floor matches
+    # the resolved major (uv.lock pins the exact version).
+    "cryptography>=44.0.0",
     "pydantic>=2.7.0",
     "pydantic-settings>=2.2.0",
     "python-dotenv>=1.0.0",

@@ -316,18 +316,14 @@ async def list_pending_debriefs(
     oldest first; ``today`` is injected so callers own the clock boundary.
     """
     result = await session.execute(
-        select(PlanDraftRow)
-        .where(PlanDraftRow.status == "approved")
-        .order_by(PlanDraftRow.id)
+        select(PlanDraftRow).where(PlanDraftRow.status == "approved").order_by(PlanDraftRow.id)
     )
     candidates: dict[str, PendingDebrief] = {}
     for row in result.scalars().all():
         for candidate in parse_plan_day_rows(row.content):
             candidates[candidate.plan_session_key] = candidate
     completed = [
-        candidate
-        for key, candidate in candidates.items()
-        if date.fromisoformat(key) < today
+        candidate for key, candidate in candidates.items() if date.fromisoformat(key) < today
     ]
     if not completed:
         return []

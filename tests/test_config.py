@@ -1,7 +1,7 @@
 """Tests for coach_web.config."""
 
-from pydantic import SecretStr
 import pytest
+from pydantic import SecretStr
 
 from coach_web.config import Settings, get_settings
 
@@ -85,9 +85,7 @@ class TestDataEncryptionKey:
         assert isinstance(settings.DATA_ENCRYPTION_KEY, SecretStr)
         assert settings.DATA_ENCRYPTION_KEY.get_secret_value() == "unit-test-fernet-key-value"
 
-    def test_str_of_settings_does_not_expose_the_key(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_str_of_settings_does_not_expose_the_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Redaction pin (MADR-0008 C5): str()/repr() mask the secret value."""
         monkeypatch.setenv("DATA_ENCRYPTION_KEY", "unit-test-fernet-key-value")
         get_settings.cache_clear()

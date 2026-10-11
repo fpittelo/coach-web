@@ -2925,8 +2925,7 @@ class TestDebriefUiContract:
     """
 
     RPE_CARD_TEMPLATE = (
-        "<template x-if=\"message.role === 'assistant' && rpe && "
-        'rpeMessageIndex === index">'
+        "<template x-if=\"message.role === 'assistant' && rpe && " 'rpeMessageIndex === index">'
     )
 
     def _script(self) -> str:

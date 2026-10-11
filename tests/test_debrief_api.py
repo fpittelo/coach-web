@@ -24,21 +24,23 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
 from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
-import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent
-from coach_web.app import create_app
+from coach_web.app import _athlete_id_for_session, create_app
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
 from coach_web.db import build_db_engine, build_session_factory
+from coach_web.debrief import DEFAULT_ATHLETE_ID, athlete_id_from_email
 from coach_web.microcycle import (
     DaySlot,
     PlanDraftRow,
@@ -59,6 +61,7 @@ ENCRYPTION_503_BODY = {
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
 OTHER_EMAIL = "other-athlete@example.com"
+AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key()
 """Per-module Fernet key — generated, never a committed literal (gitleaks)."""
@@ -199,6 +202,15 @@ def _extract_token_texts(body: str) -> str:
     return "".join(parts)
 
 
+def _extract_token_texts_tolerant(body: str) -> str:
+    """_extract_token_texts over a body polluted with a malformed data line.
+
+    The helper must skip junk frames (keep-alive comments, partial writes)
+    without crashing — exercised here so the defensive branch stays covered.
+    """
+    return _extract_token_texts(body + "\ndata:not-json{{{\n")
+
+
 class TestPostDebrief:
     """POST /api/debrief — the encrypted capture path (#189 AC1/AC2)."""
 
@@ -216,7 +228,9 @@ class TestPostDebrief:
         assert body == {"status": "saved", "plan_session_key": "2026-10-06", "rpe": 7}
         assert "Felt strong." not in response.text
 
-    def test_save_persists_ciphertext_never_plaintext(self, migrated_db: Path, encryption_key) -> None:
+    def test_save_persists_ciphertext_never_plaintext(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
         """The notes land as Fernet ciphertext — no plaintext bytes in the DB file."""
         client = TestClient(create_app())
 
@@ -238,9 +252,7 @@ class TestPostDebrief:
         """An optional-notes debrief persists a NULL notes column."""
         client = TestClient(create_app())
 
-        response = client.post(
-            "/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 5}
-        )
+        response = client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 5})
 
         assert response.status_code == 201
         with sqlite3.connect(migrated_db) as conn:
@@ -295,9 +307,7 @@ class TestPostDebrief:
         monkeypatch.setenv("DATA_ENCRYPTION_KEY", "super-secret-key-material-abc")
         client = TestClient(create_app())
 
-        response = client.post(
-            "/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 7}
-        )
+        response = client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 7})
 
         assert response.status_code == 503
         assert "super-secret-key-material-abc" not in response.text
@@ -315,9 +325,7 @@ class TestPostDebrief:
         """A non-date plan_session_key is a generic 422 (no reason body)."""
         client = TestClient(create_app())
 
-        response = client.post(
-            "/api/debrief", json={"plan_session_key": "junk-key", "rpe": 7}
-        )
+        response = client.post("/api/debrief", json={"plan_session_key": "junk-key", "rpe": 7})
 
         assert response.status_code == 422
         assert response.json() == {"detail": GENERIC_422_DETAIL}
@@ -353,20 +361,27 @@ class TestGetPendingDebriefs:
 
     def test_pending_payload_is_metadata_only(self, migrated_db: Path, encryption_key) -> None:
         """The banner payload carries key + title only — never notes or RPE."""
+        _seed_approved_draft(migrated_db, _week_draft())
         client = TestClient(create_app())
+        # Debrief the Monday session with private notes: the Tuesday session
+        # stays pending, and the notes must not leak into the pending payload.
         client.post(
             "/api/debrief",
-            json={"plan_session_key": "2099-01-01", "rpe": 7, "notes": "Private note."},
+            json={"plan_session_key": "2026-10-05", "rpe": 7, "notes": "Private note."},
         )
 
         response = client.get("/api/debrief/pending")
 
         assert response.status_code == 200
-        for item in response.json()["pending"]:
+        pending = response.json()["pending"]
+        assert [item["plan_session_key"] for item in pending] == ["2026-10-06"]
+        for item in pending:
             assert set(item) == {"plan_session_key", "session_title"}
         assert "Private note." not in response.text
 
-    def test_debriefed_sessions_leave_the_pending_list(self, migrated_db: Path, encryption_key) -> None:
+    def test_debriefed_sessions_leave_the_pending_list(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
         """Saving a debrief clears that session's pending state (same athlete)."""
         _seed_approved_draft(migrated_db, _week_draft())
         client = TestClient(create_app())
@@ -374,9 +389,7 @@ class TestGetPendingDebriefs:
 
         response = client.get("/api/debrief/pending")
 
-        assert [item["plan_session_key"] for item in response.json()["pending"]] == [
-            "2026-10-06"
-        ]
+        assert [item["plan_session_key"] for item in response.json()["pending"]] == ["2026-10-06"]
 
 
 class TestDebriefAuth:
@@ -433,7 +446,9 @@ class TestDebriefAuth:
         assert pending.json() == {"pending": []}
         assert "A private." not in pending.text
 
-    def test_athlete_b_save_creates_an_isolated_row(self, monkeypatch, migrated_db: Path, encryption_key) -> None:
+    def test_athlete_b_save_creates_an_isolated_row(
+        self, monkeypatch, migrated_db: Path, encryption_key
+    ) -> None:
         """AC4: B's save for the same session key never touches A's row."""
         client = self._auth_client(monkeypatch, [OWNER_EMAIL, OTHER_EMAIL])
         client.cookies.set(SESSION_COOKIE, self._session_cookie(OWNER_EMAIL))
@@ -471,9 +486,7 @@ class TestPendingDebriefDigestHook:
         _seed_approved_draft(migrated_db, _week_draft())
         client = _probe_client()
 
-        response = client.post(
-            "/api/agent/stream", json={"message": "Hello coach", "history": []}
-        )
+        response = client.post("/api/agent/stream", json={"message": "Hello coach", "history": []})
 
         assert response.status_code == 200
         prompt = _extract_token_texts(response.text)
@@ -485,27 +498,114 @@ class TestPendingDebriefDigestHook:
         """Without pending sessions the prompt stays byte-identical (no hook)."""
         client = _probe_client()
 
-        response = client.post(
-            "/api/agent/stream", json={"message": "Hello coach", "history": []}
-        )
+        response = client.post("/api/agent/stream", json={"message": "Hello coach", "history": []})
 
         assert response.status_code == 200
-        assert _extract_token_texts(response.text) == DEFAULT_SYSTEM_PROMPT
+        # The tolerant extractor also exercises the malformed-frame branch.
+        assert _extract_token_texts_tolerant(response.text) == DEFAULT_SYSTEM_PROMPT
 
     def test_digest_hook_degrades_gracefully_on_persistence_failure(
         self, db_path: Path, monkeypatch
     ) -> None:
         """A broken persistence layer yields no digest — the chat never breaks."""
-        client = _probe_client()
+        app = create_app()
+        app.state.agent_factory = MagicMock(side_effect=lambda _settings: _SystemPromptProbeAgent())
+        client = TestClient(app)
 
         def _broken_session_factory(*args: Any, **kwargs: Any) -> Any:
             raise OSError("db unavailable")
 
-        monkeypatch.setattr(client.app.state, "db_session_factory", _broken_session_factory)
+        monkeypatch.setattr(app.state, "db_session_factory", _broken_session_factory)
 
-        response = client.post(
-            "/api/agent/stream", json={"message": "Hello coach", "history": []}
-        )
+        response = client.post("/api/agent/stream", json={"message": "Hello coach", "history": []})
 
         assert response.status_code == 200
         assert _extract_token_texts(response.text) == DEFAULT_SYSTEM_PROMPT
+
+
+class TestAthleteIdResolutionBoundary:
+    """The request-context → athlete-id helper (#189 AC4)."""
+
+    def test_auth_disabled_maps_to_the_default_athlete(self) -> None:
+        """Dev/qa lanes (AUTH_ENABLED=false) use the single local athlete."""
+        settings = get_settings()
+
+        assert _athlete_id_for_session(settings, None) == DEFAULT_ATHLETE_ID
+        assert _athlete_id_for_session(settings, "any-cookie") == DEFAULT_ATHLETE_ID
+
+    def test_auth_enabled_without_cookie_fails_safe_to_the_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing cookie degrades to the default (middleware rejects first)."""
+        monkeypatch.setenv("AUTH_ENABLED", "true")
+        monkeypatch.setenv("AUTH_SESSION_SECRET", AUTH_TEST_SESSION_SECRET)
+        get_settings.cache_clear()
+
+        assert _athlete_id_for_session(get_settings(), None) == DEFAULT_ATHLETE_ID
+
+    def test_auth_enabled_with_unverifiable_cookie_fails_safe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A garbage cookie degrades to the default instead of raising."""
+        monkeypatch.setenv("AUTH_ENABLED", "true")
+        monkeypatch.setenv("AUTH_SESSION_SECRET", AUTH_TEST_SESSION_SECRET)
+        get_settings.cache_clear()
+
+        assert _athlete_id_for_session(get_settings(), "garbage-token") == DEFAULT_ATHLETE_ID
+
+    def test_auth_enabled_with_valid_session_derives_the_athlete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A verified session maps to the email-derived athlete id."""
+        monkeypatch.setenv("AUTH_ENABLED", "true")
+        monkeypatch.setenv("AUTH_SESSION_SECRET", AUTH_TEST_SESSION_SECRET)
+        get_settings.cache_clear()
+        cookie = create_session_token(OWNER_EMAIL, AUTH_TEST_SESSION_SECRET, ttl_seconds=3600)
+
+        athlete_id = _athlete_id_for_session(get_settings(), cookie)
+
+        assert athlete_id == athlete_id_from_email(OWNER_EMAIL)
+        assert athlete_id != DEFAULT_ATHLETE_ID
+
+
+class TestDebriefPersistenceFailure:
+    """The 503 persistence-outage posture on the debrief routes."""
+
+    def test_save_answers_the_generic_503_on_database_failure(
+        self, migrated_db: Path, monkeypatch: pytest.MonkeyPatch, encryption_key
+    ) -> None:
+        """A broken store answers the static persistence detail — no internals."""
+        app = create_app()
+
+        def _broken_session_factory(*args: Any, **kwargs: Any) -> Any:
+            raise SQLAlchemyError("db down")
+
+        monkeypatch.setattr(app.state, "db_session_factory", _broken_session_factory)
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/debrief",
+            json={"plan_session_key": "2026-10-06", "rpe": 7, "notes": "Private."},
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Service temporarily unavailable"}
+        assert "db down" not in response.text
+        assert "Private." not in response.text
+
+    def test_pending_degrades_to_an_empty_list_on_database_failure(
+        self, migrated_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The passive banner derivation degrades to silence (MADR-0010)."""
+        app = create_app()
+
+        def _broken_session_factory(*args: Any, **kwargs: Any) -> Any:
+            raise SQLAlchemyError("db down")
+
+        monkeypatch.setattr(app.state, "db_session_factory", _broken_session_factory)
+        client = TestClient(app)
+
+        response = client.get("/api/debrief/pending")
+
+        assert response.status_code == 200
+        assert response.json() == {"pending": []}

@@ -661,13 +661,16 @@ class TestDebriefMigration:
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
-            for bad_rpe in ("0", "11"):
+            for sql in (
+                "INSERT INTO debriefs "
+                "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
+                "VALUES (1, '2026-10-10', 0, 't1', 't2')",
+                "INSERT INTO debriefs "
+                "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
+                "VALUES (1, '2026-10-10', 11, 't1', 't2')",
+            ):
                 with pytest.raises(sqlite3.IntegrityError, match="rpe"):
-                    conn.execute(
-                        "INSERT INTO debriefs "
-                        "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
-                        f"VALUES (1, '2026-10-10', {bad_rpe}, 't1', 't2')"
-                    )
+                    conn.execute(sql)
 
     def test_debrief_athlete_and_session_key_are_indexed(self, db_path: Path) -> None:
         """athlete_id and plan_session_key carry indexes (pending derivation)."""
