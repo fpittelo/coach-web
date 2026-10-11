@@ -2903,3 +2903,282 @@ class TestSignInAffordanceContract:
         # The typed handler still never ends the stream (#84 AC2).
         typed = _rule_block(script, "error: (event) =>")
         assert "this.finishStream()" not in typed
+
+
+# ---------------------------------------------------------------------------
+# Debrief capture UI (#189 — Story 3.1): RPE stepper card + pending banner
+# ---------------------------------------------------------------------------
+
+
+class TestDebriefUiContract:
+    """RPE stepper card & pending-debrief banner — UI contract (#189, #165).
+
+    The check-in card follows the #182 approval-card interaction pattern
+    pinned to the proposing assistant message via the ``rpe`` /
+    ``rpeMessageIndex`` state pair; the stepper is two real buttons plus a
+    live-region value (no range input — #165 a11y spec); LOG CHECK-IN posts
+    ``{plan_session_key, rpe, notes}`` to POST /api/debrief and the card
+    collapses to a one-line summary. The pending-debrief banner is a passive,
+    dismissible, non-blocking reminder fetched once at init (#165 component
+    4, MADR-0010); LOG IT prefills the composer and never auto-sends (PO Q8).
+    JS is contracted via source assertions (no Node toolchain, ADR-006 §5).
+    """
+
+    RPE_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && rpe && "
+        'rpeMessageIndex === index">'
+    )
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.RPE_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    # --- state pair & card pinning -------------------------------------------
+
+    def test_rpe_state_pair_is_declared_once(self) -> None:
+        """The rpe/rpeMessageIndex pair is declared exactly once (#165 naming)."""
+        script = self._script()
+
+        assert script.count("rpe: null") == 1
+        assert script.count("rpeMessageIndex: -1") == 1
+        assert script.count('rpeApproval: { state: "idle", message: "" }') == 1
+
+    def test_rpe_card_is_pinned_to_the_proposing_message(self) -> None:
+        """The card template binds the rpe/rpeMessageIndex pair."""
+        html = self._html()
+
+        assert self.RPE_CARD_TEMPLATE in html
+
+    def test_rpe_request_handler_pins_the_card(self) -> None:
+        """The rpe_request handler pins the card with the check-in payload."""
+        script = self._script()
+        handler = _rule_block(script, "rpe_request: (event) =>")
+
+        assert "this.rpe = " in handler
+        assert "data.checkin" in handler
+        assert "this.rpeMessageIndex = index" in handler
+        assert "this.scrollToBottom()" in handler
+
+    def test_rpe_card_is_a_labelled_region(self) -> None:
+        """The card is a role=region with a static aria-label (#165 a11y)."""
+        card = self._card()
+
+        assert 'role="region"' in card
+        assert 'aria-label="Session check-in"' in card
+
+    # --- structured rendering (no markdown) -----------------------------------
+
+    def test_rpe_card_is_structured_pydantic_to_html(self) -> None:
+        """The card binds x-text only — never markdown/x-html."""
+        card = self._card()
+
+        assert "x-html" not in card
+        assert "renderMarkdown" not in card
+        assert "rpe.session_title" in card
+        assert "rpe.plan_session_key" in card
+
+    # --- stepper (#165: buttons, not a slider) ---------------------------------
+
+    def test_stepper_is_two_real_buttons_with_a_live_value(self) -> None:
+        """The stepper is −/+ buttons around an aria-live value — no range input."""
+        card = self._card()
+
+        assert 'type="range"' not in card
+        assert 'aria-label="Decrease RPE"' in card
+        assert 'aria-label="Increase RPE"' in card
+        assert 'aria-live="polite"' in card
+        assert "of 10" in card
+
+    def test_step_rpe_clamps_to_the_1_10_range(self) -> None:
+        """stepRpe clamps the value into 1..10 (RPE domain)."""
+        step = _rule_block(self._script(), "stepRpe(delta)")
+
+        assert "Math.min(10" in step
+        assert "Math.max(1" in step
+
+    # --- notes & submission -----------------------------------------------------
+
+    def test_notes_textarea_is_labelled(self) -> None:
+        """The notes textarea carries an explicit aria-label (#165 a11y)."""
+        card = self._card()
+
+        assert 'aria-label="Session notes"' in card
+
+    def test_log_rpe_posts_the_save_contract(self) -> None:
+        """LOG CHECK-IN posts {plan_session_key, rpe, notes} to /api/debrief."""
+        script = self._script()
+        log = _rule_block(script, "logRpe()")
+
+        assert 'fetch("/api/debrief"' in log
+        assert 'method: "POST"' in log
+        assert "plan_session_key: this.rpe.plan_session_key" in log
+        assert "rpe: this.rpeValue" in log
+        assert "notes: this.rpeNotes" in log
+
+    def test_log_rpe_guard_blocks_double_submit(self) -> None:
+        """logRpe guards on its own in-flight and completed states."""
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert 'this.rpeApproval.state === "submitting"' in log
+        assert 'this.rpeApproval.state === "submitted"' in log
+
+    def test_log_rpe_surfaces_the_signin_prompt_on_401(self) -> None:
+        """A 401 save surfaces "Please sign in." — not "try again" (#180/#181)."""
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert "Please sign in." in log
+
+    def test_log_rpe_surfaces_the_encryption_reason_on_503(self) -> None:
+        """A 503 save renders the fixed encryption vocabulary, generic fallback kept.
+
+        The server's {code, message} body reaches the card note only when the
+        code is in the client's DEBRIEF_ERROR_CODES mirror; unknown codes and
+        transport failures keep the generic text, and no error text is ever
+        echoed (nLPD #142 posture).
+        """
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert "debriefReasonMessage(" in log
+        assert "Could not save the check-in. Try again." in log
+        assert "body.detail" not in log
+        assert "error.message" not in log
+
+    def test_debrief_error_vocabulary_mirrors_the_server_enum(self) -> None:
+        """The client mirror carries exactly the server's encryption reason code."""
+        script = self._script()
+
+        assert "key_unavailable: true" in script
+
+    def test_log_rpe_success_collapses_to_a_summary_line(self) -> None:
+        """A 201 save flips the card to the submitted summary state (#165 §4.2)."""
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert 'state: "submitted"' in log
+        assert "Logged: RPE" in log
+
+    def test_skip_rpe_dismisses_the_card(self) -> None:
+        """Skip clears the card and its pin without persisting anything."""
+        skip = _rule_block(self._script(), "skipRpe()")
+
+        assert "this.rpe = null" in skip
+        assert "this.rpeMessageIndex = -1" in skip
+
+    def test_reset_chat_clears_the_debrief_state(self) -> None:
+        """resetChat clears every debrief state slice (#165 state machine)."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.rpe = null" in reset
+        assert "this.rpeMessageIndex = -1" in reset
+        assert 'this.rpeApproval = { state: "idle", message: "" }' in reset
+
+    def test_rpe_card_renders_the_submitted_summary_state(self) -> None:
+        """The card swaps the editing controls for the one-line summary.
+
+        The collapsed summary (#165 §4.2) is the role="status" note bound to
+        ``rpeApproval.message`` — logRpe fills it with the "Logged: RPE …"
+        line (pinned in the logRpe contract above) — and the editing
+        controls hide once the state flips to submitted.
+        """
+        card = self._card()
+
+        assert "rpeApproval.state !== 'submitted'" in card
+        assert "rpeApproval.message" in card
+
+    def test_rpe_card_has_a_status_note(self) -> None:
+        """The card's outcome note is a role=status live region (WCAG 4.1.3)."""
+        card = self._card()
+
+        assert 'role="status"' in card
+        assert "rpeApproval.message" in card
+
+    # --- pending-debrief banner (#165 component 4, MADR-0010) -------------------
+
+    def test_pending_banner_sits_between_the_error_banner_and_the_composer(
+        self,
+    ) -> None:
+        """The banner markup lives in the composer slot, after the error banner."""
+        html = self._html()
+        error_at = html.index('class="error-banner"')
+        banner_at = html.index('class="pending-banner"')
+        composer_at = html.index('class="composer"')
+
+        assert error_at < banner_at < composer_at
+
+    def test_pending_banner_is_a_passive_status_region(self) -> None:
+        """The banner is role=status (announces on populate) and non-blocking."""
+        html = self._html()
+        banner_at = html.index('class="pending-banner"')
+        banner = html[banner_at : html.index("</template>", banner_at)]
+
+        assert 'role="status"' in banner
+
+    def test_pending_banner_renders_metadata_only(self) -> None:
+        """The banner binds session title + key — never notes or RPE (nLPD)."""
+        html = self._html()
+        banner_at = html.index('class="pending-banner"')
+        banner = html[banner_at : html.index("</template>", banner_at)]
+
+        assert "item.session_title" in banner
+        assert "item.plan_session_key" in banner
+
+    def test_init_fetches_the_pending_list_once(self) -> None:
+        """init() calls loadPendingDebriefs — the only non-SSE data path (#165)."""
+        init = _rule_block(self._script(), "init()")
+
+        assert "this.loadPendingDebriefs()" in init
+
+    def test_load_pending_debriefs_fetches_the_derivation_endpoint(self) -> None:
+        """The loader GETs /api/debrief/pending and stores the list."""
+        load = _rule_block(self._script(), "loadPendingDebriefs()")
+
+        assert 'fetch("/api/debrief/pending"' in load
+        assert "this.pendingDebriefs = " in load
+
+    def test_load_pending_debriefs_degrades_to_silence(self) -> None:
+        """Failures (401, transport) never surface an error banner (MADR-0010)."""
+        load = _rule_block(self._script(), "loadPendingDebriefs()")
+
+        assert "this.errorBanner" not in load
+
+    def test_pending_banner_log_it_prefills_never_auto_sends(self) -> None:
+        """LOG IT prefills the composer and focuses it (PO Q8 — never auto-send)."""
+        prefill = _rule_block(self._script(), "prefillDebrief(item)")
+
+        assert "this.input = " in prefill
+        assert "this.$refs.composer.focus()" in prefill
+        assert "this.send()" not in prefill
+
+    def test_pending_banner_dismiss_is_labelled_and_client_only(self) -> None:
+        """The × button carries its aria-label; dismissal clears the local list."""
+        html = self._html()
+        banner_at = html.index('class="pending-banner"')
+        banner = html[banner_at : html.index("</template>", banner_at)]
+
+        assert 'aria-label="Dismiss pending debrief reminder"' in banner
+        dismiss = _rule_block(self._script(), "dismissPendingDebrief(key)")
+        assert "this.pendingDebriefs" in dismiss
+
+    def test_pending_debriefs_state_is_declared(self) -> None:
+        """The pendingDebriefs list is declared once in the Alpine state."""
+        script = self._script()
+
+        assert script.count("pendingDebriefs: []") == 1
+
+    # --- stylesheet --------------------------------------------------------------
+
+    def test_pending_banner_and_stepper_are_styled_with_tokens(self) -> None:
+        """The new components carry stylesheet rules (tokens only — hex guard)."""
+        css = self._css()
+
+        assert ".pending-banner" in css
+        assert ".rpe-stepper" in css

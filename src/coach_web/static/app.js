@@ -41,6 +41,19 @@
  * without persisting. The manual settings editor is gone (PO pivot):
  * phases are coach output, not athlete input.
  *
+ * Debrief capture (#189): the coach's rpe_request event opens the session
+ * check-in card (rpe/rpeMessageIndex pair, #82 replacement rule) — an RPE
+ * stepper 1–10 (two real buttons around an aria-live value, #165 a11y)
+ * plus optional notes. LOG CHECK-IN posts {plan_session_key, rpe, notes}
+ * to POST /api/debrief; the server encrypts the notes (C2 Fernet) and
+ * persists per athlete, and the card collapses to the one-line summary
+ * carried by the role="status" note. A 401 surfaces "Please sign in." and
+ * a 503 renders the fixed encryption vocabulary (DEBRIEF_ERROR_CODES
+ * mirror, generic fallback kept). The pending-debrief banner (MADR-0010)
+ * is fetched once at init from GET /api/debrief/pending — passive,
+ * dismissible, metadata-only; LOG IT prefills the composer (never
+ * auto-send, PO Q8).
+ *
  * Settings error reasons (#181): the owner-facing settings saves (objectives
  * PUT, periodization approval) surface the server's structured, owner-safe
  * 422 body {code, message} — the message renders only when its code is in
@@ -169,6 +182,32 @@ function settingsReasonMessage(body, fallback) {
   return fallback;
 }
 
+// Debrief error vocabulary (#189): the client mirror of the server's fixed
+// encryption-failure enum (coach_web.errors.EncryptionReason). The debrief
+// 503 body is {code, message}; the server-provided message renders ONLY when
+// its code is in this vocabulary — an unknown or missing code falls back to
+// the generic text (fail-safe). Fixed vocabulary only: no exception text, no
+// input echo, never key material (nLPD).
+const DEBRIEF_ERROR_CODES = {
+  key_unavailable: true,
+};
+
+function debriefReasonMessage(body, fallback) {
+  // Owner-safe 503 rendering (#189): same guard shape as
+  // settingsReasonMessage — known code + non-empty string message, else the
+  // caller's generic fallback unchanged.
+  if (
+    body &&
+    typeof body.code === "string" &&
+    Object.prototype.hasOwnProperty.call(DEBRIEF_ERROR_CODES, body.code) &&
+    typeof body.message === "string" &&
+    body.message
+  ) {
+    return body.message;
+  }
+  return fallback;
+}
+
 function parsePayload(event) {
   try {
     const raw = typeof event === "string" ? JSON.parse(event) : JSON.parse(event.data);
@@ -282,6 +321,20 @@ function coachApp() {
     periodizationPlan: null,
     periodizationMessageIndex: -1,
     periodizationApproval: { state: "idle", message: "" },
+    // Debrief capture (#189): the coach's rpe_request event opens the
+    // session check-in card (rpe/rpeMessageIndex pair, #82 replacement
+    // rule). The stepper value and notes ride their own slices; LOG
+    // CHECK-IN posts {plan_session_key, rpe, notes} to POST /api/debrief
+    // and the card collapses to the one-line summary carried by the
+    // role="status" note. pendingDebriefs is the passive banner list
+    // fetched once at init (GET /api/debrief/pending, MADR-0010) —
+    // metadata only (session key + title, never notes or RPE).
+    rpe: null,
+    rpeMessageIndex: -1,
+    rpeApproval: { state: "idle", message: "" },
+    rpeValue: 5,
+    rpeNotes: "",
+    pendingDebriefs: [],
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -326,6 +379,10 @@ function coachApp() {
       // completed final message is announced by the done handler. Tokens
       // never announce.
       this.$watch("phase", (phase) => this.announcePhase(phase));
+      // Pending-debrief banner (#189, MADR-0010): fetched once at init —
+      // the only non-SSE data path (#165). Passive: any failure degrades
+      // to no banner, never to an error surface.
+      this.loadPendingDebriefs();
       this.$nextTick(() => {
         const log = this.$refs.log;
         if (!log) {
@@ -717,6 +774,12 @@ function coachApp() {
       this.periodizationPlan = null;
       this.periodizationMessageIndex = -1;
       this.periodizationApproval = { state: "idle", message: "" };
+      // The check-in card (#189) follows the same posture: a new stream
+      // clears the previous card; the agent's rpe_request event (if any)
+      // re-pins a fresh one.
+      this.rpe = null;
+      this.rpeMessageIndex = -1;
+      this.rpeApproval = { state: "idle", message: "" };
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -982,6 +1045,24 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        rpe_request: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Check-in card (#189): the coach opened the debrief for one
+          // session; the card replaces any previous check-in card (#82
+          // rule) and the stepper starts at the midpoint value. The
+          // payload is session metadata only (key + title) — debrief
+          // notes and RPE values never travel through the agent loop.
+          this.rpe = data.checkin || null;
+          this.rpeMessageIndex = index;
+          this.rpeApproval = { state: "idle", message: "" };
+          this.rpeValue = 5;
+          this.rpeNotes = "";
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -1111,6 +1192,13 @@ function coachApp() {
       this.periodizationPlan = null;
       this.periodizationMessageIndex = -1;
       this.periodizationApproval = { state: "idle", message: "" };
+      // Check-in card (#189): a chat reset clears the debrief state — the
+      // pending banner is page-level state and survives (MADR-0010).
+      this.rpe = null;
+      this.rpeMessageIndex = -1;
+      this.rpeApproval = { state: "idle", message: "" };
+      this.rpeValue = 5;
+      this.rpeNotes = "";
       this.input = "";
       this.errorBanner = "";
       this.errorBannerSignin = false;
@@ -1377,6 +1465,125 @@ function coachApp() {
       this.periodizationPlan = null;
       this.periodizationMessageIndex = -1;
       this.periodizationApproval = { state: "idle", message: "" };
+    },
+
+    // ------------------------------------------------------------------
+    // Debrief capture (#189). The coach's rpe_request event opens the
+    // session check-in card; LOG CHECK-IN posts {plan_session_key, rpe,
+    // notes} to POST /api/debrief — the server encrypts the notes (C2)
+    // and persists per athlete. The card collapses to the one-line
+    // summary carried by the role="status" note; Skip dismisses without
+    // persisting. The pending-debrief banner (MADR-0010) is fetched once
+    // at init and stays passive: LOG IT prefills the composer (never
+    // auto-send, PO Q8), × dismisses client-only.
+    // ------------------------------------------------------------------
+
+    stepRpe(delta) {
+      // Stepper (#165): two real buttons clamping the value into 1..10 —
+      // no range input, no drag, keyboard-operable by construction.
+      if (!this.rpe || this.rpeApproval.state === "submitted") {
+        return;
+      }
+      this.rpeValue = Math.min(10, Math.max(1, this.rpeValue + delta));
+    },
+
+    logRpe() {
+      if (
+        !this.rpe ||
+        this.rpeApproval.state === "submitting" ||
+        this.rpeApproval.state === "submitted"
+      ) {
+        return;
+      }
+      this.rpeApproval = { state: "submitting", message: "Saving check-in…" };
+
+      fetch("/api/debrief", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          plan_session_key: this.rpe.plan_session_key,
+          rpe: this.rpeValue,
+          notes: this.rpeNotes.trim() === "" ? null : this.rpeNotes,
+        }),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            // 401 (#180): an expired or missing session is a sign-in
+            // problem, not a check-in problem — never "try again".
+            if (response.status === 401) {
+              this.rpeApproval = { state: "error", message: "Please sign in." };
+              return;
+            }
+            // 503 (#189 AC2): the fixed encryption vocabulary renders for
+            // the known code; unknown codes and other failures keep the
+            // generic text. No error text is echoed (nLPD #142 posture).
+            const body = await response.json().catch(() => ({}));
+            this.rpeApproval = {
+              state: "error",
+              message: debriefReasonMessage(body, "Could not save the check-in. Try again."),
+            };
+            return;
+          }
+          // Collapsed summary (#165 §4.2): the card's editing controls
+          // hide and the role="status" note carries the one-line
+          // confirmation — metadata only, the notes are never echoed.
+          this.rpeApproval = {
+            state: "submitted",
+            message: "Logged: RPE " + this.rpeValue + " · " + this.rpe.plan_session_key,
+          };
+        })
+        .catch(() => {
+          // Transport failure: the same generic message — no server detail
+          // and no error text echoed (nLPD #142 posture).
+          this.rpeApproval = {
+            state: "error",
+            message: "Could not save the check-in. Try again.",
+          };
+        });
+    },
+
+    skipRpe() {
+      // Dismiss the check-in card and clear every debrief slice: nothing
+      // is persisted (the session stays pending for a later greeting).
+      this.rpe = null;
+      this.rpeMessageIndex = -1;
+      this.rpeApproval = { state: "idle", message: "" };
+      this.rpeValue = 5;
+      this.rpeNotes = "";
+    },
+
+    loadPendingDebriefs() {
+      // Pending-debrief banner (#189 AC3, MADR-0010): fetched once at
+      // init. Passive by contract — a 401 (not signed in yet), a server
+      // failure or a transport error all degrade to no banner, never to
+      // an error surface (MADR-0010: degrade to silence).
+      fetch("/api/debrief/pending")
+        .then(async (response) => {
+          if (!response.ok) {
+            return;
+          }
+          const body = await response.json();
+          this.pendingDebriefs = body.pending || [];
+        })
+        .catch(() => {
+          // Passive reminder: silence is the failure mode.
+        });
+    },
+
+    prefillDebrief(item) {
+      // LOG IT (PO Q8): prefill-and-focus — NEVER auto-send. The coach's
+      // next turn opens the check-in card via rpe_request.
+      this.input = "How did " + item.session_title + " on " + item.plan_session_key + " feel? ";
+      this.$refs.composer.focus();
+    },
+
+    dismissPendingDebrief(key) {
+      // Client-only dismissal (#165 component 4): the reminder reappears
+      // on the next page load — acceptable for a passive reminder (KIS;
+      // no dismissal persistence in 3.1).
+      this.pendingDebriefs = this.pendingDebriefs.filter(
+        (item) => item.plan_session_key !== key
+      );
     },
 
     get planDuration() {
