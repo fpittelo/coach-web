@@ -17,6 +17,16 @@ from typing import Any, Literal, Protocol
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from coach_web.analysis import (
+    BUDGET_EXHAUSTED_MESSAGE,
+    NAMESPACE_SEPARATOR,
+    ComplianceReportMirror,
+    IcuReadBudget,
+    build_debrief_summary_card,
+    icu_tool_get_cost,
+    parse_compliance_report,
+    parse_completed_sessions,
+)
 from coach_web.config import Settings
 from coach_web.debrief import RpeRequest
 from coach_web.mcp_hub import MCPClientHub
@@ -43,6 +53,12 @@ PROPOSE_PERIODIZATION_TOOL = "propose_periodization"
 
 REQUEST_RPE_TOOL = "request_rpe"
 """Name of the synthetic tool the model calls to open a session check-in (#189)."""
+
+ICU_COMPLIANCE_TOOL = "icu_get_workout_compliance"
+"""Raw coach-mcp tool whose result drives the debrief summary card (#190)."""
+
+ICU_COMPLETED_SESSIONS_TOOL = "icu_get_completed_sessions"
+"""Raw coach-mcp tool whose result joins executed load into the card (#190)."""
 
 PLAN_VALIDATION_UI_MESSAGE = (
     "Invalid plan proposal — the coach will retry with corrected arguments."
@@ -76,6 +92,7 @@ AgentEventType = Literal[
     "week_plan",
     "periodization_plan",
     "rpe_request",
+    "debrief_summary",
     "done",
     "error",
 ]
@@ -100,7 +117,14 @@ DEFAULT_SYSTEM_PROMPT = (
     "When the athlete has completed a planned session — or the pending-debrief "
     f"context lists one — open the debrief by calling the `{REQUEST_RPE_TOOL}` tool "
     "with the session's ISO date and title, asking how the session went; the "
-    "athlete answers through the check-in card, then you respond to their RPE."
+    "athlete answers through the check-in card, then you respond to their RPE. "
+    "When the athlete asks how their training went — or a week review is the "
+    f"right deliverable — call the `{ICU_COMPLIANCE_TOOL}` tool first (adding "
+    f"`{ICU_COMPLETED_SESSIONS_TOOL}` when the executed load per session helps) "
+    "and ground every claim in the fetched sessions; never invent numbers. ICU "
+    "reads are budgeted to four GETs per message, so fetch once and analyse — "
+    "the debrief summary card is rendered automatically from the fetched "
+    "compliance report."
 )
 
 
@@ -264,6 +288,43 @@ class OpenRouterClient:
         await self.close()
 
 
+class _WeekAnalysisCollector:
+    """Per-run collector turning ICU read results into the summary card (#190).
+
+    One instance lives for one agent run (one user action). The compliance
+    report and the completed-sessions page are held as they arrive; every
+    arrival that leaves a parsed report in hand re-emits the card — the #165
+    replacement rule makes the re-emission safe (the newest card wins). A
+    failed or malformed read parses to ``None`` and can never produce a
+    card, so no fabricated data ever reaches the UI (AC1).
+    """
+
+    def __init__(self) -> None:
+        """Start an empty collection for one run."""
+        self.report: ComplianceReportMirror | None = None
+        self.page = None
+
+    def card_events(self, tool_name: str, result: str) -> list[AgentEvent]:
+        """Update the held state from *result* and return any card events.
+
+        Only the two analysis tools are observed; every other tool result
+        leaves the collector untouched. The card is built SERVER-SIDE from
+        the parsed upstream whitelist payload — never from agent-claimed
+        numbers.
+        """
+        raw_name = tool_name.rsplit(NAMESPACE_SEPARATOR, 1)[-1]
+        if raw_name == ICU_COMPLIANCE_TOOL:
+            self.report = parse_compliance_report(result)
+        elif raw_name == ICU_COMPLETED_SESSIONS_TOOL:
+            self.page = parse_completed_sessions(result)
+        else:
+            return []
+        if self.report is None:
+            return []
+        card = build_debrief_summary_card(self.report, self.page)
+        return [AgentEvent(type="debrief_summary", data={"summary": card.model_dump()})]
+
+
 class CoachAgent:
     """Autonomous agent loop bridging OpenRouter and the dual MCP hub."""
 
@@ -302,6 +363,11 @@ class CoachAgent:
             periodization_tool_schema(),
             rpe_request_tool_schema(),
         ]
+        # Per-user-action ICU GET budget (PO decision 5a, #190 AC2) and the
+        # analysis collector that turns the fetched compliance data into the
+        # debrief summary card — both live and die with this single run.
+        budget = IcuReadBudget()
+        collector = _WeekAnalysisCollector()
 
         for iteration in range(1, self.max_tool_iterations + 1):
             yield AgentEvent(type="status", data={"phase": "thinking", "iteration": iteration})
@@ -368,7 +434,28 @@ class CoachAgent:
                     for event in rpe_events:
                         yield event
                 else:
-                    result = await self.hub.execute_tool(call["name"], arguments)
+                    cost = icu_tool_get_cost(call["name"])
+                    if cost is not None and budget.would_exceed(cost):
+                        # Budget refusal (PO decision 5a): the call is NOT
+                        # executed — the model is told to summarise from the
+                        # data already fetched. The message carries counts
+                        # and the tool name only (nLPD).
+                        result = json.dumps(
+                            {
+                                "error": BUDGET_EXHAUSTED_MESSAGE.format(
+                                    used=budget.used,
+                                    budget=budget.budget,
+                                    tool=call["name"],
+                                    cost=cost,
+                                )
+                            }
+                        )
+                    else:
+                        if cost is not None:
+                            budget.consume(cost)
+                        result = await self.hub.execute_tool(call["name"], arguments)
+                        for event in collector.card_events(call["name"], result):
+                            yield event
                 yield AgentEvent(
                     type="tool_result",
                     data={"id": call["id"], "name": call["name"], "result": result},
