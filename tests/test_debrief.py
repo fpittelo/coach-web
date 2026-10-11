@@ -211,7 +211,7 @@ class TestBuildDebriefCipher:
 
     def test_error_text_never_carries_the_key_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """The technical message names the env var, never its value (nLPD)."""
-        secret_value = "super-secret-key-material-abc"  # noqa: S105 - test fixture value
+        secret_value = "not-a-valid-fernet-key"  # noqa: S105 - invalid-key fixture value
         monkeypatch.setenv("DATA_ENCRYPTION_KEY", secret_value)
         get_settings.cache_clear()
 

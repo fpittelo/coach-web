@@ -48,6 +48,7 @@ from coach_web.microcycle import (
     build_week_markdown,
     week_bounds,
 )
+from tests.conftest import AUTH_TEST_SESSION_SECRET
 
 GENERIC_422_DETAIL = "Invalid request payload"
 
@@ -61,7 +62,6 @@ ENCRYPTION_503_BODY = {
 
 OWNER_EMAIL = "frederic.pitteloud@gmail.com"
 OTHER_EMAIL = "other-athlete@example.com"
-AUTH_TEST_SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 
 TEST_ENCRYPTION_KEY = Fernet.generate_key()
 """Per-module Fernet key — generated, never a committed literal (gitleaks)."""
@@ -304,13 +304,13 @@ class TestPostDebrief:
 
     def test_503_body_never_carries_key_material(self, monkeypatch) -> None:
         """The 503 body is the fixed vocabulary — no key value can leak."""
-        monkeypatch.setenv("DATA_ENCRYPTION_KEY", "super-secret-key-material-abc")
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", "not-a-valid-fernet-key")
         client = TestClient(create_app())
 
         response = client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 7})
 
         assert response.status_code == 503
-        assert "super-secret-key-material-abc" not in response.text
+        assert "not-a-valid-fernet-key" not in response.text
 
     def test_malformed_payload_keeps_the_generic_422(self) -> None:
         """The debrief path is not a settings path — 422 stays generic (#142)."""
@@ -399,15 +399,13 @@ class TestDebriefAuth:
         monkeypatch.setenv("AUTH_ENABLED", "true")
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_ID", "test-client-id")
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_SECRET", "test-client-secret")
-        monkeypatch.setenv("AUTH_SESSION_SECRET", "unit-test-session-signing-key-0123456789abcdef")
+        monkeypatch.setenv("AUTH_SESSION_SECRET", AUTH_TEST_SESSION_SECRET)
         monkeypatch.setenv("AUTH_WHITELIST_EMAILS", json.dumps(emails))
         get_settings.cache_clear()
         return TestClient(create_app(), base_url="https://testserver")
 
     def _session_cookie(self, email: str) -> str:
-        return create_session_token(
-            email, "unit-test-session-signing-key-0123456789abcdef", ttl_seconds=3600
-        )
+        return create_session_token(email, AUTH_TEST_SESSION_SECRET, ttl_seconds=3600)
 
     def test_unauthenticated_post_answers_401(self, monkeypatch) -> None:
         """AC4: the debrief save is behind the whitelist middleware."""
