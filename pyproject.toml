@@ -4,7 +4,11 @@ build-backend = "hatchling.build"
 
 [project]
 name = "coach-web"
-version = "0.1.0"
+# Static version pinned to the honest "unknown" sentinel (#198): the version
+# reported by /healthz is derived at image build time from the git ref
+# (COACH_WEB_VERSION build-arg -> resolve_version()), so a release-looking
+# static value here would only ever go stale again. Keep 0.0.0.
+version = "0.0.0"
 description = "FastAPI web application for interactive Intervals.icu endurance coaching, agent pipeline & weekly training plan visualization"
 readme = "README.md"
 requires-python = ">=3.12"

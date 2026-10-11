@@ -1,6 +1,7 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
 from collections.abc import AsyncIterator
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -9,7 +10,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from coach_web.agent import AgentEvent
-from coach_web.app import CSP_POLICY, STATIC_DIR, create_app
+from coach_web.app import CSP_POLICY, STATIC_DIR, create_app, resolve_version
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import Settings
@@ -50,13 +51,13 @@ class TestCreateApp:
 
         assert isinstance(app, FastAPI)
 
-    def test_sets_application_metadata(self) -> None:
-        """The application exposes the Coach Web title and a resolved version."""
+    def test_sets_application_metadata(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The application exposes the Coach Web title and the resolved version (#198)."""
+        monkeypatch.setenv("COACH_WEB_VERSION", "1.2.3-test")
         app = create_app()
 
         assert app.title == "Coach Web"
-        assert app.version
-        assert app.version != "0.0.0"
+        assert app.version == "1.2.3-test"
 
     def test_mounts_static_directory(self) -> None:
         """Static assets are mounted under /static."""
@@ -88,6 +89,58 @@ class TestCreateApp:
             response = client.get("/health", headers={"Origin": "http://localhost:8000"})
 
         assert response.headers.get("access-control-allow-origin") == "http://localhost:8000"
+
+
+class TestResolveVersion:
+    """Version resolution contract (#198): env override > metadata > fallback.
+
+    The reported version must never be a stale hardcoded value: release
+    images get the git tag via the build-time ``COACH_WEB_VERSION`` override,
+    local installs report the installed distribution metadata, and bare
+    source checkouts degrade to the honest ``0.0.0`` sentinel.
+    """
+
+    def test_env_override_wins_over_installed_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC1 (#198): a build-time override beats installed metadata."""
+        monkeypatch.setenv("COACH_WEB_VERSION", "0.9.4")
+
+        assert resolve_version() == "0.9.4"
+
+    def test_env_override_reaches_the_health_payload(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The override flows through create_app into /healthz (the bug surface)."""
+        monkeypatch.setenv("COACH_WEB_VERSION", "0.9.4")
+
+        with TestClient(create_app()) as client:
+            payload = client.get("/healthz").json()
+
+        assert payload["version"] == "0.9.4"
+
+    def test_empty_override_falls_through_to_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An empty override (image built without the build-arg) is ignored."""
+        monkeypatch.setenv("COACH_WEB_VERSION", "")
+
+        assert resolve_version() == version("coach-web")
+
+    def test_unset_override_reports_installed_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """AC3 (#198): with no override, the reported version IS the metadata."""
+        monkeypatch.delenv("COACH_WEB_VERSION", raising=False)
+
+        assert resolve_version() == version("coach-web")
+
+    def test_bare_checkout_falls_back_to_the_honest_sentinel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PackageNotFoundError (bare checkout) resolves to 0.0.0 — never 0.1.0."""
+        monkeypatch.delenv("COACH_WEB_VERSION", raising=False)
+
+        with patch("coach_web.app.version", side_effect=PackageNotFoundError):
+            assert resolve_version() == "0.0.0"
 
 
 class TestHealthEndpoint:

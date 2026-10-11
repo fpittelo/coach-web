@@ -20,6 +20,14 @@ RUN pip install --no-cache-dir build && \
 # --- Runtime stage ---
 FROM python:3.12-slim AS runtime
 
+# Build-time version derivation (#198): CI passes the git-derived version
+# (release tag with the leading v stripped, or "<lane>-<short-sha>" for
+# dev/qa lane builds) and resolve_version() reads this override FIRST, so
+# every published image reports the ref it was built from. The empty default
+# keeps manual builds on the honest metadata/fallback path — never a stale
+# hardcoded version.
+ARG COACH_WEB_VERSION=""
+
 LABEL org.opencontainers.image.title="coach-web" \
       org.opencontainers.image.description="FastAPI web frontend for the Coach MCP ecosystem" \
       org.opencontainers.image.authors="Frederic Pitteloud" \
@@ -33,7 +41,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/app/site-packages \
     APP_HOST=0.0.0.0 \
     APP_PORT=8000 \
-    LOG_LEVEL=INFO
+    LOG_LEVEL=INFO \
+    COACH_WEB_VERSION=${COACH_WEB_VERSION}
 
 # Create non-root user and group (UID/GID 10001) and pre-create the
 # persistence mountpoint (MADR-008, #166): the lane volume mounts at /data,
