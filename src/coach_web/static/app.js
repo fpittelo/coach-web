@@ -74,6 +74,16 @@
  * link in the settings modal (pairs with #180). Every other surface keeps
  * the strict #142 posture: no exception text, no input echo (nLPD).
  *
+ * Tool activity indicator (#199): the per-tool status chips are gone — the
+ * tooling status line is the single compact activity indicator, carrying
+ * the friendly static label "Coach is checking your training data…" while
+ * MCP calls are in flight. Tracking is id-based: tool_call adds the call
+ * id, tool_result releases it, the last release returns the waiting dots,
+ * and finishStream clears the tracker so a failed stream never leaves a
+ * lingering indicator. Raw coach-mcp__* tool names are never rendered or
+ * stored (nLPD/#142 posture); typed and transport errors keep surfacing
+ * through the #84 paths.
+ *
  * Stream phases (#84): the UI state carries an explicit plain-string phase —
  * idle | waiting | streaming | tooling | error (KIS: no state-machine
  * framework) — driving the thinking dots, status line and non-blocking
@@ -980,25 +990,25 @@ function coachApp() {
           }
           const data = parsePayload(event);
           this.phase = "tooling"; // AC1: MCP tools running
-          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
-          this.tools.push({
-            id: data.id,
-            name: data.name,
-            state: "running",
-          });
+          // #199: the friendly static label — raw tool names never render.
+          this.statusText = "Coach is checking your training data…";
+          // In-flight tracking (#199): the call id joins the tracker; the
+          // indicator clears when tool_result releases the last id. The
+          // raw tool name is NOT stored — internal tool names never
+          // surface (nLPD/#142 posture). Unidentifiable calls are not
+          // tracked (they could never be released).
+          if (data.id && !this.tools.includes(data.id)) {
+            this.tools.push(data.id);
+          }
         },
 
         tool_start: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
           }
-          const data = parsePayload(event);
           this.phase = "tooling"; // AC1: MCP tools running
-          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
-          const tool = this.tools.find((item) => item.id === data.id);
-          if (tool) {
-            tool.state = "running";
-          }
+          // #199: the friendly static label — raw tool names never render.
+          this.statusText = "Coach is checking your training data…";
         },
 
         tool_result: (event) => {
@@ -1006,11 +1016,17 @@ function coachApp() {
             return; // stale event from an ended or superseded stream
           }
           const data = parsePayload(event);
-          this.phase = "tooling"; // AC1: tool events keep the tooling sub-state
-          this.statusText = "Running tools…"; // #148 AC4: visible tooling label
-          const tool = this.tools.find((item) => item.id === data.id);
-          if (tool) {
-            tool.state = "done";
+          // Release the call (#199): the id leaves the tracker; when the
+          // last in-flight call finishes, the indicator clears and the
+          // phase returns to the waiting dots — the coach reasons over
+          // the results next (AC1: no lingering tool chatter).
+          this.tools = this.tools.filter((id) => id !== data.id);
+          if (this.tools.length === 0) {
+            this.phase = "waiting";
+            this.statusText = "Thinking";
+          } else {
+            this.phase = "tooling"; // AC1: tool events keep the tooling sub-state
+            this.statusText = "Coach is checking your training data…";
           }
         },
 
@@ -1210,6 +1226,9 @@ function coachApp() {
       this.streaming = false;
       this.statusText = "";
       this.phase = "idle";
+      // In-flight tool tracker (#199): a finished or failed stream can
+      // never leave a lingering activity indicator behind.
+      this.tools = [];
       this.clearWatchdog();
       if (this.controller) {
         this.controller.abort();

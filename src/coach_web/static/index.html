@@ -636,14 +636,10 @@
               <p class="thought" x-text="thought"></p>
             </template>
 
-            <ul class="tool-list" x-show="tools.length > 0">
-              <template x-for="tool in tools" :key="tool.id">
-                <li class="tool" :class="{ 'tool--done': tool.state === 'done' }">
-                  <span class="tool-name" x-text="tool.name"></span>
-                  <span class="tool-state" x-text="tool.state"></span>
-                </li>
-              </template>
-            </ul>
+            <!-- Tool activity (#199): the per-tool chip list is gone — the
+                 status line above is the single compact activity indicator
+                 while MCP calls are in flight, and raw internal tool names
+                 never render (nLPD/#142 posture). -->
           </div>
 
           <!-- Non-blocking error banner (#84 AC3/AC5): a persistent,

@@ -141,6 +141,20 @@ real keyboard-reachable links to /auth/login with tokenized styling; the
 banner stays non-blocking and the #84 error-separation contract is
 untouched.
 
+Issue #199 collapses the MCP tool-status chatter into a single activity
+indicator. The v0.9.2 prod-lane test flooded the console with one raw chip
+per tool call ("coach-mcp__icu_get_workout_compliance done; …"), crushing
+the debrief card and the RPE stepper out of view. The per-tool chip list is
+removed entirely (markup + stylesheet rules); the tooling status line —
+already the #84/#148 single status surface — carries the friendly static
+label "Coach is checking your training data…" instead, driven by in-flight
+call tracking (tool_call adds the call id, tool_result releases it, the
+last release returns the phase to the waiting dots, and finishStream clears
+the tracker so a failed stream can never leave a lingering indicator). Raw
+``coach-mcp__*`` tool names are never rendered or stored client-side (Swiss
+nLPD / #142 posture); the typed-error and transport-error paths are
+untouched, so failures stay visible (AC3).
+
 Issue #200 removes the stale "Local VIDAR" codename from every
 user-visible string of the main page (masthead kicker, footer privacy
 line, settings lede) — leftover internal hostname meaningless to the
@@ -1006,27 +1020,39 @@ class TestStreamPhaseContract:
         assert 'this.phase = "waiting"' in status
 
     def test_tool_events_display_the_tooling_substate(self) -> None:
-        """AC1: tool_call, tool_start and tool_result all show tooling."""
+        """AC1 (#199): tool events drive the tooling sub-state while in flight.
+
+        Superseded for #199: tool_call and tool_start show tooling, and
+        tool_result keeps tooling only while OTHER calls are still in
+        flight — once the last in-flight call finishes, the indicator
+        clears and the phase returns to the waiting dots (the coach
+        reasons over the results next). The accumulating per-tool chips
+        are gone.
+        """
         script = self._script()
 
-        for event in ("tool_call", "tool_start", "tool_result"):
+        for event in ("tool_call", "tool_start"):
             handler = _rule_block(script, f"{event}: (event) =>")
             assert 'this.phase = "tooling"' in handler, event
 
-    def test_tool_events_surface_the_running_tools_status_label(self) -> None:
-        """AC4 (#148): tool events surface a visible "Running tools…" label.
+        result = _rule_block(script, "tool_result: (event) =>")
+        assert 'this.phase = "tooling"' in result, "tooling while calls remain in flight"
+        assert 'this.phase = "waiting"' in result, "the indicator clears once every call finished"
 
-        The tooling sub-state previously only changed the pulsing indicator —
-        the status line kept the stale "Thinking"/"Connecting" text. Every
-        tool event now writes the static tooling label so the visible status
-        matches the phase. The phase contract itself is unchanged (pinned by
-        test_tool_events_display_the_tooling_substate).
+    def test_tool_events_surface_the_friendly_activity_label(self) -> None:
+        """AC1/nLPD (#199): tool events surface ONE friendly activity label.
+
+        Supersedes the #148 "Running tools…" label: the tooling status line
+        is the single compact activity indicator and its text is static,
+        athlete-friendly prose — raw ``coach-mcp__*`` tool names are never
+        rendered anywhere. The phase contract itself is pinned by
+        test_tool_events_display_the_tooling_substate.
         """
         script = self._script()
 
         for event in ("tool_call", "tool_start", "tool_result"):
             handler = _rule_block(script, f"{event}: (event) =>")
-            assert 'this.statusText = "Running tools…"' in handler, event
+            assert 'this.statusText = "Coach is checking your training data…"' in handler, event
 
     def test_finish_stream_idles_the_phase(self) -> None:
         """Stream end returns the phase to idle (the banner persists)."""
@@ -1197,6 +1223,121 @@ class TestStreamPhaseContract:
 
         banner = _rule_block(css, ".error-banner")
         assert "var(--error)" in banner
+
+
+class TestToolStatusIndicatorContract:
+    """Single tool activity indicator replaces the accumulating chips (#199).
+
+    The v0.9.2 prod-lane test flooded the console with one raw chip per MCP
+    tool call ("coach-mcp__icu_get_workout_compliance done; …"), crushing
+    the debrief card and the RPE stepper out of view. The contract now:
+
+    - the per-tool chip list is gone (markup + stylesheet rules) — at most
+      ONE compact activity indicator exists, the tooling status line, with
+      friendly static text (pinned by TestStreamPhaseContract);
+    - raw ``coach-mcp__*`` tool names are never rendered nor stored
+      client-side (Swiss nLPD / #142 posture: internal tool schemas stay
+      internal);
+    - the indicator is driven by in-flight call tracking: ``tool_call``
+      adds the call id, ``tool_result`` releases it, and the tracker
+      empties when the calls finish — with a ``finishStream`` safety net
+      so a failed stream can never leave a lingering indicator;
+    - failures stay visible: the typed-error and transport-error paths are
+      untouched (pinned by TestStreamPhaseContract) — no silent hiding.
+
+    Source-level assertions only (ADR-006 §5 — no Node toolchain).
+    """
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    # --- AC1: no accumulating chips, one indicator -----------------------------
+
+    def test_per_tool_chip_list_is_gone(self) -> None:
+        """AC1: the accumulating tool chip list is removed from the page."""
+        html = self._html()
+
+        assert 'class="tool-list"' not in html
+        assert 'x-for="tool in tools"' not in html
+        assert "tool--done" not in html
+
+    def test_per_tool_chip_styles_are_gone(self) -> None:
+        """AC1: the chip stylesheet rules are removed (superseded, not dead)."""
+        css = self._css()
+
+        assert ".tool-list" not in css
+        assert ".tool-name" not in css
+        assert ".tool-state" not in css
+        assert ".tool--done" not in css
+        assert ".tool {" not in css
+
+    def test_tooling_status_line_is_the_single_indicator(self) -> None:
+        """AC1: exactly one tool-status surface — the tooling status line."""
+        html = self._html()
+
+        # The status line (streaming | tooling | error) remains the single
+        # activity indicator; no second tool-specific element was added.
+        assert 'class="status-line"' in html
+        assert "tool-indicator" not in html
+        assert "tool-list" not in html
+
+    # --- nLPD: internal tool names never surface --------------------------------
+
+    def test_raw_tool_names_are_never_rendered_or_stored(self) -> None:
+        """nLPD/#142: no raw coach-mcp__* tool name reaches the page or state."""
+        html = self._html()
+        script = self._script()
+
+        assert "tool.name" not in html
+        assert "coach-mcp__" not in html
+        # The client no longer even stores the name (nothing to leak later).
+        assert "name: data.name" not in script
+
+    # --- in-flight tracking ------------------------------------------------------
+
+    def test_tool_call_tracks_the_in_flight_id(self) -> None:
+        """tool_call adds the call id to the in-flight tracker (deduped)."""
+        handler = _rule_block(self._script(), "tool_call: (event) =>")
+
+        assert "this.tools.push(data.id)" in handler
+        assert "this.tools.includes(data.id)" in handler
+
+    def test_tool_result_releases_the_in_flight_id(self) -> None:
+        """tool_result releases the id; an empty tracker clears the indicator."""
+        handler = _rule_block(self._script(), "tool_result: (event) =>")
+
+        assert "this.tools = this.tools.filter(" in handler
+        assert "this.tools.length === 0" in handler
+        assert 'this.statusText = "Thinking"' in handler
+
+    def test_finish_stream_clears_the_in_flight_tracker(self) -> None:
+        """A finished or failed stream can never leave a lingering indicator."""
+        finish = _rule_block(self._script(), "finishStream()")
+
+        assert "this.tools = []" in finish
+
+    # --- AC3: failures stay visible ----------------------------------------------
+
+    def test_tool_failure_surfaces_stay_untouched(self) -> None:
+        """AC3: the error surfaces are independent of the tool tracker.
+
+        The typed-error handler still writes the banner (the #84 contract)
+        and the tool handlers never touch it — a failing call cannot be
+        silently absorbed by the indicator.
+        """
+        script = self._script()
+
+        error = _rule_block(script, "error: (event) =>")
+        assert "this.errorBanner" in error
+        for event in ("tool_call", "tool_start", "tool_result"):
+            handler = _rule_block(script, f"{event}: (event) =>")
+            assert "errorBanner" not in handler, event
 
 
 class TestAutoScrollContract:
