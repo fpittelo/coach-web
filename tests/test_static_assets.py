@@ -140,6 +140,11 @@ when a stream fails with 401 (expired-session defense-in-depth). Both are
 real keyboard-reachable links to /auth/login with tokenized styling; the
 banner stays non-blocking and the #84 error-separation contract is
 untouched.
+
+Issue #200 removes the stale "Local VIDAR" codename from every
+user-visible string of the main page (masthead kicker, footer privacy
+line, settings lede) — leftover internal hostname meaningless to the
+athlete. The privacy statements themselves stay; only the codename goes.
 """
 
 import re
