@@ -263,6 +263,18 @@ class TestDebriefSaveRequest:
 
         assert request.notes is None
 
+    def test_mirror_to_icu_defaults_to_false(self) -> None:
+        """The mirror is strictly opt-in — the default save never touches ICU."""
+        request = _save_payload()
+
+        assert request.mirror_to_icu is False
+
+    def test_mirror_to_icu_accepts_true(self) -> None:
+        """The athlete's explicit mirror consent rides the validated payload."""
+        request = _save_payload(mirror_to_icu=True)
+
+        assert request.mirror_to_icu is True
+
 
 class TestSaveDebrief:
     """The encrypted persistence path (#189 AC1/AC2/AC4)."""

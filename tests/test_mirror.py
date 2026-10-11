@@ -367,7 +367,7 @@ class TestMirrorDebriefToIcu:
     async def test_unexpected_exception_degrades_to_post_failed(self, settings) -> None:
         """The mirror never raises — any crash is a fixed soft warning."""
         hub = FakeMirrorHub(results={COMPLETED_SESSIONS_TOOL: _page_payload(_session())})
-        hub.execute_tool = MagicMock(side_effect=RuntimeError("boom"))
+        hub.execute_tool = MagicMock(side_effect=RuntimeError("boom"))  # type: ignore[method-assign]
 
         outcome, activity_id = await mirror_debrief_to_icu(
             lambda _settings: hub,

@@ -86,6 +86,12 @@ class DebriefSaveRequest(BaseModel):
     encrypted at the persistence boundary — they exist in plaintext only
     inside the request handling process, never at rest and never in a
     response, log or SSE payload (nLPD).
+
+    ``mirror_to_icu`` is the athlete's explicit, per-save consent to mirror
+    the debrief to Intervals.icu as a session comment (#190 AC3): strictly
+    opt-in (default ``False`` — the plain save never touches ICU), and the
+    mirror itself is non-blocking on the save (the debrief is durable before
+    the mirror starts).
     """
 
     plan_session_key: str = Field(
@@ -103,6 +109,13 @@ class DebriefSaveRequest(BaseModel):
         default=None,
         max_length=MAX_DEBRIEF_NOTES_LENGTH,
         description="Optional free-text session notes (stored Fernet-encrypted)",
+    )
+    mirror_to_icu: bool = Field(
+        default=False,
+        description=(
+            "Athlete's explicit per-save consent to mirror this debrief to "
+            "Intervals.icu as a session comment (#190 AC3) — strictly opt-in."
+        ),
     )
 
     @field_validator("plan_session_key")

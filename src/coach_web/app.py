@@ -34,6 +34,7 @@ from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import (
     DEFAULT_ATHLETE_ID,
+    DebriefMirrorOutcome,
     DebriefSaveRequest,
     DebriefSaveResponse,
     PendingDebriefResponse,
@@ -44,7 +45,9 @@ from coach_web.debrief import (
     save_debrief,
 )
 from coach_web.errors import (
+    MIRROR_REASON_MESSAGES,
     EncryptionUnavailableError,
+    MirrorReason,
     SettingsValidationError,
     encryption_reason_payload,
     settings_reason_from_errors,
@@ -60,6 +63,7 @@ from coach_web.microcycle import (
     upsert_week_draft,
     write_week_days,
 )
+from coach_web.mirror import mirror_debrief_to_icu
 from coach_web.models import (
     AgentStreamRequest,
     PlanApprovalRequest,
@@ -161,6 +165,32 @@ def _athlete_id_for_session(settings: Settings, session_cookie: str | None) -> i
     except TokenError:
         return DEFAULT_ATHLETE_ID
     return athlete_id_from_email(claims.get("email"))
+
+
+async def _default_debrief_mirror(
+    settings: Settings,
+    *,
+    plan_session_key: str,
+    rpe: int,
+    notes: str | None,
+) -> DebriefMirrorOutcome:
+    """Mirror one saved debrief to Intervals.icu through the real hub (#190 AC3).
+
+    Thin adapter over :func:`coach_web.mirror.mirror_debrief_to_icu` matching
+    the ``app.state.debrief_mirror`` hook signature, so tests can inject a
+    fake (ZERO network) while production routes through the MCP hub. The
+    resolved activity id is deliberately dropped: linking the debrief row to
+    its ICU mirror is not required by any #190 AC (KIS/YAGNI) — the outcome
+    alone rides the response.
+    """
+    outcome, _activity_id = await mirror_debrief_to_icu(
+        MCPClientHub.from_settings,
+        settings,
+        plan_session_key=plan_session_key,
+        rpe=rpe,
+        notes=notes,
+    )
+    return outcome
 
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
@@ -277,6 +307,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.started_at = time.monotonic()
     application.state.agent_factory = create_agent
     application.state.hub_factory = MCPClientHub.from_settings
+    application.state.debrief_mirror = _default_debrief_mirror
 
     # Persistence (MADR-008, #166): one async engine per app instance over the
     # configured SQLite file. Engine construction is lazy — no filesystem
@@ -657,7 +688,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         (AC1); the 201 confirmation carries metadata only — the notes are
         never echoed (nLPD). The debrief row is scoped to the request's
         athlete (AC4): derived from the verified session email on auth-enabled
-        lanes, the single local athlete otherwise.
+        lanes, the single local athlete otherwise. When the athlete consented
+        (``mirror_to_icu``), the saved debrief is mirrored to Intervals.icu as
+        a session comment (#190 AC3) — non-blocking: a mirror failure keeps
+        the 201 and rides the fixed soft warning in the response body.
         """
         settings: Settings = request.app.state.settings
         try:
@@ -677,8 +711,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Debrief persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # ICU session-comment mirror (#190 AC3): strictly opt-in and
+        # NON-BLOCKING on the save — the debrief row is already durable when
+        # the mirror starts, and every mirror failure degrades to the fixed
+        # soft warning while the 201 stands. The hook is injectable
+        # (app.state.debrief_mirror) so tests fake it with zero network.
+        mirror: DebriefMirrorOutcome | None = None
+        if payload.mirror_to_icu:
+            mirror_hook = getattr(request.app.state, "debrief_mirror", _default_debrief_mirror)
+            try:
+                mirror = await mirror_hook(
+                    settings,
+                    plan_session_key=payload.plan_session_key,
+                    rpe=payload.rpe,
+                    notes=payload.notes,
+                )
+            except Exception:  # noqa: BLE001 - the mirror must never break the save (AC3)
+                logger.warning("Debrief ICU mirror hook raised — degrading to the soft warning")
+                mirror = DebriefMirrorOutcome(
+                    status="failed",
+                    code=MirrorReason.POST_FAILED,
+                    message=MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED],
+                )
         return DebriefSaveResponse(
-            status="saved", plan_session_key=row.plan_session_key, rpe=row.rpe
+            status="saved", plan_session_key=row.plan_session_key, rpe=row.rpe, mirror=mirror
         )
 
     @application.get(

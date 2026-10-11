@@ -25,8 +25,8 @@ from coach_web.analysis import (
     IcuReadBudget,
     build_debrief_summary_card,
     icu_tool_get_cost,
-    parse_compliance_report,
     parse_completed_sessions,
+    parse_compliance_report,
 )
 from coach_web.config import Settings
 from coach_web.debrief import RpeRequest
