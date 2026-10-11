@@ -303,6 +303,17 @@ class TestSwissMinimalistContract:
         assert "/static/vendor/alpine.min.js" in html
         assert "/static/app.js" in html
 
+    def test_index_carries_no_vidar_codename(self) -> None:
+        """AC1 (#200): the stale "Local VIDAR" codename is absent from the page.
+
+        Leftover internal codename meaningless to the athlete (PO request,
+        v0.9.2 prod-lane test). No VIDAR reference may remain in any
+        user-visible UI text of the rendered main page.
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        assert "vidar" not in html.lower()
+
     def test_index_uses_text_interpolation_only(self) -> None:
         """User data is bound with x-text; x-html is assistant-only + sanitized.
 
