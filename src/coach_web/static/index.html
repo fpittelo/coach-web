@@ -420,6 +420,99 @@
                     ></p>
                   </div>
                 </template>
+                <!-- Debrief summary card (#190): renders beneath the assistant
+                     message that fetched the ICU compliance data. The card is
+                     built SERVER-SIDE from the fetched report (never
+                     agent-claimed numbers, AC1) and arrives on the
+                     debrief_summary SSE event; debriefSummary/
+                     debriefSummaryMessageIndex pins the single active card to
+                     that message — a new event replaces the previous one (#82
+                     rule). Structured Pydantic→HTML only: x-text bindings,
+                     never markdown (ADR-006 §9, STRIDE #87). Severity chips
+                     carry word + tokenized color, never color alone (#165).
+                     Purely informational — no actions, no editing. -->
+                <template
+                  x-if="message.role === 'assistant' && debriefSummary && debriefSummaryMessageIndex === index"
+                >
+                  <div class="plan-card debrief-card" role="region" aria-label="Debrief summary">
+                    <p class="plan-card-label">Debrief summary</p>
+                    <p class="debrief-headline" x-text="debriefSummary.headline"></p>
+                    <p class="debrief-range">
+                      <span x-text="debriefSummary.oldest"></span>
+                      →
+                      <span x-text="debriefSummary.newest"></span>
+                    </p>
+                    <dl class="debrief-counts">
+                      <div class="debrief-count">
+                        <dt>Planned</dt>
+                        <dd x-text="debriefSummary.total_planned"></dd>
+                      </div>
+                      <div class="debrief-count">
+                        <dt>Completed</dt>
+                        <dd x-text="debriefSummary.completed"></dd>
+                      </div>
+                      <div class="debrief-count">
+                        <dt>Missed</dt>
+                        <dd x-text="debriefSummary.missed"></dd>
+                      </div>
+                      <div class="debrief-count">
+                        <dt>Upcoming</dt>
+                        <dd x-text="debriefSummary.upcoming"></dd>
+                      </div>
+                      <div class="debrief-count" x-show="debriefSummary.adherence_rate !== null">
+                        <dt>Adherence</dt>
+                        <dd x-text="debriefSummary.adherence_rate + '%'"></dd>
+                      </div>
+                    </dl>
+                    <div class="plan-table-wrap">
+                      <table class="interval-table debrief-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">Date</th>
+                            <th scope="col">Session</th>
+                            <th scope="col">Status</th>
+                            <th scope="col">Compliance</th>
+                            <th scope="col">Structure</th>
+                            <th scope="col">Executed load</th>
+                            <th scope="col">Verdict</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <template
+                            x-for="row in debriefSummary.sessions"
+                            :key="row.session_date + row.session_title"
+                          >
+                            <tr>
+                              <td data-label="Date" x-text="row.session_date"></td>
+                              <td data-label="Session" x-text="row.session_title"></td>
+                              <td data-label="Status" x-text="row.status"></td>
+                              <td
+                                data-label="Compliance"
+                                x-text="row.compliance_pct === null ? '—' : row.compliance_pct + '%'"
+                              ></td>
+                              <td data-label="Structure" x-text="row.structure_diff"></td>
+                              <td
+                                data-label="Executed load"
+                                x-text="row.executed_tss === null ? '—' : row.executed_tss"
+                              ></td>
+                              <td data-label="Verdict">
+                                <span
+                                  class="debrief-chip"
+                                  :class="'debrief-chip--' + row.severity"
+                                  x-text="severityWord(row.severity)"
+                                ></span>
+                              </td>
+                            </tr>
+                          </template>
+                        </tbody>
+                      </table>
+                    </div>
+                    <p class="debrief-note">
+                      Executed load joins from the fetched Intervals.icu sessions; planned
+                      load is not exposed by the ICU report and is never guessed.
+                    </p>
+                  </div>
+                </template>
                 <!-- Check-in card (#189): renders beneath the assistant message
                      that opened the debrief. rpe/rpeMessageIndex pins the single
                      active card to the proposing message — a new rpe_request
@@ -427,12 +520,14 @@
                      Pydantic→HTML only: x-text bindings, never markdown (ADR-006
                      §9, STRIDE #87). The stepper is two real buttons around an
                      aria-live value (#165 a11y — no range input, no drag); LOG
-                     CHECK-IN posts {plan_session_key, rpe, notes} to POST
-                     /api/debrief — the server encrypts the notes (C2 Fernet) and
-                     persists per athlete; Skip dismisses without persisting. On
-                     success the editing controls hide and the role="status" note
-                     carries the one-line summary (metadata only — the notes are
-                     never echoed, nLPD). -->
+                     CHECK-IN posts {plan_session_key, rpe, notes,
+                     mirror_to_icu} to POST /api/debrief — the server encrypts
+                     the notes (C2 Fernet) and persists per athlete, then
+                     mirrors the debrief to Intervals.icu when the athlete
+                     consented (#190 AC3); Skip dismisses without persisting.
+                     On success the editing controls hide and the role="status"
+                     note carries the one-line summary plus the mirror outcome
+                     (metadata only — the notes are never echoed, nLPD). -->
                 <template x-if="message.role === 'assistant' && rpe && rpeMessageIndex === index">
                   <div class="plan-card rpe-card" role="region" aria-label="Session check-in">
                     <p class="plan-card-label">Session check-in</p>
@@ -467,6 +562,15 @@
                           aria-label="Session notes"
                           x-model="rpeNotes"
                         ></textarea>
+                      </label>
+                      <!-- ICU mirror consent (#190 AC3): strictly opt-in,
+                           folded into the LOG CHECK-IN confirmation — no
+                           second confirmation card. The server posts the
+                           fixed-format summary comment only when this is
+                           checked; a mirror failure never loses the debrief. -->
+                      <label class="rpe-mirror-field">
+                        <input type="checkbox" class="rpe-mirror" x-model="mirrorToIcu" />
+                        <span>Mirror to Intervals.icu</span>
                       </label>
                       <div class="plan-actions">
                         <button

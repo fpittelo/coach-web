@@ -54,6 +54,18 @@
  * dismissible, metadata-only; LOG IT prefills the composer (never
  * auto-send, PO Q8).
  *
+ * Debrief summary & ICU mirror (#190): the debrief_summary SSE event
+ * carries the server-built planned-vs-executed card (built from the
+ * fetched ICU compliance report — never agent-claimed numbers, AC1)
+ * pinned via the debriefSummary/debriefSummaryMessageIndex pair (#82
+ * replacement rule). The card is purely informational: headline, range,
+ * report counts and per-session rows with word+token severity chips
+ * (#165 — never color alone). The check-in card gains an opt-in
+ * "Mirror to Intervals.icu" consent folded into LOG CHECK-IN (no second
+ * confirmation card); the POST carries mirror_to_icu and a mirror
+ * failure surfaces the server's fixed soft warning in the submitted
+ * note while the debrief stays saved (AC3).
+ *
  * Settings error reasons (#181): the owner-facing settings saves (objectives
  * PUT, periodization approval) surface the server's structured, owner-safe
  * 422 body {code, message} — the message renders only when its code is in
@@ -135,6 +147,17 @@ const WEEK_DAY_LABELS = {
   fri: "Fri",
   sat: "Sat",
   sun: "Sun",
+};
+
+// Debrief-card severity vocabulary (#190): static client-side words for the
+// server-assigned severity tokens (word + tokenized color, never color alone
+// — #165). "missed" names the critical outcome (the planned work did not
+// happen); "drift" names a completed session whose executed structure
+// diverged from the plan.
+const DEBRIEF_SEVERITY_WORDS = {
+  ok: "ok",
+  warn: "drift",
+  critical: "missed",
 };
 
 const WEEK_DAY_FULL_NAMES = {
@@ -335,6 +358,15 @@ function coachApp() {
     rpeValue: 5,
     rpeNotes: "",
     pendingDebriefs: [],
+    // Debrief summary card (#190): the server-built planned-vs-executed
+    // card arrives on the debrief_summary SSE event — pinned to the
+    // message that fetched it (#82 replacement rule). mirrorToIcu is the
+    // athlete's per-check-in consent to mirror the debrief to
+    // Intervals.icu (#190 AC3) — strictly opt-in, reset whenever a new
+    // check-in opens or the card is dismissed.
+    debriefSummary: null,
+    debriefSummaryMessageIndex: -1,
+    mirrorToIcu: false,
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -1060,6 +1092,23 @@ function coachApp() {
           this.rpeApproval = { state: "idle", message: "" };
           this.rpeValue = 5;
           this.rpeNotes = "";
+          // Mirror consent (#190 AC3): strictly opt-in — every newly opened
+          // check-in starts with the consent OFF.
+          this.mirrorToIcu = false;
+          this.scrollToBottom();
+        },
+
+        debrief_summary: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Debrief summary card (#190): the server built the card from the
+          // fetched ICU compliance data — the client only renders it
+          // (structured x-text, #165). A new card replaces the previous
+          // one (#82 rule).
+          this.debriefSummary = data.summary || null;
+          this.debriefSummaryMessageIndex = index;
           this.scrollToBottom();
         },
 
@@ -1199,6 +1248,11 @@ function coachApp() {
       this.rpeApproval = { state: "idle", message: "" };
       this.rpeValue = 5;
       this.rpeNotes = "";
+      // Debrief summary card + mirror consent (#190): a chat reset clears
+      // both — the pending banner is page-level state and survives.
+      this.debriefSummary = null;
+      this.debriefSummaryMessageIndex = -1;
+      this.mirrorToIcu = false;
       this.input = "";
       this.errorBanner = "";
       this.errorBannerSignin = false;
@@ -1504,6 +1558,7 @@ function coachApp() {
           plan_session_key: this.rpe.plan_session_key,
           rpe: this.rpeValue,
           notes: this.rpeNotes.trim() === "" ? null : this.rpeNotes,
+          mirror_to_icu: this.mirrorToIcu === true,
         }),
       })
         .then(async (response) => {
@@ -1527,9 +1582,20 @@ function coachApp() {
           // Collapsed summary (#165 §4.2): the card's editing controls
           // hide and the role="status" note carries the one-line
           // confirmation — metadata only, the notes are never echoed.
+          // The ICU mirror outcome (#190 AC3) rides the same note: a
+          // successful mirror appends its confirmation, a failed mirror
+          // appends the server's fixed soft warning — the debrief stays
+          // saved either way (the message leads with the saved line).
+          const body = await response.json().catch(() => ({}));
+          let note = "Logged: RPE " + this.rpeValue + " · " + this.rpe.plan_session_key;
+          if (body.mirror && body.mirror.status === "mirrored") {
+            note += " · Mirrored to Intervals.icu.";
+          } else if (body.mirror && body.mirror.status === "failed") {
+            note += " · " + body.mirror.message;
+          }
           this.rpeApproval = {
             state: "submitted",
-            message: "Logged: RPE " + this.rpeValue + " · " + this.rpe.plan_session_key,
+            message: note,
           };
         })
         .catch(() => {
@@ -1550,6 +1616,13 @@ function coachApp() {
       this.rpeApproval = { state: "idle", message: "" };
       this.rpeValue = 5;
       this.rpeNotes = "";
+      this.mirrorToIcu = false;
+    },
+
+    severityWord(severity) {
+      // Severity chip word (#190, #165): static vocabulary for the
+      // server-assigned token — word + tokenized color, never color alone.
+      return DEBRIEF_SEVERITY_WORDS[severity] || severity;
     },
 
     loadPendingDebriefs() {
