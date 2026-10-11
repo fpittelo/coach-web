@@ -16,10 +16,18 @@ is never a raw-LLM passthrough channel (upstream security condition 4).
 The ICU activity is resolved by date from the bounded completed-sessions
 read: zero matches, several matches, and read failures each map to their
 own fixed reason — nothing is ever posted to a guessed activity.
+
+#194 hardening: every mirror tool call is bounded by the mirror-specific
+latency budget (``MIRROR_TOOL_TIMEOUT_SECONDS`` — well under the hub's
+2×30 s worst case), and the upstream post reply is classified into the
+LOCAL three-state outcome (``posted`` / ``failed`` / ``unknown``) — an
+unconfirmable reply is never treated as mirror-confirmed.
 """
 
+import asyncio
 import re
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any
 
 from coach_web.analysis import parse_completed_sessions
@@ -45,6 +53,49 @@ MIRROR_SUCCESS_MESSAGE = "Debrief mirrored to Intervals.icu."
 
 MIRROR_NOTES_PLACEHOLDER = "(none submitted)"
 """Fixed placeholder when the debrief carried no notes."""
+
+MIRROR_TOOL_TIMEOUT_SECONDS = 10.0
+"""Per-tool-call latency budget for the mirror (#194 AC2).
+
+The mirror runs inline on the debrief save response path (non-blocking on
+the DURABILITY, not on the response): its two sequential hub tool calls
+(resolve + post) would otherwise inherit the hub's 30 s per-call timeout —
+up to ~2×30 s on a slow hub. Each mirror tool call is bounded by THIS
+strictly smaller budget (two-call worst case 2×10 s), and a timed-out call
+degrades to the fixed soft warning — the mirror never raises.
+"""
+
+MIRROR_POSTED_PREFIX = "Successfully posted session comment"
+"""Upstream success reply prefix — the documented string contract.
+
+Upstream contract (coach ``src/coach_mcp/server.py``
+``icu_add_session_comment``, verified 2026-10-11 @ 7a5dcb7): the tool
+returns a plain string — ``"Successfully posted session comment on
+activity '<id>': …"`` on success, ``"Error …"`` on failure. This prefix
+match IS the success signal; a structured upstream success signal would be
+a coach-repo contract change and is deferred (fpittelo/coach#82 follow-up,
+#194 AC3).
+"""
+
+_UPSTREAM_ERROR_PREFIX = "Error"
+"""Upstream failure reply prefix — both upstream failure shapes start with it."""
+
+
+class MirrorPostVerdict(StrEnum):
+    """The three-state classification of the upstream post reply (#194 AC3).
+
+    ``posted`` — the documented success prefix AND the resolved activity id
+    appear in the reply (mirror-confirmed). ``failed`` — the upstream Error
+    shape (a definite application failure). ``unknown`` — anything else
+    (contract drift, hub transport errors, a success-shaped reply about a
+    different activity): NEVER treated as mirror-confirmed; surfaced
+    honestly as the fixed ``post_unconfirmed`` soft warning.
+    """
+
+    POSTED = "posted"
+    FAILED = "failed"
+    UNKNOWN = "unknown"
+
 
 _SCRIPT_BLOCK_RE = re.compile(
     r"<(?:script|style)\b[^>]*>.*?</(?:script|style)\s*>",
@@ -129,12 +180,21 @@ async def _resolve_activity_id(
     The bounded completed-sessions read is pinned to the single session day
     (one GET); the date match must be unique — zero matches, several
     matches and read failures each map to their own fixed reason, so
-    nothing is ever posted to a guessed activity.
+    nothing is ever posted to a guessed activity. The read is bounded by
+    the mirror latency budget (#194 AC2).
     """
-    result = await hub.execute_tool(
-        COMPLETED_SESSIONS_TOOL,
-        {"oldest": plan_session_key, "newest": plan_session_key},
-    )
+    try:
+        result = await asyncio.wait_for(
+            hub.execute_tool(
+                COMPLETED_SESSIONS_TOOL,
+                {"oldest": plan_session_key, "newest": plan_session_key},
+            ),
+            timeout=MIRROR_TOOL_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        # A timed-out read is a definite non-answer — the ICU side is
+        # unavailable (the same fixed reason as an error-shaped read).
+        return _ResolutionFailure(MirrorReason.HUB_UNAVAILABLE)
     page = parse_completed_sessions(result)
     if page is None:
         # A failed or error-shaped read cannot resolve an activity — the
@@ -148,9 +208,23 @@ async def _resolve_activity_id(
     return _Resolved(matches[0].id)
 
 
-def _post_succeeded(result: str) -> bool:
-    """Return True only on the upstream's documented success reply shape."""
-    return result.startswith("Successfully posted session comment")
+def _classify_post_reply(result: str, activity_id: str) -> MirrorPostVerdict:
+    """Classify the upstream post reply into the three-state verdict (#194 AC3).
+
+    The upstream ``icu_add_session_comment`` tool returns a plain string —
+    ``"Successfully posted session comment on activity '<id>': …"`` on
+    success, ``"Error …"`` on failure (coach ``server.py`` ~L690, verified
+    2026-10-11 @ 7a5dcb7). This string match IS the success signal: a
+    structured upstream success signal would be a coach-repo contract
+    change and is deferred (fpittelo/coach#82). ``posted`` additionally
+    requires the RESOLVED activity id in the reply, so a success-shaped
+    reply about a different activity can never confirm this mirror.
+    """
+    if result.startswith(MIRROR_POSTED_PREFIX) and activity_id in result:
+        return MirrorPostVerdict.POSTED
+    if result.startswith(_UPSTREAM_ERROR_PREFIX):
+        return MirrorPostVerdict.FAILED
+    return MirrorPostVerdict.UNKNOWN
 
 
 async def mirror_debrief_to_icu(
@@ -165,7 +239,8 @@ async def mirror_debrief_to_icu(
 
     The mirror is NON-BLOCKING on the debrief save: this coroutine never
     raises — every failure degrades to the fixed-vocabulary soft warning
-    and the debrief row (already durable) is never touched. The returned
+    and the debrief row (already durable) is never touched. Each tool call
+    is bounded by ``MIRROR_TOOL_TIMEOUT_SECONDS`` (#194 AC2). The returned
     activity id (successful resolution) lets the caller link the debrief
     row to its ICU mirror.
 
@@ -186,20 +261,33 @@ async def mirror_debrief_to_icu(
         if isinstance(resolution, _ResolutionFailure):
             return _failed_outcome(resolution.reason), None
         comment = build_mirror_comment(plan_session_key=plan_session_key, rpe=rpe, notes=notes)
-        result = await hub.execute_tool(
-            ADD_COMMENT_TOOL,
-            {
-                "activity_id": resolution.activity_id,
-                "comment": comment,
-                "confirmed": True,
-            },
-        )
-        if _post_succeeded(result):
+        try:
+            result = await asyncio.wait_for(
+                hub.execute_tool(
+                    ADD_COMMENT_TOOL,
+                    {
+                        "activity_id": resolution.activity_id,
+                        "comment": comment,
+                        "confirmed": True,
+                    },
+                ),
+                timeout=MIRROR_TOOL_TIMEOUT_SECONDS,
+            )
+        except TimeoutError:
+            # A timed-out WRITE is genuinely ambiguous — the comment may have
+            # landed; claiming a definite failure would be dishonest (#194).
+            return _failed_outcome(MirrorReason.POST_UNCONFIRMED), None
+        verdict = _classify_post_reply(result, resolution.activity_id)
+        if verdict is MirrorPostVerdict.POSTED:
             return (
                 DebriefMirrorOutcome(status="mirrored", code=None, message=MIRROR_SUCCESS_MESSAGE),
                 resolution.activity_id,
             )
-        return _failed_outcome(MirrorReason.POST_FAILED), None
+        if verdict is MirrorPostVerdict.FAILED:
+            return _failed_outcome(MirrorReason.POST_FAILED), None
+        # UNKNOWN: an unconfirmable reply is never mirror-confirmed — it
+        # surfaces the honest post_unconfirmed soft warning (#194 AC3).
+        return _failed_outcome(MirrorReason.POST_UNCONFIRMED), None
     except Exception:  # noqa: BLE001 - the mirror must never raise (AC3)
         return _failed_outcome(MirrorReason.POST_FAILED), None
     finally:
