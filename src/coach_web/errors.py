@@ -131,3 +131,43 @@ class EncryptionUnavailableError(RuntimeError):
 def encryption_reason_payload(reason: EncryptionReason) -> dict[str, str]:
     """Return the owner-safe ``{code, message}`` 503 body for *reason*."""
     return {"code": reason.value, "message": ENCRYPTION_REASON_MESSAGES[reason]}
+
+
+class MirrorReason(StrEnum):
+    """The fixed vocabulary of debrief-mirror soft-warning reasons (#190).
+
+    Story 3.2 extends the #181/#189 pattern to the ICU session-comment
+    mirror: the mirror is NON-BLOCKING on the debrief save (the debrief is
+    already durable when the mirror starts), so a mirror failure never
+    changes the 201 — the response carries ``{status: "failed", code,
+    message}`` where ``code`` comes from THIS closed vocabulary. Deliberately
+    a separate enum: the settings 422 and encryption 503 vocabularies are
+    contract-pinned to their own codes, and the mirror posture differs again
+    (success-path degradation, not a failed request).
+    """
+
+    HUB_UNAVAILABLE = "hub_unavailable"
+    SESSION_NOT_FOUND = "session_not_found"
+    SESSION_AMBIGUOUS = "session_ambiguous"
+    POST_FAILED = "post_failed"
+
+
+MIRROR_REASON_MESSAGES: dict[MirrorReason, str] = {
+    MirrorReason.HUB_UNAVAILABLE: (
+        "Debrief saved — but the Intervals.icu mirror is unavailable right now."
+    ),
+    MirrorReason.SESSION_NOT_FOUND: (
+        "Debrief saved — no matching Intervals.icu session was found to mirror."
+    ),
+    MirrorReason.SESSION_AMBIGUOUS: (
+        "Debrief saved — several Intervals.icu sessions match that day; "
+        "nothing was mirrored."
+    ),
+    MirrorReason.POST_FAILED: (
+        "Debrief saved — but the Intervals.icu mirror could not be posted."
+    ),
+}
+"""Reason → friendly static text. Fixed strings only (nLPD: no echo).
+
+Every message leads with the saved-confirmation so a mirror failure can
+never read as a lost debrief."""
