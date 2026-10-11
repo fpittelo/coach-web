@@ -85,3 +85,86 @@ def settings_reason_from_errors(errors: Sequence[Mapping[str, Any]]) -> Settings
         if isinstance(original, SettingsValidationError):
             return original.reason
     return SettingsReason.INVALID_VALUES
+
+
+class EncryptionReason(StrEnum):
+    """The fixed vocabulary of owner-safe encryption-failure reasons (#189).
+
+    Story 3.1 (#189) extends the #181 pattern to the C2 data-encryption
+    boundary: when the ``DATA_ENCRYPTION_KEY`` secret is missing or invalid,
+    the debrief save answers 503 with ``{code, message}`` from THIS closed
+    vocabulary. Deliberately a separate enum from :class:`SettingsReason` —
+    the settings 422 vocabulary is contract-pinned to exactly its four codes,
+    and the two postures differ in HTTP semantics (503 service condition vs
+    422 validation failure).
+    """
+
+    KEY_UNAVAILABLE = "key_unavailable"
+
+
+ENCRYPTION_REASON_MESSAGES: dict[EncryptionReason, str] = {
+    EncryptionReason.KEY_UNAVAILABLE: (
+        "Encrypted storage is unavailable — the debrief was not saved. "
+        "Check the DATA_ENCRYPTION_KEY configuration."
+    ),
+}
+"""Reason → friendly static text. Fixed strings only (nLPD: no echo, no key material)."""
+
+
+class EncryptionUnavailableError(RuntimeError):
+    """The C2 encryption key is missing or invalid (#189).
+
+    Subclasses :class:`RuntimeError` — a service-condition failure, not a
+    request-validation error. The exception carries the reason as a typed
+    attribute so the boundary maps structured conditions instead of
+    string-matching error messages. The exception text stays the technical
+    message for server-side logs (it may reference the env-var NAME but never
+    the key VALUE); the friendly owner-safe text comes exclusively from
+    :data:`ENCRYPTION_REASON_MESSAGES`.
+    """
+
+    def __init__(self, reason: EncryptionReason, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def encryption_reason_payload(reason: EncryptionReason) -> dict[str, str]:
+    """Return the owner-safe ``{code, message}`` 503 body for *reason*."""
+    return {"code": reason.value, "message": ENCRYPTION_REASON_MESSAGES[reason]}
+
+
+class MirrorReason(StrEnum):
+    """The fixed vocabulary of debrief-mirror soft-warning reasons (#190).
+
+    Story 3.2 extends the #181/#189 pattern to the ICU session-comment
+    mirror: the mirror is NON-BLOCKING on the debrief save (the debrief is
+    already durable when the mirror starts), so a mirror failure never
+    changes the 201 — the response carries ``{status: "failed", code,
+    message}`` where ``code`` comes from THIS closed vocabulary. Deliberately
+    a separate enum: the settings 422 and encryption 503 vocabularies are
+    contract-pinned to their own codes, and the mirror posture differs again
+    (success-path degradation, not a failed request).
+    """
+
+    HUB_UNAVAILABLE = "hub_unavailable"
+    SESSION_NOT_FOUND = "session_not_found"
+    SESSION_AMBIGUOUS = "session_ambiguous"
+    POST_FAILED = "post_failed"
+
+
+MIRROR_REASON_MESSAGES: dict[MirrorReason, str] = {
+    MirrorReason.HUB_UNAVAILABLE: (
+        "Debrief saved — but the Intervals.icu mirror is unavailable right now."
+    ),
+    MirrorReason.SESSION_NOT_FOUND: (
+        "Debrief saved — no matching Intervals.icu session was found to mirror."
+    ),
+    MirrorReason.SESSION_AMBIGUOUS: (
+        "Debrief saved — several Intervals.icu sessions match that day; " "nothing was mirrored."
+    ),
+    MirrorReason.POST_FAILED: ("Debrief saved — but the Intervals.icu mirror could not be posted."),
+}
+"""Reason → friendly static text. Fixed strings only (nLPD: no echo).
+
+Every message leads with the saved-confirmation so a mirror failure can
+never read as a lost debrief."""

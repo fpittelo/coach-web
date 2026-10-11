@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -113,6 +113,17 @@ class Settings(BaseSettings):
     Defaults inside the container to the lane volume mountpoint /data; the
     WAL side files live alongside. Override per lane via the env files only
     when a different volume path is chosen — no secret material.
+    """
+
+    DATA_ENCRYPTION_KEY: SecretStr = SecretStr("")
+    """Fernet key encrypting C2 health-data fields at rest (MADR-0008, #189).
+
+    A 32-byte urlsafe-base64 Fernet key, distinct per lane (same discipline
+    as ``AUTH_SESSION_SECRET``: env var only, ``chmod 600`` env files, never
+    logged, never committed). Loaded as :class:`pydantic.SecretStr` per
+    security condition C5 — ``str()``/``repr()`` of the settings mask it.
+    Missing or invalid key → debrief saves answer 503 with the fixed
+    ``{code, message}`` vocabulary (#189); there is NO plaintext fallback.
     """
 
     @property

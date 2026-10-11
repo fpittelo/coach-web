@@ -24,6 +24,7 @@ from coach_web.agent import (
     PROPOSE_PERIODIZATION_TOOL,
     PROPOSE_PLAN_TOOL,
     PROPOSE_WEEK_PLAN_TOOL,
+    REQUEST_RPE_TOOL,
     AgentEvent,
     CoachAgent,
     OpenRouterClient,
@@ -34,10 +35,12 @@ from coach_web.agent import (
     create_agent,
     periodization_tool_schema,
     plan_tool_schema,
+    rpe_request_tool_schema,
     week_plan_tool_schema,
 )
 from coach_web.app import create_app
 from coach_web.config import Settings
+from coach_web.debrief import RpeRequest
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
 from coach_web.periodization import PeriodizationApprovalRequest
@@ -799,6 +802,7 @@ class TestCoachAgentPlanProposal:
             PROPOSE_PLAN_TOOL,
             PROPOSE_WEEK_PLAN_TOOL,
             PROPOSE_PERIODIZATION_TOOL,
+            REQUEST_RPE_TOOL,
         ]
 
 
@@ -1046,6 +1050,8 @@ class TestAgentStreamEndpoint:
             AgentEvent(type="tool_result", data={"id": "1", "name": "t", "result": "{}"}),
             AgentEvent(type="plan", data={"plan": {"title": "Plan"}}),
             AgentEvent(type="plan_proposal", data={"plan": {"title": "Plan"}}),
+            AgentEvent(type="rpe_request", data={"checkin": {"plan_session_key": "2026-10-06"}}),
+            AgentEvent(type="debrief_summary", data={"summary": {"headline": "ok"}}),
             AgentEvent(type="error", data={"message": "boom"}),
             AgentEvent(type="done", data={"message": "hi", "iterations": 1}),
         ]
@@ -1066,6 +1072,8 @@ class TestAgentStreamEndpoint:
             "tool_result",
             "plan",
             "plan_proposal",
+            "rpe_request",
+            "debrief_summary",
             "error",
             "done",
         ):
@@ -1550,3 +1558,396 @@ class TestCoachAgentPeriodizationProposal:
         # The rationale travels beside the plan, never inside it.
         assert "rationale" not in plan_event.data["plan"]
         assert plan_event.data["rationale"]
+
+
+# ---------------------------------------------------------------------------
+# RPE request tool (#189 — Story 3.1 debrief capture)
+# ---------------------------------------------------------------------------
+
+
+def _rpe_request_payload(**overrides: Any) -> dict[str, Any]:
+    """Return a valid request_rpe tool-argument payload with optional overrides."""
+    payload: dict[str, Any] = {
+        "plan_session_key": "2026-10-06",
+        "session_title": "Threshold 3x12",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _rpe_request_streamer(
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "rpe_1",
+) -> FakeStreamer:
+    """Build a streamer emitting a single request_rpe call, then a close."""
+    return FakeStreamer(
+        [
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=call_id,
+                            name=REQUEST_RPE_TOOL,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [_chunk(content="How did the session feel?"), _chunk(finish_reason="stop")],
+        ]
+    )
+
+
+class TestCoachAgentRpeRequest:
+    """The coach opening the debrief flow via request_rpe (#189 AC3, MADR-0010)."""
+
+    async def test_request_rpe_emits_a_validated_rpe_request_event(self) -> None:
+        """A request_rpe call emits the rpe_request SSE event with the check-in."""
+        streamer = _rpe_request_streamer(_rpe_request_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How did my session go?")
+
+        rpe_event = next(e for e in events if e.type == "rpe_request")
+        assert rpe_event.data["checkin"] == {
+            "plan_session_key": "2026-10-06",
+            "session_title": "Threshold 3x12",
+        }
+        result = next(e for e in events if e.type == "tool_result")
+        assert "rpe_request_emitted" in result.data["result"]
+
+    async def test_invalid_rpe_request_is_reported_without_an_event(self) -> None:
+        """A malformed key is rejected: rule detail for the model, generic UI message."""
+        streamer = _rpe_request_streamer(_rpe_request_payload(plan_session_key="junk"))
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Open the check-in")
+
+        assert all(e.type != "rpe_request" for e in events)
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid check-in request — the coach will retry with corrected arguments."
+        )
+        result = next(e for e in events if e.type == "tool_result")
+        assert "Invalid RPE request" in result.data["result"]
+        # Value-free posture: the rejected value never reaches the model (nLPD).
+        assert "junk" not in result.data["result"]
+
+    async def test_params_wrapped_rpe_request_arguments_are_unwrapped(self) -> None:
+        """A payload nested under a single ``params`` key is unwrapped."""
+        streamer = _rpe_request_streamer({"params": _rpe_request_payload()})
+
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Open the check-in")
+        assert any(e.type == "rpe_request" for e in events)
+
+    def test_rpe_request_schema_is_advertised_with_top_level_args(self) -> None:
+        """The request_rpe tool schema documents the top-level args rule."""
+        schema = rpe_request_tool_schema()
+
+        assert schema["function"]["name"] == REQUEST_RPE_TOOL
+        description = schema["function"]["description"]
+        assert "top-level" in description
+        assert "params" in description
+        assert "ISO date" in description
+
+    def test_system_prompt_advertises_the_rpe_request_capability(self) -> None:
+        """The default system prompt tells the model it CAN open a check-in."""
+        assert REQUEST_RPE_TOOL in DEFAULT_SYSTEM_PROMPT
+        assert "debrief" in DEFAULT_SYSTEM_PROMPT.lower()
+
+    def test_rpe_request_is_a_typed_agent_event(self) -> None:
+        """The rpe_request event type is part of the typed SSE vocabulary."""
+        event = AgentEvent(type="rpe_request", data={"checkin": {}})
+
+        assert event.type == "rpe_request"
+
+    async def test_rpe_request_event_payload_fits_the_ui_contract(self) -> None:
+        """The card→UI contract: the event's check-in validates as RpeRequest."""
+        streamer = _rpe_request_streamer(_rpe_request_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How did my session go?")
+        rpe_event = next(e for e in events if e.type == "rpe_request")
+
+        checkin = RpeRequest.model_validate(rpe_event.data["checkin"])
+        assert checkin.plan_session_key == "2026-10-06"
+
+
+# ---------------------------------------------------------------------------
+# Planned-vs-executed analysis flow (#190 — Story 3.2)
+# ---------------------------------------------------------------------------
+
+COMPLIANCE_TOOL = "coach-mcp__icu_get_workout_compliance"
+COMPLETED_SESSIONS_TOOL = "coach-mcp__icu_get_completed_sessions"
+
+
+def _compliance_report_payload(**overrides: Any) -> dict[str, Any]:
+    """Return an upstream-shaped compliance report payload for the loop tests."""
+    payload: dict[str, Any] = {
+        "oldest": "2026-10-05",
+        "newest": "2026-10-11",
+        "total_planned": 2,
+        "completed": 1,
+        "missed": 1,
+        "upcoming": 0,
+        "adherence_rate": 50.0,
+        "events": [
+            {
+                "event_id": "401",
+                "date": "2026-10-06",
+                "name": "Threshold 3x12",
+                "status": "completed",
+                "compliance": 87.5,
+                "structure_diff": "match",
+            },
+            {
+                "event_id": "402",
+                "date": "2026-10-08",
+                "name": "Easy spin",
+                "status": "missed",
+                "compliance": None,
+                "structure_diff": "unavailable",
+            },
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _completed_page_payload(**overrides: Any) -> dict[str, Any]:
+    """Return an upstream-shaped completed-sessions page payload."""
+    payload: dict[str, Any] = {
+        "oldest": "2026-10-05",
+        "newest": "2026-10-11",
+        "activity_type": None,
+        "fetched": 1,
+        "returned": 1,
+        "sessions": [
+            {
+                "id": "12345678",
+                "date": "2026-10-06",
+                "type": "Ride",
+                "title": "Threshold 3x12",
+                "duration_seconds": 4500.0,
+                "load": 91.0,
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _tool_streamer(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    closing: str = "Noted.",
+) -> FakeStreamer:
+    """Build a streamer emitting one tool call per turn, then a closing turn."""
+    turns: list[list[dict[str, Any]]] = []
+    for index, (name, arguments) in enumerate(calls):
+        turns.append(
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=f"call_{index}",
+                            name=name,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ]
+        )
+    turns.append([_chunk(content=closing), _chunk(finish_reason="stop")])
+    return FakeStreamer(turns)
+
+
+class TestCoachAgentWeekAnalysis:
+    """The planned-vs-executed analysis flow (#190 AC1/AC2)."""
+
+    async def test_compliance_result_emits_the_debrief_summary_card(self) -> None:
+        """A fetched compliance report becomes a server-built summary card."""
+        report_json = json.dumps(_compliance_report_payload())
+        streamer = _tool_streamer([(COMPLIANCE_TOOL, {"oldest": "2026-10-05"})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": COMPLIANCE_TOOL}}],
+            results={COMPLIANCE_TOOL: report_json},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        card_event = next(e for e in events if e.type == "debrief_summary")
+        summary = card_event.data["summary"]
+        assert summary["oldest"] == "2026-10-05"
+        assert summary["total_planned"] == 2
+        assert summary["adherence_rate"] == 50.0
+        assert summary["headline"] == (
+            "You planned 2 workout(s) and completed 1 — 50.0% adherence (1 missed)."
+        )
+        assert summary["sessions"][0]["session_title"] == "Threshold 3x12"
+        assert summary["sessions"][0]["severity"] == "ok"
+        assert summary["sessions"][1]["severity"] == "critical"
+        # The card is emitted before the tool result feeds the model back.
+        event_types = [e.type for e in events]
+        assert event_types.index("debrief_summary") < event_types.index("tool_result")
+
+    async def test_completed_sessions_after_compliance_reemits_the_card(self) -> None:
+        """A later sessions page re-emits the card with the executed load joined."""
+        streamer = _tool_streamer(
+            [
+                (COMPLIANCE_TOOL, {}),
+                (COMPLETED_SESSIONS_TOOL, {"oldest": "2026-10-05", "newest": "2026-10-11"}),
+            ]
+        )
+        hub = FakeHub(
+            results={
+                COMPLIANCE_TOOL: json.dumps(_compliance_report_payload()),
+                COMPLETED_SESSIONS_TOOL: json.dumps(_completed_page_payload()),
+            }
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        cards = [e for e in events if e.type == "debrief_summary"]
+        assert len(cards) == 2
+        first_rows = cards[0].data["summary"]["sessions"]
+        second_rows = cards[1].data["summary"]["sessions"]
+        # The first card has no executed data yet; the re-emitted card joins it.
+        assert first_rows[0]["executed_tss"] is None
+        assert second_rows[0]["executed_tss"] == 91.0
+
+    async def test_completed_sessions_before_compliance_produce_one_joined_card(
+        self,
+    ) -> None:
+        """A sessions page alone emits no card; the later report joins it."""
+        streamer = _tool_streamer(
+            [(COMPLETED_SESSIONS_TOOL, {}), (COMPLIANCE_TOOL, {})],
+        )
+        hub = FakeHub(
+            results={
+                COMPLIANCE_TOOL: json.dumps(_compliance_report_payload()),
+                COMPLETED_SESSIONS_TOOL: json.dumps(_completed_page_payload()),
+            }
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        cards = [e for e in events if e.type == "debrief_summary"]
+        assert len(cards) == 1
+        assert cards[0].data["summary"]["sessions"][0]["executed_tss"] == 91.0
+
+    async def test_error_result_emits_no_card(self) -> None:
+        """A failed ICU read can never become a card (no fabricated data)."""
+        streamer = _tool_streamer([(COMPLIANCE_TOOL, {})])
+        hub = FakeHub(results={COMPLIANCE_TOOL: '{"error": "Tool timed out"}'})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        assert all(e.type != "debrief_summary" for e in events)
+        assert events[-1].type == "done"
+
+    async def test_malformed_result_emits_no_card_and_never_breaks_the_run(
+        self,
+    ) -> None:
+        """Junk tool output degrades to no card; the loop completes normally."""
+        streamer = _tool_streamer([(COMPLIANCE_TOOL, {})])
+        hub = FakeHub(results={COMPLIANCE_TOOL: "not json at all"})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        assert all(e.type != "debrief_summary" for e in events)
+        assert events[-1].type == "done"
+
+    async def test_budget_refuses_the_third_compliance_call(self) -> None:
+        """Two compliance calls exhaust the 4-GET budget; a third is refused."""
+        report_json = json.dumps(_compliance_report_payload())
+        streamer = _tool_streamer(
+            [(COMPLIANCE_TOOL, {}), (COMPLIANCE_TOOL, {}), (COMPLIANCE_TOOL, {})]
+        )
+        hub = FakeHub(results={COMPLIANCE_TOOL: report_json})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        # Only the first two calls reach the hub (2 GETs each = 4 total).
+        assert len(hub.calls) == 2
+        results = [e.data["result"] for e in events if e.type == "tool_result"]
+        assert len(results) == 3
+        assert "budget exhausted" in results[-1]
+        assert "4" in results[-1]
+        # The refused call still completes the run gracefully.
+        assert events[-1].type == "done"
+
+    async def test_budget_allows_the_documented_analysis_flow(self) -> None:
+        """Compliance (2 GETs) + completed sessions (1 GET) fit within 4."""
+        streamer = _tool_streamer([(COMPLIANCE_TOOL, {}), (COMPLETED_SESSIONS_TOOL, {})])
+        hub = FakeHub(
+            results={
+                COMPLIANCE_TOOL: json.dumps(_compliance_report_payload()),
+                COMPLETED_SESSIONS_TOOL: json.dumps(_completed_page_payload()),
+            }
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        assert len(hub.calls) == 2
+        assert any(e.type == "debrief_summary" for e in events)
+        assert events[-1].type == "done"
+
+    async def test_non_icu_tools_are_never_budget_charged(self) -> None:
+        """GitHub tools and synthetic tools stay outside the ICU budget."""
+        github_tool = "github-mcp__create_issue"
+        streamer = _tool_streamer(
+            [(github_tool, {}), (github_tool, {}), (github_tool, {})],
+        )
+        hub = FakeHub(results={github_tool: "{}"})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "File an issue")
+
+        assert len(hub.calls) == 3
+        results = [e.data["result"] for e in events if e.type == "tool_result"]
+        assert all("budget exhausted" not in result for result in results)
+
+    async def test_budget_refusal_message_carries_no_athlete_data(self) -> None:
+        """The refusal text names counts and the tool — never session data."""
+        streamer = _tool_streamer(
+            [(COMPLIANCE_TOOL, {}), (COMPLIANCE_TOOL, {}), (COMPLIANCE_TOOL, {})]
+        )
+        hub = FakeHub(results={COMPLIANCE_TOOL: json.dumps(_compliance_report_payload())})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        refusal = next(
+            e.data["result"]
+            for e in events
+            if e.type == "tool_result" and "budget exhausted" in e.data["result"]
+        )
+        assert "Threshold 3x12" not in refusal
+        assert "2026-10-06" not in refusal
+
+    def test_system_prompt_advertises_the_analysis_flow(self) -> None:
+        """The default system prompt tells the model how to ground a week review."""
+        assert "icu_get_workout_compliance" in DEFAULT_SYSTEM_PROMPT
+        assert "icu_get_completed_sessions" in DEFAULT_SYSTEM_PROMPT
+        assert "budget" in DEFAULT_SYSTEM_PROMPT.lower()
+
+    def test_debrief_summary_is_a_typed_agent_event(self) -> None:
+        """The debrief_summary event type is part of the typed SSE vocabulary."""
+        event = AgentEvent(type="debrief_summary", data={"summary": {}})
+
+        assert event.type == "debrief_summary"

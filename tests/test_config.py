@@ -1,6 +1,7 @@
 """Tests for coach_web.config."""
 
 import pytest
+from pydantic import SecretStr
 
 from coach_web.config import Settings, get_settings
 
@@ -60,3 +61,37 @@ class TestSettings:
 
         assert first is second
         assert isinstance(first, Settings)
+
+
+class TestDataEncryptionKey:
+    """The C2 field-encryption key setting (MADR-0008 C5, #189)."""
+
+    def test_defaults_to_empty_secret(self) -> None:
+        """Absent env var → empty SecretStr (fail-safe: saves answer 503)."""
+        get_settings.cache_clear()
+
+        settings = get_settings()
+
+        assert isinstance(settings.DATA_ENCRYPTION_KEY, SecretStr)
+        assert settings.DATA_ENCRYPTION_KEY.get_secret_value() == ""
+
+    def test_env_value_is_loaded_as_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The env value is wrapped as SecretStr — never a plain str attribute."""
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", "unit-test-fernet-key-value")
+        get_settings.cache_clear()
+
+        settings = get_settings()
+
+        assert isinstance(settings.DATA_ENCRYPTION_KEY, SecretStr)
+        assert settings.DATA_ENCRYPTION_KEY.get_secret_value() == "unit-test-fernet-key-value"
+
+    def test_str_of_settings_does_not_expose_the_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Redaction pin (MADR-0008 C5): str()/repr() mask the secret value."""
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", "unit-test-fernet-key-value")
+        get_settings.cache_clear()
+
+        settings = get_settings()
+
+        assert "unit-test-fernet-key-value" not in str(settings)
+        assert "unit-test-fernet-key-value" not in repr(settings)
+        assert "**********" in repr(settings.DATA_ENCRYPTION_KEY)
