@@ -62,7 +62,7 @@
           </div>
         </div>
         <div class="rule"></div>
-        <p class="kicker">Endurance Cockpit · Local VIDAR</p>
+        <p class="kicker">Endurance Cockpit</p>
         <h1>Coach Web</h1>
         <p class="lede">
           Ask your coach about readiness, fitness and the week ahead. Every answer is
@@ -722,7 +722,7 @@
       <footer class="footer">
         <span>FastAPI · Python 3.12</span>
         <span>Alpine.js · self-hosted</span>
-        <span>Data stays on VIDAR</span>
+        <span>Data stays local</span>
       </footer>
 
       <!-- Objectives settings modal (#166, AC1): toggled from the identity
@@ -762,7 +762,7 @@
           </div>
           <p class="settings-lede">
             Your goals anchor every training recommendation. They are stored
-            locally on VIDAR and injected into the coach's context.
+            locally and injected into the coach's context.
           </p>
           <form class="settings-form" @submit.prevent="saveObjectives()">
             <template x-for="(goal, goalIndex) in objectivesForm.goals" :key="goalIndex">
