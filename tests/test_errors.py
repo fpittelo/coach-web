@@ -277,15 +277,20 @@ class TestMirrorReasonEnum:
     THIS closed vocabulary and ``message`` from the fixed map. The messages
     always lead with the saved-confirmation so the athlete never mistakes a
     mirror failure for a lost debrief.
+
+    #194 adds ``post_unconfirmed``: the three-state post-reply classification
+    surfaces an unconfirmable mirror outcome honestly — never mirror-confirmed,
+    never a claimed definite failure (the write may have landed).
     """
 
-    def test_enum_has_exactly_the_four_documented_codes(self) -> None:
+    def test_enum_has_exactly_the_documented_codes(self) -> None:
         """The vocabulary is closed: no code can be added without a contract change."""
         assert {reason.value for reason in MirrorReason} == {
             "hub_unavailable",
             "session_not_found",
             "session_ambiguous",
             "post_failed",
+            "post_unconfirmed",
         }
 
     def test_every_code_maps_to_its_exact_friendly_message(self) -> None:
@@ -302,6 +307,9 @@ class TestMirrorReasonEnum:
         )
         assert MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED] == (
             "Debrief saved — but the Intervals.icu mirror could not be posted."
+        )
+        assert MIRROR_REASON_MESSAGES[MirrorReason.POST_UNCONFIRMED] == (
+            "Debrief saved — but the Intervals.icu mirror could not be confirmed."
         )
 
     def test_message_map_covers_the_whole_enum(self) -> None:

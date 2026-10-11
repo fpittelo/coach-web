@@ -3,8 +3,10 @@
 Creates the ``debriefs`` table — the MADR-008 C2 data class (SENSITIVE
 health data, nLPD Art. 5(c)). Each row is one post-session debrief: the
 athlete dimension (per-athlete isolation, #189 AC4), the optional
-Intervals.icu workout link (``session_external_id`` — populated by Story
-3.2, nullable until then), the local planned-session key, the CHECK-bounded
+Intervals.icu workout link (``session_external_id`` — reserved and still
+nullable: Story 3.2's mirror deliberately drops the resolved activity id,
+so linking the row to its ICU mirror is deferred to a follow-up story —
+#190 review, PR #193; #194 AC1), the local planned-session key, the CHECK-bounded
 RPE (1–10) and the free-text notes as Fernet ciphertext
 (``notes_encrypted`` — NEVER plaintext at rest; the encryption key travels
 in ``DATA_ENCRYPTION_KEY``, outside this schema). ``athlete_id`` and

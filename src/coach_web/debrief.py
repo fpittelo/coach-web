@@ -324,8 +324,9 @@ def parse_plan_day_rows(content: str) -> list[PendingDebrief]:
     (prose, foreign tables, malformed rows) fails safe to no session. Rest
     days carry no session to rate and never become pending. The plan-session
     key IS the day's ISO date — the local, stable identity of a planned
-    session (the ICU workout id arrives with Story 3.2 as
-    ``session_external_id``).
+    session (``session_external_id`` stays reserved for the deferred ICU
+    workout-link story: Story 3.2's mirror deliberately drops the resolved
+    activity id — #194 AC1).
     """
     sessions: list[PendingDebrief] = []
     for line in content.splitlines():
