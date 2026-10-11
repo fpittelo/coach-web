@@ -17,9 +17,17 @@ tool. The contract pinned here:
   the documented #190 decision) is the ONLY path to ``confirmed=True``;
 - the ICU activity is resolved by date from the bounded completed-sessions
   read: zero matches, several matches, and read failures each map to their
-  own fixed reason — nothing is ever posted to a guessed activity.
+  own fixed reason — nothing is ever posted to a guessed activity;
+- the upstream post reply is classified into the LOCAL three-state outcome
+  (#194 AC3): ``posted`` (success prefix AND the resolved activity id in the
+  reply), ``failed`` (the upstream Error shape) and ``unknown`` (anything
+  else — never treated as mirror-confirmed, surfaced honestly);
+- every mirror tool call is bounded by the mirror-specific latency budget
+  (#194 AC2) — well under the hub's 2×30 s worst case.
 """
 
+import asyncio
+import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -32,6 +40,7 @@ from coach_web.mirror import (
     MIRROR_COMMENT_MAX_LENGTH,
     MIRROR_NOTES_EXCERPT_LENGTH,
     MIRROR_SUCCESS_MESSAGE,
+    MIRROR_TOOL_TIMEOUT_SECONDS,
     build_mirror_comment,
     mirror_debrief_to_icu,
 )
@@ -80,6 +89,25 @@ class FakeMirrorHub:
         """Record the call and return the configured payload."""
         self.calls.append((name, arguments))
         return self._results.get(name, "{}")
+
+
+class SlowMirrorHub(FakeMirrorHub):
+    """FakeMirrorHub whose configured tools answer after a per-tool delay."""
+
+    def __init__(self, *, delays: dict[str, float] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._delays = delays or {}
+
+    async def execute_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> str:
+        """Delay the configured tool, then record the call and answer."""
+        delay = self._delays.get(name, 0.0)
+        if delay:
+            await asyncio.sleep(delay)
+        return await super().execute_tool(name, arguments)
 
 
 def _page_payload(*sessions: dict[str, Any]) -> str:
@@ -396,3 +424,143 @@ class TestMirrorDebriefToIcu:
 
         assert "secret internals" not in outcome.message
         assert outcome.message.startswith("Debrief saved")
+
+
+class TestMirrorPostOutcomeClassification:
+    """The three-state post-reply classification (#194 AC3).
+
+    The upstream ``icu_add_session_comment`` reply is a plain string with a
+    documented success prefix and an ``Error`` failure prefix (coach
+    ``server.py`` ~L690, verified 2026-10-11 @ 7a5dcb7). The mirror pins the
+    LOCAL three-state outcome: ``posted`` requires the success prefix AND
+    the resolved activity id in the reply, ``failed`` is the upstream Error
+    shape, and ``unknown`` — anything else, including a success-shaped reply
+    about a DIFFERENT activity — is never treated as mirror-confirmed and
+    surfaces the honest ``post_unconfirmed`` soft warning.
+    """
+
+    async def test_success_reply_about_another_activity_is_never_mirror_confirmed(
+        self, settings
+    ) -> None:
+        """A success-shaped reply naming a DIFFERENT activity id is unknown."""
+        hub = FakeMirrorHub(
+            results={
+                COMPLETED_SESSIONS_TOOL: _page_payload(_session(id="12345678")),
+                ADD_COMMENT_TOOL: (
+                    "Successfully posted session comment on activity " "'99999999': {\"id\": 1}"
+                ),
+            }
+        )
+
+        outcome, activity_id = await mirror_debrief_to_icu(
+            lambda _settings: hub,
+            settings,
+            plan_session_key="2026-10-06",
+            rpe=7,
+            notes=None,
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.code is MirrorReason.POST_UNCONFIRMED
+        assert activity_id is None
+
+    @pytest.mark.parametrize(
+        "reply",
+        [
+            "Successfully posted session comment: ok",
+            '{"error": "Tool \'icu_add_session_comment\' timed out after 30s"}',
+            "",
+        ],
+        ids=["success-prefix-without-id", "hub-error-json", "empty-reply"],
+    )
+    async def test_unrecognized_reply_shapes_are_never_mirror_confirmed(
+        self, settings, reply: str
+    ) -> None:
+        """Anything neither the posted shape nor Error stays unconfirmed."""
+        hub = FakeMirrorHub(
+            results={
+                COMPLETED_SESSIONS_TOOL: _page_payload(_session(id="12345678")),
+                ADD_COMMENT_TOOL: reply,
+            }
+        )
+
+        outcome, activity_id = await mirror_debrief_to_icu(
+            lambda _settings: hub,
+            settings,
+            plan_session_key="2026-10-06",
+            rpe=7,
+            notes=None,
+        )
+
+        assert outcome.status == "failed"
+        assert outcome.code is MirrorReason.POST_UNCONFIRMED
+        assert activity_id is None
+
+
+class TestMirrorLatencyBudget:
+    """The mirror-specific tool-call latency budget (#194 AC2).
+
+    The mirror runs inline on the debrief save response path (non-blocking
+    on the DURABILITY, not on the response): its two sequential hub tool
+    calls would otherwise inherit the hub's 30 s per-call timeout — up to
+    ~2×30 s on a slow hub. Each mirror tool call is bounded by the strictly
+    smaller mirror budget, and a timed-out call degrades to the fixed soft
+    warning — the mirror never raises.
+    """
+
+    def test_mirror_budget_is_well_under_the_hub_worst_case(self) -> None:
+        """The dedicated budget keeps the two-call worst case well under 2×30 s."""
+        assert MIRROR_TOOL_TIMEOUT_SECONDS < 30.0
+
+    async def test_slow_resolve_read_times_out_to_hub_unavailable(
+        self, settings, monkeypatch
+    ) -> None:
+        """A resolve read exceeding the budget degrades to hub_unavailable — fast."""
+        monkeypatch.setattr("coach_web.mirror.MIRROR_TOOL_TIMEOUT_SECONDS", 0.05)
+        hub = SlowMirrorHub(
+            delays={COMPLETED_SESSIONS_TOOL: 5.0},
+            results={COMPLETED_SESSIONS_TOOL: _page_payload(_session())},
+        )
+
+        start = time.monotonic()
+        outcome, activity_id = await mirror_debrief_to_icu(
+            lambda _settings: hub,
+            settings,
+            plan_session_key="2026-10-06",
+            rpe=7,
+            notes=None,
+        )
+        elapsed = time.monotonic() - start
+
+        assert outcome.status == "failed"
+        assert outcome.code is MirrorReason.HUB_UNAVAILABLE
+        assert activity_id is None
+        assert hub.closed is True
+        assert elapsed < 2.0  # the budget fired — not the 5 s stub sleep
+
+    async def test_slow_post_times_out_to_post_unconfirmed(self, settings, monkeypatch) -> None:
+        """A post exceeding the budget is unconfirmed — a timed-out write is ambiguous."""
+        monkeypatch.setattr("coach_web.mirror.MIRROR_TOOL_TIMEOUT_SECONDS", 0.05)
+        hub = SlowMirrorHub(
+            delays={ADD_COMMENT_TOOL: 5.0},
+            results={
+                COMPLETED_SESSIONS_TOOL: _page_payload(_session()),
+                ADD_COMMENT_TOOL: "Successfully posted session comment on activity '12345678'",
+            },
+        )
+
+        start = time.monotonic()
+        outcome, activity_id = await mirror_debrief_to_icu(
+            lambda _settings: hub,
+            settings,
+            plan_session_key="2026-10-06",
+            rpe=7,
+            notes=None,
+        )
+        elapsed = time.monotonic() - start
+
+        assert outcome.status == "failed"
+        assert outcome.code is MirrorReason.POST_UNCONFIRMED
+        assert activity_id is None
+        assert hub.closed is True
+        assert elapsed < 2.0  # the budget fired — not the 5 s stub sleep

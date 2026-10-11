@@ -144,12 +144,19 @@ class MirrorReason(StrEnum):
     a separate enum: the settings 422 and encryption 503 vocabularies are
     contract-pinned to their own codes, and the mirror posture differs again
     (success-path degradation, not a failed request).
+
+    #194 adds ``post_unconfirmed`` for the three-state post-reply
+    classification: an unconfirmable mirror outcome (unrecognized reply
+    shape, a success-shaped reply about a different activity, a timed-out
+    write) is never treated as mirror-confirmed and never claimed as a
+    definite failure — it surfaces honestly as its own fixed reason.
     """
 
     HUB_UNAVAILABLE = "hub_unavailable"
     SESSION_NOT_FOUND = "session_not_found"
     SESSION_AMBIGUOUS = "session_ambiguous"
     POST_FAILED = "post_failed"
+    POST_UNCONFIRMED = "post_unconfirmed"
 
 
 MIRROR_REASON_MESSAGES: dict[MirrorReason, str] = {
@@ -163,6 +170,9 @@ MIRROR_REASON_MESSAGES: dict[MirrorReason, str] = {
         "Debrief saved — several Intervals.icu sessions match that day; " "nothing was mirrored."
     ),
     MirrorReason.POST_FAILED: ("Debrief saved — but the Intervals.icu mirror could not be posted."),
+    MirrorReason.POST_UNCONFIRMED: (
+        "Debrief saved — but the Intervals.icu mirror could not be confirmed."
+    ),
 }
 """Reason → friendly static text. Fixed strings only (nLPD: no echo).
 
