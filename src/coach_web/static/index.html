@@ -420,6 +420,84 @@
                     ></p>
                   </div>
                 </template>
+                <!-- Check-in card (#189): renders beneath the assistant message
+                     that opened the debrief. rpe/rpeMessageIndex pins the single
+                     active card to the proposing message — a new rpe_request
+                     replaces the previous one (#82 rule). Structured
+                     Pydantic→HTML only: x-text bindings, never markdown (ADR-006
+                     §9, STRIDE #87). The stepper is two real buttons around an
+                     aria-live value (#165 a11y — no range input, no drag); LOG
+                     CHECK-IN posts {plan_session_key, rpe, notes} to POST
+                     /api/debrief — the server encrypts the notes (C2 Fernet) and
+                     persists per athlete; Skip dismisses without persisting. On
+                     success the editing controls hide and the role="status" note
+                     carries the one-line summary (metadata only — the notes are
+                     never echoed, nLPD). -->
+                <template x-if="message.role === 'assistant' && rpe && rpeMessageIndex === index">
+                  <div class="plan-card rpe-card" role="region" aria-label="Session check-in">
+                    <p class="plan-card-label">Session check-in</p>
+                    <p class="rpe-session" x-text="rpe.session_title"></p>
+                    <p class="rpe-session-date" x-text="rpe.plan_session_key"></p>
+                    <div class="rpe-editing" x-show="rpeApproval.state !== 'submitted'">
+                      <p class="rpe-question">How hard was the session?</p>
+                      <div class="rpe-stepper">
+                        <button
+                          class="button rpe-step"
+                          type="button"
+                          aria-label="Decrease RPE"
+                          @click="stepRpe(-1)"
+                        >
+                          −
+                        </button>
+                        <span class="rpe-value" aria-live="polite" x-text="rpeValue + ' of 10'"></span>
+                        <button
+                          class="button rpe-step"
+                          type="button"
+                          aria-label="Increase RPE"
+                          @click="stepRpe(1)"
+                        >
+                          +
+                        </button>
+                      </div>
+                      <label class="rpe-notes-field">
+                        <span class="field-label">Notes (optional)</span>
+                        <textarea
+                          rows="2"
+                          class="rpe-notes"
+                          aria-label="Session notes"
+                          x-model="rpeNotes"
+                        ></textarea>
+                      </label>
+                      <div class="plan-actions">
+                        <button
+                          class="button"
+                          type="button"
+                          @click="logRpe()"
+                          :disabled="
+                            rpeApproval.state === 'submitting' ||
+                            rpeApproval.state === 'submitted'
+                          "
+                        >
+                          Log check-in
+                        </button>
+                        <button
+                          class="button button--ghost"
+                          type="button"
+                          @click="skipRpe()"
+                        >
+                          Skip
+                        </button>
+                      </div>
+                    </div>
+                    <p
+                      class="approval-note"
+                      role="status"
+                      :class="{ 'approval-note--error': rpeApproval.state === 'error' }"
+                      x-show="rpeApproval.message"
+                      x-text="rpeApproval.message"
+                    ></p>
+                  </div>
+                </template>
               </article>
             </template>
           </div>
@@ -476,6 +554,42 @@
             <span x-text="errorBanner"></span>
             <a class="signin-link" x-show="errorBannerSignin" href="/auth/login">Sign in</a>
           </p>
+
+          <!-- Pending-debrief banner (#189, MADR-0010): a passive, dismissible,
+               non-blocking reminder between the error banner and the composer —
+               same visual grammar, never overlays or disables anything. Populated
+               once at init from GET /api/debrief/pending (metadata only: session
+               title + key — never notes or RPE, nLPD). role="status" announces
+               the reminder once on populate (WCAG 4.1.3). LOG IT prefills the
+               composer (PO Q8 — never auto-send); × dismisses client-only (the
+               reminder reappears on the next page load — acceptable for a
+               passive reminder). -->
+          <template x-for="item in pendingDebriefs" :key="item.plan_session_key">
+            <p class="pending-banner" role="status">
+              <span
+                class="pending-banner-text"
+                x-text="
+                  'Pending debrief: ' + item.session_title + ' (' + item.plan_session_key +
+                  ') not yet rated.'
+                "
+              ></span>
+              <button
+                class="button button--ghost pending-banner-log"
+                type="button"
+                @click="prefillDebrief(item)"
+              >
+                Log it
+              </button>
+              <button
+                class="pending-banner-dismiss"
+                type="button"
+                aria-label="Dismiss pending debrief reminder"
+                @click="dismissPendingDebrief(item.plan_session_key)"
+              >
+                ×
+              </button>
+            </p>
+          </template>
 
           <form class="composer" @submit.prevent="send()">
             <!-- Auto-growing composer (#83): rows="1" starts as a single

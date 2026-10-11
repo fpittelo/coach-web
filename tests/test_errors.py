@@ -21,9 +21,13 @@ from typing import Any
 import pytest
 
 from coach_web.errors import (
+    ENCRYPTION_REASON_MESSAGES,
     SETTINGS_REASON_MESSAGES,
+    EncryptionReason,
+    EncryptionUnavailableError,
     SettingsReason,
     SettingsValidationError,
+    encryption_reason_payload,
     settings_reason_from_errors,
     settings_reason_payload,
 )
@@ -183,3 +187,79 @@ def test_every_reason_payload_is_owner_safe(reason: SettingsReason) -> None:
         if forbidden == "'" and reason is SettingsReason.COVERAGE_TARGET_DATE:
             continue
         assert forbidden not in payload["message"]
+
+
+class TestEncryptionReasonEnum:
+    """The fixed 503 vocabulary for encryption-unavailable debrief saves (#189).
+
+    Story 3.1 splits a second owner-facing error posture out of the #142
+    generic rule: when the C2 data-encryption key is missing or invalid, the
+    debrief save answers 503 with ``{code, message}`` from THIS closed
+    vocabulary — never exception text, never key material, and never a
+    plaintext fallback. The pattern mirrors :class:`SettingsReason` (#181)
+    but is a separate enum: the settings 422 contract test above pins
+    SettingsReason's membership exactly, so the encryption vocabulary cannot
+    silently ride the same enum.
+    """
+
+    def test_enum_has_exactly_the_documented_code(self) -> None:
+        """The vocabulary is closed: no code can be added without a contract change."""
+        assert {reason.value for reason in EncryptionReason} == {"key_unavailable"}
+
+    def test_code_maps_to_its_exact_friendly_message(self) -> None:
+        """The message is the documented fixed string — static, owner-safe."""
+        assert ENCRYPTION_REASON_MESSAGES[EncryptionReason.KEY_UNAVAILABLE] == (
+            "Encrypted storage is unavailable — the debrief was not saved. "
+            "Check the DATA_ENCRYPTION_KEY configuration."
+        )
+
+    def test_message_map_covers_the_whole_enum(self) -> None:
+        """Every reason has exactly one message — no missing, no extra entries."""
+        assert set(ENCRYPTION_REASON_MESSAGES) == set(EncryptionReason)
+
+    def test_payload_carries_code_and_message_only(self) -> None:
+        """The 503 body shape is exactly {code, message} — nothing else leaks."""
+        payload = encryption_reason_payload(EncryptionReason.KEY_UNAVAILABLE)
+
+        assert payload == {
+            "code": "key_unavailable",
+            "message": (
+                "Encrypted storage is unavailable — the debrief was not saved. "
+                "Check the DATA_ENCRYPTION_KEY configuration."
+            ),
+        }
+        assert set(payload) == {"code", "message"}
+
+    def test_payload_never_carries_key_material(self) -> None:
+        """No friendly message can echo the key value — the map is static text."""
+        payload = encryption_reason_payload(EncryptionReason.KEY_UNAVAILABLE)
+
+        assert "gAAAA" not in payload["message"]
+        assert "base64" not in payload["message"]
+
+
+class TestEncryptionUnavailableError:
+    """The threading exception for encryption-unavailable saves (#189)."""
+
+    def test_is_a_runtime_error(self) -> None:
+        """It is a hard service condition, not a request-validation error."""
+        error = EncryptionUnavailableError(EncryptionReason.KEY_UNAVAILABLE, "technical text")
+
+        assert isinstance(error, RuntimeError)
+
+    def test_carries_its_reason_attribute(self) -> None:
+        """The reason rides the exception — no string-matching at the boundary."""
+        error = EncryptionUnavailableError(EncryptionReason.KEY_UNAVAILABLE, "technical text")
+
+        assert error.reason is EncryptionReason.KEY_UNAVAILABLE
+
+    def test_technical_message_stays_server_side(self) -> None:
+        """The exception text is the technical log message, not the friendly one."""
+        error = EncryptionUnavailableError(
+            EncryptionReason.KEY_UNAVAILABLE,
+            "DATA_ENCRYPTION_KEY is not a valid Fernet key: bad base64",
+        )
+
+        assert "bad base64" in str(error)
+        # The friendly message never mixes into the exception text.
+        assert "Encrypted storage is unavailable" not in str(error)

@@ -69,6 +69,19 @@ EXPECTED_PLAN_DRAFT_COLUMNS = (
 PLAN_DRAFT_STATUS_CHECK = "status IN ('draft', 'submitted', 'approved', 'rejected', 'superseded')"
 PLAN_DRAFT_WEEK_RANGE_CHECK = "week_start_date <= week_end_date"
 
+EXPECTED_DEBRIEF_COLUMNS = (
+    "id",
+    "athlete_id",
+    "session_external_id",
+    "plan_session_key",
+    "rpe",
+    "notes_encrypted",
+    "created_at",
+    "updated_at",
+)
+
+DEBRIEF_RPE_RANGE_CHECK = "rpe BETWEEN 1 AND 10"
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     """Open the per-test database file with the stdlib driver."""
@@ -242,7 +255,8 @@ class TestPeriodizationMigration:
         """After upgrade head, the MADR-008 C1 tables exist (#167).
 
         Superseded for #168: migration 0003 adds the C3 ``plan_drafts``
-        table, so head now carries three domain tables.
+        table. Superseded for #189: migration 0004 adds the C2 ``debriefs``
+        table, so head now carries four domain tables.
         """
         command.upgrade(alembic_config(), "head")
 
@@ -251,6 +265,7 @@ class TestPeriodizationMigration:
             "athlete_objectives",
             "periodization_phases",
             "plan_drafts",
+            "debriefs",
         }
 
     def test_phase_table_columns_match_the_madr008_schema(self, db_path: Path) -> None:
@@ -397,16 +412,17 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0003.
+        """Re-running upgrade head is a no-op and the version stays at 0004.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
+        Superseded for #189: migration 0004 (debriefs) extends the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0003"
+        assert version == "0004"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -552,3 +568,123 @@ class TestPlanDraftMigration:
         tables = _table_names(db_path)
         assert "plan_drafts" not in tables
         assert "periodization_phases" in tables
+
+
+def _debrief_column_flags(db_path: Path) -> dict[str, tuple[bool, bool]]:
+    """Return ``(notnull, is_pk)`` flags per column of debriefs."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(debriefs)").fetchall()
+    return {row[1]: (bool(row[3]), bool(row[5])) for row in rows}
+
+
+def _debrief_table_sql(db_path: Path) -> str:
+    """Return the CREATE TABLE statement text of debriefs."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='debriefs'"
+        ).fetchone()
+    assert row is not None, "debriefs table is missing"
+    return str(row[0])
+
+
+def _debrief_indexed_columns(db_path: Path) -> set[str]:
+    """Return every column covered by an index on debriefs."""
+    with _connect(db_path) as conn:
+        indexes = conn.execute("PRAGMA index_list(debriefs)").fetchall()
+        columns: set[str] = set()
+        for index in indexes:
+            columns.update(
+                row[2] for row in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
+            )
+    return columns
+
+
+class TestDebriefMigration:
+    """Migration 0004 adds the debriefs table (MADR-008 C2, #189).
+
+    The debrief is health data (nLPD Art. 5(c)): the notes column is
+    Fernet ciphertext by contract (``notes_encrypted``), the RPE is a
+    CHECK-bounded integer per the story schema, and the athlete dimension
+    plus the plan-session key are indexed for the per-athlete pending
+    derivation. The contract pins the exact column set, the CHECK
+    constraint, the indexes and the downgrade path.
+    """
+
+    def test_debrief_table_columns_match_the_story_schema(self, db_path: Path) -> None:
+        """The column set matches the #189 schema exactly, in order."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            columns = [row[1] for row in conn.execute("PRAGMA table_info(debriefs)").fetchall()]
+
+        assert tuple(columns) == EXPECTED_DEBRIEF_COLUMNS
+
+    def test_debrief_required_columns_are_not_null(self, db_path: Path) -> None:
+        """athlete_id, plan_session_key, rpe and timestamps are NOT NULL."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _debrief_column_flags(db_path)
+        for column in (
+            "athlete_id",
+            "plan_session_key",
+            "rpe",
+            "created_at",
+            "updated_at",
+        ):
+            assert flags[column][0] is True, column
+
+    def test_debrief_optional_columns_are_nullable(self, db_path: Path) -> None:
+        """session_external_id (ICU link, 3.2) and notes allow NULL."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _debrief_column_flags(db_path)
+        for column in ("session_external_id", "notes_encrypted"):
+            assert flags[column][0] is False, column
+
+    def test_debrief_id_is_the_primary_key(self, db_path: Path) -> None:
+        """id is the single INTEGER primary key (AUTOINCREMENT rowid alias)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _debrief_column_flags(db_path)
+        assert flags["id"][1] is True
+        assert [name for name, (_, pk) in flags.items() if pk] == ["id"]
+
+    def test_debrief_rpe_check_constraint_is_declared(self, db_path: Path) -> None:
+        """The RPE range CHECK is declared on the table."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _debrief_table_sql(db_path)
+        assert DEBRIEF_RPE_RANGE_CHECK in sql
+
+    def test_debrief_rpe_check_rejects_out_of_range_values(self, db_path: Path) -> None:
+        """Inserting an RPE below 1 or above 10 fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            for sql in (
+                "INSERT INTO debriefs "
+                "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
+                "VALUES (1, '2026-10-10', 0, 't1', 't2')",
+                "INSERT INTO debriefs "
+                "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
+                "VALUES (1, '2026-10-10', 11, 't1', 't2')",
+            ):
+                with pytest.raises(sqlite3.IntegrityError, match="rpe"):
+                    conn.execute(sql)
+
+    def test_debrief_athlete_and_session_key_are_indexed(self, db_path: Path) -> None:
+        """athlete_id and plan_session_key carry indexes (pending derivation)."""
+        command.upgrade(alembic_config(), "head")
+
+        indexed = _debrief_indexed_columns(db_path)
+        assert "athlete_id" in indexed
+        assert "plan_session_key" in indexed
+
+    def test_downgrade_to_0003_drops_the_debrief_table(self, db_path: Path) -> None:
+        """Downgrade to 0003 removes debriefs (data-destructive; documented)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "0003")
+
+        tables = _table_names(db_path)
+        assert "debriefs" not in tables
+        assert "plan_drafts" in tables
