@@ -154,6 +154,11 @@ the tracker so a failed stream can never leave a lingering indicator). Raw
 ``coach-mcp__*`` tool names are never rendered or stored client-side (Swiss
 nLPD / #142 posture); the typed-error and transport-error paths are
 untouched, so failures stay visible (AC3).
+
+Issue #200 removes the stale "Local VIDAR" codename from every
+user-visible string of the main page (masthead kicker, footer privacy
+line, settings lede) — leftover internal hostname meaningless to the
+athlete. The privacy statements themselves stay; only the codename goes.
 """
 
 import re
@@ -316,6 +321,17 @@ class TestSwissMinimalistContract:
         assert "/static/vendor/DOMPurify.min.js" in html
         assert "/static/vendor/alpine.min.js" in html
         assert "/static/app.js" in html
+
+    def test_index_carries_no_vidar_codename(self) -> None:
+        """AC1 (#200): the stale "Local VIDAR" codename is absent from the page.
+
+        Leftover internal codename meaningless to the athlete (PO request,
+        v0.9.2 prod-lane test). No VIDAR reference may remain in any
+        user-visible UI text of the rendered main page.
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        assert "vidar" not in html.lower()
 
     def test_index_uses_text_interpolation_only(self) -> None:
         """User data is bound with x-text; x-html is assistant-only + sanitized.
