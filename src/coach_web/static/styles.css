@@ -521,6 +521,95 @@ body {
   font-size: 0.85rem;
 }
 
+/* Pending-debrief banner (issue 189, MADR-0010): passive, dismissible reminder
+   between the error banner and the composer — mirrors the error banner's
+   geometry (border-left, radius, paper background) with the accent edge.
+   Never overlays or disables anything; one row per pending session. */
+
+.pending-banner {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-2) var(--space-3);
+  border-left: 2px solid var(--accent);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 0.85rem;
+}
+
+.pending-banner-text {
+  flex: 1;
+}
+
+.pending-banner-dismiss {
+  border: none;
+  background: none;
+  color: var(--muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  padding: var(--space-1) var(--space-2);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+
+.pending-banner-dismiss:hover {
+  color: var(--ink);
+}
+
+/* Session check-in card (issue 189): RPE stepper per the issue 165 a11y spec — two
+   real buttons (44px min touch targets) around an aria-live value, no
+   range input, no drag. */
+
+.rpe-stepper {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: var(--space-2) 0;
+}
+
+.rpe-step {
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  font-size: 1.1rem;
+  line-height: 1;
+}
+
+.rpe-value {
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--ink);
+  min-width: 4.5rem;
+  text-align: center;
+}
+
+.rpe-question {
+  margin: var(--space-2) 0;
+  color: var(--muted);
+}
+
+.rpe-session {
+  margin: var(--space-1) 0 0;
+  font-weight: 600;
+}
+
+.rpe-session-date {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.rpe-notes-field {
+  display: block;
+  margin: var(--space-3) 0;
+}
+
+.rpe-notes {
+  width: 100%;
+  resize: vertical;
+}
+
 /* Sign-in affordance (issue 180): real /auth/login links — the
    server-injected identity-bar link for unauthenticated visitors and the
    401 banner action (expired-session path). Token-driven;

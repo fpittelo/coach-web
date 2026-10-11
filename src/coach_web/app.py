@@ -29,11 +29,24 @@ from coach_web.auth.middleware import (
     validate_auth_config,
 )
 from coach_web.auth.router import router as auth_router
-from coach_web.auth.tokens import verify_session_token
+from coach_web.auth.tokens import TokenError, verify_session_token
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
+from coach_web.debrief import (
+    DEFAULT_ATHLETE_ID,
+    DebriefSaveRequest,
+    DebriefSaveResponse,
+    PendingDebriefResponse,
+    apply_pending_debrief_digest,
+    athlete_id_from_email,
+    build_debrief_cipher,
+    list_pending_debriefs,
+    save_debrief,
+)
 from coach_web.errors import (
+    EncryptionUnavailableError,
     SettingsValidationError,
+    encryption_reason_payload,
     settings_reason_from_errors,
     settings_reason_payload,
 )
@@ -128,6 +141,26 @@ def _has_valid_session(request: Request, settings: Settings) -> bool:
     except Exception:  # noqa: BLE001 - fail-safe: the landing page must never 500
         return False
     return True
+
+
+def _athlete_id_for_session(settings: Settings, session_cookie: str | None) -> int:
+    """Resolve the debrief athlete id from the request context (#189 AC4).
+
+    Auth-disabled lanes (dev/qa) map to the single local athlete. Auth-enabled
+    requests derive the id from the verified session email — the middleware
+    has already admitted the request, so the defensive branches below are a
+    fail-safe against a crash, never an access-control decision: an
+    unverifiable cookie degrades to the default athlete instead of raising.
+    """
+    if not settings.AUTH_ENABLED:
+        return DEFAULT_ATHLETE_ID
+    if not session_cookie:
+        return DEFAULT_ATHLETE_ID
+    try:
+        claims = verify_session_token(session_cookie, settings.AUTH_SESSION_SECRET)
+    except TokenError:
+        return DEFAULT_ATHLETE_ID
+    return athlete_id_from_email(claims.get("email"))
 
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
@@ -370,6 +403,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # degrade to no digest, so the chat never depends on the database's
         # health (graceful empty state). Both reads share one boundary: any
         # failure yields no digest at all.
+        #
+        # Pending-debrief digest (MADR-0010 greeting hook, #189 AC3): the
+        # prompt also gains the athlete's pending debriefs (completed plan
+        # sessions without a debrief row — metadata only: date + title) so
+        # the coach opens the debrief flow with the request_rpe tool. The
+        # same failure boundary applies: an unreadable store yields no
+        # pending digest and never breaks the turn.
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -379,10 +419,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if objective_row is not None
                     else []
                 )
+                pending_debriefs = await list_pending_debriefs(
+                    session,
+                    athlete_id=_athlete_id_for_session(
+                        settings, request.cookies.get(SESSION_COOKIE)
+                    ),
+                    today=date.today(),
+                )
         except (OSError, SQLAlchemyError, ValidationError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
             phases = []
+            pending_debriefs = []
         if profile is not None:
             # Duck-typed agents (test stubs) may not carry the attribute; the
             # default prompt is the base every real agent is built with.
@@ -392,6 +440,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # owns the clock boundary instead of the domain default.
             agent.system_prompt = apply_objectives_digest(
                 base_prompt, profile, phases=phases, today=date.today()
+            )
+        if pending_debriefs:
+            agent.system_prompt = apply_pending_debrief_digest(
+                agent.system_prompt, pending_debriefs
             )
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
@@ -583,6 +635,77 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             objective_id = objective_row.id
             phases = await replace_phases(session, objective_id, payload.plan)
         return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
+
+    @application.post(
+        "/api/debrief",
+        response_model=DebriefSaveResponse,
+        status_code=201,
+        tags=["debrief"],
+    )
+    async def post_debrief_endpoint(
+        request: Request,
+        payload: DebriefSaveRequest,
+    ) -> DebriefSaveResponse | JSONResponse:
+        """Persist one post-session debrief with C2-encrypted notes (#189 AC1).
+
+        The Fernet cipher is resolved from ``DATA_ENCRYPTION_KEY`` BEFORE any
+        persistence: a missing or invalid key answers 503 with the fixed
+        ``{code, message}`` vocabulary (#189 AC2) and nothing is written —
+        there is no plaintext fallback. The notes are encrypted inside the
+        repository call, so no plaintext bytes ever reach a database file
+        (AC1); the 201 confirmation carries metadata only — the notes are
+        never echoed (nLPD). The debrief row is scoped to the request's
+        athlete (AC4): derived from the verified session email on auth-enabled
+        lanes, the single local athlete otherwise.
+        """
+        settings: Settings = request.app.state.settings
+        try:
+            cipher = build_debrief_cipher(settings)
+        except EncryptionUnavailableError as exc:
+            # Fail-safe (#189 AC2): the typed reason becomes the fixed 503
+            # body — no exception text, no key material, nothing persisted.
+            logger.warning("Debrief save unavailable: %s", exc)
+            return JSONResponse(status_code=503, content=encryption_reason_payload(exc.reason))
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        session_factory = request.app.state.db_session_factory
+        try:
+            async with session_factory() as session:
+                row = await save_debrief(
+                    session, athlete_id=athlete_id, payload=payload, cipher=cipher
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Debrief persistence failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        return DebriefSaveResponse(
+            status="saved", plan_session_key=row.plan_session_key, rpe=row.rpe
+        )
+
+    @application.get(
+        "/api/debrief/pending",
+        response_model=PendingDebriefResponse,
+        tags=["debrief"],
+    )
+    async def get_pending_debriefs_endpoint(request: Request) -> PendingDebriefResponse:
+        """List the athlete's completed plan sessions awaiting a debrief (#189 AC3).
+
+        The derivation is per-athlete (AC4) and metadata-only (MADR-0010
+        privacy posture: date + title, never notes or RPE). A persistence
+        failure degrades to an empty list — the pending-debrief banner is a
+        passive reminder and must never break the page (MADR-0010 latency
+        contract: degrade to silence, never to a slow or failing page).
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        session_factory = request.app.state.db_session_factory
+        try:
+            async with session_factory() as session:
+                pending = await list_pending_debriefs(
+                    session, athlete_id=athlete_id, today=date.today()
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Pending debrief derivation failed: %s", exc)
+            pending = []
+        return PendingDebriefResponse(pending=pending)
 
     return application
 
