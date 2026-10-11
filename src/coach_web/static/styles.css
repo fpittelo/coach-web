@@ -722,45 +722,6 @@ body {
   font-style: italic;
 }
 
-.tool-list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-}
-
-.tool {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: var(--space-2) var(--space-3);
-  font-size: 0.85rem;
-}
-
-.tool-name {
-  font-family: var(--font-mono);
-  font-size: 0.8rem;
-  word-break: break-all;
-}
-
-.tool-state {
-  flex-shrink: 0;
-  font-size: 0.7rem;
-  font-weight: 600;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.tool--done .tool-state {
-  color: var(--ink);
-}
-
 /* --- Composer ---------------------------------------------------------- */
 
 /* Pinned footer (AC3, #83): flex-end keeps the Send button on the bottom

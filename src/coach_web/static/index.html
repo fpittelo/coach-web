@@ -62,7 +62,7 @@
           </div>
         </div>
         <div class="rule"></div>
-        <p class="kicker">Endurance Cockpit · Local VIDAR</p>
+        <p class="kicker">Endurance Cockpit</p>
         <h1>Coach Web</h1>
         <p class="lede">
           Ask your coach about readiness, fitness and the week ahead. Every answer is
@@ -636,14 +636,10 @@
               <p class="thought" x-text="thought"></p>
             </template>
 
-            <ul class="tool-list" x-show="tools.length > 0">
-              <template x-for="tool in tools" :key="tool.id">
-                <li class="tool" :class="{ 'tool--done': tool.state === 'done' }">
-                  <span class="tool-name" x-text="tool.name"></span>
-                  <span class="tool-state" x-text="tool.state"></span>
-                </li>
-              </template>
-            </ul>
+            <!-- Tool activity (#199): the per-tool chip list is gone — the
+                 status line above is the single compact activity indicator
+                 while MCP calls are in flight, and raw internal tool names
+                 never render (nLPD/#142 posture). -->
           </div>
 
           <!-- Non-blocking error banner (#84 AC3/AC5): a persistent,
@@ -722,7 +718,7 @@
       <footer class="footer">
         <span>FastAPI · Python 3.12</span>
         <span>Alpine.js · self-hosted</span>
-        <span>Data stays on VIDAR</span>
+        <span>Data stays local</span>
       </footer>
 
       <!-- Objectives settings modal (#166, AC1): toggled from the identity
@@ -762,7 +758,7 @@
           </div>
           <p class="settings-lede">
             Your goals anchor every training recommendation. They are stored
-            locally on VIDAR and injected into the coach's context.
+            locally and injected into the coach's context.
           </p>
           <form class="settings-form" @submit.prevent="saveObjectives()">
             <template x-for="(goal, goalIndex) in objectivesForm.goals" :key="goalIndex">
