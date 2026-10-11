@@ -1,6 +1,7 @@
 """FastAPI application factory for Coach Web."""
 
 import logging
+import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -255,8 +256,29 @@ class CoachWebApp(FastAPI):
         await self._csp_wrapped(scope, receive, send)
 
 
+VERSION_ENV_OVERRIDE = "COACH_WEB_VERSION"
+"""Build-time version override (#198): the single source of truth for images.
+
+CI derives the value from the git ref — the release tag with the leading
+``v`` stripped for release builds, ``<lane>-<short-sha>`` for dev/qa lane
+builds — and passes it as the ``COACH_WEB_VERSION`` Docker build-arg, which
+the Dockerfile bakes into the runtime environment. No manual ``pyproject``
+bump ever participates, so the reported version can never drift from the
+built ref again.
+"""
+
+
 def resolve_version() -> str:
-    """Return the installed package version, falling back for bare source checkouts."""
+    """Resolve the reported version: build override, metadata, honest fallback.
+
+    Resolution order (#198):
+    1. the ``COACH_WEB_VERSION`` env override (set at image build time),
+    2. the installed distribution metadata (local/editable installs),
+    3. ``0.0.0`` — the honest "unknown" sentinel for bare source checkouts.
+    """
+    override = os.environ.get(VERSION_ENV_OVERRIDE, "")
+    if override:
+        return override
     try:
         return version(PACKAGE_NAME)
     except PackageNotFoundError:

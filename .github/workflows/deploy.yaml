@@ -75,8 +75,18 @@ jobs:
             latest|prod|v*)  DEPLOY_ENV="prod" ;;
             *)               DEPLOY_ENV="prod" ;;
           esac
+          # Version derivation (#198): a v* tag push reports the release
+          # version (leading v stripped); every other build reports a
+          # traceable non-release version "<lane>-<short-sha>". No manual
+          # pyproject bump participates — the git ref is the single source.
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${ENV_TAG}-${GITHUB_SHA::7}"
+          fi
           echo "tag=${ENV_TAG}" >> "$GITHUB_OUTPUT"
           echo "deploy_env=${DEPLOY_ENV}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Generate OCI image metadata
         id: meta
@@ -104,6 +114,11 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Build-time version derivation (#198): the image reports the git
+          # ref it was built from on /healthz (release tag, or
+          # "<lane>-<short-sha>" for dev/qa lane builds).
+          build-args: |
+            COACH_WEB_VERSION=${{ steps.env.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
