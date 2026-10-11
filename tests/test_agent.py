@@ -1742,7 +1742,11 @@ def _completed_page_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def _tool_streamer(calls: list[tuple[str, dict[str, Any]]], *, closing: str = "Noted.") -> FakeStreamer:
+def _tool_streamer(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    closing: str = "Noted.",
+) -> FakeStreamer:
     """Build a streamer emitting one tool call per turn, then a closing turn."""
     turns: list[list[dict[str, Any]]] = []
     for index, (name, arguments) in enumerate(calls):
@@ -1915,7 +1919,8 @@ class TestCoachAgentWeekAnalysis:
         events = await _collect(agent, "File an issue")
 
         assert len(hub.calls) == 3
-        assert all("budget exhausted" not in e.data["result"] for e in events if e.type == "tool_result")
+        results = [e.data["result"] for e in events if e.type == "tool_result"]
+        assert all("budget exhausted" not in result for result in results)
 
     async def test_budget_refusal_message_carries_no_athlete_data(self) -> None:
         """The refusal text names counts and the tool — never session data."""

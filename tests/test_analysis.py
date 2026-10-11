@@ -25,16 +25,11 @@ The contract pinned here:
   and renders a fixed-format headline derived from the report numbers alone.
 """
 
-import pytest
-from pydantic import ValidationError
-
 from coach_web.analysis import (
     ICU_GET_BUDGET,
     ICU_TOOL_GET_COSTS,
     CompletedSessionMirror,
-    CompletedSessionsPageMirror,
     ComplianceEventMirror,
-    ComplianceReportMirror,
     DebriefSummaryCard,
     IcuReadBudget,
     SessionDebriefRow,

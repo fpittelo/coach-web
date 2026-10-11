@@ -160,12 +160,9 @@ MIRROR_REASON_MESSAGES: dict[MirrorReason, str] = {
         "Debrief saved — no matching Intervals.icu session was found to mirror."
     ),
     MirrorReason.SESSION_AMBIGUOUS: (
-        "Debrief saved — several Intervals.icu sessions match that day; "
-        "nothing was mirrored."
+        "Debrief saved — several Intervals.icu sessions match that day; " "nothing was mirrored."
     ),
-    MirrorReason.POST_FAILED: (
-        "Debrief saved — but the Intervals.icu mirror could not be posted."
-    ),
+    MirrorReason.POST_FAILED: ("Debrief saved — but the Intervals.icu mirror could not be posted."),
 }
 """Reason → friendly static text. Fixed strings only (nLPD: no echo).
 

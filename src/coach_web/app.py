@@ -639,6 +639,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @application.post(
         "/api/debrief",
         response_model=DebriefSaveResponse,
+        response_model_exclude_none=True,
         status_code=201,
         tags=["debrief"],
     )

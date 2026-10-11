@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 from coach_web.analysis import (
     BUDGET_EXHAUSTED_MESSAGE,
     NAMESPACE_SEPARATOR,
+    CompletedSessionsPageMirror,
     ComplianceReportMirror,
     IcuReadBudget,
     build_debrief_summary_card,
@@ -302,7 +303,7 @@ class _WeekAnalysisCollector:
     def __init__(self) -> None:
         """Start an empty collection for one run."""
         self.report: ComplianceReportMirror | None = None
-        self.page = None
+        self.page: CompletedSessionsPageMirror | None = None
 
     def card_events(self, tool_name: str, result: str) -> list[AgentEvent]:
         """Update the held state from *result* and return any card events.
