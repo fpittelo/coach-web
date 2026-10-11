@@ -24,6 +24,7 @@ from coach_web.agent import (
     PROPOSE_PERIODIZATION_TOOL,
     PROPOSE_PLAN_TOOL,
     PROPOSE_WEEK_PLAN_TOOL,
+    REQUEST_RPE_TOOL,
     AgentEvent,
     CoachAgent,
     OpenRouterClient,
@@ -34,10 +35,12 @@ from coach_web.agent import (
     create_agent,
     periodization_tool_schema,
     plan_tool_schema,
+    rpe_request_tool_schema,
     week_plan_tool_schema,
 )
 from coach_web.app import create_app
 from coach_web.config import Settings
+from coach_web.debrief import RpeRequest
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
 from coach_web.periodization import PeriodizationApprovalRequest
@@ -799,6 +802,7 @@ class TestCoachAgentPlanProposal:
             PROPOSE_PLAN_TOOL,
             PROPOSE_WEEK_PLAN_TOOL,
             PROPOSE_PERIODIZATION_TOOL,
+            REQUEST_RPE_TOOL,
         ]
 
 
@@ -1550,3 +1554,121 @@ class TestCoachAgentPeriodizationProposal:
         # The rationale travels beside the plan, never inside it.
         assert "rationale" not in plan_event.data["plan"]
         assert plan_event.data["rationale"]
+
+
+# ---------------------------------------------------------------------------
+# RPE request tool (#189 — Story 3.1 debrief capture)
+# ---------------------------------------------------------------------------
+
+
+def _rpe_request_payload(**overrides: Any) -> dict[str, Any]:
+    """Return a valid request_rpe tool-argument payload with optional overrides."""
+    payload: dict[str, Any] = {
+        "plan_session_key": "2026-10-06",
+        "session_title": "Threshold 3x12",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _rpe_request_streamer(
+    arguments: dict[str, Any],
+    *,
+    call_id: str = "rpe_1",
+) -> FakeStreamer:
+    """Build a streamer emitting a single request_rpe call, then a close."""
+    return FakeStreamer(
+        [
+            [
+                _chunk(
+                    tool_calls=[
+                        _tool_call_delta(
+                            0,
+                            call_id=call_id,
+                            name=REQUEST_RPE_TOOL,
+                            arguments=json.dumps(arguments),
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                )
+            ],
+            [_chunk(content="How did the session feel?"), _chunk(finish_reason="stop")],
+        ]
+    )
+
+
+class TestCoachAgentRpeRequest:
+    """The coach opening the debrief flow via request_rpe (#189 AC3, MADR-0010)."""
+
+    async def test_request_rpe_emits_a_validated_rpe_request_event(self) -> None:
+        """A request_rpe call emits the rpe_request SSE event with the check-in."""
+        streamer = _rpe_request_streamer(_rpe_request_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How did my session go?")
+
+        rpe_event = next(e for e in events if e.type == "rpe_request")
+        assert rpe_event.data["checkin"] == {
+            "plan_session_key": "2026-10-06",
+            "session_title": "Threshold 3x12",
+        }
+        result = next(e for e in events if e.type == "tool_result")
+        assert "rpe_request_emitted" in result.data["result"]
+
+    async def test_invalid_rpe_request_is_reported_without_an_event(self) -> None:
+        """A malformed key is rejected: rule detail for the model, generic UI message."""
+        streamer = _rpe_request_streamer(_rpe_request_payload(plan_session_key="junk"))
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Open the check-in")
+
+        assert all(e.type != "rpe_request" for e in events)
+        error = next(e for e in events if e.type == "error")
+        assert error.data["message"] == (
+            "Invalid check-in request — the coach will retry with corrected arguments."
+        )
+        result = next(e for e in events if e.type == "tool_result")
+        assert "Invalid RPE request" in result.data["result"]
+        # Value-free posture: the rejected value never reaches the model (nLPD).
+        assert "junk" not in result.data["result"]
+
+    async def test_params_wrapped_rpe_request_arguments_are_unwrapped(self) -> None:
+        """A payload nested under a single ``params`` key is unwrapped."""
+        streamer = _rpe_request_streamer({"params": _rpe_request_payload()})
+
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Open the check-in")
+        assert any(e.type == "rpe_request" for e in events)
+
+    def test_rpe_request_schema_is_advertised_with_top_level_args(self) -> None:
+        """The request_rpe tool schema documents the top-level args rule."""
+        schema = rpe_request_tool_schema()
+
+        assert schema["function"]["name"] == REQUEST_RPE_TOOL
+        description = schema["function"]["description"]
+        assert "top-level" in description
+        assert "params" in description
+        assert "ISO date" in description
+
+    def test_system_prompt_advertises_the_rpe_request_capability(self) -> None:
+        """The default system prompt tells the model it CAN open a check-in."""
+        assert REQUEST_RPE_TOOL in DEFAULT_SYSTEM_PROMPT
+        assert "debrief" in DEFAULT_SYSTEM_PROMPT.lower()
+
+    def test_rpe_request_is_a_typed_agent_event(self) -> None:
+        """The rpe_request event type is part of the typed SSE vocabulary."""
+        event = AgentEvent(type="rpe_request", data={"checkin": {}})
+
+        assert event.type == "rpe_request"
+
+    async def test_rpe_request_event_payload_fits_the_ui_contract(self) -> None:
+        """The card→UI contract: the event's check-in validates as RpeRequest."""
+        streamer = _rpe_request_streamer(_rpe_request_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How did my session go?")
+        rpe_event = next(e for e in events if e.type == "rpe_request")
+
+        checkin = RpeRequest.model_validate(rpe_event.data["checkin"])
+        assert checkin.plan_session_key == "2026-10-06"

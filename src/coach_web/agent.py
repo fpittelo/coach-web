@@ -18,6 +18,7 @@ import httpx
 from pydantic import BaseModel, Field, ValidationError
 
 from coach_web.config import Settings
+from coach_web.debrief import RpeRequest
 from coach_web.mcp_hub import MCPClientHub
 from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
@@ -40,6 +41,9 @@ PROPOSE_WEEK_PLAN_TOOL = "propose_week_plan"
 PROPOSE_PERIODIZATION_TOOL = "propose_periodization"
 """Name of the synthetic tool the model calls to submit a season phase plan (#182)."""
 
+REQUEST_RPE_TOOL = "request_rpe"
+"""Name of the synthetic tool the model calls to open a session check-in (#189)."""
+
 PLAN_VALIDATION_UI_MESSAGE = (
     "Invalid plan proposal — the coach will retry with corrected arguments."
 )
@@ -55,6 +59,11 @@ PERIODIZATION_VALIDATION_UI_MESSAGE = (
 )
 """Generic UI-facing periodization validation failure message (nLPD posture)."""
 
+RPE_REQUEST_VALIDATION_UI_MESSAGE = (
+    "Invalid check-in request — the coach will retry with corrected arguments."
+)
+"""Generic UI-facing RPE-request validation failure message (nLPD posture, #189)."""
+
 AgentEventType = Literal[
     "status",
     "thought",
@@ -66,6 +75,7 @@ AgentEventType = Literal[
     "plan_proposal",
     "week_plan",
     "periodization_plan",
+    "rpe_request",
     "done",
     "error",
 ]
@@ -86,7 +96,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "When the athlete asks you to structure their season — or a macrocycle phase "
     f"plan is the right deliverable — call the `{PROPOSE_PERIODIZATION_TOOL}` tool "
     "with the complete phase sequence grounded in the objective's target date and "
-    "weekly availability, then summarise it in your answer."
+    "weekly availability, then summarise it in your answer. "
+    "When the athlete has completed a planned session — or the pending-debrief "
+    f"context lists one — open the debrief by calling the `{REQUEST_RPE_TOOL}` tool "
+    "with the session's ISO date and title, asking how the session went; the "
+    "athlete answers through the check-in card, then you respond to their RPE."
 )
 
 
@@ -286,6 +300,7 @@ class CoachAgent:
             plan_tool_schema(),
             week_plan_tool_schema(),
             periodization_tool_schema(),
+            rpe_request_tool_schema(),
         ]
 
         for iteration in range(1, self.max_tool_iterations + 1):
@@ -347,6 +362,10 @@ class CoachAgent:
                 elif call["name"] == PROPOSE_PERIODIZATION_TOOL:
                     result, periodization_events = self._handle_periodization_proposal(arguments)
                     for event in periodization_events:
+                        yield event
+                elif call["name"] == REQUEST_RPE_TOOL:
+                    result, rpe_events = self._handle_rpe_request(arguments)
+                    for event in rpe_events:
                         yield event
                 else:
                     result = await self.hub.execute_tool(call["name"], arguments)
@@ -501,6 +520,47 @@ class CoachAgent:
         )
         return result, events
 
+    @staticmethod
+    def _handle_rpe_request(arguments: dict[str, Any]) -> tuple[str, list[AgentEvent]]:
+        """Validate an RPE request and build its ``rpe_request`` event (#189).
+
+        Mirrors the periodization posture: a ``params``-nested payload is
+        unwrapped, the request is validated server-side through the #189
+        domain model (the session key must be a real ISO date — never trust
+        agent numbers), the model receives field-level detail without the
+        rejected values, and the UI only receives a generic error message
+        (nLPD). The payload carries session METADATA only (key + title) —
+        debrief notes and RPE values never travel through the agent loop.
+        """
+        candidate = arguments
+        if set(arguments) == {"params"} and isinstance(arguments["params"], dict):
+            candidate = arguments["params"]
+        try:
+            request = RpeRequest.model_validate(candidate)
+        except ValidationError as exc:
+            logger.warning("Rejected RPE request arguments: %s", exc.errors())
+            detail = [
+                _value_free_detail(err)
+                for err in exc.errors(include_url=False, include_input=False)
+            ]
+            return json.dumps({"error": f"Invalid RPE request: {detail}"}), [
+                AgentEvent(
+                    type="error",
+                    data={"message": RPE_REQUEST_VALIDATION_UI_MESSAGE},
+                ),
+            ]
+
+        events = [
+            AgentEvent(type="rpe_request", data={"checkin": request.model_dump()}),
+        ]
+        result = json.dumps(
+            {
+                "status": "rpe_request_emitted",
+                "plan_session_key": request.plan_session_key,
+            }
+        )
+        return result, events
+
     async def aclose(self) -> None:
         """Close the tool hub and the streaming backend."""
         await self.hub.close()
@@ -597,6 +657,26 @@ def periodization_tool_schema() -> dict[str, Any]:
                 "sequence must cover the window to the objective's target date."
             ),
             "parameters": PeriodizationProposal.model_json_schema(),
+        },
+    }
+
+
+def rpe_request_tool_schema() -> dict[str, Any]:
+    """Return the synthetic ``request_rpe`` tool schema for the model (#189)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": REQUEST_RPE_TOOL,
+            "description": (
+                "Open a post-session check-in (debrief) for one completed planned "
+                "session: the athlete rates the session's perceived exertion "
+                "through the check-in card. Pass every field (plan_session_key, "
+                "session_title) as top-level tool arguments; never nest them "
+                "under a params key. plan_session_key is the session's ISO date "
+                "(YYYY-MM-DD) from the pending-debrief context or the "
+                "conversation; session_title is the planned session's title."
+            ),
+            "parameters": RpeRequest.model_json_schema(),
         },
     }
 
