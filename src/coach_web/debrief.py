@@ -43,7 +43,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 from coach_web.auth.whitelist import normalize_email
 from coach_web.config import Settings
 from coach_web.db import Base
-from coach_web.errors import EncryptionReason, EncryptionUnavailableError
+from coach_web.errors import (
+    EncryptionReason,
+    EncryptionUnavailableError,
+    MirrorReason,
+)
 from coach_web.microcycle import MAX_SESSION_TITLE_LENGTH, PlanDraftRow
 from coach_web.models import validate_iso_date
 
@@ -82,6 +86,12 @@ class DebriefSaveRequest(BaseModel):
     encrypted at the persistence boundary — they exist in plaintext only
     inside the request handling process, never at rest and never in a
     response, log or SSE payload (nLPD).
+
+    ``mirror_to_icu`` is the athlete's explicit, per-save consent to mirror
+    the debrief to Intervals.icu as a session comment (#190 AC3): strictly
+    opt-in (default ``False`` — the plain save never touches ICU), and the
+    mirror itself is non-blocking on the save (the debrief is durable before
+    the mirror starts).
     """
 
     plan_session_key: str = Field(
@@ -100,6 +110,13 @@ class DebriefSaveRequest(BaseModel):
         max_length=MAX_DEBRIEF_NOTES_LENGTH,
         description="Optional free-text session notes (stored Fernet-encrypted)",
     )
+    mirror_to_icu: bool = Field(
+        default=False,
+        description=(
+            "Athlete's explicit per-save consent to mirror this debrief to "
+            "Intervals.icu as a session comment (#190 AC3) — strictly opt-in."
+        ),
+    )
 
     @field_validator("plan_session_key")
     @classmethod
@@ -112,12 +129,38 @@ class DebriefSaveResponse(BaseModel):
     """Response payload for ``POST /api/debrief`` (201).
 
     Metadata only — the notes are never echoed back (nLPD posture: the
-    athlete just wrote them; the confirmation carries no copy).
+    athlete just wrote them; the confirmation carries no copy). The optional
+    ``mirror`` outcome rides along when the athlete asked for the ICU
+    session-comment mirror (#190 AC3): ``None`` when no mirror was
+    requested, so the pre-#190 body shape is byte-identical on that path.
     """
 
     status: Literal["saved"] = Field(..., description="Fixed confirmation status")
     plan_session_key: str = Field(..., description="The debriefed session key")
     rpe: int = Field(..., ge=1, le=10, description="The stored RPE")
+    mirror: "DebriefMirrorOutcome | None" = Field(
+        default=None,
+        description=(
+            "ICU session-comment mirror outcome (#190 AC3) — present only when "
+            "the athlete asked for the mirror; None keeps the body shape "
+            "byte-identical to the pre-#190 contract."
+        ),
+    )
+
+
+class DebriefMirrorOutcome(BaseModel):
+    """The debrief ICU session-comment mirror outcome (#190 AC3).
+
+    ``status`` is ``mirrored`` when the comment was posted upstream and
+    ``failed`` otherwise; ``code`` carries the fixed-vocabulary reason on
+    failure (``None`` when mirrored); ``message`` is the fixed friendly
+    text — always leading with the saved-confirmation so a mirror failure
+    can never read as a lost debrief.
+    """
+
+    status: Literal["mirrored", "failed"]
+    code: MirrorReason | None = None
+    message: str
 
 
 class PendingDebrief(BaseModel):

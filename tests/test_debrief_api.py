@@ -40,7 +40,12 @@ from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
 from coach_web.db import build_db_engine, build_session_factory
-from coach_web.debrief import DEFAULT_ATHLETE_ID, athlete_id_from_email
+from coach_web.debrief import (
+    DEFAULT_ATHLETE_ID,
+    DebriefMirrorOutcome,
+    athlete_id_from_email,
+)
+from coach_web.errors import MIRROR_REASON_MESSAGES, MirrorReason
 from coach_web.microcycle import (
     DaySlot,
     PlanDraftRow,
@@ -329,6 +334,221 @@ class TestPostDebrief:
 
         assert response.status_code == 422
         assert response.json() == {"detail": GENERIC_422_DETAIL}
+
+
+class TestDebriefIcuMirror:
+    """POST /api/debrief — the opt-in ICU session-comment mirror (#190 AC3).
+
+    The mirror is strictly opt-in (``mirror_to_icu`` consent flag), runs
+    AFTER the durable save (the debrief row is never touched by a mirror
+    failure) and degrades to the fixed-vocabulary soft warning on every
+    failure path — the 201 stands either way. The hook is injectable via
+    ``app.state.debrief_mirror`` (mirrors the ``agent_factory`` pattern);
+    tests fake it — ZERO network.
+    """
+
+    @staticmethod
+    def _recording_hook(
+        outcome: DebriefMirrorOutcome,
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """Build an async mirror hook recording its calls, plus the call log."""
+        calls: list[dict[str, Any]] = []
+
+        async def hook(
+            settings: Any,
+            *,
+            plan_session_key: str,
+            rpe: int,
+            notes: str | None,
+        ) -> DebriefMirrorOutcome:
+            calls.append(
+                {
+                    "settings": settings,
+                    "plan_session_key": plan_session_key,
+                    "rpe": rpe,
+                    "notes": notes,
+                }
+            )
+            return outcome
+
+        return hook, calls
+
+    def test_mirror_consent_returns_the_mirrored_outcome(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
+        """AC3: consent rides the save; the 201 carries the mirror outcome."""
+        outcome = DebriefMirrorOutcome(
+            status="mirrored", code=None, message="Debrief mirrored to Intervals.icu."
+        )
+        hook, calls = self._recording_hook(outcome)
+        app = create_app()
+        app.state.debrief_mirror = hook
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/debrief",
+            json={
+                "plan_session_key": "2026-10-06",
+                "rpe": 7,
+                "notes": "Felt strong.",
+                "mirror_to_icu": True,
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "saved"
+        assert body["mirror"] == {
+            "status": "mirrored",
+            "message": "Debrief mirrored to Intervals.icu.",
+        }
+        assert len(calls) == 1
+        assert calls[0]["plan_session_key"] == "2026-10-06"
+        assert calls[0]["rpe"] == 7
+        assert calls[0]["notes"] == "Felt strong."
+
+    def test_mirror_failure_is_a_soft_warning_and_the_row_is_intact(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
+        """AC3: a failed mirror keeps the 201 and the fixed soft warning."""
+        outcome = DebriefMirrorOutcome(
+            status="failed",
+            code=MirrorReason.SESSION_NOT_FOUND,
+            message=MIRROR_REASON_MESSAGES[MirrorReason.SESSION_NOT_FOUND],
+        )
+        hook, _calls = self._recording_hook(outcome)
+        app = create_app()
+        app.state.debrief_mirror = hook
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/debrief",
+            json={"plan_session_key": "2026-10-06", "rpe": 7, "mirror_to_icu": True},
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "saved"
+        assert body["mirror"] == {
+            "status": "failed",
+            "code": "session_not_found",
+            "message": MIRROR_REASON_MESSAGES[MirrorReason.SESSION_NOT_FOUND],
+        }
+        assert _debrief_count(migrated_db) == 1
+
+    def test_mirror_hook_exception_degrades_to_the_fixed_soft_warning(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
+        """AC3: even a raising hook can never break the saved debrief."""
+
+        async def _raising_hook(
+            settings: Any,
+            *,
+            plan_session_key: str,
+            rpe: int,
+            notes: str | None,
+        ) -> DebriefMirrorOutcome:
+            raise RuntimeError("hub exploded")
+
+        app = create_app()
+        app.state.debrief_mirror = _raising_hook
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/debrief",
+            json={"plan_session_key": "2026-10-06", "rpe": 7, "mirror_to_icu": True},
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "saved"
+        assert body["mirror"] == {
+            "status": "failed",
+            "code": "post_failed",
+            "message": MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED],
+        }
+        assert _debrief_count(migrated_db) == 1
+
+    def test_no_consent_skips_the_hook_and_keeps_the_body_shape(
+        self, migrated_db: Path, encryption_key
+    ) -> None:
+        """The plain save never touches ICU — body shape is byte-identical."""
+
+        async def _forbidden_hook(
+            settings: Any,
+            *,
+            plan_session_key: str,
+            rpe: int,
+            notes: str | None,
+        ) -> DebriefMirrorOutcome:
+            raise AssertionError("the mirror hook must not run without consent")
+
+        app = create_app()
+        app.state.debrief_mirror = _forbidden_hook
+        client = TestClient(app)
+
+        response = client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 7})
+
+        assert response.status_code == 201
+        assert response.json() == {
+            "status": "saved",
+            "plan_session_key": "2026-10-06",
+            "rpe": 7,
+        }
+        assert "mirror" not in response.json()
+
+    def test_default_hook_routes_through_the_mirror_service(
+        self, migrated_db: Path, encryption_key, monkeypatch
+    ) -> None:
+        """Without an injected hook the save mirrors through the real service."""
+        import coach_web.app as app_module
+
+        captured: dict[str, Any] = {}
+
+        async def _fake_mirror(
+            hub_factory: Any,
+            settings: Any,
+            *,
+            plan_session_key: str,
+            rpe: int,
+            notes: str | None,
+        ) -> tuple[DebriefMirrorOutcome, str | None]:
+            captured["hub_factory"] = hub_factory
+            captured["plan_session_key"] = plan_session_key
+            captured["rpe"] = rpe
+            captured["notes"] = notes
+            return (
+                DebriefMirrorOutcome(
+                    status="mirrored",
+                    code=None,
+                    message="Debrief mirrored to Intervals.icu.",
+                ),
+                "i42",
+            )
+
+        monkeypatch.setattr(app_module, "mirror_debrief_to_icu", _fake_mirror)
+        client = TestClient(create_app())
+
+        response = client.post(
+            "/api/debrief",
+            json={
+                "plan_session_key": "2026-10-06",
+                "rpe": 7,
+                "notes": "Felt strong.",
+                "mirror_to_icu": True,
+            },
+        )
+
+        assert response.status_code == 201
+        assert response.json()["mirror"]["status"] == "mirrored"
+        from coach_web.mcp_hub import MCPClientHub
+
+        # Classmethod attribute access binds a new method object per read —
+        # bound-method equality compares the underlying function and target.
+        assert captured["hub_factory"] == MCPClientHub.from_settings
+        assert captured["plan_session_key"] == "2026-10-06"
+        assert captured["rpe"] == 7
+        assert captured["notes"] == "Felt strong."
 
 
 class TestGetPendingDebriefs:

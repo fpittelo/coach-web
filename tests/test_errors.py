@@ -22,9 +22,11 @@ import pytest
 
 from coach_web.errors import (
     ENCRYPTION_REASON_MESSAGES,
+    MIRROR_REASON_MESSAGES,
     SETTINGS_REASON_MESSAGES,
     EncryptionReason,
     EncryptionUnavailableError,
+    MirrorReason,
     SettingsReason,
     SettingsValidationError,
     encryption_reason_payload,
@@ -263,3 +265,58 @@ class TestEncryptionUnavailableError:
         assert "bad base64" in str(error)
         # The friendly message never mixes into the exception text.
         assert "Encrypted storage is unavailable" not in str(error)
+
+
+class TestMirrorReasonEnum:
+    """The fixed soft-warning vocabulary for the debrief ICU mirror (#190).
+
+    Story 3.2 extends the #181/#189 pattern to the mirror path: when the
+    post-save mirror to Intervals.icu fails, the debrief save STILL answers
+    201 (the debrief is durable — the mirror is non-blocking) and the body
+    carries ``{status: "failed", code, message}`` where ``code`` comes from
+    THIS closed vocabulary and ``message`` from the fixed map. The messages
+    always lead with the saved-confirmation so the athlete never mistakes a
+    mirror failure for a lost debrief.
+    """
+
+    def test_enum_has_exactly_the_four_documented_codes(self) -> None:
+        """The vocabulary is closed: no code can be added without a contract change."""
+        assert {reason.value for reason in MirrorReason} == {
+            "hub_unavailable",
+            "session_not_found",
+            "session_ambiguous",
+            "post_failed",
+        }
+
+    def test_every_code_maps_to_its_exact_friendly_message(self) -> None:
+        """The messages are the documented fixed strings — static, owner-safe."""
+        assert MIRROR_REASON_MESSAGES[MirrorReason.HUB_UNAVAILABLE] == (
+            "Debrief saved — but the Intervals.icu mirror is unavailable right now."
+        )
+        assert MIRROR_REASON_MESSAGES[MirrorReason.SESSION_NOT_FOUND] == (
+            "Debrief saved — no matching Intervals.icu session was found to mirror."
+        )
+        assert MIRROR_REASON_MESSAGES[MirrorReason.SESSION_AMBIGUOUS] == (
+            "Debrief saved — several Intervals.icu sessions match that day; "
+            "nothing was mirrored."
+        )
+        assert MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED] == (
+            "Debrief saved — but the Intervals.icu mirror could not be posted."
+        )
+
+    def test_message_map_covers_the_whole_enum(self) -> None:
+        """Every reason has exactly one message — no missing, no extra entries."""
+        assert set(MIRROR_REASON_MESSAGES) == set(MirrorReason)
+
+    def test_every_message_leads_with_the_saved_confirmation(self) -> None:
+        """A mirror failure never reads as a lost debrief — durability first."""
+        for message in MIRROR_REASON_MESSAGES.values():
+            assert message.startswith("Debrief saved")
+
+    @pytest.mark.parametrize("reason", list(MirrorReason))
+    def test_every_message_is_owner_safe(self, reason: MirrorReason) -> None:
+        """No friendly message echoes exception-shaped content (braces, quotes)."""
+        message = MIRROR_REASON_MESSAGES[reason]
+
+        for forbidden in ("{", "}", "\\", "'", '"'):
+            assert forbidden not in message

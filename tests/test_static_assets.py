@@ -3181,3 +3181,141 @@ class TestDebriefUiContract:
 
         assert ".pending-banner" in css
         assert ".rpe-stepper" in css
+
+
+class TestDebriefSummaryCardContract:
+    """Debrief summary card + ICU mirror consent (#190, #165 wireframes).
+
+    Source-level contract pins (ADR-006 §5 — no Node toolchain):
+
+    - the debrief_summary SSE event renders a single conversation card
+      pinned to the message that fetched it (#82 replacement rule);
+    - the card is structured Pydantic→HTML (x-text only — never markdown,
+      ADR-006 §9 / STRIDE #87) with word+token severity chips (#165:
+      never color alone);
+    - the ICU mirror consent is an opt-in checkbox folded into the LOG
+      CHECK-IN card (no second confirmation card — #190 design decision);
+    - a mirror failure surfaces the server's fixed soft warning in the
+      submitted note while the debrief stays saved (AC3).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _card_block(self) -> str:
+        html = self._html()
+        marker = "debriefSummary && debriefSummaryMessageIndex === index"
+        card_at = html.index(marker)
+        start = html.rindex("<template", 0, card_at)
+        return html[start : html.index("</template>", card_at)]
+
+    # --- debrief summary card (AC4) ----------------------------------------------
+
+    def test_summary_card_is_pinned_to_the_proposing_message(self) -> None:
+        """AC4: the card renders beneath the assistant message that fetched it."""
+        assert (
+            "message.role === 'assistant' && debriefSummary && debriefSummaryMessageIndex === index"
+            in self._html()
+        )
+
+    def test_summary_card_is_structured_xtext_never_markdown(self) -> None:
+        """AC4/nLPD: the card stays structured Pydantic→HTML (x-text only)."""
+        block = self._card_block()
+
+        assert "x-html" not in block
+        assert "renderMarkdown" not in block
+
+    def test_summary_card_renders_headline_range_and_counts(self) -> None:
+        """AC1: the plain-language read, the range and the report counts render."""
+        block = self._card_block()
+
+        assert "debriefSummary.headline" in block
+        assert "debriefSummary.oldest" in block
+        assert "debriefSummary.newest" in block
+        assert "debriefSummary.total_planned" in block
+        assert "debriefSummary.completed" in block
+        assert "debriefSummary.missed" in block
+        assert "debriefSummary.upcoming" in block
+        assert "debriefSummary.adherence_rate" in block
+
+    def test_summary_card_renders_per_session_rows_with_severity_words(self) -> None:
+        """AC1/AC4: every session row renders with a word+token severity chip."""
+        block = self._card_block()
+        script = self._script()
+
+        assert "row.session_date" in block
+        assert "row.session_title" in block
+        assert "row.status" in block
+        assert "row.compliance_pct" in block
+        assert "row.structure_diff" in block
+        assert "row.executed_tss" in block
+        assert "severityWord(row.severity)" in block
+        assert "'debrief-chip--' + row.severity" in block
+        # The word map is static client-side vocabulary — one entry per token.
+        for severity in ("ok", "warn", "critical"):
+            assert f"{severity}:" in script
+
+    def test_severity_chips_have_stylesheet_rules(self) -> None:
+        """The three severity tokens carry stylesheet rules (tokens only)."""
+        css = self._css()
+
+        assert ".debrief-chip--ok" in css
+        assert ".debrief-chip--warn" in css
+        assert ".debrief-chip--critical" in css
+
+    def test_debrief_summary_handler_pins_the_card(self) -> None:
+        """The debrief_summary SSE event feeds the pinned card state."""
+        handler = _rule_block(self._script(), "debrief_summary: (event) =>")
+
+        assert "this.debriefSummary = data.summary || null" in handler
+        assert "this.debriefSummaryMessageIndex = index" in handler
+
+    def test_reset_chat_clears_the_summary_and_consent(self) -> None:
+        """A chat reset clears the summary card and the mirror consent."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.debriefSummary = null" in reset
+        assert "this.debriefSummaryMessageIndex = -1" in reset
+        assert "this.mirrorToIcu = false" in reset
+
+    # --- ICU mirror consent (AC3) -------------------------------------------------
+
+    def test_mirror_consent_is_a_checkbox_in_the_checkin_card(self) -> None:
+        """AC3: the consent is an opt-in checkbox inside the check-in card."""
+        html = self._html()
+        card_at = html.index('class="plan-card rpe-card"')
+        card = html[card_at : html.index("</template>", card_at)]
+
+        assert "rpe-mirror-field" in card
+        assert 'x-model="mirrorToIcu"' in card
+        assert 'type="checkbox"' in card
+
+    def test_mirror_consent_defaults_to_off(self) -> None:
+        """AC3: strictly opt-in — a new check-in resets the consent to off."""
+        handler = _rule_block(self._script(), "rpe_request: (event) =>")
+
+        assert "this.mirrorToIcu = false" in handler
+
+    def test_log_checkin_posts_the_mirror_consent(self) -> None:
+        """AC3: the save POST carries the athlete's consent flag."""
+        body = _rule_block(self._script(), "logRpe()")
+
+        assert "mirror_to_icu: this.mirrorToIcu" in body
+
+    def test_mirror_soft_warning_surfaces_in_the_submitted_note(self) -> None:
+        """AC3: a failed mirror appends the server's fixed soft warning."""
+        body = _rule_block(self._script(), "logRpe()")
+
+        assert "body.mirror" in body
+        assert "body.mirror.status === " in body
+        assert "body.mirror.message" in body
+
+    def test_mirror_field_is_styled(self) -> None:
+        """The consent checkbox carries a stylesheet rule (tokens only)."""
+        assert ".rpe-mirror-field" in self._css()

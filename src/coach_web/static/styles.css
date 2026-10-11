@@ -610,6 +610,88 @@ body {
   resize: vertical;
 }
 
+/* ICU mirror consent (issue 190 AC3): opt-in checkbox folded into the LOG
+   CHECK-IN card — no second confirmation card. Token-driven. */
+
+.rpe-mirror-field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+  font-size: 0.85rem;
+  color: var(--ink);
+}
+
+.rpe-mirror {
+  accent-color: var(--accent);
+}
+
+/* Debrief summary card (issue 190): the server-built planned-vs-executed card
+   (issue 165 contract, weekly flow). Structured x-text rendering only; severity
+   chips carry word + tokenized color, never color alone (issue 165). */
+
+.debrief-headline {
+  margin: 0 0 var(--space-2);
+  font-weight: 600;
+}
+
+.debrief-range {
+  margin: 0 0 var(--space-3);
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.debrief-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  margin: 0 0 var(--space-4);
+  padding: 0;
+}
+
+.debrief-count {
+  min-width: 4rem;
+}
+
+.debrief-count dt {
+  color: var(--muted);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.debrief-count dd {
+  margin: 0;
+  font-weight: 600;
+}
+
+.debrief-chip {
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.debrief-chip--ok {
+  color: var(--accent);
+}
+
+.debrief-chip--warn {
+  color: var(--ink);
+}
+
+.debrief-chip--critical {
+  color: var(--error);
+}
+
+.debrief-note {
+  margin: var(--space-3) 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
 /* Sign-in affordance (issue 180): real /auth/login links — the
    server-injected identity-bar link for unauthenticated visitors and the
    401 banner action (expired-session path). Token-driven;
