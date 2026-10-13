@@ -100,7 +100,7 @@ body {
 /* --- Masthead ---------------------------------------------------------- */
 
 .masthead {
-  max-width: 760px;
+  max-width: 72rem;
   margin: 0 auto;
   padding: var(--space-6) var(--space-5) var(--space-5);
 }
@@ -169,7 +169,7 @@ body {
 /* --- Layout ------------------------------------------------------------ */
 
 .layout {
-  max-width: 760px;
+  max-width: 72rem;
   margin: 0 auto;
   padding: 0 var(--space-5) var(--space-7);
   display: flex;
@@ -195,24 +195,35 @@ body {
 
 /* --- Chat console ------------------------------------------------------ */
 
-/* Definite viewport height (#83 AC3, PR 130 review): flex: 1 + overflow-y:
-   auto on the log only scroll against a container with a DEFINITE main
-   size — an auto-height column grows with the transcript and pushes the
-   composer below the fold. The panel is therefore height-bounded to the
-   viewport minus the masthead chrome (26rem covers the worst case:
-   narrow viewports where the lede wraps to five lines); the layout
-   padding and footer sit below the panel and may scroll out of view
-    without affecting the composer. dvh tracks mobile browser chrome, with
-    the vh declaration as the fallback; max-height caps the panel on very
-    tall monitors. The v0.5 min-height: 32rem floor is superseded: on
-    phones it exceeds the space below the masthead, and a floor taller
-    than the computed height would win and un-pin the composer exactly
-    there. A 14rem floor (issue 150) guards only the degenerate case: on
-    viewports shorter than the 26rem masthead allowance (landscape
-    phones) the calc clamps to 0 and the panel vanishes — the floor
-    resolves the used height to max(calc(100dvh - 26rem), 14rem) and
-    stays below the computed height on typical portrait phones (≥ 40rem
-    tall), leaving the #83 behavior there unchanged. */
+/* Definite viewport height (#83 AC3, PR 130 review; #207 recomputation):
+   flex: 1 + overflow-y: auto on the log only scroll against a container
+   with a DEFINITE main size — an auto-height column grows with the
+   transcript and pushes the composer below the fold. The panel is
+   therefore height-bounded to the viewport minus the masthead chrome
+   (26rem covers the worst case: narrow viewports where the lede wraps to
+   five lines); the layout padding and footer sit below the panel and may
+   scroll out of view without affecting the composer. dvh tracks mobile
+   browser chrome, with the vh declaration as the fallback; max-height
+   caps the panel on very tall monitors. The v0.5 min-height: 32rem floor
+   is superseded: on phones it exceeds the space below the masthead, and
+   a floor taller than the computed height would win and un-pin the
+   composer exactly there. A 14rem floor (issue 150) guards only the
+   degenerate case: on viewports shorter than the 26rem masthead allowance
+   (landscape phones) the calc clamps to 0 and the panel vanishes — the
+   floor resolves the used height to max(calc(100dvh - 26rem), 14rem) and
+   stays below the computed height on typical portrait phones (≥ 40rem
+   tall), leaving the #83 behavior there unchanged.
+
+   #207 recomputation (floating capsule): the values are re-derived, not
+   assumed. (1) The greeting renders INSIDE the scrolling log and the
+   capsule INSIDE the panel — neither adds fixed chrome above the panel,
+   so the 26rem masthead allowance is unchanged. (2) The capsule's fixed
+   interior (panel padding 3rem + panel-title ≈ 2.1rem + capsule ≈ 8rem
+   with its dock row) totals ≈ 13.1rem ≤ the 14rem floor, so the composer
+   stays pinned even in the floor's degenerate case. (3) The floor still
+   satisfies floor ≤ 40rem − 26rem allowance, so on ≥ 40rem portrait
+   viewports the computed height always wins and the #83/#150 behavior is
+   unchanged. */
 
 .chat {
   display: flex;
@@ -287,6 +298,18 @@ body {
 .monogram--hero {
   width: 48px;
   height: 48px;
+}
+
+/* Time-of-day salutation (#207 AC 1.2): the greeting headline above the
+   #86 welcome line — bound via x-text (greetingLine), never an HTML
+   path (ADR-006 §9). */
+
+.greeting-line {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--ink);
 }
 
 .empty-state-welcome {
@@ -547,11 +570,12 @@ body {
   border: none;
   background: none;
   color: var(--muted);
-  font-size: 1.1rem;
-  line-height: 1;
   padding: var(--space-1) var(--space-2);
   cursor: pointer;
   border-radius: var(--radius);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
 
 .pending-banner-dismiss:hover {
@@ -724,42 +748,157 @@ body {
 
 /* --- Composer ---------------------------------------------------------- */
 
-/* Pinned footer (AC3, #83): flex-end keeps the Send button on the bottom
-   edge of the composer row while the textarea grows above it. */
+/* Floating capsule (AC 1.1, #207): the composer is an enclosed rounded
+   card — surface background, hairline border, soft shadow — pinned as the
+   panel footer (see .chat above). The column layout stacks the textarea
+   above the utility dock; the dock is a single row INSIDE the capsule
+   (AC 1.4) and flex-wrap: wrap is its only narrow-viewport degradation —
+   no stacking media query. */
 
 .composer {
   margin-top: var(--space-4);
-  border-top: 1px solid var(--line);
-  padding-top: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: 1.25rem;
+  background: var(--paper);
+  box-shadow: var(--shadow-md);
+  padding: var(--space-2) var(--space-3);
   display: flex;
-  align-items: flex-end;
-  gap: var(--space-3);
+  flex-direction: column;
+  gap: var(--space-2);
 }
 
-/* Auto-growing textarea (AC1, #83): rows="1" starts as a single line and
-   app.js sizes the box to its content; the max-height cap encodes ~5
-   lines (5 × 1.5 line-height) plus the vertical padding and border, and
-   overflow-y: auto scrolls internally beyond the cap. */
+/* Capsule focus ring (AC 1.6, #207): the borderless textarea hands the
+   focus indicator to the capsule — :focus-within lights the whole card
+   while the textarea (or any child) holds focus, keyboard or pointer. */
+
+.composer:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Auto-growing textarea (AC 1.3, #83/#207): rows="1" starts as a single
+   line and app.js sizes the box to its content; the max-height cap
+   encodes ~8 lines (8 × 1.5 line-height) plus the vertical padding, and
+   overflow-y: auto scrolls internally beyond the cap. Borderless: the
+   capsule is the enclosure. */
 
 .composer textarea {
-  flex: 1;
-  min-width: 0;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  padding: var(--space-3);
+  border: none;
+  padding: var(--space-2);
   font-family: inherit;
   font-size: 0.95rem;
   line-height: 1.5;
   color: var(--ink);
-  background: var(--paper);
+  background: transparent;
   resize: none;
   overflow-y: auto;
-  max-height: calc(7.5em + 2 * var(--space-3) + 2px);
+  max-height: calc(12em + 2 * var(--space-2));
 }
 
 .composer textarea:focus-visible {
+  outline: none; /* the capsule carries the ring (see :focus-within) */
+}
+
+/* Utility dock (AC 1.4, #207): one row inside the capsule — clip + tools
+   left, mic + submit right. flex-wrap: wrap is the only narrow-viewport
+   degradation (no stacking media query). */
+
+.composer-dock {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+}
+
+.dock-tools,
+.dock-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* Icon buttons (AC 1.4/1.6, #207): square ghost controls for the dock.
+   Clip/tools/mic ship as disabled placeholders with honest "Coming soon"
+   tooltips — no dummy handlers (Phases 2–4 of epic #206). */
+
+.icon-button {
+  border: none;
+  background: transparent;
+  border-radius: var(--radius);
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.icon-button:hover:not(:disabled) {
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.icon-button:focus-visible {
   outline: 2px solid var(--accent);
-  outline-offset: -1px;
+  outline-offset: 2px;
+}
+
+.icon-button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* Icon sprite (#207 AC 1.7): the symbol sheet is display:none — an inline
+   style attribute would be blocked by the style-src 'self' CSP (#84).
+   Stroke presentation attributes ride the <symbol> elements; the glyph
+   color inherits from the control (currentColor). */
+
+.icon-sprite {
+  display: none;
+}
+
+.icon {
+  width: 1.25rem;
+  height: 1.25rem;
+  flex-shrink: 0;
+}
+
+/* Submit/Stop morph (AC 1.5, #207): a circular accent control. While a
+   stream is in flight it becomes the Stop square (ink surface) driving
+   the existing client-side AbortController; the muted state is the
+   whitespace-only idle input. The background transition is the morph
+   animation — disabled under prefers-reduced-motion (see below). */
+
+.composer-submit {
+  border: none;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  width: 2.5rem;
+  height: 2.5rem;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background-color 150ms ease;
+}
+
+.composer-submit--stop {
+  background: var(--ink);
+}
+
+.composer-submit:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.composer-submit:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 /* --- Buttons ----------------------------------------------------------- */
@@ -1049,7 +1188,7 @@ body {
 /* --- Footer ------------------------------------------------------------ */
 
 .footer {
-  max-width: 760px;
+  max-width: 72rem;
   margin: 0 auto;
   padding: var(--space-5);
   border-top: 1px solid var(--line);
@@ -1219,5 +1358,11 @@ body {
 
   .chat-log {
     scroll-behavior: auto;
+  }
+
+  /* Submit/Stop morph (#207 AC 1.5): the background transition is the
+     morph animation — reduced-motion users get the instant swap. */
+  .composer-submit {
+    transition: none;
   }
 }
