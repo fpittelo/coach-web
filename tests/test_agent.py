@@ -32,6 +32,7 @@ from coach_web.agent import (
     _accumulate_tool_call,
     _first_choice,
     _parse_arguments,
+    apply_temporal_anchor,
     create_agent,
     periodization_tool_schema,
     plan_tool_schema,
@@ -939,6 +940,29 @@ class TestCreateAgent:
         app = create_app(settings)
 
         assert app.state.agent_factory is create_agent
+
+
+# ---------------------------------------------------------------------------
+# Temporal anchor (#220)
+# ---------------------------------------------------------------------------
+
+
+class TestTemporalAnchor:
+    """Server-side temporal anchor appended to the coach system prompt (#220)."""
+
+    def test_anchor_renders_the_injected_date_and_weekday(self) -> None:
+        """AC3: a frozen clock (injected ``today``) renders ISO date + weekday."""
+        anchored = apply_temporal_anchor("BASE PROMPT", date(2026, 10, 13))
+
+        assert anchored == "BASE PROMPT\n\nToday is 2026-10-13 (Tuesday)."
+
+    def test_anchor_composes_with_the_default_prompt_as_one_stable_line(self) -> None:
+        """The anchor is a single stable, parseable trailing line — never duplicated."""
+        anchored = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date(2026, 1, 1))
+
+        assert anchored.startswith(DEFAULT_SYSTEM_PROMPT)
+        assert anchored.endswith("\n\nToday is 2026-01-01 (Thursday).")
+        assert anchored.count("Today is ") == 1
 
 
 # ---------------------------------------------------------------------------

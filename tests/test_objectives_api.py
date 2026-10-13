@@ -14,13 +14,14 @@ failed. The chat/model-facing endpoints keep the strict #142 generic detail
 import json
 import sqlite3
 from collections.abc import AsyncIterator
+from datetime import date
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent
+from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, apply_temporal_anchor
 from coach_web.app import create_app
 
 GENERIC_422_DETAIL = "Invalid request payload"
@@ -290,22 +291,30 @@ class TestSystemPromptDigestInjection:
         assert "Secondary process goal: Three threshold sessions weekly" in streamed
 
     def test_no_digest_when_objectives_are_absent(self, migrated_db: Path) -> None:
-        """Absent objectives leave the system prompt untouched (graceful empty)."""
+        """Absent objectives leave the prompt at the anchored base (graceful empty).
+
+        #220: the temporal anchor is part of the base prompt applied
+        unconditionally, so the no-digest baseline is the anchored prompt.
+        """
         with _probe_client() as client:
             streamed = _streamed_text(client)
 
-        assert streamed == DEFAULT_SYSTEM_PROMPT
+        assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
     def test_digest_degrades_gracefully_when_the_database_is_unavailable(
         self, monkeypatch: Any
     ) -> None:
-        """An unreadable database yields no digest and the stream still works."""
+        """An unreadable database yields no digest and the stream still works.
+
+        #220 AC2: the degradation keeps the temporal anchor — the date must
+        survive the persistence failure even though the digest does not.
+        """
         monkeypatch.setenv("COACH_DB_PATH", "/proc/definitely-not-writable/coach.db")
 
         with _probe_client() as client:
             streamed = _streamed_text(client)
 
-        assert streamed == DEFAULT_SYSTEM_PROMPT
+        assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
     def test_digest_degrades_when_a_stored_row_is_corrupt(
         self, migrated_db: Path, db_path: Path
@@ -316,7 +325,8 @@ class TestSystemPromptDigestInjection:
         the CHECK constraints — e.g. an emptied title, which has no CHECK)
         fails profile re-validation with ``pydantic.ValidationError``. The
         digest boundary must degrade to no-digest like every other
-        persistence failure, never break the agent turn.
+        persistence failure, never break the agent turn. #220: the anchored
+        base prompt survives the degradation.
         """
         with _probe_client() as client:
             client.put("/api/objectives", json=_profile_payload())
@@ -324,7 +334,7 @@ class TestSystemPromptDigestInjection:
                 conn.execute("UPDATE athlete_objectives SET title = ''")
             streamed = _streamed_text(client)
 
-        assert streamed == DEFAULT_SYSTEM_PROMPT
+        assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
     def test_digest_reflects_the_latest_saved_profile(self, migrated_db: Path) -> None:
         """The digest is rebuilt per turn from the persisted profile."""
@@ -340,6 +350,37 @@ class TestSystemPromptDigestInjection:
         assert "Race the Alpenbrevet 2027" in first
         assert "Revised goal" in second
         assert "Race the Alpenbrevet 2027" not in second
+
+
+class TestTemporalAnchorInjection:
+    """The coach system prompt carries the server-side temporal anchor (#220)."""
+
+    def test_anchor_is_present_on_a_turn_without_objectives(self, migrated_db: Path) -> None:
+        """AC1/AC2: the anchor rides the base prompt even when no digest applies."""
+        with _probe_client() as client:
+            streamed = _streamed_text(client)
+
+        expected = f"Today is {date.today().isoformat()} ({date.today().strftime('%A')})."
+        assert expected in streamed
+
+    def test_anchor_appears_exactly_once_when_digests_also_apply(self, migrated_db: Path) -> None:
+        """AC3: digest layering must not duplicate the anchor line."""
+        with _probe_client() as client:
+            client.put("/api/objectives", json=_profile_payload())
+            streamed = _streamed_text(client)
+
+        assert streamed.count("Today is ") == 1
+        # The anchor precedes the digest: base prompt first, digests on top.
+        assert streamed.index("Today is ") < streamed.index("Athlete objectives")
+
+    def test_anchor_survives_the_database_failure_fallback(self, monkeypatch: Any) -> None:
+        """AC2: the profile=None degradation branch still carries the anchor."""
+        monkeypatch.setenv("COACH_DB_PATH", "/proc/definitely-not-writable/coach.db")
+
+        with _probe_client() as client:
+            streamed = _streamed_text(client)
+
+        assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
 
 class TestGenericValidationHandler:

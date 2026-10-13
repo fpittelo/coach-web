@@ -29,7 +29,7 @@ from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
-from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent
+from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, apply_temporal_anchor
 from coach_web.app import create_app
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.objectives import get_active_objective_row
@@ -495,7 +495,8 @@ class TestSystemPromptPhaseInjection:
         API (raw SQL bypasses nothing here — the blank name has no CHECK)
         fails phase re-validation with ``pydantic.ValidationError``. The
         digest boundary degrades to no-digest like every other persistence
-        failure, never breaking the agent turn.
+        failure, never breaking the agent turn. #220: the anchored base
+        prompt survives the degradation.
         """
         with _probe_client() as client:
             client.put("/api/objectives", json=_profile_payload())
@@ -504,7 +505,7 @@ class TestSystemPromptPhaseInjection:
                 conn.execute("UPDATE periodization_phases SET name = ''")
             streamed = _streamed_text(client)
 
-        assert streamed == DEFAULT_SYSTEM_PROMPT
+        assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
 
 class TestPeriodizationOpenApiContract:
