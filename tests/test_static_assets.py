@@ -165,7 +165,7 @@ import re
 
 from fastapi.testclient import TestClient
 
-from coach_web.app import STATIC_DIR, create_app
+from coach_web.app import _SIGNIN_SLOT, STATIC_DIR, create_app
 
 VENDOR_DIR = STATIC_DIR / "vendor"
 
@@ -233,6 +233,24 @@ def _media_block(css: str, query: str) -> str:
 def _header_block(html: str) -> str:
     """Return the <header>…</header> block of the page."""
     return html[html.index("<header") : html.index("</header>")]
+
+
+def _iter_media_blocks(css: str) -> list[str]:
+    """Return the body of every ``@media`` block in the stylesheet."""
+    blocks = []
+    for match in re.finditer(r"@media[^{]+\{", css):
+        depth = 1
+        start = match.end()
+        index = start
+        while index < len(css) and depth > 0:
+            char = css[index]
+            if char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+            index += 1
+        blocks.append(css[start : index - 1])
+    return blocks
 
 
 def _has_rule(css: str, selector: str) -> bool:
@@ -421,12 +439,20 @@ class TestSwissMinimalistContract:
         assert "#d5d5d5" not in css
         assert "--radius: 2px" not in css
 
-        # Single centered reading column (epic band 720–800px).
-        assert "max-width: 760px" in css
+        # Single centered column — widened to the #207 chat container band
+        # (~72rem; supersedes the v0.7 720–800px reading column, ADR-006 §2).
+        assert "max-width: 72rem" in css
 
     def test_stylesheet_colors_are_tokenized(self) -> None:
-        """Every color literal lives in the :root token block (ADR-006, AC1)."""
+        """Every color literal lives in the :root token block (ADR-006, AC1).
+
+        CSS comments are stripped before the scan (#207): issue-reference
+        markers like "#207" in commentary are prose, not color literals —
+        the contract governs colors in rules, and comment text can never
+        render.
+        """
         css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+        css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
         root = _rule_block(css, ":root")
 
         root_hex = set(re.findall(r"#[0-9a-f]{3,8}\b", root))
@@ -440,12 +466,17 @@ class TestSwissMinimalistContract:
         assert not stray_rgba, f"hard-coded rgba outside tokens: {sorted(stray_rgba)}"
 
     def test_layout_is_single_centered_column(self) -> None:
-        """Masthead, content and footer share one centered 760px column (AC3)."""
+        """Masthead, content and footer share one centered column (AC3).
+
+        Rewritten for #207 AC 1.1: the centered column widens from the v0.7
+        760px reading column to the ~72rem chat container — the composer
+        capsule floats inside it. Explicit supersession (ADR-006 §2).
+        """
         css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
 
         for selector in (".masthead", ".layout", ".footer"):
             block = _rule_block(css, selector)
-            assert "max-width: 760px" in block, selector
+            assert "max-width: 72rem" in block, selector
             assert "margin: 0 auto" in block, selector
 
         # The v0.3 two-panel grid (1.4fr/1fr) is gone; panels stack in one column.
@@ -647,21 +678,38 @@ class TestIdentityBarContract:
 
     # --- AC4: monogram -------------------------------------------------------
 
-    def test_monogram_is_inline_svg_only(self) -> None:
-        """Inline SVGs only: header brand mark + empty-state hero mark.
+    def test_icons_are_an_inline_svg_sprite(self) -> None:
+        """Inline SVGs only: monograms + the vendored Lucide icon sprite (#207).
 
-        Superseded for #86 (explicit, per ADR-006 §2 — never silent
-        deletion): the onboarding empty state repeats the monogram as its
-        hero mark, so the page carries exactly TWO hand-authored inline
-        SVGs. Still no sprite, no icon font, no fetch, no <use>/xlink.
+        Superseded for #207 (explicit, per ADR-006 §2 — never silent
+        deletion): the page still carries the two hand-authored monogram
+        SVGs, and the composer's icon set ships as an inline SVG sprite —
+        hand-vendored Lucide symbols referenced via ``<use href="#i-…">``,
+        with the ISC license comment beside the sprite. Still no icon font,
+        no JS icon library, no external request, no xlink.
         """
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-        assert html.count("<svg") == 2
         assert "currentColor" in html
         assert 'viewBox="0 0 32 32"' in html
-        assert "<use" not in html
         assert "xlink" not in html
+        # The sprite: exactly the six vendored Lucide symbols, each
+        # referenced through <use> — no icon font, no external icon request.
+        for symbol_id in (
+            "i-paperclip",
+            "i-sliders-horizontal",
+            "i-mic",
+            "i-arrow-up",
+            "i-square",
+            "i-x",
+        ):
+            assert f'<symbol id="{symbol_id}"' in html, symbol_id
+            assert f'href="#{symbol_id}"' in html, symbol_id
+        assert html.count("<symbol") == 6
+        # The ISC license notice rides the sprite block (the vendor/*.LICENSE
+        # pattern mirrored inline — the icons live in the markup itself).
+        assert "ISC License" in html
+        assert "Lucide" in html
 
     def test_monogram_is_sized_and_token_colored(self) -> None:
         """The monogram renders at a fixed pixel size in the accent color."""
@@ -1652,13 +1700,18 @@ class TestComposerErgonomicsContract:
             'this.$watch("input", () => this.$nextTick(() => this.autoGrowTextarea()));' in init
         ), "$watch(input) → $nextTick → autoGrowTextarea() hook missing"
 
-    def test_textarea_caps_at_five_lines_and_scrolls_internally(self) -> None:
-        """AC1: the CSS cap is ~5 lines; overflow scrolls inside the box."""
+    def test_textarea_caps_at_eight_lines_and_scrolls_internally(self) -> None:
+        """AC1 (#207): the CSS cap is ~8 lines; overflow scrolls inside the box.
+
+        Supersedes the #83 five-line cap (explicit, per ADR-006 §2): the
+        floating capsule grows the composer to ~8 lines before the internal
+        scroll engages.
+        """
         css = self._css()
         textarea = _rule_block(css, ".composer textarea")
 
         assert "max-height:" in textarea, "textarea max-height cap missing"
-        assert "7.5em" in textarea, "cap must encode 5 lines × 1.5 line-height"
+        assert "12em" in textarea, "cap must encode 8 lines × 1.5 line-height"
         assert "overflow-y: auto" in textarea, "internal scroll beyond the cap missing"
         assert "resize: none" in textarea, "manual resize handle must be gone"
 
@@ -1676,21 +1729,30 @@ class TestComposerErgonomicsContract:
     # --- AC2: Enter-to-send keyboard contract ------------------------------------
 
     def test_keydown_handler_sends_on_plain_enter(self) -> None:
-        """AC2: Enter (no Shift) prevents the newline and sends."""
+        """AC2 (#207 rewrite): Enter (no Shift) prevents the newline and sends.
+
+        The dispatch route changes with the single-dispatch guard: the
+        keydown handler no longer calls send() directly — it routes through
+        the form's submit event via requestSubmit(), the ONE send() dispatch
+        path (AC 1.3). The observable contract is unchanged: plain Enter
+        sends, the newline is prevented.
+        """
         handler = _rule_block(self._script(), "onComposerKeydown(event)")
 
         assert handler, "onComposerKeydown(event) must exist"
         assert 'event.key === "Enter" && !event.shiftKey' in handler
         assert "event.preventDefault()" in handler
-        assert "this.send()" in handler
+        assert "requestSubmit()" in handler
+        assert "this.send()" not in handler, "keydown must not be a second send() path"
 
     def test_keydown_handler_guards_ime_composition(self) -> None:
         """AC2: the composition-confirm Enter never sends (IME guard)."""
         handler = _rule_block(self._script(), "onComposerKeydown(event)")
 
         assert "event.isComposing" in handler
-        # The guard precedes the send branch: a composing Enter returns early.
-        assert handler.index("event.isComposing") < handler.index("this.send()")
+        # The guard precedes the dispatch branch: a composing Enter returns
+        # early — never reaching the requestSubmit() route into send().
+        assert handler.index("event.isComposing") < handler.index("requestSubmit()")
 
     def test_textarea_wires_the_keydown_handler(self) -> None:
         """AC2: the composer textarea binds onComposerKeydown($event)."""
@@ -1758,10 +1820,16 @@ class TestComposerErgonomicsContract:
     # --- AC4: send-disabled bindings preserved ------------------------------------
 
     def test_send_button_disabled_when_empty_or_streaming(self) -> None:
-        """AC4: the button disable binding is preserved verbatim."""
+        """AC4 (#207 rewrite): the submit control's disable binding.
+
+        Supersedes the #83 verbatim binding: the morphing submit control is
+        disabled only while IDLE with a whitespace-only input — during a
+        stream it is the enabled Stop control (AC 1.5). The streaming send
+        guard lives in send() itself (unchanged below).
+        """
         composer = self._composer()
 
-        assert ":disabled=\"streaming || input.trim() === ''\"" in composer
+        assert ":disabled=\"!streaming && input.trim() === ''\"" in composer
 
     def test_send_guard_still_blocks_empty_and_in_flight(self) -> None:
         """AC4: send() keeps its empty-input and streaming guards."""
@@ -1772,18 +1840,303 @@ class TestComposerErgonomicsContract:
     # --- AC5: token-based focus ring ------------------------------------------------
 
     def test_textarea_has_token_based_focus_ring(self) -> None:
-        """AC5: the composer focus ring is drawn from the accent token.
+        """AC5 (#207 rewrite): the composer focus ring is drawn from the accent token.
 
-        The selector is ``:focus-visible`` (modern convention, PR #130
-        review nit) — text-entry controls match ``:focus-visible`` on
-        every focus, so the ring stays visible for keyboard AND pointer
-        users.
+        Supersedes the per-textarea ring: the borderless textarea inside the
+        capsule hands the focus ring to the capsule itself —
+        ``:focus-within`` lights the whole card while any child (textarea
+        included) holds focus, so the ring stays visible for keyboard AND
+        pointer users.
         """
         css = self._css()
-        focus = _rule_block(css, ".composer textarea:focus-visible")
+        focus = _rule_block(css, ".composer:focus-within")
 
         assert "outline" in focus, "focus ring missing"
         assert "var(--accent)" in focus, "focus ring must use the accent token"
+
+
+class TestFloatingComposerContract:
+    """Floating composer capsule, stop-morph & single dispatch (#207).
+
+    Phase 1 of epic #206 (LibreChat aesthetic): the composer becomes an
+    enclosed rounded capsule — textarea on top, a single utility dock row
+    inside the capsule (clip + tools left, mic + submit right) — with the
+    submit control morphing into a Stop square while a stream is in flight.
+
+    The four study landmines are contracted here:
+    1. Double-send: the form's submit event is the ONLY send() dispatch
+       path; the keydown handler routes Enter through requestSubmit() into
+       the same handler, so keydown and implicit submit can never both fire
+       send().
+    2. Stop-morph: the Stop control drives the existing client-side
+       AbortController (no new server endpoint), finalizes the partial
+       assistant message and produces NO error banner — the AbortError
+       swallow in the transport catch is explicit, not accidental.
+    3. Height budget: the capsule lives INSIDE the height-bounded .chat
+       panel (the pinned-footer mechanism is untouched); the height-budget
+       comment carries the honest recomputation.
+    4. _SIGNIN_SLOT: the literal marker comment survives byte-exact
+       (cross-checked against app.py's constant).
+
+    app.js behavior is contracted through source assertions (ADR-006 §5 —
+    no Node toolchain), same as every stream/composer wiring test above.
+    """
+
+    DOCK_ARIA_LABELS = ("Attach file", "Configure tools", "Voice input")
+    SUBMIT_ARIA_LABEL = "Send message"
+    STOP_ARIA_LABEL = "Stop generating"
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _composer(self) -> str:
+        html = self._html()
+        composer_at = html.index('<form class="composer"')
+        return html[composer_at : html.index("</form>", composer_at)]
+
+    # --- AC 1.1: enclosed floating capsule -------------------------------------
+
+    def test_composer_capsule_is_an_enclosed_rounded_card(self) -> None:
+        """AC 1.1: the capsule is a rounded, shadowed, surfaced card."""
+        css = self._css()
+        capsule = _rule_block(css, ".composer")
+
+        assert "border-radius: 1.25rem" in capsule, "capsule radius missing"
+        assert "box-shadow" in capsule, "subtle shadow missing"
+        assert "background: var(--paper)" in capsule, "surface background missing"
+        assert "border: 1px solid var(--line)" in capsule, "enclosing border missing"
+
+    def test_capsule_floats_inside_the_max_width_container(self) -> None:
+        """AC 1.1: the capsule sits in the centered ~72rem container."""
+        css = self._css()
+        layout = _rule_block(css, ".layout")
+
+        assert "max-width: 72rem" in layout
+        assert "margin: 0 auto" in layout
+
+    def test_height_budget_is_preserved_with_an_honest_comment(self) -> None:
+        """AC 1.1: the .chat height budget survives the redesign.
+
+        The pinned-footer mechanism is untouched: the panel stays
+        viewport-height-bounded (dvh over vh fallback, 26rem masthead
+        allowance, 14rem floor, 40rem tall-monitor cap) and the capsule is
+        its last flex child. The budget comment carries the honest
+        recomputation: the capsule's dock row lives INSIDE the panel
+        budget, and the greeting renders inside the scrolling log — no new
+        fixed chrome above the panel.
+        """
+        css = self._css()
+        chat = _rule_block(css, ".chat")
+
+        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "min-height: 14rem" in chat, "short-viewport floor missing"
+        assert "max-height: 40rem" in chat, "tall-monitor cap missing"
+
+        # The comment above the .chat rule documents the #207 recomputation.
+        css_raw = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+        comment_at = css_raw.index(".chat {")
+        comment_start = css_raw.rindex("/*", 0, comment_at)
+        comment = css_raw[comment_start:comment_at]
+        assert "#207" in comment, "height-budget comment must carry the #207 recomputation"
+
+    # --- AC 1.4: action dock — single row inside the capsule --------------------
+
+    def test_dock_is_a_single_row_inside_the_capsule(self) -> None:
+        """AC 1.4: textarea on top, one utility row below, inside the capsule."""
+        composer = self._composer()
+
+        # The textarea precedes the dock; the dock is a single row holding
+        # both groups — clip/tools left, mic/submit right.
+        textarea_at = composer.index("<textarea")
+        dock_at = composer.index('class="composer-dock"')
+        tools_at = composer.index('class="dock-tools"')
+        actions_at = composer.index('class="dock-actions"')
+        assert textarea_at < dock_at < tools_at < actions_at
+        clip_at = composer.index("i-paperclip")
+        sliders_at = composer.index("i-sliders-horizontal")
+        mic_at = composer.index("i-mic")
+        arrow_at = composer.index("i-arrow-up")
+        assert clip_at < sliders_at < mic_at < arrow_at
+
+    def test_dock_degrades_only_via_flex_wrap(self) -> None:
+        """AC 1.4: flex-wrap: wrap is the only narrow-viewport degradation."""
+        css = self._css()
+        dock = _rule_block(css, ".composer-dock")
+
+        assert "display: flex" in dock
+        assert "flex-wrap: wrap" in dock
+        # No stacking media query may target the composer/dock.
+        for media in _iter_media_blocks((STATIC_DIR / "styles.css").read_text(encoding="utf-8")):
+            assert ".composer-dock" not in media, "stacking media query added"
+            assert ".composer " not in media and ".composer{" not in media
+
+    def test_placeholder_buttons_are_disabled_with_coming_soon_tooltips(self) -> None:
+        """AC 1.4: clip/tools/mic are disabled placeholders — no dummy handlers."""
+        composer = self._composer()
+
+        for label in self.DOCK_ARIA_LABELS:
+            button_at = composer.index(f'aria-label="{label}"')
+            tag_start = composer.rindex("<button", 0, button_at)
+            tag = composer[tag_start : composer.index(">", button_at) + 1]
+            assert "disabled" in tag, f"{label} must be a disabled placeholder"
+            assert 'title="Coming soon"' in tag, f"{label} must carry the honest tooltip"
+            # No dummy handlers: the placeholder buttons carry no @click.
+            button = composer[button_at : composer.index("</button>", button_at)]
+            assert "@click" not in button, label
+
+    def test_icon_buttons_carry_the_aria_labels(self) -> None:
+        """AC 1.6: every icon button is labeled for assistive tech."""
+        composer = self._composer()
+
+        for label in self.DOCK_ARIA_LABELS:
+            assert f'aria-label="{label}"' in composer, label
+        # The morphing submit control carries both labels as the dynamic
+        # binding's branches (one control, two states).
+        assert ":aria-label=\"streaming ? 'Stop generating' : 'Send message'\"" in composer
+
+    def test_icon_buttons_have_visible_focus_rings(self) -> None:
+        """AC 1.6: icon buttons and the submit control draw accent focus rings."""
+        css = self._css()
+
+        for selector in (".icon-button:focus-visible", ".composer-submit:focus-visible"):
+            focus = _rule_block(css, selector)
+            assert "outline" in focus, selector
+            assert "var(--accent)" in focus, selector
+
+    # --- AC 1.5: submit/stop morph ----------------------------------------------
+
+    def test_submit_control_morphs_into_stop_while_streaming(self) -> None:
+        """AC 1.5: the submit button becomes the Stop square during a stream."""
+        composer = self._composer()
+
+        assert ":class=\"{ 'composer-submit--stop': streaming }\"" in composer
+        assert 'href="#i-arrow-up"' in composer, "send glyph missing"
+        assert 'href="#i-square"' in composer, "stop glyph missing"
+        # The stop glyph is visible only while streaming (and the send glyph
+        # only while idle) — one morphing control, not two buttons.
+        assert 'x-show="streaming"' in composer
+        assert 'x-show="!streaming"' in composer
+
+    def test_stop_drives_the_existing_abort_path(self) -> None:
+        """AC 1.5: Stop drives the client-side AbortController — no new endpoint."""
+        script = self._script()
+        stop = _rule_block(script, "stopStreaming()")
+
+        assert stop, "stopStreaming() must exist"
+        assert "this.finishStream()" in stop, "Stop must reuse the existing finalize path"
+        # No new server endpoint, no second transport: the stop is local.
+        assert "fetch" not in stop
+        assert "EventSource" not in stop
+
+        # The submit handler branches to the stop while streaming.
+        submit = _rule_block(script, "onComposerSubmit()")
+        assert "this.stopStreaming()" in submit
+
+    def test_stop_finalizes_the_partial_message_without_an_error_banner(self) -> None:
+        """AC 1.5: the partial assistant message stays; no banner is raised."""
+        script = self._script()
+        stop = _rule_block(script, "stopStreaming()")
+
+        # The accumulated partial content is never overwritten or cleared by
+        # the stop path (finishStream leaves messages untouched).
+        assert "this.messages" in stop, "stop must reason about the partial bubble"
+
+        # The AbortError swallow is explicit: the transport catch documents
+        # that the stream was ended on purpose (resetChat / Stop) — no error
+        # banner. The #207 marker pins the deliberate (not accidental)
+        # swallow contract.
+        catch = _rule_block(script, ".catch((error) =>")
+        assert 'error.name === "AbortError"' in catch
+        assert "#207" in catch, "the swallow must be documented as deliberate"
+
+    def test_send_has_exactly_one_dispatch_path(self) -> None:
+        """AC 1.3: keydown and form submit can never both fire send()."""
+        script = self._script()
+        html = self._html()
+
+        # Exactly ONE send() call site in the component: the submit handler.
+        assert script.count("this.send()") == 1, "send() must have exactly one call site"
+        submit = _rule_block(script, "onComposerSubmit()")
+        assert "this.send()" in submit
+
+        # The form's submit event is the single dispatch entry; the keydown
+        # handler routes into it via requestSubmit().
+        assert '@submit.prevent="onComposerSubmit()"' in html
+        assert "this.$refs.composerForm.requestSubmit()" in script
+        assert 'x-ref="composerForm"' in html
+
+    # --- AC 1.2: greeting visibility & x-text binding ----------------------------
+
+    def test_greeting_renders_only_when_empty_and_no_pending_banner(self) -> None:
+        """AC 1.2: the greeting yields to an active pending-debrief banner."""
+        html = self._html()
+        greeting_at = html.index('<div class="empty-state"')
+        greeting = html[greeting_at : html.index('x-for="chip in starterChips"', greeting_at)]
+
+        assert 'x-show="messages.length === 0 && pendingDebriefs.length === 0"' in greeting
+
+    def test_greeting_line_is_bound_via_x_text_only(self) -> None:
+        """AC 1.2: the salutation is plain x-text — no new HTML path (ADR-006 §9)."""
+        html = self._html()
+        script = self._script()
+
+        greeting_at = html.index('<div class="empty-state"')
+        greeting = html[greeting_at : html.index('x-for="chip in starterChips"', greeting_at)]
+        assert 'x-text="greetingLine"' in greeting
+        assert "x-html" not in greeting
+
+        # The getter exists and is time-of-day based (client-side, no fetch).
+        getter = _rule_block(script, "get greetingLine()")
+        assert getter, "greetingLine getter missing"
+        assert "getHours" in getter
+        assert "fetch" not in getter
+
+    # --- AC 1.5: reduced motion ---------------------------------------------------
+
+    def test_morph_animation_honors_reduced_motion(self) -> None:
+        """AC 1.5: the submit/stop morph transition is disabled under reduce."""
+        css_raw = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+        media = _media_block(css_raw, "@media (prefers-reduced-motion: reduce)")
+
+        assert media, "prefers-reduced-motion block missing"
+        assert ".composer-submit" in media, "morph transition must be disabled"
+        assert "transition: none" in media
+
+    # --- AC 1.7: markup invariants --------------------------------------------------
+
+    def test_signin_slot_survives_byte_exact(self) -> None:
+        """AC 1.7: the _SIGNIN_SLOT marker survives the redesign byte-exact.
+
+        Cross-checked against app.py's constant (the / route does a literal
+        string replace for the auth landing variant) — drift on either side
+        fails here.
+        """
+        html = self._html()
+
+        assert _SIGNIN_SLOT in html
+
+    def test_stop_stays_client_side_no_new_server_endpoint(self) -> None:
+        """AC 1.7: the stop path adds no fetch target beyond the known API."""
+        script = self._script()
+
+        # The only fetch targets are the pre-existing API surface.
+        endpoints = set(re.findall(r'fetch\("([^"]+)"', script))
+        assert endpoints <= {
+            "/api/agent/stream",
+            "/api/plan/approve",
+            "/api/week/approve",
+            "/api/periodization/approve",
+            "/api/debrief",
+            "/api/debrief/pending",
+            "/api/objectives",
+        }, sorted(endpoints)
 
 
 class TestOnboardingEmptyStateContract:
@@ -1857,14 +2210,23 @@ class TestOnboardingEmptyStateContract:
         assert self.WELCOME_LINE in html, "welcome line missing"
 
     def test_empty_state_shows_monogram_welcome_and_chips(self) -> None:
-        """AC1: monogram + welcome + chips, bound to the empty transcript."""
+        """AC1 (#207 rewrite): monogram + greeting + welcome + chips.
+
+        The onboarding block becomes the #207 greeting: it renders only when
+        the thread is empty AND no pending-debrief banner is active (AC 1.2
+        — the banner owns the empty thread's attention), and the time-of-day
+        salutation is bound via x-text (ADR-006 §9).
+        """
         empty = self._empty_state()
 
-        # The block is the empty-transcript onboarding state.
-        assert 'x-show="messages.length === 0"' in empty
-        # Hero monogram mark (the second inline SVG on the page).
+        # The block is the empty-transcript onboarding state, suppressed
+        # while a pending-debrief banner is active (AC 1.2, #207).
+        assert 'x-show="messages.length === 0 && pendingDebriefs.length === 0"' in empty
+        # Hero monogram mark — the coach avatar of the greeting.
         assert 'class="monogram monogram--hero"' in empty
         assert 'aria-hidden="true"' in empty
+        # The time-of-day salutation rides x-text (never an HTML path).
+        assert 'x-text="greetingLine"' in empty
         # The one-line welcome.
         assert self.WELCOME_LINE in empty
         # The starter chips render from the static array.

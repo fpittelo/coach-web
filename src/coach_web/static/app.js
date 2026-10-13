@@ -124,6 +124,28 @@
  * the composer (disabling the textarea on send drops it to <body>)
  * without stealing it from a deliberate target such as a plan-card
  * button (AC4).
+ *
+ * Floating composer (#207, epic #206 phase 1): the composer becomes an
+ * enclosed rounded capsule — textarea on top, a single utility dock row
+ * inside the capsule (clip + tools left, mic + submit right). The
+ * clip/tools/mic buttons are DISABLED placeholders with honest "Coming
+ * soon" tooltips — no dummy handlers (Phases 2–4). The submit control
+ * morphs into a Stop square while a stream is in flight: stopStreaming()
+ * drives the SAME client-side AbortController path resetChat() uses
+ * (finishStream finalizes the partial assistant message and clears the
+ * stream state; no error banner, no new server endpoint). The greeting
+ * (empty thread, no pending-debrief banner) carries a time-of-day
+ * salutation bound via x-text only (ADR-006 §9) — the client holds no
+ * athlete name, so the salutation stays generic.
+ *
+ * Single dispatch path (#207 AC 1.3): the form's submit event is the ONLY
+ * send() entry point. The keydown handler routes a plain Enter through
+ * requestSubmit() into the same submit handler (the IME guard returns
+ * before the route), so keydown and implicit submit can never both fire
+ * send() — the double-send landmine from the #206 study. While a stream is
+ * in flight the submit handler branches to stopStreaming() instead: the
+ * textarea is disabled then, so the keydown route is dead and the Stop
+ * click is the only submit event source.
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -487,16 +509,16 @@ function coachApp() {
     },
 
     autoGrowTextarea() {
-      // Auto-grow composer (AC1, #83): reset to the intrinsic single-row
-      // height first so scrollHeight reflects the current content, then
-      // size the box to fit it. The border correction reads the computed
-      // border widths — scrollbar-blind, unlike a client/offset box
-      // delta, which would absorb a horizontal scrollbar's height
-      // (~15px) and over-size the box if one ever appeared (#130
-      // review). overflow-y: auto only engages past the stylesheet's
-      // ~5-line max-height cap — never at the fitted size. Clearing the
-      // input (send / reset) shrinks the box back through the same
-      // $watch("input") path.
+      // Auto-grow composer (AC1, #83; #207 recap): reset to the intrinsic
+      // single-row height first so scrollHeight reflects the current
+      // content, then size the box to fit it. The border correction reads
+      // the computed border widths — scrollbar-blind, unlike a
+      // client/offset box delta, which would absorb a horizontal
+      // scrollbar's height (~15px) and over-size the box if one ever
+      // appeared (#130 review). overflow-y: auto only engages past the
+      // stylesheet's ~8-line max-height cap — never at the fitted size.
+      // Clearing the input (send / reset) shrinks the box back through the
+      // same $watch("input") path.
       const textarea = this.$refs.composer;
       if (!textarea) {
         return;
@@ -509,19 +531,84 @@ function coachApp() {
     },
 
     onComposerKeydown(event) {
-      // Enter-to-send (AC2, #83): plain Enter prevents the newline and
-      // sends; Shift+Enter fails the !event.shiftKey half and falls
-      // through to the textarea's default action (newline inserted). The
-      // IME composition guard returns early while an input method editor
-      // is composing (e.g. Japanese kana conversion) — the
+      // Enter-to-send (AC2, #83; single dispatch #207): plain Enter
+      // prevents the newline and routes through the form's submit event —
+      // the ONE send() dispatch path (keydown and implicit submit can
+      // never both fire send()). Shift+Enter fails the !event.shiftKey
+      // half and falls through to the textarea's default action (newline
+      // inserted). The IME composition guard returns early while an input
+      // method editor is composing (e.g. Japanese kana conversion) — the
       // composition-confirm Enter must never send.
       if (event.isComposing) {
         return;
       }
       if (event.key === "Enter" && !event.shiftKey) {
         event.preventDefault();
-        this.send();
+        this.$refs.composerForm.requestSubmit();
       }
+    },
+
+    onComposerSubmit() {
+      // Single dispatch entry (#207 AC 1.3): the form's submit event —
+      // reached from the submit button's activation AND from the keydown
+      // handler's requestSubmit() route — is the only send() call site.
+      // While a stream is in flight the submit control IS the Stop button
+      // (AC 1.5): the branch drives the client-side abort instead. The
+      // textarea is disabled during a stream, so the keydown route is dead
+      // then and the Stop activation is the only submit source.
+      if (this.streaming) {
+        this.stopStreaming();
+        return;
+      }
+      this.send();
+    },
+
+    stopStreaming() {
+      // Stop control (AC 1.5, #207): the user-visible stop affordance
+      // drives the SAME client-side AbortController path resetChat() uses
+      // — no new server endpoint. finishStream() aborts the in-flight
+      // request AFTER finalizing the stream state (phase idled, watchdog
+      // cleared), so the partial assistant message stays exactly as
+      // streamed; the resulting AbortError rejection is swallowed
+      // explicitly in startStream's catch (a deliberate local abort — no
+      // error banner).
+      if (!this.streaming) {
+        return;
+      }
+      // The in-flight assistant placeholder is the last message (send()
+      // is the only stream starter and is guarded by this.streaming). An
+      // empty bubble (Stop pressed before the first token) is dropped —
+      // unless an inline card is pinned to it (a card may arrive before
+      // any token; removing the bubble would re-pin the card to the wrong
+      // message).
+      const index = this.messages.length - 1;
+      const bubble = this.messages[index];
+      const pinnedCard =
+        this.planMessageIndex === index ||
+        this.weekMessageIndex === index ||
+        this.periodizationMessageIndex === index ||
+        this.rpeMessageIndex === index ||
+        this.debriefSummaryMessageIndex === index;
+      this.finishStream();
+      if (bubble && bubble.role === "assistant" && !bubble.content && !pinnedCard) {
+        this.messages.splice(index, 1);
+      }
+    },
+
+    get greetingLine() {
+      // Time-of-day salutation (#207 AC 1.2): bound via x-text only
+      // (ADR-006 §9 — the greeting is plain text, never HTML). The client
+      // holds no athlete name (nLPD posture; no backend change in Phase 1
+      // scope), so the salutation stays generic — a future name source
+      // must ride this same x-text path, never an HTML binding.
+      const hour = new Date().getHours();
+      if (hour < 12) {
+        return "Good morning";
+      }
+      if (hour < 18) {
+        return "Good afternoon";
+      }
+      return "Good evening";
     },
 
     announce(text) {
@@ -860,7 +947,15 @@ function coachApp() {
         })
         .catch((error) => {
           if (error && error.name === "AbortError") {
-            return; // resetChat() aborted this stream on purpose
+            // Explicit swallow (#207 AC 1.5): an AbortError here ALWAYS
+            // means the stream was ended on purpose, client-side —
+            // resetChat() or the composer's Stop control (stopStreaming)
+            // called finishStream(), which aborts this fetch only AFTER
+            // the stream state is finalized (partial assistant message
+            // kept, phase idled, watchdog cleared). The rejection is the
+            // transport echo of that deliberate local abort: swallowing it
+            // is the contract — no error banner, no state write.
+            return;
           }
           if (epoch === this.streamEpoch) {
             if (this.streaming) {

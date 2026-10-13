@@ -15,6 +15,68 @@
     <script defer src="/static/vendor/alpine.min.js"></script>
   </head>
   <body>
+    <!-- Vendored Lucide icon sprite (#207 AC 1.7): a hand-copied subset of
+         six Lucide icons (paperclip, sliders-horizontal, mic, arrow-up,
+         square, x), referenced via <use href="#i-…"> — no icon font, no JS
+         icon library, no external request, no CSP change. The sprite is
+         hidden through the .icon-sprite class: an inline style attribute
+         would be blocked by the style-src 'self' CSP (#84). Lucide is
+         ISC-licensed; the notice below mirrors the vendor/*.LICENSE
+         pattern (the icons live inline in this markup, so the license
+         rides beside them). -->
+    <!-- ISC License
+
+         Copyright (c) for portions of Lucide are held by Cole Bemis
+         2013-2022 as part of Feather (MIT). All other copyright (c) for
+         Lucide are held by Lucide Contributors 2022.
+
+         Permission to use, copy, modify, and/or distribute this software
+         for any purpose with or without fee is hereby granted, provided
+         that the above copyright notice and this permission notice appear
+         in all copies.
+
+         THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+         WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+         WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+         AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+         CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+         LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+         NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+         CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE. -->
+    <svg class="icon-sprite" aria-hidden="true" focusable="false">
+      <symbol id="i-paperclip" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path
+          d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"
+        ></path>
+      </symbol>
+      <symbol id="i-sliders-horizontal" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="21" x2="14" y1="4" y2="4"></line>
+        <line x1="10" x2="3" y1="4" y2="4"></line>
+        <line x1="21" x2="12" y1="12" y2="12"></line>
+        <line x1="8" x2="3" y1="12" y2="12"></line>
+        <line x1="21" x2="16" y1="20" y2="20"></line>
+        <line x1="12" x2="3" y1="20" y2="20"></line>
+        <line x1="14" x2="14" y1="2" y2="6"></line>
+        <line x1="8" x2="8" y1="10" y2="14"></line>
+        <line x1="16" x2="16" y1="18" y2="22"></line>
+      </symbol>
+      <symbol id="i-mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+        <line x1="12" x2="12" y1="19" y2="22"></line>
+      </symbol>
+      <symbol id="i-arrow-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="m5 12 7-7 7 7"></path>
+        <path d="M12 19V5"></path>
+      </symbol>
+      <symbol id="i-square" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect width="14" height="14" x="5" y="5" rx="2" ry="2"></rect>
+      </symbol>
+      <symbol id="i-x" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 6 6 18"></path>
+        <path d="m6 6 12 12"></path>
+      </symbol>
+    </svg>
     <div x-data="coachApp()" x-init="init()" x-cloak>
       <header class="masthead">
         <div class="identity-bar">
@@ -89,12 +151,19 @@
           ></p>
 
           <div class="chat-log" x-ref="log" role="log" aria-label="Conversation with your coach">
-            <!-- Onboarding empty state (#86 AC1): hero monogram, one-line
-                 welcome and 3 static endurance starter chips (PO Q2/Q7 —
-                 domain-correct, client-side strings, no personal data).
-                 Chips prefill the composer and focus it — never auto-send
-                 (PO Q8). -->
-            <div class="empty-state" x-show="messages.length === 0">
+            <!-- Greeting (#207 AC 1.2): the #86 onboarding empty state
+                  becomes the centered greeting — coach monogram avatar,
+                  time-of-day salutation bound via x-text (ADR-006 §9: no
+                  HTML path; the client holds no athlete name — nLPD
+                  posture, no backend change in Phase 1 scope — so the
+                  salutation stays generic), the one-line welcome and the 3
+                  static endurance starter chips (PO Q2/Q7 — domain-correct,
+                  client-side strings, no personal data). Renders only when
+                  the thread is empty AND no pending-debrief banner is
+                  active — the banner owns the empty thread's attention.
+                  Chips prefill the composer and focus it — never auto-send
+                  (PO Q8). -->
+            <div class="empty-state" x-show="messages.length === 0 && pendingDebriefs.length === 0">
               <svg
                 class="monogram monogram--hero"
                 viewBox="0 0 32 32"
@@ -117,6 +186,7 @@
                   stroke-linecap="round"
                 />
               </svg>
+              <p class="greeting-line" x-text="greetingLine"></p>
               <p class="empty-state-welcome">Hello! I'm your coach — what should we work on today?</p>
               <div class="starter-chips" role="group" aria-label="Starter prompts">
                 <template x-for="chip in starterChips" :key="chip">
@@ -686,17 +756,33 @@
                 aria-label="Dismiss pending debrief reminder"
                 @click="dismissPendingDebrief(item.plan_session_key)"
               >
-                ×
+                <svg class="icon" aria-hidden="true"><use href="#i-x"></use></svg>
               </button>
             </p>
           </template>
 
-          <form class="composer" @submit.prevent="send()">
-            <!-- Auto-growing composer (#83): rows="1" starts as a single
-                 line, autoGrowTextarea() grows it with content up to the
-                 ~5-line CSS cap (internal scroll beyond) and the input
-                 clear on send/reset shrinks it back via the $watch hook.
-                 Enter sends, Shift+Enter newlines, IME-guarded (AC2). -->
+          <!-- Floating composer capsule (#207 AC 1.1/1.3/1.4/1.5): an
+                enclosed rounded card pinned as the panel footer. The dock
+                is a single row INSIDE the capsule (textarea above,
+                utilities below): clip + tools left, mic + submit right;
+                flex-wrap: wrap is the only narrow-viewport degradation —
+                no stacking media query. Clip/tools/mic are disabled
+                placeholders with honest "Coming soon" tooltips — no dummy
+                handlers (Phases 2–4 of epic #206). The submit control
+                morphs into the Stop square while a stream is in flight
+                (AC 1.5) and drives the existing client-side
+                AbortController — no new server endpoint. The form's
+                submit event is the SINGLE send() dispatch path: the
+                keydown handler routes Enter through requestSubmit() into
+                the same handler, so keydown and implicit submit can never
+                both fire send() (double-send guard, AC 1.3). -->
+          <form class="composer" x-ref="composerForm" @submit.prevent="onComposerSubmit()">
+            <!-- Auto-growing composer (#83, recapped for #207): rows="1"
+                  starts as a single line, autoGrowTextarea() grows it with
+                  content up to the ~8-line CSS cap (internal scroll
+                  beyond) and the input clear on send/reset shrinks it back
+                  via the $watch hook. Enter sends, Shift+Enter newlines,
+                  IME-guarded (AC2). -->
             <textarea
               rows="1"
               name="message"
@@ -708,9 +794,55 @@
               :disabled="streaming"
               @keydown="onComposerKeydown($event)"
             ></textarea>
-            <button class="button" type="submit" :disabled="streaming || input.trim() === ''">
-              Send
-            </button>
+            <div class="composer-dock">
+              <div class="dock-tools">
+                <button
+                  class="icon-button"
+                  type="button"
+                  aria-label="Attach file"
+                  title="Coming soon"
+                  disabled
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#i-paperclip"></use></svg>
+                </button>
+                <button
+                  class="icon-button"
+                  type="button"
+                  aria-label="Configure tools"
+                  title="Coming soon"
+                  disabled
+                >
+                  <svg class="icon" aria-hidden="true">
+                    <use href="#i-sliders-horizontal"></use>
+                  </svg>
+                </button>
+              </div>
+              <div class="dock-actions">
+                <button
+                  class="icon-button"
+                  type="button"
+                  aria-label="Voice input"
+                  title="Coming soon"
+                  disabled
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#i-mic"></use></svg>
+                </button>
+                <button
+                  class="composer-submit"
+                  type="submit"
+                  :class="{ 'composer-submit--stop': streaming }"
+                  :disabled="!streaming && input.trim() === ''"
+                  :aria-label="streaming ? 'Stop generating' : 'Send message'"
+                >
+                  <svg class="icon" aria-hidden="true" x-show="!streaming">
+                    <use href="#i-arrow-up"></use>
+                  </svg>
+                  <svg class="icon" aria-hidden="true" x-show="streaming">
+                    <use href="#i-square"></use>
+                  </svg>
+                </button>
+              </div>
+            </div>
           </form>
         </section>
       </main>
