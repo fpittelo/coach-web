@@ -24,7 +24,7 @@ import asyncio
 import json
 import sqlite3
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -34,7 +34,7 @@ from cryptography.fernet import Fernet
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
-from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent
+from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, apply_temporal_anchor
 from coach_web.app import _athlete_id_for_session, create_app
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
@@ -713,19 +713,29 @@ class TestPendingDebriefDigestHook:
         assert "2026-10-06: Threshold 3x12" in prompt
 
     def test_no_pending_sessions_leave_the_prompt_unchanged(self) -> None:
-        """Without pending sessions the prompt stays byte-identical (no hook)."""
+        """Without pending sessions the prompt stays at the anchored base (no hook).
+
+        #220: the temporal anchor is part of the base prompt applied
+        unconditionally, so the no-digest baseline is the anchored prompt.
+        """
         client = _probe_client()
 
         response = client.post("/api/agent/stream", json={"message": "Hello coach", "history": []})
 
         assert response.status_code == 200
         # The tolerant extractor also exercises the malformed-frame branch.
-        assert _extract_token_texts_tolerant(response.text) == DEFAULT_SYSTEM_PROMPT
+        assert _extract_token_texts_tolerant(response.text) == apply_temporal_anchor(
+            DEFAULT_SYSTEM_PROMPT, date.today()
+        )
 
     def test_digest_hook_degrades_gracefully_on_persistence_failure(
         self, db_path: Path, monkeypatch
     ) -> None:
-        """A broken persistence layer yields no digest — the chat never breaks."""
+        """A broken persistence layer yields no digest — the chat never breaks.
+
+        #220 AC2: the degradation keeps the temporal anchor — the date must
+        survive the persistence failure even though the digest does not.
+        """
         app = create_app()
         app.state.agent_factory = MagicMock(side_effect=lambda _settings: _SystemPromptProbeAgent())
         client = TestClient(app)
@@ -738,7 +748,9 @@ class TestPendingDebriefDigestHook:
         response = client.post("/api/agent/stream", json={"message": "Hello coach", "history": []})
 
         assert response.status_code == 200
-        assert _extract_token_texts(response.text) == DEFAULT_SYSTEM_PROMPT
+        assert _extract_token_texts(response.text) == apply_temporal_anchor(
+            DEFAULT_SYSTEM_PROMPT, date.today()
+        )
 
 
 class TestAthleteIdResolutionBoundary:
