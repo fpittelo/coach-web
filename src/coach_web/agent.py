@@ -11,6 +11,7 @@ SSE endpoint serialises verbatim.
 import json
 import logging
 from collections.abc import AsyncIterator
+from datetime import date
 from types import TracebackType
 from typing import Any, Literal, Protocol
 
@@ -127,6 +128,22 @@ DEFAULT_SYSTEM_PROMPT = (
     "the debrief summary card is rendered automatically from the fetched "
     "compliance report."
 )
+
+TEMPORAL_ANCHOR_FORMAT = "Today is {date} ({weekday})."
+"""The stable, parseable anchor line: ISO date + weekday name (#220)."""
+
+
+def apply_temporal_anchor(system_prompt: str, today: date) -> str:
+    """Append the server-side temporal anchor line to a base system prompt (#220).
+
+    The model is never told today's date by any digest — it would otherwise
+    infer the date from tool payloads and anchor on the wrong time of year.
+    The caller (the request scope in :mod:`coach_web.app`) owns the clock
+    boundary (N3, PR #173): ``today`` is injected, never re-read here, so the
+    anchor shares the digests' single per-request resolution.
+    """
+    anchor = TEMPORAL_ANCHOR_FORMAT.format(date=today.isoformat(), weekday=today.strftime("%A"))
+    return f"{system_prompt}\n\n{anchor}"
 
 
 class OpenRouterError(Exception):

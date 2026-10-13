@@ -23,7 +23,13 @@ from starlette.datastructures import MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, CoachAgent, create_agent
+from coach_web.agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    AgentEvent,
+    CoachAgent,
+    apply_temporal_anchor,
+    create_agent,
+)
 from coach_web.auth.middleware import (
     SESSION_COOKIE,
     AuthMiddleware,
@@ -463,6 +469,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # the coach opens the debrief flow with the request_rpe tool. The
         # same failure boundary applies: an unreadable store yields no
         # pending digest and never breaks the turn.
+        #
+        # Temporal anchor (#220): the model is never told today's date by any
+        # digest, so it infers the date from tool payloads and can anchor on
+        # the wrong time of year. The anchor is applied to the base prompt
+        # UNCONDITIONALLY — before the digest boundary below — so a
+        # persistence failure (no digest at all) still leaves the coach with
+        # the correct date on every turn. The clock is resolved ONCE here
+        # (N3, PR #173) — the same request-scoped boundary the digests use —
+        # and passed down; the agent never reads the clock itself.
+        today = date.today()
+        # Duck-typed agents (test stubs) may not carry the attribute; the
+        # default prompt is the base every real agent is built with.
+        base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
+        agent.system_prompt = apply_temporal_anchor(base_prompt, today)
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -477,7 +497,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     athlete_id=_athlete_id_for_session(
                         settings, request.cookies.get(SESSION_COOKIE)
                     ),
-                    today=date.today(),
+                    today=today,
                 )
         except (OSError, SQLAlchemyError, ValidationError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
@@ -485,14 +505,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             phases = []
             pending_debriefs = []
         if profile is not None:
-            # Duck-typed agents (test stubs) may not carry the attribute; the
-            # default prompt is the base every real agent is built with.
-            base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
-            # The clock is resolved once here (N3, PR #173): the digest's
-            # phase resolution takes an explicit ``today`` so the call site
-            # owns the clock boundary instead of the domain default.
+            # The digest's phase resolution takes the same explicit ``today``
+            # so the call site owns the clock boundary (N3, PR #173).
             agent.system_prompt = apply_objectives_digest(
-                base_prompt, profile, phases=phases, today=date.today()
+                agent.system_prompt, profile, phases=phases, today=today
             )
         if pending_debriefs:
             agent.system_prompt = apply_pending_debrief_digest(
