@@ -66,8 +66,13 @@ from coach_web.microcycle import (
     PlanDraftRow,
     WeekApprovalRequest,
     WeekApprovalResponse,
+    apply_approved_week_digest,
+    build_week_markdown,
+    list_drafts_by_week,
+    past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
+    week_bounds,
     write_week_days,
 )
 from coach_web.mirror import mirror_debrief_to_icu
@@ -119,6 +124,20 @@ approval, week approval) keeps the generic detail verbatim.
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
 """Static 503 detail for persistence outages — no internals echoed (nLPD)."""
+
+WEEK_ADJUSTMENT_PAST_DAYS_DETAIL = "Week adjustment rejected: past days are immutable"
+"""Static 422 detail for an adjustment touching a past day (#225 C2, AC3).
+
+Past-day immutability is a security property: the body stays value-free
+(no dates, no titles, no draft content) per the GENERIC_VALIDATION_DETAIL
+precedent.
+"""
+
+WEEK_ADJUSTMENT_AVAILABILITY_DETAIL = "Week adjustment rejected: weekly availability exceeded"
+"""Static 422 detail for an adjustment over the availability budget (#225 C2, D2)."""
+
+WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL = "Week adjustment rejected: no future days to adjust"
+"""Static 422 detail for an adjustment whose write set is empty (#225 C2, D3.4)."""
 
 _SIGNIN_SLOT = (
     "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
@@ -470,6 +489,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # same failure boundary applies: an unreadable store yields no
         # pending digest and never breaks the turn.
         #
+        # Approved-week digest (D4, #225): when the CURRENT ISO week already
+        # has an approved draft, the prompt gains its compact metadata
+        # digest (week id, title, per-day date/title/TSS/rest marker) so a
+        # mid-week adjustment request can be grounded in what is already on
+        # the calendar (past days are locked server-side). The identical
+        # failure boundary applies: an unreadable store yields no digest at
+        # all and never breaks the turn.
+        #
         # Temporal anchor (#220): the model is never told today's date by any
         # digest, so it infers the date from tool payloads and can anchor on
         # the wrong time of year. The anchor is applied to the base prompt
@@ -483,6 +510,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # default prompt is the base every real agent is built with.
         base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
         agent.system_prompt = apply_temporal_anchor(base_prompt, today)
+        iso_year, iso_week, _ = today.isocalendar()
+        current_week_start, _ = week_bounds(f"{iso_year}-W{iso_week:02d}")
+        approved_week_row: PlanDraftRow | None = None
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -499,11 +529,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     ),
                     today=today,
                 )
+                approved_rows = [
+                    row
+                    for row in await list_drafts_by_week(session, current_week_start)
+                    if row.status == "approved"
+                ]
+                approved_week_row = approved_rows[-1] if approved_rows else None
         except (OSError, SQLAlchemyError, ValidationError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
             phases = []
             pending_debriefs = []
+            approved_week_row = None
         if profile is not None:
             # The digest's phase resolution takes the same explicit ``today``
             # so the call site owns the clock boundary (N3, PR #173).
@@ -514,6 +551,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             agent.system_prompt = apply_pending_debrief_digest(
                 agent.system_prompt, pending_debriefs
             )
+        if approved_week_row is not None:
+            agent.system_prompt = apply_approved_week_digest(agent.system_prompt, approved_week_row)
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
@@ -557,24 +596,96 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         payload: WeekApprovalRequest,
     ) -> WeekApprovalResponse:
-        """Approve a weekly plan and write one Intervals.icu event per day.
+        """Approve a weekly plan and write its days as one batch upsert (#225).
 
         The draft is persisted first (MADR-008 ``plan_drafts``: create-or-reuse
         per week, replacement rule, ``submitted`` while the write is in
-        flight), then the days are written SEQUENTIALLY through ``coach-mcp``
-        (#163: no batch tool — the write is not atomic). Every day yields its
-        own :class:`~coach_web.microcycle.DayWriteResult`; the draft only
-        transitions to ``approved`` when every requested day succeeded, so a
-        partial failure stays ``submitted`` for the retry-failed-days
-        affordance (AC5: no silent partial calendar). The explicit POST is
-        the approval gate — human-in-the-loop preserved (#87 C7).
+        flight), then the requested days are written through the confirm-
+        gated ``coach-mcp__icu_batch_create_events`` upsert (D1 — idempotent
+        per ``external_id``, so re-approvals never duplicate events). Every
+        day yields its own :class:`~coach_web.microcycle.DayWriteResult`;
+        the draft only transitions to ``approved`` when every requested day
+        succeeded, so a partial failure stays ``submitted`` for the
+        retry-failed-days affordance (AC5: no silent partial calendar).
+
+        Adjusting an already-approved week (D3): the current approved row is
+        captured BEFORE the upsert supersedes it, and a changed incoming
+        draft is validated as a mid-week adjustment — past days must render
+        byte-identically to the stored rows, the write set is restricted to
+        days strictly after today (both 422 with a static body, C2), and the
+        adjusted week must fit the active objective's weekly availability
+        budget (D2). ``today`` is resolved ONCE here and passed down (D3.5).
+        The explicit POST is the approval gate — human-in-the-loop preserved
+        (#87 C7).
         """
         settings: Settings = request.app.state.settings
         factory = getattr(request.app.state, "hub_factory", MCPClientHub.from_settings)
         hub = factory(settings)
         session_factory = request.app.state.db_session_factory
 
-        # 1. Persist the draft before any side effect (MADR-008, AC4).
+        # Clock boundary (D3.5): resolved ONCE per request, passed down —
+        # helpers never read the clock themselves.
+        today = date.today()
+
+        # 1. Capture the CURRENT approved draft BEFORE the upsert supersedes
+        # it (D3.1), plus the active objective profile for the availability
+        # gate (D2). The profiles read degrades to None on failure (graceful,
+        # same posture as the agent_stream digests); the drafts read is
+        # required — a persistence outage answers the static 503.
+        week_start, _ = week_bounds(payload.week.week_id)
+        try:
+            async with session_factory() as session:
+                stored_rows = await list_drafts_by_week(session, week_start)
+                try:
+                    profile = await get_objective_profile(session)
+                except (OSError, SQLAlchemyError, ValidationError):
+                    logger.warning("Week adjustment availability gate unavailable")
+                    profile = None
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Week draft persistence failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        approved_rows = [row for row in stored_rows if row.status == "approved"]
+        stored = approved_rows[-1] if approved_rows else None
+
+        # 2. Adjustment detection (D3.2): an approved row whose stored
+        # content DIFFERS from the incoming draft is a mid-week adjustment;
+        # identical content keeps the unchanged approval path below.
+        write_dates = payload.dates
+        if stored is not None and build_week_markdown(payload.week) != stored.content:
+            # 2a. Past-day immutability (D3.3, AC3): every past day must
+            # render byte-identically to its stored day-table row.
+            if not past_days_render_identically(payload.week, stored.content, today):
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PAST_DAYS_DETAIL)
+            # 2b. Write-set exclusion (D3.4): the batch may touch ONLY days
+            # strictly after today; an explicit request targeting a past day
+            # is rejected outright.
+            if payload.dates is not None and any(
+                requested_date <= today.isoformat() for requested_date in payload.dates
+            ):
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PAST_DAYS_DETAIL)
+            requested_days = (
+                payload.week.days
+                if payload.dates is None
+                else [day for day in payload.week.days if day.date in set(payload.dates)]
+            )
+            write_set = [day for day in requested_days if day.date > today.isoformat()]
+            if not write_set:
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL)
+            # 2c. Availability gate (D2, AC6): the adjusted week must fit the
+            # athlete's weekly availability budget; no active objective
+            # degrades to no gate (the digests' graceful posture).
+            if (
+                profile is not None
+                and sum(day.duration_minutes for day in payload.week.days)
+                > profile.weekly_availability_hours * 60
+            ):
+                logger.warning("Rejected week adjustment over the availability budget")
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_AVAILABILITY_DETAIL)
+            write_dates = [day.date for day in write_set]
+
+        # 3. Persist the draft before any side effect (MADR-008, AC4) — on
+        # the adjustment path the upsert SUPERSEDES the captured approved row
+        # and lands the replacement as ``submitted`` (AC2).
         try:
             async with session_factory() as session:
                 row = await upsert_week_draft(session, payload.week)
@@ -585,10 +696,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # Terminal-state short-circuit (PR #174 F3): an already-APPROVED
         # matching draft means the week was fully written to the calendar —
-        # re-issuing the events would create duplicates (intervals_create_event
-        # is not idempotent, #163). Report the existing success without any
-        # tool call. A REJECTED draft was promoted back to submitted by the
-        # upsert, so the write proceeds below.
+        # re-issuing the events would create duplicates. Report the existing
+        # success without any tool call. A REJECTED draft was promoted back
+        # to submitted by the upsert, so the write proceeds below.
         if row.status == "approved":
             requested = (
                 payload.week.days
@@ -599,14 +709,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 results=[DayWriteResult(date=day.date, success=True) for day in requested]
             )
 
-        # 2. Sequential per-day calendar writes (#163).
+        # 4. Two-phase batch calendar writes (D1) — on the adjustment path
+        # the batch already excludes every day on or before today (2b).
         try:
             async with hub:
-                results = await write_week_days(hub, payload.week, payload.dates)
+                results = await write_week_days(hub, payload.week, write_dates)
         except MCPHubError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-        # 3. Transition on outcome: approved only when EVERY requested day
+        # 5. Transition on outcome: approved only when EVERY requested day
         # succeeded; a partial failure stays submitted for retry. A
         # transition failure after successful writes must not mask the
         # per-day results — it is logged and the response still reports them.

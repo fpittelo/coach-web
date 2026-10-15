@@ -13,6 +13,7 @@ persistence fixtures run against a per-test SQLite file.
 """
 
 import json
+import re
 from datetime import date
 from typing import Any
 
@@ -21,20 +22,25 @@ from pydantic import ValidationError
 
 from coach_web.microcycle import (
     ALLOWED_TRANSITIONS,
+    APPROVED_WEEK_DIGEST_MAX_CHARS,
+    CALENDAR_WRITE_FAILED,
+    COACH_BATCH_CREATE_EVENTS_TOOL,
     DaySlot,
     PlanDraftRow,
     WeekApprovalRequest,
     WeekApprovalResponse,
     WeeklyPlanDraft,
-    build_day_event_arguments,
+    apply_approved_week_digest,
+    approved_week_digest,
+    build_batch_event_draft,
     build_week_markdown,
     list_drafts_by_week,
+    past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
     week_bounds,
     write_week_days,
 )
-from coach_web.plan_approval import COACH_CREATE_EVENT_TOOL, EVENT_START_TIME
 
 WEEK_START = "2026-10-05"
 """Monday of ISO week 2026-W41 (pinned literal — the tests' calendar anchor)."""
@@ -86,21 +92,6 @@ def _raw_week(**overrides: Any) -> dict[str, Any]:
 def _week(**overrides: Any) -> WeeklyPlanDraft:
     """Build a validated WeeklyPlanDraft with optional overrides."""
     return WeeklyPlanDraft.model_validate(_raw_week(**overrides))
-
-
-class _RecordingHub:
-    """In-memory stand-in for the MCP hub recording every tool call."""
-
-    def __init__(self, results: list[str] | None = None) -> None:
-        self._results = list(results or [])
-        self.calls: list[tuple[str, dict[str, Any] | None]] = []
-
-    async def execute_tool(self, name: str, arguments: dict[str, Any] | None = None) -> str:
-        """Record the call and replay the next configured payload."""
-        self.calls.append((name, arguments))
-        if self._results:
-            return self._results.pop(0)
-        return json.dumps({"id": "evt", "status": "created"})
 
 
 # ---------------------------------------------------------------------------
@@ -364,35 +355,416 @@ class TestPlanDraftRepository:
 
 
 # ---------------------------------------------------------------------------
-# Calendar event arguments
+# Batch event drafts (D1/C6, #225)
 # ---------------------------------------------------------------------------
 
 
-class TestBuildDayEventArguments:
-    """Per-day ``intervals_create_event`` payload construction."""
+class TestBuildBatchEventDraft:
+    """Per-day ``icu_batch_create_events`` draft construction."""
 
-    def test_training_day_maps_to_a_workout_event(self) -> None:
+    def test_training_day_maps_to_a_batch_workout_draft(self) -> None:
         """A training day carries the WORKOUT category, load and duration."""
-        args = build_day_event_arguments(DaySlot.model_validate(_raw_day(1)))
+        draft = build_batch_event_draft(DaySlot.model_validate(_raw_day(1)), "2026-W41")
         tuesday = date.fromisocalendar(2026, 41, 2).isoformat()
 
-        assert args["name"] == "VO2 intervals"
-        assert args["type"] == "Ride"
-        assert args["category"] == "WORKOUT"
-        assert args["start_date_local"] == f"{tuesday}T{EVENT_START_TIME}"
-        assert args["moving_time_seconds"] == 75 * 60
-        assert args["icu_training_load"] == 85.0
-        assert "Threshold zones" in args["description"]
-        assert "Z4" in args["description"]
+        assert draft["external_id"] == "coach-web-2026-W41-tue"
+        assert draft["date"] == tuesday
+        assert draft["name"] == "VO2 intervals"
+        assert draft["type"] == "Ride"
+        assert draft["category"] == "WORKOUT"
+        assert draft["moving_time_seconds"] == 75 * 60
+        assert draft["icu_training_load"] == 85.0
+        assert "Threshold zones" in draft["description"]
 
-    def test_rest_day_maps_to_a_note_event_without_load(self) -> None:
+    def test_rest_day_maps_to_a_note_draft_without_load(self) -> None:
         """A rest day is a calendar NOTE without duration or load."""
-        args = build_day_event_arguments(DaySlot.model_validate(_raw_day(6)))
+        draft = build_batch_event_draft(DaySlot.model_validate(_raw_day(6)), "2026-W41")
 
-        assert args["category"] == "NOTE"
-        assert "moving_time_seconds" not in args
-        assert "icu_training_load" not in args
-        assert args["start_date_local"].startswith(WEEK_END)
+        assert draft["external_id"] == "coach-web-2026-W41-sun"
+        assert draft["category"] == "NOTE"
+        assert "moving_time_seconds" not in draft
+        assert "icu_training_load" not in draft
+
+    def test_external_ids_fit_the_coach_mcp_contract(self) -> None:
+        """Keys match the coach-mcp character pattern and its 128-char cap."""
+        pattern = re.compile(r"^[A-Za-z0-9_.-]+$")
+        for index in range(7):
+            draft = build_batch_event_draft(DaySlot.model_validate(_raw_day(index)), "2026-W41")
+            assert pattern.fullmatch(draft["external_id"])
+            assert len(draft["external_id"]) <= 128
+
+
+# ---------------------------------------------------------------------------
+# Two-phase batch week writes (D1, #225)
+# ---------------------------------------------------------------------------
+
+
+STUB_CONFIRM_TOKEN = "stub-confirm-token"  # noqa: S105
+"""Stub preview token of the two-phase batch hub (a payload fingerprint)."""
+
+
+class _BatchHub:
+    """Stub hub implementing the two-phase ``icu_batch_create_events`` contract.
+
+    Preview calls (without ``confirm_token``) return a stub token; execute
+    calls return the configured report (or a per-event ``created`` report).
+    """
+
+    def __init__(
+        self,
+        report: dict[str, Any] | None = None,
+        preview_response: str | None = None,
+        report_response: str | None = None,
+    ) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self._report = report
+        self._preview_response = preview_response
+        self._report_response = report_response
+
+    async def execute_tool(self, name: str, arguments: dict[str, Any] | None = None) -> str:
+        """Record the call and answer per the two-phase contract."""
+        self.calls.append((name, arguments or {}))
+        payload = arguments or {}
+        if payload.get("confirm_token") is None:
+            if self._preview_response is not None:
+                return self._preview_response
+            events = payload.get("events") or []
+            return json.dumps(
+                {
+                    "phase": "preview",
+                    "item_count": len(events),
+                    "confirm_token": STUB_CONFIRM_TOKEN,
+                    "events": events,
+                    "note": "Re-invoke with confirm_token to place these events.",
+                }
+            )
+        if self._report_response is not None:
+            return self._report_response
+        if self._report is not None:
+            return json.dumps(self._report)
+        events = payload.get("events") or []
+        return json.dumps(
+            {
+                "created": len(events),
+                "updated": 0,
+                "failed": 0,
+                "outcomes": [
+                    {
+                        "external_id": event["external_id"],
+                        "outcome": "created",
+                        "event_id": f"evt-{event['date']}",
+                        "reason": None,
+                    }
+                    for event in events
+                ],
+            }
+        )
+
+
+class TestBatchWeekWrites:
+    """Two-phase ``icu_batch_create_events`` orchestration (D1, #225)."""
+
+    async def test_writes_the_week_as_one_two_phase_batch(self) -> None:
+        """Preview first, then execute with the token over the identical batch."""
+        hub = _BatchHub()
+
+        results = await write_week_days(hub, _week())
+
+        assert len(hub.calls) == 2
+        preview_tool, preview_args = hub.calls[0]
+        execute_tool, execute_args = hub.calls[1]
+        assert preview_tool == COACH_BATCH_CREATE_EVENTS_TOOL
+        assert execute_tool == COACH_BATCH_CREATE_EVENTS_TOOL
+        assert "confirm_token" not in preview_args
+        assert preview_args["response_format"] == "json"
+        assert execute_args["confirm_token"] == STUB_CONFIRM_TOKEN
+        assert execute_args["events"] == preview_args["events"]
+        assert [result.date for result in results] == [day.date for day in _week().days]
+        assert all(result.success for result in results)
+
+    async def test_outcomes_map_back_to_week_order(self) -> None:
+        """Report outcomes map onto the draft's week order by external_id."""
+        report = {
+            "created": 1,
+            "updated": 1,
+            "failed": 1,
+            "outcomes": [
+                {
+                    "external_id": "coach-web-2026-W41-wed",
+                    "outcome": "failed",
+                    "event_id": None,
+                    "reason": "rejected upstream",
+                },
+                {
+                    "external_id": "coach-web-2026-W41-mon",
+                    "outcome": "created",
+                    "event_id": "1",
+                    "reason": None,
+                },
+                {
+                    "external_id": "coach-web-2026-W41-tue",
+                    "outcome": "updated",
+                    "event_id": "2",
+                    "reason": None,
+                },
+            ],
+        }
+        hub = _BatchHub(report=report)
+        subset = [date.fromisocalendar(2026, 41, i + 1).isoformat() for i in range(3)]
+
+        results = await write_week_days(hub, _week(), dates=subset)
+
+        assert [result.date for result in results] == subset
+        assert [result.success for result in results] == [True, True, False]
+        # C3: a static error only — the upstream reason never surfaces.
+        assert results[2].error == CALENDAR_WRITE_FAILED
+
+    async def test_updated_outcomes_succeed_so_reapproval_never_duplicates(self) -> None:
+        """``updated`` outcomes are successes — re-approval upserts, not duplicates (AC4)."""
+        report = {
+            "created": 0,
+            "updated": 7,
+            "failed": 0,
+            "outcomes": [
+                {
+                    "external_id": f"coach-web-2026-W41-{day}",
+                    "outcome": "updated",
+                    "event_id": str(index),
+                    "reason": None,
+                }
+                for index, day in enumerate(("mon", "tue", "wed", "thu", "fri", "sat", "sun"))
+            ],
+        }
+        hub = _BatchHub(report=report)
+
+        results = await write_week_days(hub, _week())
+
+        assert len(results) == 7
+        assert all(result.success for result in results)
+
+    async def test_non_json_preview_fails_the_whole_batch_without_executing(self) -> None:
+        """A non-JSON preview fails every day; no execute call is made (C3)."""
+        hub = _BatchHub(preview_response="Error: upstream hiccup")
+
+        results = await write_week_days(hub, _week())
+
+        assert len(hub.calls) == 1
+        assert len(results) == 7
+        assert all(not result.success for result in results)
+        assert all(result.error == CALENDAR_WRITE_FAILED for result in results)
+
+    async def test_non_json_report_fails_the_whole_batch(self) -> None:
+        """A non-JSON execute response fails every day of the batch (C3)."""
+        hub = _BatchHub(report_response="<html>500</html>")
+
+        results = await write_week_days(hub, _week())
+
+        assert len(hub.calls) == 2
+        failed = all(not result.success for result in results)
+        assert failed and all(result.error == CALENDAR_WRITE_FAILED for result in results)
+
+    async def test_preview_without_a_confirm_token_fails_the_whole_batch(self) -> None:
+        """A preview without a confirm token cannot be executed (C4)."""
+        hub = _BatchHub(
+            preview_response=json.dumps({"phase": "preview", "item_count": 7, "events": []})
+        )
+
+        results = await write_week_days(hub, _week())
+
+        assert len(hub.calls) == 1
+        assert all(not result.success for result in results)
+
+    async def test_report_without_outcomes_fails_the_whole_batch(self) -> None:
+        """A report without an outcome list is a structural failure (C3)."""
+        hub = _BatchHub(report_response=json.dumps({"created": 7}))
+
+        results = await write_week_days(hub, _week())
+
+        assert len(hub.calls) == 2
+        assert all(not result.success for result in results)
+
+    async def test_a_raising_tool_call_fails_the_whole_batch(self) -> None:
+        """A hub exception degrades to per-day failures, never a crash."""
+
+        class ExplodingHub(_BatchHub):
+            async def execute_tool(self, name: str, arguments: dict[str, Any] | None = None) -> str:
+                self.calls.append((name, arguments or {}))
+                raise RuntimeError("transport died")
+
+        results = await write_week_days(ExplodingHub(), _week())
+
+        assert len(results) == 7
+        assert all(result.error == CALENDAR_WRITE_FAILED for result in results)
+
+    async def test_subset_writes_only_the_requested_days(self) -> None:
+        """A dates subset (retry-failed-days) batches only those days."""
+        hub = _BatchHub()
+        failed = [date.fromisocalendar(2026, 41, 3).isoformat()]
+
+        results = await write_week_days(hub, _week(), dates=failed)
+
+        execute_events = hub.calls[1][1]["events"]
+        assert [draft["external_id"] for draft in execute_events] == ["coach-web-2026-W41-wed"]
+        assert [result.date for result in results] == failed
+
+    async def test_an_empty_selection_writes_nothing(self) -> None:
+        """Dates matching no day produce no batch call and no results."""
+        hub = _BatchHub()
+
+        results = await write_week_days(hub, _week(), dates=["2027-01-01"])
+
+        assert results == []
+        assert hub.calls == []
+
+    async def test_the_confirm_token_never_leaks_into_logs_or_results(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """C4: the confirm token stays in the endpoint's local scope."""
+        hub = _BatchHub()
+
+        with caplog.at_level("DEBUG"):
+            results = await write_week_days(hub, _week())
+
+        blob = "\n".join(record.getMessage() for record in caplog.records)
+        assert STUB_CONFIRM_TOKEN not in blob
+        assert all(STUB_CONFIRM_TOKEN not in result.model_dump_json() for result in results)
+
+
+# ---------------------------------------------------------------------------
+# Past-day immutability (AC3, D3.3 — #225)
+# ---------------------------------------------------------------------------
+
+
+class TestPastDayImmutability:
+    """Server-side past-day lock for mid-week adjustments."""
+
+    TODAY = date(2026, 10, 8)
+    """Thursday of 2026-W41 — four locked days (mon–thu), three adjustable."""
+
+    @staticmethod
+    def _stored_content() -> str:
+        """The pristine stored rendition both sides are compared against."""
+        return build_week_markdown(_week())
+
+    def _renders_identically(self, draft: WeeklyPlanDraft) -> bool:
+        """Compare the adjusted draft against the pristine stored content."""
+        return past_days_render_identically(draft, self._stored_content(), self.TODAY)
+
+    def test_an_unchanged_draft_matches_its_stored_content(self) -> None:
+        """Identical content trivially renders past days identically."""
+        assert self._renders_identically(_week()) is True
+
+    def test_an_altered_past_day_is_rejected(self) -> None:
+        """Changing a past day's row is an immutability violation."""
+        days = [_raw_day(i) for i in range(7)]
+        days[0] = _raw_day(0, session_title="Rewritten Monday")
+
+        assert self._renders_identically(_week(days=days)) is False
+
+    def test_a_future_day_may_change(self) -> None:
+        """Changing a strictly-after-today day keeps past days immutable."""
+        days = [_raw_day(i) for i in range(7)]
+        days[5] = _raw_day(5, session_title="Recovery roll")
+
+        assert self._renders_identically(_week(days=days)) is True
+
+    def test_the_today_boundary_day_is_locked(self) -> None:
+        """The rule is date <= today: the current day itself is locked."""
+        days = [_raw_day(i) for i in range(7)]
+        days[2] = _raw_day(2, session_title="Today tweaked")
+
+        assert self._renders_identically(_week(days=days)) is False
+
+    def test_a_day_after_today_is_mutable(self) -> None:
+        """The immediate day before ``today`` is mutable; ``today`` is not."""
+        days = [_raw_day(i) for i in range(7)]
+        days[3] = _raw_day(3, session_title="Rescheduled Thursday")
+        draft = _week(days=days)
+        stored = self._stored_content()
+
+        # Thursday 10-08 is still adjustable when ``today`` is the Wednesday...
+        assert past_days_render_identically(draft, stored, date(2026, 10, 7)) is True
+        # ...and locked once ``today`` reaches the day itself (date <= today).
+        assert past_days_render_identically(draft, stored, date(2026, 10, 8)) is False
+
+    def test_a_past_day_missing_from_stored_content_is_rejected(self) -> None:
+        """Fail closed when the stored content lacks a past day's row."""
+        stored = "\n".join(
+            line for line in self._stored_content().splitlines() if "| 2026-10-05 |" not in line
+        )
+
+        assert past_days_render_identically(_week(), stored, self.TODAY) is False
+
+
+# ---------------------------------------------------------------------------
+# Approved-week digest (D4/C5, #225)
+# ---------------------------------------------------------------------------
+
+
+class TestApprovedWeekDigest:
+    """Approved-week digest — metadata only, single-line, token-bounded."""
+
+    def _approved_row(self, **overrides: Any) -> PlanDraftRow:
+        """A persisted-looking approved row carrying the rendered content."""
+        content = build_week_markdown(_week(**overrides))
+        return PlanDraftRow(
+            week_start_date=WEEK_START,
+            week_end_date=WEEK_END,
+            content=content,
+            status="approved",
+            created_at="t0",
+            updated_at="t0",
+        )
+
+    def test_digest_carries_week_title_and_day_metadata_only(self) -> None:
+        """The digest exposes week_id, title and per-day metadata — nothing else."""
+        digest = approved_week_digest(self._approved_row())
+
+        assert "2026-W41" in digest
+        assert "Base week 41" in digest
+        assert "2026-10-05: Easy spin (TSS 45)" in digest
+        assert "2026-10-11: Rest day (rest day)" in digest
+        assert "Threshold zones" not in digest  # focus/zones never digested
+        assert "Endurance zones" not in digest
+        assert "75m" not in digest  # durations never digested
+
+    def test_titles_collapse_to_a_single_line(self) -> None:
+        """Titles are stripped of control characters and stay single-line (C5)."""
+        digest = approved_week_digest(self._approved_row(title="Safe\x07\x1b title"))
+
+        assert "Safe title" in digest
+        assert "\r" not in digest
+        assert "\x1b" not in digest
+
+    def test_a_line_broken_title_never_leaks_its_fragments(self) -> None:
+        """A title carrying \\r\\n degrades to its parseable segment — no leak."""
+        digest = approved_week_digest(self._approved_row(title="Long\r\nInjected\x1b"))
+
+        assert "\r" not in digest
+        assert "\x1b" not in digest
+        assert "Injected" not in digest
+
+    def test_session_titles_collapse_to_a_single_line(self) -> None:
+        """A session title with control characters collapses to one safe line."""
+        days = [_raw_day(i, session_title="VO2\trepeats\x07") for i in range(7)]
+        digest = approved_week_digest(self._approved_row(days=days))
+
+        assert "VO2 repeats" in digest
+        assert "\x07" not in digest
+
+    def test_the_digest_is_token_bounded(self) -> None:
+        """A maximal week never exceeds the digest character budget (C5)."""
+        days = [_raw_day(i, session_title="S" * 190) for i in range(7)]
+        digest = approved_week_digest(self._approved_row(days=days))
+
+        assert len(digest) <= APPROVED_WEEK_DIGEST_MAX_CHARS
+
+    def test_apply_appends_the_digest_to_the_prompt(self) -> None:
+        """apply_approved_week_digest composes the base prompt with the digest."""
+        prompt = apply_approved_week_digest("BASE PROMPT", self._approved_row())
+
+        assert prompt.startswith("BASE PROMPT\n\n")
+        assert "2026-W41" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -420,85 +792,6 @@ class TestBuildWeekMarkdown:
         markdown = build_week_markdown(_week(rationale=None))
 
         assert "## Rationale" not in markdown
-
-
-# ---------------------------------------------------------------------------
-# write_week_days — sequential per-day calendar writes (#163)
-# ---------------------------------------------------------------------------
-
-
-class TestWriteWeekDays:
-    """Sequential per-day ``intervals_create_event`` orchestration."""
-
-    async def test_writes_every_day_in_order(self) -> None:
-        """All 7 days are written sequentially, in draft order."""
-        hub = _RecordingHub()
-
-        results = await write_week_days(hub, _week())
-
-        assert [result.date for result in results] == [day.date for day in _week().days]
-        assert all(result.success for result in results)
-        assert len(hub.calls) == 7
-        assert all(name == COACH_CREATE_EVENT_TOOL for name, _ in hub.calls)
-
-    async def test_writes_only_the_requested_subset(self) -> None:
-        """A dates subset (retry-failed-days) writes only those days."""
-        hub = _RecordingHub()
-        failed = [date.fromisocalendar(2026, 41, 3).isoformat()]
-
-        results = await write_week_days(hub, _week(), dates=failed)
-
-        assert [result.date for result in results] == failed
-        assert len(hub.calls) == 1
-
-    async def test_a_failing_day_does_not_stop_the_week(self) -> None:
-        """One rejected day is isolated; the remaining days still write."""
-        hub = _RecordingHub(
-            results=[json.dumps({"id": "ok"})] * 3 + [json.dumps({"error": "rejected"})] * 4
-        )
-
-        results = await write_week_days(hub, _week())
-
-        assert sum(1 for result in results if result.success) == 3
-        assert results[3].success is False
-        assert results[3].error == "rejected"
-        assert len(hub.calls) == 7
-
-    async def test_malformed_tool_response_is_a_failure(self) -> None:
-        """A non-JSON tool response is a per-day failure, never a crash."""
-        hub = _RecordingHub(results=["not-json"] + [json.dumps({"id": "ok"})] * 6)
-
-        results = await write_week_days(hub, _week())
-
-        assert results[0].success is False
-        assert results[0].error == "Malformed tool response"
-        assert results[1].success is True
-
-    async def test_non_object_tool_response_is_a_failure(self) -> None:
-        """A JSON array tool response is a per-day failure, never a crash."""
-        hub = _RecordingHub(results=["[1, 2]"] + [json.dumps({"id": "ok"})] * 6)
-
-        results = await write_week_days(hub, _week())
-
-        assert results[0].success is False
-        assert results[0].error == "Malformed tool response"
-        assert results[1].success is True
-
-    async def test_a_raising_tool_call_is_a_failure(self) -> None:
-        """A hub exception degrades to a per-day failure result."""
-
-        class ExplodingHub(_RecordingHub):
-            async def execute_tool(self, name: str, arguments: dict[str, Any] | None = None) -> str:
-                self.calls.append((name, arguments))
-                raise RuntimeError("transport died")
-
-        hub = ExplodingHub()
-
-        results = await write_week_days(hub, _week())
-
-        assert len(results) == 7
-        assert all(result.success is False for result in results)
-        assert all(result.error == "Calendar write failed" for result in results)
 
 
 # ---------------------------------------------------------------------------
