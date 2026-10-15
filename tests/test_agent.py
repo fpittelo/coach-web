@@ -17,6 +17,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
     DEFAULT_OPENROUTER_MODEL,
@@ -43,6 +44,11 @@ from coach_web.app import create_app
 from coach_web.config import Settings
 from coach_web.debrief import RpeRequest
 from coach_web.mcp_hub import MCPClientHub, MCPHubError
+from coach_web.microcycle import (
+    WeeklyPlanDraft,
+    transition_draft_status,
+    upsert_week_draft,
+)
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
 from coach_web.periodization import PeriodizationApprovalRequest
 
@@ -972,6 +978,9 @@ class TestTemporalAnchor:
 
 class FakeAgent:
     """In-memory agent emitting a canned event sequence."""
+
+    # The stream endpoint stamps the anchor/digests onto this attribute.
+    system_prompt: str = ""
 
     def __init__(self, events: list[AgentEvent]) -> None:
         self._events = events
@@ -1975,3 +1984,140 @@ class TestCoachAgentWeekAnalysis:
         event = AgentEvent(type="debrief_summary", data={"summary": {}})
 
         assert event.type == "debrief_summary"
+
+
+# ---------------------------------------------------------------------------
+# Mid-week adjustment guidance (#225 D5)
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultPromptAdjustmentGuidance:
+    """DEFAULT_SYSTEM_PROMPT grounds mid-week adjustment requests (D5, #225)."""
+
+    def test_the_default_prompt_carries_the_adjustment_instruction(self) -> None:
+        """The coach proposes for the CURRENT week, keeps past days locked, states why."""
+        assert "mid-week adjustment" in DEFAULT_SYSTEM_PROMPT
+        assert "current week" in DEFAULT_SYSTEM_PROMPT
+        assert PROPOSE_WEEK_PLAN_TOOL in DEFAULT_SYSTEM_PROMPT
+        assert "past days" in DEFAULT_SYSTEM_PROMPT
+        assert "future days" in DEFAULT_SYSTEM_PROMPT
+        assert "rationale" in DEFAULT_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Approved-week digest injection (#225 D4)
+# ---------------------------------------------------------------------------
+
+
+def _week_2026_w41() -> dict[str, Any]:
+    """A raw 7-day weekly plan payload for ISO week 2026-W41."""
+    day_names = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    return {
+        "week_id": "2026-W41",
+        "title": "Base week 41",
+        "summary": "Two hard days after the recovery block.",
+        "rationale": "Volume capped at the availability budget.",
+        "days": [
+            {
+                "day_of_week": day_names[index],
+                "date": date.fromisocalendar(2026, 41, index + 1).isoformat(),
+                "session_title": "Rest day" if index == 6 else "Easy spin",
+                "focus": None,
+                "zones": [],
+                "planned_tss": 0.0 if index == 6 else 45.0,
+                "duration_minutes": 0.0 if index == 6 else 60.0,
+                "rest_day": index == 6,
+            }
+            for index in range(7)
+        ],
+        "total_tss": 270.0,
+        "hard_days": 0,
+        "easy_days": 6,
+    }
+
+
+class _ExplodingSessionFactory:
+    """Session factory whose sessions always fail (persistence outage)."""
+
+    def __call__(self) -> Any:
+        raise SQLAlchemyError("database unavailable")
+
+
+class TestApprovedWeekDigestEndpoint:
+    """POST /api/agent/stream injects the approved-week digest (D4, #225)."""
+
+    def _client_with(
+        self, settings: Settings, agent: Any, session_factory: Any = None
+    ) -> TestClient:
+        """Build a TestClient with a stub agent and an optional session factory."""
+        app = create_app(settings)
+        app.state.agent_factory = MagicMock(return_value=agent)
+        if session_factory is not None:
+            app.state.db_session_factory = session_factory
+        return TestClient(app)
+
+    async def _seed_approved_week(self, factory: Any, week: dict[str, Any]) -> None:
+        """Persist an approved draft row for the given week payload."""
+        async with factory() as session:
+            row = await upsert_week_draft(session, WeeklyPlanDraft.model_validate(week))
+            await transition_draft_status(session, row, "approved")
+
+    async def test_approved_week_digest_reaches_the_system_prompt(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """The digest is applied after the temporal anchor, metadata only."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 8)  # Thursday of 2026-W41
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        await self._seed_approved_week(db_session_factory, _week_2026_w41())
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent, db_session_factory)
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert "event: done" in body
+        prompt = agent.system_prompt
+        assert "Today is 2026-10-08 (Thursday)." in prompt
+        # The digest is applied AFTER the temporal anchor.
+        assert prompt.index("Today is ") < prompt.index("Approved current week")
+        assert "2026-W41" in prompt
+        assert "Base week 41" in prompt
+        assert "2026-10-05: Easy spin (TSS 45)" in prompt
+        assert "2026-10-11: Rest day (rest day)" in prompt
+        # Metadata only — no focus/zone or duration leakage.
+        assert "Threshold zones" not in prompt
+        assert "60m" not in prompt
+
+    async def test_persistence_failure_yields_no_digest_and_the_turn_survives(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A persistence outage degrades to no digest — the SSE turn is intact."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 8)
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent, _ExplodingSessionFactory())
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert "event: done" in body
+        assert "Approved current week" not in agent.system_prompt
