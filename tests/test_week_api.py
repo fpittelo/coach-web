@@ -21,13 +21,20 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
-from coach_web.app import create_app
+from coach_web.app import (
+    WEEK_ADJUSTMENT_AVAILABILITY_DETAIL,
+    WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL,
+    WEEK_ADJUSTMENT_PAST_DAYS_DETAIL,
+    create_app,
+)
 from coach_web.config import Settings
 from coach_web.microcycle import WeeklyPlanDraft, build_week_markdown, week_bounds
-from coach_web.plan_approval import EVENT_START_TIME
 
 WEEK_START = "2026-10-05"
 """Monday of ISO week 2026-W41 (pinned literal — the tests' calendar anchor)."""
+
+ADJUSTMENT_TODAY = date(2026, 10, 8)
+"""Frozen clock: the Thursday of 2026-W41 (four locked days, three adjustable)."""
 
 
 # ---------------------------------------------------------------------------
@@ -35,23 +42,82 @@ WEEK_START = "2026-10-05"
 # ---------------------------------------------------------------------------
 
 
+class _FrozenDate(date):
+    """date subclass whose ``today()`` is pinned to the adjustment clock."""
+
+    @classmethod
+    def today(cls) -> "_FrozenDate":
+        return _FrozenDate(ADJUSTMENT_TODAY.year, ADJUSTMENT_TODAY.month, ADJUSTMENT_TODAY.day)
+
+
 class WeekHub:
-    """Fake hub succeeding per day except the configured failing dates."""
+    """Fake hub implementing the two-phase ``icu_batch_create_events`` contract.
+
+    Preview calls (without ``confirm_token``) return a stub token; execute
+    calls return the per-item upsert report — every placed day succeeds as
+    ``created`` (or ``updated`` once already placed) except the configured
+    failing dates, which report ``failed``.
+    """
 
     def __init__(self, failing_dates: set[str] | None = None) -> None:
         self.failing_dates = failing_dates or set()
         self.calls: list[dict[str, Any]] = []
+        self.outcomes: list[list[dict[str, Any]]] = []
+        self._written: set[str] = set()
         self.entered = False
         self.exited = False
 
     async def execute_tool(self, name: str, arguments: dict[str, Any] | None = None) -> str:
-        """Record the call; fail the days configured as failing."""
+        """Record the call and answer per the two-phase batch contract."""
         payload = arguments or {}
         self.calls.append(payload)
-        day_date = str(payload.get("start_date_local", ""))[:10]
-        if day_date in self.failing_dates:
-            return json.dumps({"error": "intervals rejected the event"})
-        return json.dumps({"id": f"evt-{day_date}", "status": "created"})
+        events = payload.get("events") or []
+        if payload.get("confirm_token") is None:
+            return json.dumps(
+                {
+                    "phase": "preview",
+                    "item_count": len(events),
+                    "confirm_token": "preview-token-abc",
+                    "events": events,
+                    "note": "Re-invoke with confirm_token to place these events.",
+                }
+            )
+        outcomes: list[dict[str, Any]] = []
+        for event in events:
+            if event["date"] in self.failing_dates:
+                outcomes.append(
+                    {
+                        "external_id": event["external_id"],
+                        "outcome": "failed",
+                        "event_id": None,
+                        "reason": "intervals rejected the event",
+                    }
+                )
+                continue
+            created_before = event["external_id"] in self._written
+            outcomes.append(
+                {
+                    "external_id": event["external_id"],
+                    "outcome": "updated" if created_before else "created",
+                    "event_id": f"evt-{event['date']}",
+                    "reason": None,
+                }
+            )
+            self._written.add(event["external_id"])
+        self.outcomes.append(outcomes)
+        return json.dumps(
+            {
+                "created": sum(1 for item in outcomes if item["outcome"] == "created"),
+                "updated": sum(1 for item in outcomes if item["outcome"] == "updated"),
+                "failed": sum(1 for item in outcomes if item["outcome"] == "failed"),
+                "outcomes": outcomes,
+            }
+        )
+
+    @property
+    def execute_batches(self) -> list[list[dict[str, Any]]]:
+        """The event drafts of every execute-phase call, in call order."""
+        return [list(call["events"]) for call in self.calls if call.get("confirm_token")]
 
     async def __aenter__(self) -> "WeekHub":
         """Mark the hub as entered."""
@@ -178,23 +244,25 @@ class TestWeekApproveEndpoint:
     def test_event_arguments_are_strictly_built(
         self, week_client: tuple[TestClient, WeekHub], migrated_db: Path
     ) -> None:
-        """Every day write carries the validated Intervals.icu event shape."""
+        """The batch carries the validated Intervals.icu event drafts."""
         client, hub = week_client
 
         _post_week(client)
 
-        assert len(hub.calls) == 7
-        assert all(call["type"] == "Ride" for call in hub.calls)
-        tuesday = next(
-            call for call in hub.calls if call["start_date_local"].startswith("2026-10-06")
-        )
+        batches = hub.execute_batches
+        assert len(batches) == 1
+        events = batches[0]
+        assert len(events) == 7
+        assert all(draft["type"] == "Ride" for draft in events)
+        # The batch tool pins its own local start time server-side.
+        assert all("start_date_local" not in draft for draft in events)
+        tuesday = next(draft for draft in events if draft["date"] == "2026-10-06")
+        assert tuesday["external_id"] == "coach-web-2026-W41-tue"
         assert tuesday["category"] == "WORKOUT"
-        assert tuesday["start_date_local"] == f"2026-10-06T{EVENT_START_TIME}"
         assert tuesday["moving_time_seconds"] == 75 * 60
         assert tuesday["icu_training_load"] == 85.0
-        rest_day = next(
-            call for call in hub.calls if call["start_date_local"].startswith("2026-10-11")
-        )
+        rest_day = next(draft for draft in events if draft["date"] == "2026-10-11")
+        assert rest_day["external_id"] == "coach-web-2026-W41-sun"
         assert rest_day["category"] == "NOTE"
         assert "icu_training_load" not in rest_day
 
@@ -212,7 +280,8 @@ class TestWeekApproveEndpoint:
         results = response.json()["results"]
         failed = next(result for result in results if not result["success"])
         assert failed["date"] == thursday
-        assert "rejected" in failed["error"]
+        # C3: the upstream failure reason never reaches the response.
+        assert failed["error"] == "Calendar write failed"
 
         rows = _draft_rows(migrated_db)
         assert rows[0]["status"] == "submitted"
@@ -238,7 +307,8 @@ class TestWeekApproveEndpoint:
         assert [result["date"] for result in results] == [thursday]
         assert all(result["success"] for result in results)
         # Only the retried day was written on the second request.
-        assert len(hub.calls) == 8
+        assert hub.execute_batches[-1][0]["date"] == thursday
+        assert len(hub.execute_batches) == 2
         # The draft is now fully approved.
         rows = _draft_rows(migrated_db)
         assert rows[0]["status"] == "approved"
@@ -264,14 +334,13 @@ class TestWeekApproveEndpoint:
     ) -> None:
         """Re-approving an approved week reports success WITHOUT re-writing (F3).
 
-        ``intervals_create_event`` is not idempotent: re-issuing the events
-        would duplicate calendar entries, so the terminal state short-circuits
-        the endpoint before any tool call.
+        Re-issuing the batch would rewrite the calendar entries, so the
+        terminal state short-circuits the endpoint before any tool call.
         """
         client, hub = week_client
 
         _post_week(client)
-        assert len(hub.calls) == 7
+        assert len(hub.execute_batches) == 1
 
         again = _post_week(client)
 
@@ -280,7 +349,7 @@ class TestWeekApproveEndpoint:
         assert len(results) == 7
         assert all(result["success"] for result in results)
         # No additional calendar writes: the tool-call count is unchanged.
-        assert len(hub.calls) == 7
+        assert len(hub.execute_batches) == 1
         rows = _draft_rows(migrated_db)
         assert len(rows) == 1
         assert rows[0]["status"] == "approved"
@@ -305,18 +374,29 @@ class TestWeekApproveEndpoint:
 
         assert response.status_code == 200
         assert all(result["success"] for result in response.json()["results"])
-        assert len(hub.calls) == 7
+        assert len(hub.execute_batches) == 1
+        assert len(hub.execute_batches[0]) == 7
         rows = _draft_rows(migrated_db)
         assert rows[0]["status"] == "approved"
 
     def test_a_new_proposal_supersedes_the_previous_draft(
-        self, week_client: tuple[TestClient, WeekHub], migrated_db: Path
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
     ) -> None:
-        """A revised proposal supersedes the old draft and lands as its own row."""
-        client, _ = week_client
+        """A revised proposal supersedes the old draft and lands as its own row.
 
+        The clock is frozen mid-week and the revision touches a future day:
+        changing an approved draft whose week is already over is an
+        illegal adjustment (AC3), so the supersede chain is exercised on a
+        live week.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
         _post_week(client)
-        _post_week(client, title="Revised week 41")
+
+        client.post("/api/week/approve", json={"week": _adjusted_week()})
 
         rows = _draft_rows(migrated_db)
         assert len(rows) == 2
@@ -419,3 +499,268 @@ class TestWeekApproveValidation:
         response = auth_client.post("/api/week/approve", json={"week": _raw_week()})
 
         assert response.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------------------
+# Mid-week adjustment path (#225 — AC1..AC6, D2/D3, C1/C2)
+# ---------------------------------------------------------------------------
+
+
+def _adjusted_week() -> dict[str, Any]:
+    """An adjusted draft of 2026-W41: Saturday replaces its session."""
+    payload = _raw_week()
+    payload["days"][5] = _raw_day(
+        5, session_title="Recovery roll", planned_tss=30.0, duration_minutes=45.0
+    )
+    payload["total_tss"] = 335.0
+    return payload
+
+
+def _seed_approved_week(db_path: Path, week: dict[str, Any]) -> None:
+    """Persist an already-approved draft row for the given week payload."""
+    content = build_week_markdown(WeeklyPlanDraft.model_validate(week))
+    week_start, week_end = week_bounds(week["week_id"])
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO plan_drafts (week_start_date, week_end_date, content, "
+            "status, approved_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'approved', 't0', 't0', 't0')",
+            (week_start, week_end, content),
+        )
+
+
+@pytest.fixture
+def frozen_today(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pin the endpoint's clock inside the current ISO week (D3.5)."""
+    monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+
+
+class TestWeekAdjustmentApproval:
+    """POST /api/week/approve on an already-approved current week (#225)."""
+
+    def test_adjusting_future_days_writes_only_future_events(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC3/D3.4: the batch contains only days strictly after today."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+
+        response = client.post("/api/week/approve", json={"week": _adjusted_week()})
+
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert [result["date"] for result in results] == [
+            "2026-10-09",
+            "2026-10-10",
+            "2026-10-11",
+        ]
+        assert all(result["success"] for result in results)
+        batches = hub.execute_batches
+        assert len(batches) == 1
+        assert all(draft["date"] > ADJUSTMENT_TODAY.isoformat() for draft in batches[0])
+
+    def test_adjusting_future_days_supersedes_and_reapproves(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC2: the adjusted approval supersedes the approved row, history retained."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+
+        response = client.post("/api/week/approve", json={"week": _adjusted_week()})
+
+        assert response.status_code == 200
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 2
+        assert rows[0]["status"] == "superseded"
+        assert rows[1]["status"] == "approved"
+        assert rows[1]["approved_at"] is not None
+        assert "Recovery roll" in rows[1]["content"]
+
+    def test_altering_a_past_day_is_rejected_with_a_static_body(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC3/C1/C2: rewriting a past day fails closed before any write."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+        adjusted = _adjusted_week()
+        adjusted["days"][0] = _raw_day(0, session_title="Rewritten Monday")
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PAST_DAYS_DETAIL
+        # Fail-closed ordering: no calendar write, no draft supersede.
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_explicit_dates_cannot_target_a_past_day(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC3: even an unchanged past day is never rewritten on request."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+
+        response = client.post(
+            "/api/week/approve",
+            json={"week": _adjusted_week(), "dates": ["2026-10-05"]},
+        )
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PAST_DAYS_DETAIL
+        assert hub.execute_batches == []
+
+    def test_an_empty_write_set_is_rejected(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        migrated_db: Path,
+    ) -> None:
+        """AC3: an adjustment leaving no day strictly after today is rejected."""
+
+        class _FrozenSunday(date):
+            @classmethod
+            def today(cls) -> "_FrozenSunday":
+                return _FrozenSunday(2026, 10, 11)
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenSunday)
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+        adjusted = _raw_week()
+        # Drop a PAST day so the content differs without touching future days
+        # (none exist: every 2026-W41 day is on or before the frozen Sunday).
+        adjusted["days"] = [day for day in adjusted["days"] if day["date"] != "2026-10-07"]
+        adjusted["total_tss"] = 305.0
+        adjusted["easy_days"] = 3
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_an_adjustment_over_the_weekly_availability_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC6/D2: Σ duration_minutes ≤ weekly_availability_hours × 60."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+        client.put(
+            "/api/objectives",
+            json={
+                "primary_goal": {"objective_type": "outcome", "title": "A mountain finish"},
+                "weekly_availability_hours": 5.0,
+            },
+        )
+
+        response = client.post("/api/week/approve", json={"week": _adjusted_week()})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_AVAILABILITY_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_without_an_active_objective_the_availability_gate_is_skipped(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """D2 graceful degrade: no active objective → no availability gate."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+        adjusted = _raw_week()
+        adjusted["days"][5] = _raw_day(
+            5, session_title="Big ride", planned_tss=120.0, duration_minutes=300.0
+        )
+        adjusted["total_tss"] = 425.0
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 200
+        assert all(result["success"] for result in response.json()["results"])
+
+    def test_reapproval_after_a_partial_failure_re_upserts_the_same_external_ids(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC4/AC5: retry re-upserts the upsert keys — no duplicates, approved end state.
+
+        The failed attempt (adjustment path) writes the FUTURE set only; the
+        retry (the approved row is gone, so the plain path runs with
+        ``dates=None``) re-upserts the WHOLE week with the same deterministic
+        ``coach-web-{week}-{day}`` keys — the failed day is retried under its
+        original key and already-written days come back as ``updated``.
+        """
+        saturday = "2026-10-10"
+        hub = WeekHub(failing_dates={saturday})
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+
+        first = client.post("/api/week/approve", json={"week": _adjusted_week()})
+        assert first.status_code == 200
+        failed = next(result for result in first.json()["results"] if not result["success"])
+        assert failed["date"] == saturday
+        assert failed["error"] == "Calendar write failed"
+        rows = _draft_rows(migrated_db)
+        assert [row["status"] for row in rows] == ["superseded", "submitted"]
+
+        hub.failing_dates = set()
+        retry = client.post("/api/week/approve", json={"week": _adjusted_week()})
+
+        assert retry.status_code == 200
+        assert all(result["success"] for result in retry.json()["results"])
+        batches = hub.execute_batches
+        assert len(batches) == 2
+        first_keys = {draft["external_id"] for draft in batches[0]}
+        assert first_keys == {
+            "coach-web-2026-W41-fri",
+            "coach-web-2026-W41-sat",
+            "coach-web-2026-W41-sun",
+        }
+        # The failed day is retried under its ORIGINAL upsert key...
+        assert "coach-web-2026-W41-sat" in {d["external_id"] for d in batches[1]}
+        # ...and every key written by the first attempt is re-upserted as
+        # ``updated`` — never duplicated.
+        first_outcomes = {item["external_id"]: item["outcome"] for item in hub.outcomes[0]}
+        retry_outcomes = {item["external_id"]: item["outcome"] for item in hub.outcomes[1]}
+        assert first_outcomes == {
+            "coach-web-2026-W41-fri": "created",
+            "coach-web-2026-W41-sat": "failed",
+            "coach-web-2026-W41-sun": "created",
+        }
+        assert retry_outcomes["coach-web-2026-W41-sun"] == "updated"
+        assert retry_outcomes["coach-web-2026-W41-sat"] == "created"
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 2
+        assert rows[1]["status"] == "approved"
