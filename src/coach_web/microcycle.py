@@ -2,11 +2,14 @@
 
 The coach proposes a structured 7-day microcycle (epic #161 story 2.1) as a
 validated :class:`WeeklyPlanDraft`, the UI renders it as a weekly plan card
-(#165 contract), and approval writes one Intervals.icu event per day through
-``coach-mcp`` (``intervals_create_event`` — no batch tool exists, #163). The
-write is deliberately NOT atomic: every day yields its own
-:class:`DayWriteResult`, a partial failure stays retryable (the draft stays
-``submitted``), and only a fully successful week transitions to ``approved``.
+(#165 contract), and approval writes the week's Intervals.icu events as ONE
+batch through ``coach-mcp`` (``icu_batch_create_events`` — the confirm-gated
+batch upsert, #225). Upsert semantics keep re-approvals idempotent (AC4):
+re-submitting the same ``external_id`` keys updates the existing events
+instead of duplicating them. The write is deliberately NOT atomic: every day
+yields its own :class:`DayWriteResult` mapped from the batch outcome report,
+a partial failure stays retryable (the draft stays ``submitted``), and only
+a fully successful week transitions to ``approved``.
 
 Persistence follows MADR-008: drafts live in the ``plan_drafts`` table
 (C3 — plaintext, operational workflow state) with the draft state machine
@@ -19,6 +22,7 @@ model_validator posture).
 
 import json
 import logging
+import re
 from datetime import UTC, date, datetime
 from typing import Any, Literal
 
@@ -29,11 +33,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
 from coach_web.models import _validate_iso_week, validate_iso_date
-from coach_web.plan_approval import (
-    COACH_CREATE_EVENT_TOOL,
-    EVENT_START_TIME,
-    ToolExecutor,
-)
+from coach_web.plan_approval import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,36 @@ replacement; a REJECTED draft returns to ``submitted`` on re-approval (the
 athlete changed their mind — the write is allowed again, PR #174 F3).
 ``superseded`` is terminal (retention pruning is operational, out of scope
 here)."""
+
+COACH_BATCH_CREATE_EVENTS_TOOL = "coach-mcp__icu_batch_create_events"
+"""Namespaced coach-mcp batch upsert tool (D1, #225): confirm-gated, and
+idempotent per ``external_id`` — re-submitting the same key upserts instead
+of duplicating the calendar event."""
+
+CALENDAR_WRITE_FAILED = "Calendar write failed"
+"""Static per-day failure message (C3, #225): no upstream event id, reason
+or raw error string ever reaches a browser-facing surface."""
+
+APPROVED_WEEK_DIGEST_MAX_CHARS = 600
+"""Hard character budget for the approved-week digest (~150 tokens, C5)."""
+
+_REST_DAY_LOAD = "—"
+"""Rest-day load cell rendered by :func:`build_week_markdown` (and debrief)."""
+
+_DAY_ROW_PATTERN = re.compile(
+    r"^\|\s*(?:mon|tue|wed|thu|fri|sat|sun)\s*"
+    r"\|\s*(?P<date>\d{4}-\d{2}-\d{2})\s*"
+    r"\|\s*(?P<title>.+?)\s*"
+    r"\|\s*(?P<focus>.*?)\s*"
+    r"\|\s*(?P<load>.*?)\s*"
+    r"\|\s*(?P<duration>.*?)\s*\|\s*$"
+)
+"""Day-table row shape rendered by :func:`build_week_markdown` (mirrors the
+debrief module's parser — one pattern per module, no cross-import)."""
+
+_APPROVED_WEEK_DIGEST_HEADER = (
+    "Approved current week (past days are locked — adjust future days only):"
+)
 
 
 class DaySlot(BaseModel):
@@ -347,6 +377,120 @@ def build_week_markdown(draft: WeeklyPlanDraft) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Past-day immutability (AC3, D3.3 — #225)
+# ---------------------------------------------------------------------------
+
+
+def _day_rows_by_date(content: str) -> dict[str, str]:
+    """Key each rendered day-table row by its date cell (D3.3, #225).
+
+    Rows that do not match the :data:`_DAY_ROW_PATTERN` shape (prose, headers,
+    separator rules) are ignored; the mapping is only ever fed content
+    produced by :func:`build_week_markdown`.
+    """
+    rows: dict[str, str] = {}
+    for line in content.splitlines():
+        stripped = line.strip()
+        match = _DAY_ROW_PATTERN.match(stripped)
+        if match is not None:
+            rows[match.group("date")] = stripped
+    return rows
+
+
+def past_days_render_identically(draft: WeeklyPlanDraft, stored_content: str, today: date) -> bool:
+    """Whether every past day of the adjusted draft matches the stored rows.
+
+    Both sides are rendered by :func:`build_week_markdown`; the comparison
+    is the raw day-table row string keyed by the day's date cell (D3.3,
+    #225). ``today`` is ALWAYS injected by the caller — the endpoint owns
+    the clock boundary (D3.5), this helper never reads the clock. Fail
+    closed: a past day missing from either side is a violation.
+    """
+    stored_rows = _day_rows_by_date(stored_content)
+    incoming_rows = _day_rows_by_date(build_week_markdown(draft))
+    today_iso = today.isoformat()
+    return all(
+        incoming_rows.get(day.date) == stored_rows.get(day.date)
+        for day in draft.days
+        if day.date <= today_iso
+    )
+
+
+# ---------------------------------------------------------------------------
+# Approved-week digest (D4/C5 — #225)
+# ---------------------------------------------------------------------------
+
+
+def _digest_single_line(value: str) -> str:
+    """Collapse a title to one line: no newlines, no control characters (C5).
+
+    Whitespace runs collapse to single spaces first, then non-printable
+    control characters are dropped, so ``"Long\\r\\nweek\\x1b"`` renders as
+    one safe line — never a prompt-injection carrier.
+    """
+    collapsed = " ".join(value.split())
+    return "".join(ch for ch in collapsed if ch.isprintable())
+
+
+def _approved_week_parts(row: PlanDraftRow) -> tuple[str, str, list[tuple[str, str, str]]]:
+    """Parse (week_id, title, day metadata) from a stored draft row's content.
+
+    The parser understands exactly the document
+    :func:`build_week_markdown` renders; missing pieces degrade to empty
+    strings and per-day metadata is limited to (date, session_title, load
+    cell) — the load cell doubles as the rest-day marker (D4: metadata
+    only, never focus/zones/durations).
+    """
+    week_id = ""
+    title = ""
+    days: list[tuple[str, str, str]] = []
+    for line in row.content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# ") and not title:
+            title = _digest_single_line(stripped[2:])
+        elif stripped.startswith("- **Week:** ") and not week_id:
+            week_id = stripped[len("- **Week:** ") :].strip()
+        else:
+            match = _DAY_ROW_PATTERN.match(stripped)
+            if match is not None:
+                days.append((match.group("date"), match.group("title"), match.group("load")))
+    return week_id, title, days
+
+
+def approved_week_digest(row: PlanDraftRow) -> str:
+    """Build the token-budgeted approved-week digest for the coach prompt.
+
+    The digest carries the week identifier, the collapsed title and one
+    line per day (date, session title, planned TSS or the rest-day marker)
+    ONLY (D4/C5, #225) — no focus/zone text, no durations, no upstream
+    identifiers. The day lines are appended while the whole digest stays
+    within :data:`APPROVED_WEEK_DIGEST_MAX_CHARS`.
+    """
+    week_id, title, days = _approved_week_parts(row)
+    title_line = _digest_single_line(title) if title else None
+    head_bits = [bit for bit in (f"Week: {week_id}" if week_id else None, title_line) if bit]
+    lines: list[str] = []
+    if head_bits:
+        lines.append(" — ".join(head_bits))
+    for day_date, session_title, load in days:
+        collapsed_title = _digest_single_line(session_title)
+        if load == _REST_DAY_LOAD:
+            candidate = f"- {day_date}: {collapsed_title} (rest day)"
+        else:
+            candidate = f"- {day_date}: {collapsed_title} (TSS {load})"
+        candidate_digest = "\n".join([_APPROVED_WEEK_DIGEST_HEADER, *lines, candidate])
+        if len(candidate_digest) > APPROVED_WEEK_DIGEST_MAX_CHARS:
+            break
+        lines.append(candidate)
+    return "\n".join([_APPROVED_WEEK_DIGEST_HEADER, *lines])
+
+
+def apply_approved_week_digest(system_prompt: str, row: PlanDraftRow) -> str:
+    """Append the approved-week digest to a base system prompt (D4, #225)."""
+    return f"{system_prompt}\n\n{approved_week_digest(row)}"
+
+
+# ---------------------------------------------------------------------------
 # Repository (MADR-008 plan_drafts)
 # ---------------------------------------------------------------------------
 
@@ -438,45 +582,74 @@ async def upsert_week_draft(session: AsyncSession, draft: WeeklyPlanDraft) -> Pl
 
 
 # ---------------------------------------------------------------------------
-# Calendar write orchestration (#163: sequential, non-atomic)
+# Calendar write orchestration (#225: two-phase batch upsert, D1)
 # ---------------------------------------------------------------------------
 
 
-def build_day_event_arguments(day: DaySlot) -> dict[str, Any]:
-    """Build the ``intervals_create_event`` argument payload for one day.
+def build_batch_event_draft(day: DaySlot, week_id: str) -> dict[str, Any]:
+    """Build one ``icu_batch_create_events`` draft payload for one day (D1).
 
-    Training days map to a ``WORKOUT`` event carrying the planned load and
-    duration; rest days map to a lightweight ``NOTE`` calendar entry so the
-    week renders completely on the Intervals.icu calendar (AC2: all 7 days).
+    Training days map to a ``WORKOUT`` draft carrying the planned load and
+    duration; rest days map to a lightweight ``NOTE`` draft so the week
+    renders completely on the Intervals.icu calendar (AC2: all 7 days). The
+    ``external_id`` reconciliation key (C6) is deterministic per
+    week/day-of-week, so re-approvals UPSERT instead of duplicating.
+
+    The batch tool pins its own default local start time server-side, so —
+    unlike the retired per-day tool — no start time is sent.
     """
-    arguments: dict[str, Any] = {
+    draft: dict[str, Any] = {
+        "external_id": f"coach-web-{week_id}-{day.day_of_week}",
+        "date": day.date,
         "name": day.session_title,
         "type": "Ride",
         "category": "NOTE" if day.rest_day else "WORKOUT",
-        "start_date_local": f"{day.date}T{EVENT_START_TIME}",
     }
     focus_bits = [bit for bit in (day.focus, "–".join(day.zones) if day.zones else "") if bit]
     if focus_bits:
-        arguments["description"] = " · ".join(focus_bits)
+        draft["description"] = " · ".join(focus_bits)
     if day.duration_minutes > 0:
-        arguments["moving_time_seconds"] = int(round(day.duration_minutes * 60))
+        draft["moving_time_seconds"] = int(round(day.duration_minutes * 60))
     if day.planned_tss > 0:
-        arguments["icu_training_load"] = day.planned_tss
-    return arguments
+        draft["icu_training_load"] = day.planned_tss
+    return draft
 
 
-def _day_result(day_date: str, raw: str) -> DayWriteResult:
-    """Convert a raw tool response into a structured per-day outcome."""
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return DayWriteResult(date=day_date, success=False, error="Malformed tool response")
-    if not isinstance(parsed, dict):
-        return DayWriteResult(date=day_date, success=False, error="Malformed tool response")
-    error = parsed.get("error")
-    if error:
-        return DayWriteResult(date=day_date, success=False, error=str(error))
-    return DayWriteResult(date=day_date, success=True)
+def _preview_confirm_token(raw: str) -> str:
+    """Extract the two-phase confirm token from a batch preview (C4).
+
+    Raises:
+        ValueError: on any non-JSON, non-object or token-less preview.
+    """
+    parsed = json.loads(raw)
+    token = parsed.get("confirm_token") if isinstance(parsed, dict) else None
+    if not isinstance(token, str) or not token:
+        raise ValueError("batch preview carries no confirm token")
+    return token
+
+
+def _batch_outcomes(raw: str) -> dict[str, str]:
+    """Extract the external_id → outcome mapping from a batch report.
+
+    Raises:
+        ValueError: on any non-JSON response or report without an outcomes
+            list (a structural surprise fails the whole batch, C3).
+    """
+    parsed = json.loads(raw)
+    entries = parsed.get("outcomes") if isinstance(parsed, dict) else None
+    if not isinstance(entries, list):
+        raise ValueError("batch report carries no outcome list")
+    outcomes: dict[str, str] = {}
+    for entry in entries:
+        if isinstance(entry, dict):
+            external_id = entry.get("external_id")
+            outcome = entry.get("outcome")
+            if isinstance(external_id, str) and isinstance(outcome, str):
+                outcomes[external_id] = outcome
+    return outcomes
+
+
+_SUCCESS_OUTCOMES = frozenset({"created", "updated"})
 
 
 async def write_week_days(
@@ -484,23 +657,48 @@ async def write_week_days(
     week: WeeklyPlanDraft,
     dates: list[str] | None = None,
 ) -> list[DayWriteResult]:
-    """Write one Intervals.icu event per requested day, sequentially.
+    """Write the requested days as ONE two-phase batch upsert (D1, #225).
 
-    ``dates`` selects the retry-failed-days subset (``None`` = all days). A
-    failing day never stops the week: every day yields its own
-    :class:`DayWriteResult`, so the response reports exactly what succeeded
-    and what did not (#163 — no silent partial calendar).
+    ``dates`` selects the retry-failed-days subset (``None`` = all days).
+    Phase 1 calls :data:`COACH_BATCH_CREATE_EVENTS_TOOL` without a confirm
+    token and derives the token from the JSON preview; phase 2 re-supplies
+    the identical batch plus the token (C4 — the token never leaves this
+    scope: not logged, never returned). Every selected day yields its own
+    :class:`DayWriteResult` in week order; any surprise (non-JSON phase
+    response, missing token, missing outcomes, hub exception) fails the
+    whole batch STATICALLY instead of crashing the approval (C3) —
+    ``created``/``updated`` outcomes are successes, per AC4's upsert
+    semantics.
     """
     selected = [day for day in week.days if dates is None or day.date in set(dates)]
+    if not selected:
+        return []
+    drafts = [build_batch_event_draft(day, week.week_id) for day in selected]
+    try:
+        preview_raw = await hub.execute_tool(
+            COACH_BATCH_CREATE_EVENTS_TOOL,
+            {"events": drafts, "response_format": "json"},
+        )
+        token = _preview_confirm_token(preview_raw)
+        report_raw = await hub.execute_tool(
+            COACH_BATCH_CREATE_EVENTS_TOOL,
+            {"events": drafts, "response_format": "json", "confirm_token": token},
+        )
+        report_outcomes = _batch_outcomes(report_raw)
+    except Exception as exc:  # noqa: BLE001 - a batch surprise must never crash the week
+        logger.warning("Calendar batch write failed: %s", exc)
+        return [
+            DayWriteResult(date=day.date, success=False, error=CALENDAR_WRITE_FAILED)
+            for day in selected
+        ]
     results: list[DayWriteResult] = []
-    for day in selected:
-        try:
-            raw = await hub.execute_tool(COACH_CREATE_EVENT_TOOL, build_day_event_arguments(day))
-        except Exception as exc:  # noqa: BLE001 - one day must never crash the week
-            logger.warning("Calendar write failed for %s: %s", day.date, exc)
-            results.append(
-                DayWriteResult(date=day.date, success=False, error="Calendar write failed")
+    for day, draft in zip(selected, drafts, strict=True):
+        succeeded = report_outcomes.get(draft["external_id"]) in _SUCCESS_OUTCOMES
+        results.append(
+            DayWriteResult(
+                date=day.date,
+                success=succeeded,
+                error=None if succeeded else CALENDAR_WRITE_FAILED,
             )
-            continue
-        results.append(_day_result(day.date, raw))
+        )
     return results
