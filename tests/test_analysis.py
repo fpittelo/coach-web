@@ -257,6 +257,9 @@ class TestIcuGetBudget:
             "icu_get_completed_sessions": 1,
             "icu_get_wellness": 1,
             "icu_get_trends": 1,
+            # #262 (C-BR-6, finding F1): the morning briefing's single
+            # budgeted dashboard GET — registered, not free.
+            "intervals_get_readiness_dashboard": 1,
         }
 
     def test_cost_lookup_strips_the_hub_namespace(self) -> None:

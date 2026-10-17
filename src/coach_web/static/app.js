@@ -405,6 +405,12 @@ function coachApp() {
     debriefSummary: null,
     debriefSummaryMessageIndex: -1,
     mirrorToIcu: false,
+    // Morning briefing card (#262): the server-rendered greeting card
+    // arrives on the morning_briefing SSE event — pinned to the message
+    // that opened the stream (#82 replacement rule). The request is
+    // gated by the client-side date flag (R3 — not a security boundary).
+    morningBriefing: null,
+    morningBriefingMessageIndex: -1,
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -594,7 +600,8 @@ function coachApp() {
         this.weekMessageIndex === index ||
         this.periodizationMessageIndex === index ||
         this.rpeMessageIndex === index ||
-        this.debriefSummaryMessageIndex === index;
+        this.debriefSummaryMessageIndex === index ||
+        this.morningBriefingMessageIndex === index;
       this.finishStream();
       if (bubble && bubble.role === "assistant" && !bubble.content && !pinnedCard) {
         this.messages.splice(index, 1);
@@ -871,6 +878,32 @@ function coachApp() {
       this.startStream(message);
     },
 
+    briefingFlagStale() {
+      // First-load-of-the-day flag (#262, R3): client-derived and NOT a
+      // security boundary — a forged or absent flag only re-renders the
+      // same read-only, server-derived card. UTC day granularity; storage
+      // unavailability fails open (the card may re-render, harmlessly).
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        return window.localStorage.getItem("coachBriefingDate") !== today;
+      } catch (error) {
+        return true;
+      }
+    },
+
+    markBriefingShown() {
+      // Marked at REQUEST time (#262): repeated sends on the first load
+      // never re-request the briefing (the server derives statelessly and
+      // the readiness read is TTL-cached — but one request per day is the
+      // contract). A failed stream loses the day's briefing (accepted).
+      try {
+        const today = new Date().toISOString().slice(0, 10);
+        window.localStorage.setItem("coachBriefingDate", today);
+      } catch (error) {
+        // Storage unavailable — the flag stays stale; the card is read-only.
+      }
+    },
+
     startStream(message) {
       // Stale-event hardening: every SSE handler below captures the epoch at
       // registration and bails unless it is still current. resetChat() aborts
@@ -915,6 +948,19 @@ function coachApp() {
       this.rpe = null;
       this.rpeMessageIndex = -1;
       this.rpeApproval = { state: "idle", message: "" };
+      // The morning briefing card (#262) follows the same posture: a new
+      // stream clears the previous card; the morning_briefing event (if
+      // any) re-pins a fresh one.
+      this.morningBriefing = null;
+      this.morningBriefingMessageIndex = -1;
+
+      // Morning briefing request (#262): the FIRST stream of the day
+      // carries briefing=true; the flag is marked at request time so
+      // repeated sends never re-request it.
+      const requestBriefing = this.briefingFlagStale();
+      if (requestBriefing) {
+        this.markBriefingShown();
+      }
 
       // History replay (#79): the conversation is client-owned. Snapshot the
       // PRIOR turns before pushing the in-flight assistant placeholder — the
@@ -937,7 +983,11 @@ function coachApp() {
       fetch("/api/agent/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: message, history: history }),
+        body: JSON.stringify({
+          message: message,
+          history: history,
+          briefing: requestBriefing,
+        }),
         signal: controller.signal,
       })
         .then(async (response) => {
@@ -1229,6 +1279,20 @@ function coachApp() {
           this.scrollToBottom();
         },
 
+        morning_briefing: (event) => {
+          if (!this.streaming || epoch !== this.streamEpoch) {
+            return; // stale event from an ended or superseded stream
+          }
+          const data = parsePayload(event);
+          // Morning briefing card (#262): the server derived the card
+          // statelessly (readiness band + today's session + cues) — the
+          // client only renders it (structured x-text, ADR-006 §9). A new
+          // card replaces the previous one (#82 rule).
+          this.morningBriefing = data.briefing || null;
+          this.morningBriefingMessageIndex = index;
+          this.scrollToBottom();
+        },
+
         error: (event) => {
           if (!this.streaming || epoch !== this.streamEpoch) {
             return; // stale event from an ended or superseded stream
@@ -1373,6 +1437,11 @@ function coachApp() {
       this.debriefSummary = null;
       this.debriefSummaryMessageIndex = -1;
       this.mirrorToIcu = false;
+      // Morning briefing card (#262): a chat reset clears the card; the
+      // date flag is request-time state and is NOT reset (the briefing
+      // was already requested today).
+      this.morningBriefing = null;
+      this.morningBriefingMessageIndex = -1;
       this.input = "";
       this.errorBanner = "";
       this.errorBannerSignin = false;
