@@ -1,5 +1,6 @@
 """FastAPI application factory for Coach Web."""
 
+import asyncio
 import logging
 import os
 import time
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+from cryptography.fernet import InvalidToken
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -38,6 +40,11 @@ from coach_web.auth.middleware import (
 )
 from coach_web.auth.router import router as auth_router
 from coach_web.auth.tokens import TokenError, verify_session_token
+from coach_web.briefing import (
+    BRIEFING_DERIVE_TIMEOUT_SECONDS,
+    MorningBriefingCard,
+    derive_morning_briefing,
+)
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import (
@@ -560,6 +567,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
         approved_week_row: PlanDraftRow | None = None
         debrief_rpes: dict[str, int] = {}
+        store_ok = True
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -578,7 +586,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # RPE, decrypted SERVER-SIDE from the stored Fernet tokens —
                 # the notes_encrypted column is never selected (C-S2-2). A
                 # missing/invalid key degrades to no digest like any other
-                # unreadable store (the turn must survive).
+                # unreadable store (the turn must survive); #259 R5 joins
+                # InvalidToken (a tampered non-NULL token) to the same
+                # degrade family — the projection skips such rows itself,
+                # this catch is the boundary backstop.
                 cipher = build_debrief_cipher(settings)
                 debrief_rpes = await list_debrief_rpes(
                     session, athlete_id=athlete_id, cipher=cipher
@@ -589,12 +600,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if row.status == "approved"
                 ]
                 approved_week_row = approved_rows[-1] if approved_rows else None
-        except (OSError, SQLAlchemyError, ValidationError, EncryptionUnavailableError) as exc:
+        except (
+            OSError,
+            SQLAlchemyError,
+            ValidationError,
+            EncryptionUnavailableError,
+            InvalidToken,
+        ) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
             phases = []
             pending_debriefs = []
             approved_week_row = None
+            store_ok = False
         if profile is not None:
             # The digest's phase resolution takes the same explicit ``today``
             # so the call site owns the clock boundary (N3, PR #173).
@@ -633,9 +651,54 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             agent.system_prompt = apply_divergence_digest(agent.system_prompt, divergence)
 
+        # Morning briefing card (#262, epic #215-A): on the FIRST page load
+        # of the day (the client-derived date flag — R3, not a security
+        # boundary) the stream opens with a server-rendered briefing card.
+        # C-BR-3 (binding): the card is Pydantic→HTML on a dedicated SSE
+        # event — readiness data NEVER enters the LLM prompt. C-BR-4: a
+        # pending-debrief greeting claims the slot first and suppresses the
+        # briefing; an unreadable store suppresses it too (the digest
+        # boundary's degrade family — the greeting slot's state is unknown).
+        # C-BR-7: the derivation joins this degrade boundary — a failing or
+        # slow ICU read yields no briefing event and never delays first
+        # paint (the whole derivation is bounded; the read itself is
+        # TTL-cached per C-BR-6 so repeated loads issue no ICU call).
+        briefing: MorningBriefingCard | None = None
+        if payload.briefing and store_ok and not pending_debriefs:
+            hub_factory = getattr(request.app.state, "hub_factory", MCPClientHub.from_settings)
+            try:
+                briefing = await asyncio.wait_for(
+                    derive_morning_briefing(
+                        hub_factory,
+                        settings,
+                        content=(
+                            approved_week_row.content if approved_week_row is not None else None
+                        ),
+                        today=today,
+                    ),
+                    timeout=BRIEFING_DERIVE_TIMEOUT_SECONDS,
+                )
+            except (
+                OSError,
+                SQLAlchemyError,
+                ValidationError,
+                EncryptionUnavailableError,
+                InvalidToken,
+                MCPHubError,
+                TimeoutError,
+            ) as exc:
+                logger.warning("Morning briefing unavailable: %s", exc)
+                briefing = None
+
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
+                    if briefing is not None:
+                        greeting = AgentEvent(
+                            type="morning_briefing",
+                            data={"briefing": briefing.model_dump()},
+                        )
+                        yield ServerSentEvent(event=greeting.type, data=greeting.model_dump_json())
                     async for event in agent.run(payload.message, history=payload.history):
                         yield ServerSentEvent(event=event.type, data=event.model_dump_json())
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
@@ -1029,10 +1092,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # (#243 — the API surface keeps consuming INTEGER RPE, decrypted
             # server-side, and no token/plaintext value is ever logged).
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL)
+        try:
+            rpe_value = decrypt_rpe(cipher, stored_rpe_token)
+        except InvalidToken as exc:
+            # A tampered non-NULL token fails closed with the same 503
+            # posture (#259 R5): the response never echoes a bogus RPE and
+            # never 500s — save_debrief always writes a fresh token, so this
+            # branch is defense-in-depth for an unreadable store.
+            logger.warning("Debrief save response RPE undecryptable: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         return DebriefSaveResponse(
             status="saved",
             plan_session_key=row.plan_session_key,
-            rpe=decrypt_rpe(cipher, stored_rpe_token),
+            rpe=rpe_value,
             mirror=mirror,
             week_adherence=week_adherence,
         )

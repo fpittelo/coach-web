@@ -140,6 +140,14 @@ class AgentStreamRequest(BaseModel):
         max_length=AGENT_MESSAGE_MAX_LENGTH,
         description="Current user message for the coach agent",
     )
+    briefing: bool = Field(
+        default=False,
+        description=(
+            "Request the morning briefing card (first page load of the day, "
+            "#262). The flag is client-derived (R3 — not a security "
+            "boundary); the server derives the card statelessly per request."
+        ),
+    )
     history: list[ChatMessage] = Field(
         default_factory=list,
         max_length=AGENT_HISTORY_MAX_ENTRIES,

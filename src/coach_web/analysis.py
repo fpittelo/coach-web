@@ -56,12 +56,15 @@ ICU_TOOL_GET_COSTS: dict[str, int] = {
     "icu_get_completed_sessions": 1,
     "icu_get_wellness": 1,
     "icu_get_trends": 1,
+    "intervals_get_readiness_dashboard": 1,
 }
 """Raw tool name → ICU GETs issued per call (the upstream #82 contracts).
 
 ``icu_get_workout_compliance`` issues exactly two GETs (planned events +
 executed activities, in parallel); the single-read tools issue one each.
-``icu_add_session_comment`` is a write and costs no GET."""
+``icu_add_session_comment`` is a write and costs no GET.
+``intervals_get_readiness_dashboard`` is the #262 briefing's single
+budgeted GET (finding F1: it was absent from the budget before)."""
 
 NAMESPACE_SEPARATOR = "__"
 """Separator the MCP hub uses to namespace tool names as ``<server><sep><tool>``."""

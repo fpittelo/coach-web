@@ -37,12 +37,13 @@ health content; the pure computation lives in :mod:`coach_web.analysis`).
 """
 
 import hashlib
+import logging
 import re
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from typing import Literal
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import CheckConstraint, Float, Integer, Text, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,6 +65,8 @@ from coach_web.microcycle import (
     week_bounds,
 )
 from coach_web.models import validate_iso_date
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_ATHLETE_ID = 1
 """Athlete id for auth-disabled lanes (dev/qa): the single local athlete."""
@@ -668,8 +671,10 @@ async def list_debrief_rpes(
     decrypted on this path (C-S2-2), so no note text can reach the digest.
     Since #243 the ``rpe`` column stores the Fernet token: each token is
     decrypted SERVER-SIDE here, so the digest keeps consuming INTEGER RPE.
-    A tampered NULL-rpe row fails safe — it yields no entry (the session
-    counts as missed) instead of crashing the turn.
+    An unreadable row fails safe (#259 R5) — a NULL rpe OR a tampered
+    non-NULL token (``InvalidToken``) yields no entry (the session drops
+    out of the divergence facts and counts as missed) instead of crashing
+    the turn; the skip is logged server-side, never the token itself.
     """
     result = await session.execute(
         select(DebriefRow.plan_session_key, DebriefRow.rpe).where(
@@ -680,7 +685,13 @@ async def list_debrief_rpes(
     for key, token in result.all():
         if token is None:
             continue
-        rpes[key] = decrypt_rpe(cipher, token)
+        try:
+            rpes[key] = decrypt_rpe(cipher, token)
+        except InvalidToken:
+            logger.warning(
+                "Debrief RPE token for session key %s is undecryptable — skipping the row",
+                key,
+            )
     return rpes
 
 
