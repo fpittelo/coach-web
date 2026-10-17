@@ -30,10 +30,20 @@ summary card. This module is the analysis half of the story:
 nLPD posture: everything here operates on the whitelisted tool output only —
 raw ICU payloads never reach this layer, and the card carries summary
 fields exclusively.
+
+Weekly adherence metric (#234, epic #213 S4): the pure half of the weekly
+plan-adherence metric lives here too — :class:`WeekAdherenceMetric` (the
+strict counts/percentage schema), :func:`iso_week_key` (the ISO week
+identity) and :func:`compute_week_adherence` (planned vs completed session
+keys → metric, ``None`` for zero-planned weeks). The persistence half (the
+C3 ``week_adherence`` row and the debrief-save upsert) lives in
+:mod:`coach_web.debrief` — the debrief-save path is the metric's
+event-driven write trigger.
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from datetime import date
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -301,4 +311,69 @@ def build_debrief_summary_card(
         adherence_rate=report.adherence_rate,
         sessions=rows,
         headline=_session_headline(report),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Weekly adherence metric (#234 — epic #213 S4)
+# ---------------------------------------------------------------------------
+
+WEEK_KEY_PATTERN = r"^\d{4}-W\d{2}$"
+"""ISO week key shape (``YYYY-Www``) — the metric row's week identity."""
+
+
+class WeekAdherenceMetric(BaseModel):
+    """One ISO week's plan-adherence metric (#234 AC1).
+
+    COUNTS AND PERCENTAGES ONLY (MADR-008 C3): the metric is derived from
+    existing DB compliance data — planned sessions from approved plan
+    drafts' day rows, completed sessions from the athlete's debrief rows —
+    and never carries health content (no RPE, no notes, no wellness values).
+    """
+
+    week_key: str = Field(..., pattern=WEEK_KEY_PATTERN, description="ISO week key (YYYY-Www).")
+    planned_count: int = Field(
+        ..., ge=0, strict=True, description="Planned sessions in the week (approved drafts)."
+    )
+    completed_count: int = Field(
+        ..., ge=0, strict=True, description="Debriefed planned sessions (this athlete)."
+    )
+    adherence_pct: float = Field(
+        ..., ge=0, le=100, description="Completed / planned sessions, in percent."
+    )
+
+
+def iso_week_key(day: date) -> str:
+    """Return the ISO week key (``YYYY-Www``) of *day* (#234).
+
+    Monday..Sunday of one ISO week share one key; ISO-year boundaries
+    (e.g. 2026-12-28 → ``2026-W53``) follow :meth:`date.isocalendar`.
+    """
+    iso_year, iso_week, _ = day.isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+def compute_week_adherence(
+    week_key: str,
+    planned_keys: Iterable[str],
+    completed_keys: Iterable[str],
+) -> WeekAdherenceMetric | None:
+    """Compute one ISO week's adherence from session keys (#234 AC1).
+
+    ``planned_keys`` are the week's planned session keys (approved draft day
+    rows); ``completed_keys`` are the athlete's debriefed session keys. The
+    completed count is the INTERSECTION with the planned keys — a debrief
+    for a session the plan no longer contains never inflates the metric, so
+    adherence can never exceed 100%. A week with zero planned sessions
+    yields ``None`` — no metric row (0/0 noise avoided).
+    """
+    planned = set(planned_keys)
+    if not planned:
+        return None
+    completed = len(planned.intersection(completed_keys))
+    return WeekAdherenceMetric(
+        week_key=week_key,
+        planned_count=len(planned),
+        completed_count=completed,
+        adherence_pct=round(completed / len(planned) * 100, 1),
     )

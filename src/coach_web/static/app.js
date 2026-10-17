@@ -1728,6 +1728,19 @@ function coachApp() {
           // saved either way (the message leads with the saved line).
           const body = await response.json().catch(() => ({}));
           let note = "Logged: RPE " + this.rpeValue + " · " + this.rpe.plan_session_key;
+          // Weekly adherence (#234 AC3): the save response carries the
+          // debriefed session's ISO-week metric (counts + percentage, C3) —
+          // rendered on this same card's collapsed summary, no new fetch.
+          if (body.week_adherence) {
+            note +=
+              " · Week adherence " +
+              body.week_adherence.adherence_pct +
+              "% (" +
+              body.week_adherence.completed_count +
+              "/" +
+              body.week_adherence.planned_count +
+              ")";
+          }
           if (body.mirror && body.mirror.status === "mirrored") {
             note += " · Mirrored to Intervals.icu.";
           } else if (body.mirror && body.mirror.status === "failed") {
