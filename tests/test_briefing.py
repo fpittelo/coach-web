@@ -27,10 +27,11 @@ as contract tests — the controls ARE the acceptance criteria:
   planned-TSS ONLY — no C2 fields (RPE/notes) exist on the schema.
 - C-BR-9 (AC9): stored-content text passes through ``_digest_single_line``.
 
-Sentinel note (C-BR-1): the seeded numerics are 999 / 999.9 / 99.9 — the
-string ``"999"`` is a substring of all three, so one absence assertion pins
-the whole family. No fixture string contains "999" otherwise, so any leak
-of a seeded numeric introduces a match that cannot exist legitimately.
+Sentinel note (C-BR-1): the seeded numerics are 999 / 999.9 / 99.9 — three
+DISTINCT sentinel strings ("999", "999.9", "99.9"), each asserted absent
+explicitly, because "999" is NOT a substring of "99.9". No fixture string
+contains any sentinel string otherwise, so any leak of a seeded numeric
+introduces a match that cannot exist legitimately.
 """
 
 import json
@@ -75,10 +76,10 @@ SENTINEL_RESTING_HR = 999
 """Sentinel resting HR — must never appear in any SSE payload or prompt."""
 
 SENTINEL_HRV_RMSSD = 999.9
-"""Sentinel HRV — its string contains "999" (one assertion pins the family)."""
+"""Sentinel HRV — asserted absent by its own string form "999.9"."""
 
 SENTINEL_SLEEP_HOURS = 99.9
-"""Sentinel sleep hours — its string contains "999" too."""
+"""Sentinel sleep hours — asserted absent by its own string form "99.9"."""
 
 SENTINEL_NOTE_TITLE = "Recovery\tInjected\x1b"
 """Stored-title sentinel: control characters must never survive to the card.
@@ -434,6 +435,7 @@ class TestSentinelHygiene:
         rendered = json.dumps(card.model_dump())
 
         assert "999" not in rendered
+        assert "99.9" not in rendered
         assert card.readiness_band == "fresh"
         assert card.cues
 
@@ -625,15 +627,24 @@ class TestBriefingEndpoint:
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
-        """AC1/AC3: the readiness source is absent from prompt and payload."""
+        """AC1/AC3: the readiness source is absent from prompt and payload.
+
+        Each seeded numeric is pinned by its own string form — "999"
+        (resting_hr), "999.9" (hrv_rmssd) and "99.9" (sleep_hours) — since
+        "999" is not a substring of "99.9".
+        """
         hub = _FakeHub(_readiness_payload(_sentinel_metrics(tsb=15.0)))
         client, agent = await self._seeded_client(settings, monkeypatch, db_session_factory, hub)
 
         body = _stream(client, briefing=True)
 
-        assert "999" not in body
         assert agent.captured_prompt is not None
+        assert "999" not in body
+        assert "999.9" not in body
+        assert "99.9" not in body
         assert "999" not in agent.captured_prompt
+        assert "999.9" not in agent.captured_prompt
+        assert "99.9" not in agent.captured_prompt
 
     async def test_a_pending_debrief_suppresses_the_briefing(
         self,
