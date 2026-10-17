@@ -10,6 +10,7 @@ import jwt
 import pytest
 from alembic import command
 from alembic.config import Config
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from fastapi.testclient import TestClient
@@ -20,6 +21,9 @@ from coach_web.app import create_app
 from coach_web.config import Settings, get_settings
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.models import ReadinessMetrics, TrainingPlan
+
+TEST_DATA_ENCRYPTION_KEY = Fernet.generate_key()
+"""Generated Fernet key backing the default test environment (never committed)."""
 
 
 @pytest.fixture(autouse=True)
@@ -32,6 +36,18 @@ def _isolate_settings_cache(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     get_settings.cache_clear()
     yield
     get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _default_encryption_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test a valid ``DATA_ENCRYPTION_KEY`` unless it overrides one.
+
+    Migration 0006 (#243) encrypts the debrief RPE at rest and FAILS CLOSED
+    when the key is missing (MADR-008: a failed migration aborts startup), so
+    every migration-running test needs a key in the environment. Tests pinning
+    the missing/invalid-key behavior delenv/setenv explicitly.
+    """
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", TEST_DATA_ENCRYPTION_KEY.decode("ascii"))
 
 
 @pytest.fixture

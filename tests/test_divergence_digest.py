@@ -49,7 +49,7 @@ import coach_web.debrief
 from coach_web.agent import AgentEvent
 from coach_web.analysis import ICU_TOOL_GET_COSTS
 from coach_web.app import create_app
-from coach_web.config import Settings
+from coach_web.config import Settings, get_settings
 from coach_web.db import Base
 from coach_web.debrief import (
     DEFAULT_ATHLETE_ID,
@@ -73,11 +73,31 @@ from coach_web.microcycle import (
 TEST_ENCRYPTION_KEY = Fernet.generate_key()
 """Per-module Fernet key — generated, never a committed literal (gitleaks)."""
 
+TEST_CIPHER = Fernet(TEST_ENCRYPTION_KEY)
+
 SENTINEL_NOTE = "sentinel-note-quiet-meadow-do-not-leak"
 """Unique debrief-note sentinel: must never reach the prompt or the SSE stream."""
 
 SENTINEL_RPE = 9
 """The seeded RPE value — absent from every fixture string (see module docstring)."""
+
+
+@pytest.fixture
+def cipher_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
+    """Settings carrying the module's generated key (the stream endpoint's cipher).
+
+    #243: the divergence read decrypts the stored RPE tokens, so the app
+    needs a valid ``DATA_ENCRYPTION_KEY`` — injected here per test (the
+    shared ``settings`` fixture stays key-agnostic).
+    """
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", TEST_ENCRYPTION_KEY.decode("ascii"))
+    get_settings.cache_clear()
+    return get_settings()
+
+
+def _rpe_token(rpe: int) -> str:
+    """Encrypt an RPE exactly the way the save path stores it (#243)."""
+    return TEST_CIPHER.encrypt(str(rpe).encode("utf-8")).decode("ascii")
 
 
 # ---------------------------------------------------------------------------
@@ -523,14 +543,18 @@ class TestDivergenceDigestEndpoint:
         rpe: int,
         notes_encrypted: str | None,
     ) -> None:
-        """Insert one debrief row directly (fixture state, not path coverage)."""
+        """Insert one debrief row directly (fixture state, not path coverage).
+
+        #243: the RPE is seeded the way the save path stores it — as the
+        Fernet token, never the plaintext integer.
+        """
         async with factory() as session:
             session.add(
                 DebriefRow(
                     athlete_id=DEFAULT_ATHLETE_ID,
                     session_external_id=None,
                     plan_session_key=plan_session_key,
-                    rpe=rpe,
+                    rpe=_rpe_token(rpe),
                     notes_encrypted=notes_encrypted,
                     created_at="2026-10-12T10:00:00+00:00",
                     updated_at="2026-10-12T10:00:00+00:00",
@@ -547,7 +571,7 @@ class TestDivergenceDigestEndpoint:
 
     async def test_the_divergence_digest_rides_the_existing_digest_boundary(
         self,
-        settings: Settings,
+        cipher_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
@@ -561,7 +585,7 @@ class TestDivergenceDigestEndpoint:
             notes_encrypted=None,
         )
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
-        client = self._client_with(settings, agent, db_session_factory)
+        client = self._client_with(cipher_settings, agent, db_session_factory)
 
         body = await self._stream(client)
 
@@ -579,7 +603,7 @@ class TestDivergenceDigestEndpoint:
 
     async def test_zero_divergence_week_yields_no_digest_section(
         self,
-        settings: Settings,
+        cipher_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
@@ -593,7 +617,7 @@ class TestDivergenceDigestEndpoint:
             db_session_factory, plan_session_key="2026-10-13", rpe=3, notes_encrypted=None
         )
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
-        client = self._client_with(settings, agent, db_session_factory)
+        client = self._client_with(cipher_settings, agent, db_session_factory)
 
         body = await self._stream(client)
 
@@ -604,7 +628,7 @@ class TestDivergenceDigestEndpoint:
 
     async def test_rpe_numeric_sentinel_never_reaches_prompt_or_sse(
         self,
-        settings: Settings,
+        cipher_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
@@ -618,7 +642,7 @@ class TestDivergenceDigestEndpoint:
             notes_encrypted=None,
         )
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
-        client = self._client_with(settings, agent, db_session_factory)
+        client = self._client_with(cipher_settings, agent, db_session_factory)
 
         body = await self._stream(client)
 
@@ -633,7 +657,7 @@ class TestDivergenceDigestEndpoint:
 
     async def test_note_sentinel_never_reaches_prompt_or_sse(
         self,
-        settings: Settings,
+        cipher_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
@@ -659,7 +683,7 @@ class TestDivergenceDigestEndpoint:
             await session.commit()
 
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
-        client = self._client_with(settings, agent, db_session_factory)
+        client = self._client_with(cipher_settings, agent, db_session_factory)
 
         body = await self._stream(client)
 
@@ -692,7 +716,7 @@ class TestDivergenceDigestEndpoint:
 
     async def test_the_digest_shares_the_single_request_scoped_db_session(
         self,
-        settings: Settings,
+        cipher_settings: Settings,
         monkeypatch: pytest.MonkeyPatch,
         db_session_factory: Any,
     ) -> None:
@@ -707,7 +731,7 @@ class TestDivergenceDigestEndpoint:
         )
         counting = _CountingSessionFactory(db_session_factory)
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
-        client = self._client_with(settings, agent, counting)
+        client = self._client_with(cipher_settings, agent, counting)
 
         body = await self._stream(client)
 
@@ -756,7 +780,11 @@ class TestDivergenceDigestScope:
         }
 
     def test_no_new_orm_model_or_migration_is_added(self) -> None:
-        """C-S2-6: the digest is computed per-request — no new table/migration."""
+        """C-S2-6: the digest is computed per-request — no new table/migration.
+
+        Superseded for #243: migration 0006 (encrypted debrief RPE) extends
+        the chain — the digest itself still adds no persistence of its own.
+        """
         import coach_web.app  # noqa: F401 - pulls every model module into Base
 
         assert sorted(Base.metadata.tables) == [
@@ -778,6 +806,7 @@ class TestDivergenceDigestScope:
             "0003_plan_drafts.py",
             "0004_debriefs.py",
             "0005_week_adherence.py",
+            "0006_encrypt_debrief_rpe.py",
         ]
 
     def test_the_digest_module_imports_no_mcp_or_icu_client(self) -> None:

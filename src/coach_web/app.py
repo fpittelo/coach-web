@@ -51,6 +51,7 @@ from coach_web.debrief import (
     athlete_id_from_email,
     build_debrief_cipher,
     build_divergence_digest,
+    decrypt_rpe,
     list_debrief_rpes,
     list_pending_debriefs,
     parse_plan_day_rows,
@@ -573,16 +574,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     athlete_id=athlete_id,
                     today=today,
                 )
-                # The divergence digest's executed side (#236): key → RPE
-                # only — the notes_encrypted column is never selected (C-S2-2).
-                debrief_rpes = await list_debrief_rpes(session, athlete_id=athlete_id)
+                # The divergence digest's executed side (#236, #243): key →
+                # RPE, decrypted SERVER-SIDE from the stored Fernet tokens —
+                # the notes_encrypted column is never selected (C-S2-2). A
+                # missing/invalid key degrades to no digest like any other
+                # unreadable store (the turn must survive).
+                cipher = build_debrief_cipher(settings)
+                debrief_rpes = await list_debrief_rpes(
+                    session, athlete_id=athlete_id, cipher=cipher
+                )
                 approved_rows = [
                     row
                     for row in await list_drafts_by_week(session, current_week_start)
                     if row.status == "approved"
                 ]
                 approved_week_row = approved_rows[-1] if approved_rows else None
-        except (OSError, SQLAlchemyError, ValidationError) as exc:
+        except (OSError, SQLAlchemyError, ValidationError, EncryptionUnavailableError) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
             phases = []
@@ -1015,10 +1022,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     code=MirrorReason.POST_FAILED,
                     message=MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED],
                 )
+        stored_rpe_token = row.rpe
+        if stored_rpe_token is None:
+            # Unreachable via save_debrief (it always writes a token); a
+            # tampered store fails closed instead of echoing a bogus RPE
+            # (#243 — the API surface keeps consuming INTEGER RPE, decrypted
+            # server-side, and no token/plaintext value is ever logged).
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL)
         return DebriefSaveResponse(
             status="saved",
             plan_session_key=row.plan_session_key,
-            rpe=row.rpe,
+            rpe=decrypt_rpe(cipher, stored_rpe_token),
             mirror=mirror,
             week_adherence=week_adherence,
         )
