@@ -294,33 +294,55 @@ class TestSaveDebrief:
         """
         payload = _save_payload(notes="SECRET-NOTE-CONTENT-XYZ")
 
-        async with db_session_factory() as session:
-            row = await save_debrief(session, athlete_id=1, payload=payload, cipher=TEST_CIPHER)
+        # AC3 (#259): the WAL scan is unconditional. The engine's NullPool
+        # connections checkpoint and REMOVE the -wal side file when their
+        # commit closes them, so a post-save scan would pass vacuously — the
+        # side file never survives to scan time. Holding a second WAL-mode
+        # connection open across the save keeps the save's page images
+        # materialized in the side file (the verifier's "forcing a WAL-mode
+        # write"), so the plaintext-in-WAL claim is exercised for real; a
+        # genuinely absent WAL fails the assert loud, never a silent skip.
+        holder = sqlite3.connect(db_path)
+        try:
+            holder.execute("PRAGMA journal_mode=WAL").fetchone()
+            holder.execute("SELECT count(*) FROM debriefs").fetchone()
 
-        assert row.id is not None
-        assert row.athlete_id == 1
-        assert row.plan_session_key == "2026-10-06"
-        # The ORM attribute carries the Fernet token, not the plaintext RPE.
-        assert isinstance(row.rpe, str)
-        assert row.rpe.startswith("gAAAA")
-        assert row.rpe != "7"
-        assert row.notes_encrypted is not None
-        assert row.notes_encrypted.startswith("gAAAA")
-        # The stored token decrypts back to the submitted RPE with the same key.
-        assert decrypt_rpe(TEST_CIPHER, row.rpe) == 7
-        # AC1/AC3: NO plaintext health-data bytes exist anywhere in the
-        # database files (main file and WAL side file alike — the plaintext
-        # never enters SQL). The raw column read yields the token, never 7.
-        for candidate in (db_path, Path(str(db_path) + "-wal")):
-            if candidate.exists():
-                raw = candidate.read_bytes()
-                assert b"SECRET-NOTE-CONTENT-XYZ" not in raw
-                assert b'"rpe": 7' not in raw
-        with sqlite3.connect(db_path) as conn:
-            stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
-        assert stored_rpe != 7
-        assert stored_rpe != "7"
-        assert str(stored_rpe).startswith("gAAAA")
+            async with db_session_factory() as session:
+                row = await save_debrief(session, athlete_id=1, payload=payload, cipher=TEST_CIPHER)
+
+            assert row.id is not None
+            assert row.athlete_id == 1
+            assert row.plan_session_key == "2026-10-06"
+            # The ORM attribute carries the Fernet token, not the plaintext RPE.
+            assert isinstance(row.rpe, str)
+            assert row.rpe.startswith("gAAAA")
+            assert row.rpe != "7"
+            assert row.notes_encrypted is not None
+            assert row.notes_encrypted.startswith("gAAAA")
+            # The stored token decrypts back to the submitted RPE with the same key.
+            assert decrypt_rpe(TEST_CIPHER, row.rpe) == 7
+            # AC1/AC3: NO plaintext health-data bytes exist anywhere in the
+            # database files — the main file and the WAL side file alike
+            # (the plaintext never enters SQL). The raw column read yields
+            # the token, never 7.
+            db_raw = db_path.read_bytes()
+            assert b"SECRET-NOTE-CONTENT-XYZ" not in db_raw
+            assert b'"rpe": 7' not in db_raw
+            wal_path = Path(str(db_path) + "-wal")
+            assert wal_path.exists()
+            wal_raw = wal_path.read_bytes()
+            # Positive control: the save's own write product is inside the
+            # scanned window — the WAL scan can never pass vacuously.
+            assert row.rpe.encode("ascii") in wal_raw
+            assert b"SECRET-NOTE-CONTENT-XYZ" not in wal_raw
+            assert b'"rpe": 7' not in wal_raw
+            with sqlite3.connect(db_path) as conn:
+                stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
+            assert stored_rpe != 7
+            assert stored_rpe != "7"
+            assert str(stored_rpe).startswith("gAAAA")
+        finally:
+            holder.close()
 
     async def test_rpe_ciphertext_differs_per_save(self, db_session_factory) -> None:
         """AC3: Fernet is non-deterministic — equal RPEs encrypt differently."""
@@ -672,6 +694,36 @@ class TestListDebriefRpes:
                     session_external_id=None,
                     plan_session_key="2026-10-06",
                     rpe=None,
+                    notes_encrypted=None,
+                    created_at="2026-10-06T10:00:00+00:00",
+                    updated_at="2026-10-06T10:00:00+00:00",
+                )
+            )
+            await session.commit()
+
+            rpes = await list_debrief_rpes(
+                session, athlete_id=DEFAULT_ATHLETE_ID, cipher=TEST_CIPHER
+            )
+
+        assert rpes == {"2026-10-05": 3}
+
+    async def test_a_tampered_rpe_token_is_skipped_not_crashed(self, db_session_factory) -> None:
+        """A tampered non-NULL token fails safe like the NULL case (#259 R5).
+
+        A token encrypted under a different key is undecryptable for the
+        lane cipher — the row yields no entry (the session drops out of the
+        divergence facts and counts as missed) instead of crashing the read
+        with ``InvalidToken``.
+        """
+        tampered = Fernet(Fernet.generate_key()).encrypt(b"9").decode("ascii")
+        async with db_session_factory() as session:
+            await self._save_rpe(session, key="2026-10-05", rpe=3)
+            session.add(
+                DebriefRow(
+                    athlete_id=DEFAULT_ATHLETE_ID,
+                    session_external_id=None,
+                    plan_session_key="2026-10-06",
+                    rpe=tampered,
                     notes_encrypted=None,
                     created_at="2026-10-06T10:00:00+00:00",
                     updated_at="2026-10-06T10:00:00+00:00",

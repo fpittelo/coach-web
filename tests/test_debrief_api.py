@@ -30,10 +30,11 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
+import coach_web.app
 from coach_web.agent import DEFAULT_SYSTEM_PROMPT, AgentEvent, apply_temporal_anchor
 from coach_web.app import _athlete_id_for_session, create_app
 from coach_web.auth.middleware import SESSION_COOKIE
@@ -252,28 +253,48 @@ class TestPostDebrief:
         self, migrated_db: Path, encryption_key
     ) -> None:
         """The notes AND the RPE land as Fernet ciphertext (#243 AC1/AC3)."""
-        client = TestClient(create_app())
+        # AC3 (#259): the WAL scan is unconditional. The engine's NullPool
+        # connections checkpoint and REMOVE the -wal side file on
+        # commit-close, so a post-save scan would pass vacuously. Holding a
+        # second WAL-mode connection open across the HTTP save keeps the
+        # save's page images materialized in the side file, so the
+        # plaintext-in-WAL claim is exercised for real; a genuinely absent
+        # WAL fails the assert loud, never a silent skip.
+        holder = sqlite3.connect(migrated_db)
+        try:
+            holder.execute("PRAGMA journal_mode=WAL").fetchone()
+            holder.execute("SELECT count(*) FROM debriefs").fetchone()
 
-        response = client.post(
-            "/api/debrief",
-            json={"plan_session_key": "2026-10-06", "rpe": 7, "notes": "SECRET-NOTE-XYZ"},
-        )
+            client = TestClient(create_app())
 
-        assert response.status_code == 201
-        assert _debrief_count(migrated_db) == 1
-        for candidate in (migrated_db, Path(str(migrated_db) + "-wal")):
-            if candidate.exists():
-                raw = candidate.read_bytes()
-                assert b"SECRET-NOTE-XYZ" not in raw
-                assert b'"rpe": 7' not in raw
-        with sqlite3.connect(migrated_db) as conn:
-            stored_notes = conn.execute("SELECT notes_encrypted FROM debriefs").fetchone()[0]
-            stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
-        assert str(stored_notes).startswith("gAAAA")
-        # The RPE column carries the token too — never the plaintext value.
-        assert stored_rpe != 7
-        assert stored_rpe != "7"
-        assert str(stored_rpe).startswith("gAAAA")
+            response = client.post(
+                "/api/debrief",
+                json={"plan_session_key": "2026-10-06", "rpe": 7, "notes": "SECRET-NOTE-XYZ"},
+            )
+
+            assert response.status_code == 201
+            assert _debrief_count(migrated_db) == 1
+            db_raw = migrated_db.read_bytes()
+            assert b"SECRET-NOTE-XYZ" not in db_raw
+            assert b'"rpe": 7' not in db_raw
+            wal_path = Path(str(migrated_db) + "-wal")
+            assert wal_path.exists()
+            wal_raw = wal_path.read_bytes()
+            with sqlite3.connect(migrated_db) as conn:
+                stored_notes = conn.execute("SELECT notes_encrypted FROM debriefs").fetchone()[0]
+                stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
+            assert str(stored_notes).startswith("gAAAA")
+            # The RPE column carries the token too — never the plaintext value.
+            assert stored_rpe != 7
+            assert stored_rpe != "7"
+            assert str(stored_rpe).startswith("gAAAA")
+            # Positive control: the save's own write product is inside the
+            # scanned window — the WAL scan can never pass vacuously.
+            assert str(stored_rpe).encode("ascii") in wal_raw
+            assert b"SECRET-NOTE-XYZ" not in wal_raw
+            assert b'"rpe": 7' not in wal_raw
+        finally:
+            holder.close()
 
     def test_save_without_notes_persists_null(self, migrated_db: Path, encryption_key) -> None:
         """An optional-notes debrief persists a NULL notes column."""
@@ -904,6 +925,35 @@ class TestDebriefPersistenceFailure:
         assert response.status_code == 503
         assert response.json() == {"detail": "Service temporarily unavailable"}
         assert "db down" not in response.text
+        assert "Private." not in response.text
+
+    def test_tampered_response_token_answers_the_fail_closed_503(
+        self, migrated_db: Path, monkeypatch: pytest.MonkeyPatch, encryption_key
+    ) -> None:
+        """An undecryptable response token fails closed — 503, never a 500 (#259 R5).
+
+        ``save_debrief`` always writes a fresh token, so the save-response
+        decrypt cannot encounter tampered ciphertext through the API alone —
+        the branch is defense-in-depth, pinned here at the wiring level: IF
+        the stored token were ever undecryptable, the endpoint answers the
+        same fail-closed 503 posture as the NULL-token case, never a 500 and
+        never a bogus RPE echo.
+        """
+        app = create_app()
+
+        def _raise_invalid_token(cipher: Any, token: str) -> int:
+            raise InvalidToken("tampered")
+
+        monkeypatch.setattr(coach_web.app, "decrypt_rpe", _raise_invalid_token)
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/debrief",
+            json={"plan_session_key": "2026-10-06", "rpe": 7, "notes": "Private."},
+        )
+
+        assert response.status_code == 503
+        assert response.json() == {"detail": "Service temporarily unavailable"}
         assert "Private." not in response.text
 
     def test_pending_degrades_to_an_empty_list_on_database_failure(

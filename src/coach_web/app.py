@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import uvicorn
+from cryptography.fernet import InvalidToken
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -578,7 +579,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 # RPE, decrypted SERVER-SIDE from the stored Fernet tokens —
                 # the notes_encrypted column is never selected (C-S2-2). A
                 # missing/invalid key degrades to no digest like any other
-                # unreadable store (the turn must survive).
+                # unreadable store (the turn must survive); #259 R5 joins
+                # InvalidToken (a tampered non-NULL token) to the same
+                # degrade family — the projection skips such rows itself,
+                # this catch is the boundary backstop.
                 cipher = build_debrief_cipher(settings)
                 debrief_rpes = await list_debrief_rpes(
                     session, athlete_id=athlete_id, cipher=cipher
@@ -589,7 +593,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if row.status == "approved"
                 ]
                 approved_week_row = approved_rows[-1] if approved_rows else None
-        except (OSError, SQLAlchemyError, ValidationError, EncryptionUnavailableError) as exc:
+        except (
+            OSError,
+            SQLAlchemyError,
+            ValidationError,
+            EncryptionUnavailableError,
+            InvalidToken,
+        ) as exc:
             logger.warning("Objectives digest unavailable: %s", exc)
             profile = None
             phases = []
@@ -1029,10 +1039,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # (#243 — the API surface keeps consuming INTEGER RPE, decrypted
             # server-side, and no token/plaintext value is ever logged).
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL)
+        try:
+            rpe_value = decrypt_rpe(cipher, stored_rpe_token)
+        except InvalidToken as exc:
+            # A tampered non-NULL token fails closed with the same 503
+            # posture (#259 R5): the response never echoes a bogus RPE and
+            # never 500s — save_debrief always writes a fresh token, so this
+            # branch is defense-in-depth for an unreadable store.
+            logger.warning("Debrief save response RPE undecryptable: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         return DebriefSaveResponse(
             status="saved",
             plan_session_key=row.plan_session_key,
-            rpe=decrypt_rpe(cipher, stored_rpe_token),
+            rpe=rpe_value,
             mirror=mirror,
             week_adherence=week_adherence,
         )

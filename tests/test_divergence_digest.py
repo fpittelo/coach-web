@@ -38,13 +38,14 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 import coach_web
+import coach_web.app
 import coach_web.debrief
 from coach_web.agent import AgentEvent
 from coach_web.analysis import ICU_TOOL_GET_COSTS
@@ -706,6 +707,78 @@ class TestDivergenceDigestEndpoint:
         _freeze_today(monkeypatch, date(2026, 10, 14))
         agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
         client = self._client_with(settings, agent, _ExplodingSessionFactory())
+
+        body = await self._stream(client)
+
+        assert "event: done" in body
+        prompt = agent.captured_prompt
+        assert prompt is not None
+        assert "Divergence digest" not in prompt
+
+    async def test_a_tampered_rpe_token_drops_the_session_from_the_facts(
+        self,
+        cipher_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """A tampered stored token degrades — the turn survives (#259 AC2).
+
+        The tampered row yields no RPE entry, so its session drops out of
+        the divergence facts and counts as missed; the digest still renders
+        from what remains readable and the SSE turn completes (never a 500).
+        """
+        _freeze_today(monkeypatch, date(2026, 10, 14))
+        await self._seed_approved_week(db_session_factory, _week_2026_w42())
+        tampered = Fernet(Fernet.generate_key()).encrypt(b"9").decode("ascii")
+        async with db_session_factory() as session:
+            session.add(
+                DebriefRow(
+                    athlete_id=DEFAULT_ATHLETE_ID,
+                    session_external_id=None,
+                    plan_session_key="2026-10-12",
+                    rpe=tampered,
+                    notes_encrypted=None,
+                    created_at="2026-10-12T10:00:00+00:00",
+                    updated_at="2026-10-12T10:00:00+00:00",
+                )
+            )
+            await session.commit()
+
+        agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(cipher_settings, agent, db_session_factory)
+
+        body = await self._stream(client)
+
+        assert "event: done" in body
+        prompt = agent.captured_prompt
+        assert prompt is not None
+        # Both past slots (2026-10-12, 2026-10-13) count as missed — the
+        # tampered row contributes no readable RPE — and nothing is flagged.
+        assert "- 2 sessions missed" in prompt
+        assert "flagged" not in prompt
+
+    async def test_an_undecryptable_projection_degrades_to_no_digest(
+        self,
+        cipher_settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """InvalidToken joins the digest degrade boundary (#259 R5) — turn intact.
+
+        The per-row skip inside the projection already contains tampered
+        rows; this pins the boundary backstop: an ``InvalidToken`` escaping
+        the projection degrades exactly like ``EncryptionUnavailableError``
+        (no digest section, the turn survives), never a 500.
+        """
+        _freeze_today(monkeypatch, date(2026, 10, 14))
+        await self._seed_approved_week(db_session_factory, _week_2026_w42())
+
+        async def _raising_projection(*args: Any, **kwargs: Any) -> dict[str, int]:
+            raise InvalidToken("tampered")
+
+        monkeypatch.setattr(coach_web.app, "list_debrief_rpes", _raising_projection)
+        agent = _DigestProbeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(cipher_settings, agent, db_session_factory)
 
         body = await self._stream(client)
 
