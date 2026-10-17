@@ -825,12 +825,19 @@ class TestDivergenceDigestScope:
     """The digest adds no ICU read, no endpoint, no persistence (AC6)."""
 
     def test_icu_tool_get_costs_are_unchanged(self) -> None:
-        """C-S2-5 (AC6): the digest adds no ICU read — the cost table is pinned."""
+        """C-S2-5 (AC6): the digest adds no ICU read — the cost table is pinned.
+
+        Rewritten by #262 (C-BR-6, finding F1): the readiness dashboard
+        GET joined the budget table for the morning briefing. The digest
+        itself still adds no ICU read — the pin now guards the table
+        WITH the #262 entry so no further silent growth is possible.
+        """
         assert ICU_TOOL_GET_COSTS == {
             "icu_get_workout_compliance": 2,
             "icu_get_completed_sessions": 1,
             "icu_get_wellness": 1,
             "icu_get_trends": 1,
+            "intervals_get_readiness_dashboard": 1,
         }
 
     def test_no_new_endpoint_is_added(self, settings: Settings) -> None:

@@ -95,10 +95,14 @@ AgentEventType = Literal[
     "periodization_plan",
     "rpe_request",
     "debrief_summary",
+    "morning_briefing",
     "done",
     "error",
 ]
-"""Typed SSE event categories emitted by the agent loop."""
+"""Typed SSE event categories emitted by the agent loop.
+
+``morning_briefing`` (#262) is emitted by the stream endpoint itself —
+the server-rendered greeting card, never model-streamed prose."""
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Coach Web, an expert endurance cycling coach embedded in Frederic's "

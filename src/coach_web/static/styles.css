@@ -742,6 +742,49 @@ body {
   font-size: 0.75rem;
 }
 
+/* Morning briefing card (issue 262): the server-derived greeting card —
+   readiness band chip (word + tokenized color, never color alone),
+   today's session block and the static execution cues. Structured
+   x-text rendering only; the readiness numerics never travel (C-BR-1). */
+
+.briefing-readiness {
+  margin: 0 0 var(--space-2);
+}
+
+.briefing-session {
+  margin: 0 0 var(--space-2);
+}
+
+.briefing-session-title {
+  margin: 0;
+  font-weight: 600;
+}
+
+.briefing-session-meta {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.briefing-cues {
+  margin: var(--space-2) 0 0;
+  padding-left: 1.25rem;
+  color: var(--muted);
+  font-size: 0.85rem;
+}
+
+.briefing-chip--fresh {
+  color: var(--accent);
+}
+
+.briefing-chip--moderate {
+  color: var(--ink);
+}
+
+.briefing-chip--fatigued {
+  color: var(--error);
+}
+
 /* Sign-in affordance (issue 180): real /auth/login links — the
    server-injected identity-bar link for unauthenticated visitors and the
    401 banner action (expired-session path). Token-driven;
