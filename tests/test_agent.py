@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
+    COACH_MCP_READ_TOOLS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     PROPOSE_PERIODIZATION_TOOL,
@@ -35,6 +36,7 @@ from coach_web.agent import (
     _parse_arguments,
     apply_temporal_anchor,
     create_agent,
+    filter_model_tools,
     periodization_tool_schema,
     plan_tool_schema,
     rpe_request_tool_schema,
@@ -820,6 +822,140 @@ class TestCoachAgentPlanProposal:
             PROPOSE_PERIODIZATION_TOOL,
             REQUEST_RPE_TOOL,
         ]
+
+
+# ---------------------------------------------------------------------------
+# Model toolset least-privilege filter (#248 B1, ADR-0010 / #87-C7)
+# ---------------------------------------------------------------------------
+
+# Frozen copy of the live coach-mcp sidecar registry, enumerated on the dev
+# lane (2026-10-17) via `docker exec coach-web-dev-coach-mcp-1 python -c ...`
+# and classified read vs write against the sidecar's server.py signatures.
+# The contract pins the filter against this frozen catalogue; upstream drift
+# breaks the classification test, not the filter itself.
+FROZEN_COACH_MCP_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_add_session_comment",
+        "icu_batch_create_events",
+        "intervals_create_activity",
+        "intervals_create_event",
+        "intervals_delete_activity",
+        "intervals_delete_event",
+        "intervals_record_wellness",
+        "intervals_record_wellness_bulk",
+        "intervals_update_activity",
+        "intervals_update_event",
+    }
+)
+
+FROZEN_COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_get_completed_sessions",
+        "icu_get_trends",
+        "icu_get_wellness",
+        "icu_get_workout_compliance",
+        "intervals_get_activity",
+        "intervals_get_activity_intervals",
+        "intervals_get_activity_streams",
+        "intervals_get_athlete_profile",
+        "intervals_get_event",
+        "intervals_get_fitness_summary",
+        "intervals_get_power_curve",
+        "intervals_get_power_model",
+        "intervals_get_readiness_dashboard",
+        "intervals_get_sport_settings",
+        "intervals_get_wellness",
+        "intervals_list_activities",
+        "intervals_list_events",
+        "intervals_list_folders",
+        "intervals_list_workouts",
+    }
+)
+
+
+def _hub_schema(raw_name: str) -> dict[str, Any]:
+    """Build a hub tool schema for a namespaced coach-mcp/github-mcp tool."""
+    server = "github-mcp" if raw_name.startswith("gh_") else "coach-mcp"
+    return {"type": "function", "function": {"name": f"{server}__{raw_name}"}}
+
+
+class TestModelToolsetFilter:
+    """The model toolset carries coach-mcp READ tools only (#248 AC1)."""
+
+    def test_frozen_classification_covers_the_whole_registry(self) -> None:
+        """The frozen read/write sets partition the 29-tool live registry."""
+        assert not (FROZEN_COACH_MCP_READ_TOOLS & FROZEN_COACH_MCP_WRITE_TOOLS)
+        assert FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_WRITE_TOOLS == frozenset(
+            FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_WRITE_TOOLS
+        )
+        assert len(FROZEN_COACH_MCP_READ_TOOLS) == 19
+        assert len(FROZEN_COACH_MCP_WRITE_TOOLS) == 10
+
+    def test_production_allow_list_matches_the_frozen_read_registry(self) -> None:
+        """The shipped allow-list equals the frozen read classification."""
+        assert COACH_MCP_READ_TOOLS == FROZEN_COACH_MCP_READ_TOOLS
+
+    def test_filter_drops_every_coach_mcp_write_tool(self) -> None:
+        """No write tool survives the filter (the #248 incident tool first)."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
+        catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        names = {schema["function"]["name"] for schema in filtered}
+        for write_tool in FROZEN_COACH_MCP_WRITE_TOOLS:
+            assert f"coach-mcp__{write_tool}" not in names
+
+    def test_filter_keeps_every_coach_mcp_read_tool(self) -> None:
+        """Every read tool survives the filter."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        names = {schema["function"]["name"] for schema in filtered}
+        assert names == {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+
+    def test_filter_passes_github_mcp_tools_through(self) -> None:
+        """github-mcp tools are unaffected (plan-persistence flow, #248)."""
+        catalogue = [
+            {"type": "function", "function": {"name": "github-mcp__create_or_update_file"}},
+            {"type": "function", "function": {"name": "github-mcp__list_issues"}},
+        ]
+
+        filtered = filter_model_tools(catalogue)
+
+        assert [schema["function"]["name"] for schema in filtered] == [
+            "github-mcp__create_or_update_file",
+            "github-mcp__list_issues",
+        ]
+
+    def test_filter_is_an_allow_list_unknown_coach_mcp_tools_are_dropped(self) -> None:
+        """A future upstream write tool is invisible by default (no leak)."""
+        catalogue = [_hub_schema("icu_delete_everything")]
+
+        filtered = filter_model_tools(catalogue)
+
+        assert filtered == []
+
+    async def test_agent_toolset_exposes_reads_and_proposal_tools_only(self) -> None:
+        """The assembled toolset: 19 reads + 4 proposal tools, zero writes."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
+        catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+        streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
+        agent = CoachAgent(streamer, FakeHub(tools=catalogue))
+
+        _ = [event async for event in agent.run("hi")]
+
+        names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
+        assert set(names) == (
+            {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+            | {
+                PROPOSE_PLAN_TOOL,
+                PROPOSE_WEEK_PLAN_TOOL,
+                PROPOSE_PERIODIZATION_TOOL,
+                REQUEST_RPE_TOOL,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------

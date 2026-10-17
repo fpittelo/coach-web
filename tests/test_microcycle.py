@@ -13,6 +13,7 @@ persistence fixtures run against a per-test SQLite file.
 """
 
 import json
+import logging
 import re
 from datetime import date
 from typing import Any
@@ -649,6 +650,54 @@ class TestBatchWeekWrites:
         blob = "\n".join(record.getMessage() for record in caplog.records)
         assert STUB_CONFIRM_TOKEN not in blob
         assert all(STUB_CONFIRM_TOKEN not in result.model_dump_json() for result in results)
+
+    async def test_a_hub_error_preview_logs_the_upstream_error(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC2 (#248): a hub-error preview logs the actual error server-side.
+
+        The generic token ValueError must not swallow the hub's failure —
+        the underlying error text is diagnosable in the server log while the
+        UI keeps the static ``CALENDAR_WRITE_FAILED`` per-day error.
+        """
+        hub = _BatchHub(preview_response=json.dumps({"error": "params Field required"}))
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.microcycle"):
+            results = await write_week_days(hub, _week())
+
+        blob = "\n".join(record.getMessage() for record in caplog.records)
+        assert "params Field required" in blob
+        assert "hub error" in blob
+        assert all(result.error == CALENDAR_WRITE_FAILED for result in results)
+
+    async def test_a_tokenless_success_preview_logs_the_response(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC2 (#248): a token-less success-shaped preview logs its response."""
+        hub = _BatchHub(
+            preview_response=json.dumps({"phase": "preview", "item_count": 7, "events": []})
+        )
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.microcycle"):
+            results = await write_week_days(hub, _week())
+
+        blob = "\n".join(record.getMessage() for record in caplog.records)
+        assert '"item_count": 7' in blob
+        assert "no confirm token" in blob
+        assert all(result.error == CALENDAR_WRITE_FAILED for result in results)
+
+    async def test_a_non_json_preview_logs_the_raw_response(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """AC2 (#248): a non-JSON preview logs the raw response text."""
+        hub = _BatchHub(preview_response="Error: upstream hiccup")
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.microcycle"):
+            results = await write_week_days(hub, _week())
+
+        blob = "\n".join(record.getMessage() for record in caplog.records)
+        assert "upstream hiccup" in blob
+        assert all(result.error == CALENDAR_WRITE_FAILED for result in results)
 
 
 # ---------------------------------------------------------------------------

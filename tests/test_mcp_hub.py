@@ -379,3 +379,202 @@ class TestExecuteTool:
         result = await hub.execute_tool(f"{COACH_SERVER}__intervals_get_readiness_dashboard")
 
         assert json.loads(result) == {}
+
+
+class TestParamsWrapping:
+    """Sidecar ``params``-model argument normalization (#248 B2b).
+
+    The coach-mcp sidecar (mcp 2.x ``MCPServer``) exposes every tool as a
+    single ``params`` Pydantic-model argument, so its advertised schema is
+    ``required: ["params"]``. Server-side call sites speak the flat legacy
+    shape; the model speaks the wrapped shape it reads from the schema.
+    The hub normalizes at this single transport boundary so both shapes work.
+    """
+
+    def _params_tool(self, name: str, description: str = "A tool") -> Tool:
+        """Build a Tool whose schema requires a single ``params`` object."""
+        return Tool(
+            name=name,
+            description=description,
+            input_schema={
+                "type": "object",
+                "properties": {"params": {"type": "object", "additionalProperties": True}},
+                "required": ["params"],
+            },
+        )
+
+    async def test_flat_arguments_are_wrapped_into_params(self) -> None:
+        """A flat legacy payload is wrapped as ``{"params": args}``."""
+        coach = _mock_client([self._params_tool("icu_batch_create_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__icu_batch_create_events",
+            {"events": [{"external_id": "e1"}], "response_format": "json"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "icu_batch_create_events",
+            {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
+        )
+
+    async def test_params_wrapped_arguments_pass_through_unchanged(self) -> None:
+        """The model's wrapped shape is never double-wrapped.
+
+        The pre-existing top-level ``response_format`` default injection is
+        untouched (the sidecar tolerates the extra key; changing its
+        position would alter agent-path response formats — out of scope).
+        """
+        coach = _mock_client([self._params_tool("icu_batch_create_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__icu_batch_create_events",
+            {"params": {"events": [{"external_id": "e1"}]}},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "icu_batch_create_events",
+            {"params": {"events": [{"external_id": "e1"}]}, "response_format": "json"},
+        )
+
+    async def test_injected_response_format_lands_inside_params(self) -> None:
+        """The coach default injection lands inside the wrapped params object."""
+        coach = _mock_client([self._params_tool("icu_get_workout_compliance")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__icu_get_workout_compliance",
+            {"start_date": "2026-10-05", "end_date": "2026-10-11"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "icu_get_workout_compliance",
+            {
+                "params": {
+                    "start_date": "2026-10-05",
+                    "end_date": "2026-10-11",
+                    "response_format": "json",
+                }
+            },
+        )
+
+    async def test_tools_without_a_params_property_are_untouched(self) -> None:
+        """Flat-schema tools are called with flat (unwrapped) args."""
+        coach = _mock_client([_tool("flat_tool")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(f"{COACH_SERVER}__flat_tool", {"x": "1"})
+
+        coach.call_tool.assert_awaited_once_with("flat_tool", {"x": "1", "response_format": "json"})
+
+    async def test_wrapping_applies_to_unique_raw_name_resolution(self) -> None:
+        """A unique un-namespaced raw name resolves and wraps identically."""
+        coach = _mock_client([self._params_tool("icu_batch_create_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool("icu_batch_create_events", {"events": [{"external_id": "e1"}]})
+
+        coach.call_tool.assert_awaited_once_with(
+            "icu_batch_create_events",
+            {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
+        )
+
+    async def test_empty_arguments_are_wrapped_for_params_requiring_tools(self) -> None:
+        """A no-argument call wraps to ``{"params": {}}`` instead of failing."""
+        coach = _mock_client([self._params_tool("intervals_get_readiness_dashboard")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(f"{COACH_SERVER}__intervals_get_readiness_dashboard")
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_get_readiness_dashboard",
+            {"params": {"response_format": "json"}},
+        )
+
+
+class TestResultSerialization:
+    """Tool-result serialisation across mcp 1.x/2.x shapes (#248 B2b)."""
+
+    async def test_mcp2_string_result_envelope_is_unwrapped(self) -> None:
+        """mcp 2.x wraps a string tool return as ``{"result": <text>}``.
+
+        The text content IS the tool's payload; serialising the envelope
+        double-encodes it and every JSON parser downstream (confirm-token
+        extraction, mirror parsers) sees a foreign ``result`` key instead.
+        """
+        coach = _mock_client([_tool("icu_batch_create_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        payload = json.dumps({"phase": "preview", "confirm_token": "tok"})
+        coach.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text=payload)],
+                structured_content={"result": payload},
+            )
+        )
+
+        result = await hub.execute_tool(f"{COACH_SERVER}__icu_batch_create_events")
+
+        assert json.loads(result) == {"phase": "preview", "confirm_token": "tok"}
+
+    async def test_genuine_structured_payload_is_preserved(self) -> None:
+        """A real structured payload (no matching text) stays the JSON body."""
+        coach = _mock_client([_tool("t")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[],
+                structured_content={"ftp": 260},
+            )
+        )
+
+        result = await hub.execute_tool(f"{COACH_SERVER}__t")
+
+        assert json.loads(result) == {"ftp": 260}
+
+    async def test_structured_result_key_collision_is_preserved(self) -> None:
+        """A genuine ``{"result": ...}`` payload is not mistaken for the envelope.
+
+        The envelope unwrap requires the structured value to EQUAL the text
+        content; a tool whose actual payload is ``{"result": <x>}`` serialises
+        its text as the full JSON body, which never equals the bare value.
+        """
+        coach = _mock_client([_tool("t")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        structured = {"result": "different"}
+        coach.call_tool = AsyncMock(
+            return_value=CallToolResult(
+                content=[TextContent(type="text", text=json.dumps(structured))],
+                structured_content=structured,
+            )
+        )
+
+        result = await hub.execute_tool(f"{COACH_SERVER}__t")
+
+        assert json.loads(result) == {"result": "different"}
+
+    async def test_plain_text_result_without_structured_content(self) -> None:
+        """A text-only result (mcp 1.x / github-mcp shape) passes through."""
+        coach = _mock_client([_tool("t")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result('{"ok": true}'))
+
+        result = await hub.execute_tool(f"{COACH_SERVER}__t")
+
+        assert json.loads(result) == {"ok": True}

@@ -738,6 +738,27 @@ def _preview_confirm_token(raw: str) -> str:
     return token
 
 
+def _log_phase1_preview_failure(raw: str) -> None:
+    """Log a token-less phase-1 preview response server-side (#248 AC2).
+
+    The generic ValueError from :func:`_preview_confirm_token` hides the
+    hub's actual failure; this helper distinguishes a hub-error payload from
+    a token-less success-shaped preview and logs the raw response text so
+    the root cause is diagnosable. Server-side only — the UI keeps the
+    static ``CALENDAR_WRITE_FAILED`` per-day error, and a token-less
+    response by definition carries no confirm token to leak (C4).
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Calendar batch preview was not JSON: %s", raw)
+        return
+    if isinstance(parsed, dict) and parsed.get("error"):
+        logger.warning("Calendar batch preview returned a hub error: %s", raw)
+    else:
+        logger.warning("Calendar batch preview carried no confirm token: %s", raw)
+
+
 def _batch_outcomes(raw: str) -> dict[str, str]:
     """Extract the external_id → outcome mapping from a batch report.
 
@@ -789,7 +810,14 @@ async def write_week_days(
             COACH_BATCH_CREATE_EVENTS_TOOL,
             {"events": drafts, "response_format": "json"},
         )
-        token = _preview_confirm_token(preview_raw)
+        try:
+            token = _preview_confirm_token(preview_raw)
+        except ValueError:
+            # AC2 (#248): surface the hub's actual failure server-side before
+            # the generic batch-failure log — the token error alone is not
+            # diagnosable.
+            _log_phase1_preview_failure(preview_raw)
+            raise
         report_raw = await hub.execute_tool(
             COACH_BATCH_CREATE_EVENTS_TOOL,
             {"events": drafts, "response_format": "json", "confirm_token": token},
