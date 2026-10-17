@@ -1978,6 +1978,177 @@ def _tool_streamer(
     return FakeStreamer(turns)
 
 
+class TestDispatchAllowListEnforcement:
+    """The dispatch boundary re-checks the coach-mcp read allow-list (#252).
+
+    The #248 filter hides coach-mcp writes from the advertised toolset, but
+    the dispatch path resolves whatever name the model emits. These contract
+    tests pin the refusal: a write call (namespaced or raw) is refused with a
+    structured error before the hub is ever called, while reads, github-mcp
+    tools and the synthetic proposal tools pass through untouched.
+    """
+
+    async def test_namespaced_write_is_refused_before_the_hub(self) -> None:
+        """A model-emitted coach-mcp write call is refused, never executed."""
+        tool_name = "coach-mcp__icu_batch_create_events"
+        streamer = _tool_streamer([(tool_name, {"events": []})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+            results={tool_name: '{"created": true}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Book these sessions")
+
+        assert hub.calls == []
+        result = next(e for e in events if e.type == "tool_result")
+        assert json.loads(result.data["result"]) == {
+            "error": "Tool 'coach-mcp__icu_batch_create_events' is not available"
+        }
+        # The turn continues: the refusal is fed back and the run completes.
+        assert events[-1].type == "done"
+        follow_up = streamer.requests[1]["messages"]
+        assert follow_up[-1]["role"] == "tool"
+        assert "not available" in follow_up[-1]["content"]
+
+    async def test_every_frozen_write_tool_is_refused_by_namespaced_name(self) -> None:
+        """All ten frozen write tools are refused at dispatch (allow-list reuse)."""
+        for raw in sorted(FROZEN_COACH_MCP_WRITE_TOOLS):
+            tool_name = f"coach-mcp__{raw}"
+            streamer = _tool_streamer([(tool_name, {})])
+            hub = FakeHub(
+                tools=[{"type": "function", "function": {"name": tool_name}}],
+                results={tool_name: '{"created": true}'},
+            )
+            agent = CoachAgent(streamer, hub)
+
+            await _collect(agent, "go")
+
+            assert hub.calls == [], tool_name
+
+    async def test_raw_write_name_is_refused_before_the_hub(self) -> None:
+        """A raw write name resolvable through the hub catalogue is refused."""
+        namespaced = "coach-mcp__icu_batch_create_events"
+        streamer = _tool_streamer([("icu_batch_create_events", {})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": namespaced}}],
+            results={namespaced: '{"created": true}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "go")
+
+        assert hub.calls == []
+        result = next(e for e in events if e.type == "tool_result")
+        assert "not available" in result.data["result"]
+
+    async def test_hallucinated_coach_mcp_name_is_refused(self) -> None:
+        """Any coach-mcp name off the allow-list is refused, catalogue or not."""
+        tool_name = "coach-mcp__icu_delete_everything"
+        streamer = _tool_streamer([(tool_name, {})])
+        hub = FakeHub(results={tool_name: '{"deleted": true}'})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "go")
+
+        assert hub.calls == []
+        result = next(e for e in events if e.type == "tool_result")
+        assert "not available" in result.data["result"]
+
+    async def test_namespaced_read_still_executes(self) -> None:
+        """A coach-mcp read on the allow-list executes through the hub."""
+        tool_name = "coach-mcp__intervals_get_readiness_dashboard"
+        streamer = _tool_streamer([(tool_name, {})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+            results={tool_name: '{"tsb": 5}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Readiness?")
+
+        assert hub.calls == [(tool_name, {})]
+        result = next(e for e in events if e.type == "tool_result")
+        assert result.data["result"] == '{"tsb": 5}'
+
+    async def test_raw_read_name_still_executes(self) -> None:
+        """A raw read name resolves and executes as before."""
+        namespaced = "coach-mcp__intervals_get_readiness_dashboard"
+        streamer = _tool_streamer([("intervals_get_readiness_dashboard", {})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": namespaced}}],
+            results={"intervals_get_readiness_dashboard": '{"tsb": 5}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Readiness?")
+
+        assert hub.calls == [("intervals_get_readiness_dashboard", {})]
+        result = next(e for e in events if e.type == "tool_result")
+        assert result.data["result"] == '{"tsb": 5}'
+
+    async def test_github_mcp_namespaced_tool_is_unaffected(self) -> None:
+        """github-mcp tools execute as before (plan-persistence flow)."""
+        tool_name = "github-mcp__create_or_update_file"
+        streamer = _tool_streamer([(tool_name, {})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+            results={tool_name: '{"commit": "abc"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Save the plan")
+
+        assert hub.calls == [(tool_name, {})]
+        result = next(e for e in events if e.type == "tool_result")
+        assert result.data["result"] == '{"commit": "abc"}'
+
+    async def test_raw_github_mcp_name_is_unaffected(self) -> None:
+        """A raw github-mcp name passes the guard and executes."""
+        namespaced = "github-mcp__create_or_update_file"
+        streamer = _tool_streamer([("create_or_update_file", {})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": namespaced}}],
+            results={"create_or_update_file": '{"commit": "abc"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Save the plan")
+
+        assert hub.calls == [("create_or_update_file", {})]
+        result = next(e for e in events if e.type == "tool_result")
+        assert result.data["result"] == '{"commit": "abc"}'
+
+    async def test_proposal_tools_are_unaffected(self) -> None:
+        """The synthetic proposal tools never touch the dispatch guard."""
+        streamer = _plan_call_streamer(_plan_payload(), call_id="plan_guard")
+        hub = FakeHub()
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Plan my week")
+
+        plan_event = next(e for e in events if e.type == "plan")
+        assert plan_event.data["plan"]["title"] == "Threshold Builder"
+        assert hub.calls == []
+
+    async def test_refusal_logs_a_warning_naming_the_tool_only(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The server-side warning carries the tool name — no arguments, no data."""
+        tool_name = "coach-mcp__icu_batch_create_events"
+        streamer = _tool_streamer([(tool_name, {"events": [{"external_id": "secret"}]})])
+        hub = FakeHub(tools=[{"type": "function", "function": {"name": tool_name}}])
+        agent = CoachAgent(streamer, hub)
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            await _collect(agent, "go")
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("icu_batch_create_events" in r.getMessage() for r in warnings)
+        assert all("secret" not in r.getMessage() for r in warnings)
+
+
 class TestCoachAgentWeekAnalysis:
     """The planned-vs-executed analysis flow (#190 AC1/AC2)."""
 
