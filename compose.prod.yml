@@ -13,9 +13,9 @@
 #   cp .env.prod.example .env.prod  # then fill in secrets + release digest
 #   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml \
 #       --env-file .env.prod pull
+#   ./scripts/e2e-preflight.sh prod  # validates, then tears its lane down on exit
 #   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml \
-#       --env-file .env.prod up -d
-#   ./scripts/e2e-preflight.sh prod
+#       --env-file .env.prod up -d   # FINAL step — lane left serving
 
 name: coach-web-prod
 

@@ -30,6 +30,7 @@ from coach_web.agent import (
     apply_temporal_anchor,
     create_agent,
 )
+from coach_web.analysis import WeekAdherenceMetric
 from coach_web.auth.middleware import (
     SESSION_COOKIE,
     AuthMiddleware,
@@ -45,11 +46,16 @@ from coach_web.debrief import (
     DebriefSaveRequest,
     DebriefSaveResponse,
     PendingDebriefResponse,
+    apply_divergence_digest,
     apply_pending_debrief_digest,
     athlete_id_from_email,
     build_debrief_cipher,
+    build_divergence_digest,
+    list_debrief_rpes,
     list_pending_debriefs,
+    parse_plan_day_rows,
     save_debrief,
+    upsert_week_adherence,
 )
 from coach_web.errors import (
     MIRROR_REASON_MESSAGES,
@@ -66,9 +72,11 @@ from coach_web.microcycle import (
     PlanDraftRow,
     WeekApprovalRequest,
     WeekApprovalResponse,
+    adjusted_future_days,
     apply_approved_week_digest,
     build_week_markdown,
     list_drafts_by_week,
+    moved_session_origins,
     past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
@@ -91,9 +99,11 @@ from coach_web.objectives import (
 )
 from coach_web.periodization import (
     PeriodizationApprovalRequest,
+    PeriodizationPhase,
     PeriodizationPlanResponse,
     list_phases,
     replace_phases,
+    resolve_phase_status,
     validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
@@ -138,6 +148,18 @@ WEEK_ADJUSTMENT_AVAILABILITY_DETAIL = "Week adjustment rejected: weekly availabi
 
 WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL = "Week adjustment rejected: no future days to adjust"
 """Static 422 detail for an adjustment whose write set is empty (#225 C2, D3.4)."""
+
+WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL = (
+    "Week adjustment rejected: session moved across a phase boundary"
+)
+"""Static 422 detail for an adjustment moving a session out of the approved
+week's phase (#233 AC1). Value-free like the other adjustment bodies."""
+
+WEEK_ADJUSTMENT_PEAK_DATE_DETAIL = (
+    "Week adjustment rejected: session scheduled after the objective peak date"
+)
+"""Static 422 detail for an adjustment placing a session past the active
+objective's target date (#233 AC2). Value-free like the other bodies."""
 
 _SIGNIN_SLOT = (
     "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
@@ -217,6 +239,15 @@ async def _default_debrief_mirror(
         notes=notes,
     )
     return outcome
+
+
+def _covering_phase(phases: list[PeriodizationPhase], day: str) -> PeriodizationPhase | None:
+    """The phase whose date range covers ``day``, or None when uncovered.
+
+    ISO date strings compare lexicographically, so the range check works
+    directly on the phase model's string dates (#233 AC1).
+    """
+    return next((phase for phase in phases if phase.start_date <= day <= phase.end_date), None)
 
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
@@ -493,9 +524,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # has an approved draft, the prompt gains its compact metadata
         # digest (week id, title, per-day date/title/TSS/rest marker) so a
         # mid-week adjustment request can be grounded in what is already on
-        # the calendar (past days are locked server-side). The identical
-        # failure boundary applies: an unreadable store yields no digest at
-        # all and never breaks the turn.
+        # the calendar (past days are locked server-side). Since #233 (AC4)
+        # the digest also carries the guardrail facts (current phase window,
+        # peak/target date — metadata only) so adjustment proposals are
+        # shaped within the season structure. The identical failure
+        # boundary applies: an unreadable store yields no digest at all and
+        # never breaks the turn.
+        #
+        # Divergence digest (#236 AC1): when the current week has an
+        # approved draft, the prompt also gains the plan-vs-reality
+        # divergence facts — missed sessions (planned slots so far without
+        # a debrief row) and flagged-exertion sessions (the debrief RPE
+        # mapped to a severity band server-side; only the band label is
+        # emitted — the numeric RPE and the notes never leave the
+        # database). Read-only context (MADR-0010 pull model): the digest
+        # proposes nothing itself. Same failure boundary: an unreadable
+        # store yields no digest and never breaks the turn.
         #
         # Temporal anchor (#220): the model is never told today's date by any
         # digest, so it infers the date from tool payloads and can anchor on
@@ -512,7 +556,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         agent.system_prompt = apply_temporal_anchor(base_prompt, today)
         iso_year, iso_week, _ = today.isocalendar()
         current_week_start, _ = week_bounds(f"{iso_year}-W{iso_week:02d}")
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
         approved_week_row: PlanDraftRow | None = None
+        debrief_rpes: dict[str, int] = {}
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -524,11 +570,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 pending_debriefs = await list_pending_debriefs(
                     session,
-                    athlete_id=_athlete_id_for_session(
-                        settings, request.cookies.get(SESSION_COOKIE)
-                    ),
+                    athlete_id=athlete_id,
                     today=today,
                 )
+                # The divergence digest's executed side (#236): key → RPE
+                # only — the notes_encrypted column is never selected (C-S2-2).
+                debrief_rpes = await list_debrief_rpes(session, athlete_id=athlete_id)
                 approved_rows = [
                     row
                     for row in await list_drafts_by_week(session, current_week_start)
@@ -552,7 +599,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 agent.system_prompt, pending_debriefs
             )
         if approved_week_row is not None:
-            agent.system_prompt = apply_approved_week_digest(agent.system_prompt, approved_week_row)
+            # Adjustment guardrail facts (#233 AC4): the proposal context
+            # carries the current phase window and the objective's peak date
+            # (metadata only — no health data) so mid-week proposals are
+            # shaped within the season structure the approval gates enforce.
+            adjustment_target = profile.primary_goal.target_date if profile is not None else None
+            adjustment_phase = resolve_phase_status(phases, adjustment_target, today).phase
+            agent.system_prompt = apply_approved_week_digest(
+                agent.system_prompt,
+                approved_week_row,
+                phase=adjustment_phase,
+                target_date=adjustment_target,
+            )
+            # Divergence digest (#236 AC1): the approved week's day slots vs
+            # this athlete's debrief RPEs — a pure function of the rows
+            # already read in this request scope. Missed sessions (no
+            # debrief recorded) and flagged-exertion sessions (RPE mapped to
+            # a severity band server-side; the numeric RPE and the notes
+            # never leave the database — C-S2-1/C-S2-2) reach the prompt as
+            # metadata facts + severity chips only. Read-only context (pull
+            # model): the digest proposes nothing itself.
+            divergence = build_divergence_digest(
+                planned=parse_plan_day_rows(approved_week_row.content),
+                debrief_rpes=debrief_rpes,
+                today=today,
+            )
+            agent.system_prompt = apply_divergence_digest(agent.system_prompt, divergence)
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
@@ -612,9 +684,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         captured BEFORE the upsert supersedes it, and a changed incoming
         draft is validated as a mid-week adjustment — past days must render
         byte-identically to the stored rows, the write set is restricted to
-        days strictly after today (both 422 with a static body, C2), and the
+        days strictly after today (both 422 with a static body, C2), the
         adjusted week must fit the active objective's weekly availability
-        budget (D2). ``today`` is resolved ONCE here and passed down (D3.5).
+        budget (D2), and the season structure is preserved (#233): a moved
+        session's new date must stay within the phase containing the
+        approved week (AC1) and no adjusted session may be placed after the
+        objective's target/peak date (AC2) — both 422 with a static body.
+        ``today`` is resolved ONCE here and passed down (D3.5).
         The explicit POST is the approval gate — human-in-the-loop preserved
         (#87 C7).
         """
@@ -629,9 +705,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # 1. Capture the CURRENT approved draft BEFORE the upsert supersedes
         # it (D3.1), plus the active objective profile for the availability
-        # gate (D2). The profiles read degrades to None on failure (graceful,
-        # same posture as the agent_stream digests); the drafts read is
-        # required — a persistence outage answers the static 503.
+        # gate (D2) and the objective row + phase plan for the season-
+        # structure guardrails (#233). The profile and guardrail reads
+        # degrade to None/[] on failure (graceful, same posture as the
+        # agent_stream digests); the drafts read is required — a persistence
+        # outage answers the static 503.
         week_start, _ = week_bounds(payload.week.week_id)
         try:
             async with session_factory() as session:
@@ -641,6 +719,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except (OSError, SQLAlchemyError, ValidationError):
                     logger.warning("Week adjustment availability gate unavailable")
                     profile = None
+                try:
+                    objective_row = await get_active_objective_row(session)
+                    phases = (
+                        await list_phases(session, objective_row.id)
+                        if objective_row is not None
+                        else []
+                    )
+                except (OSError, SQLAlchemyError, ValidationError):
+                    logger.warning("Week adjustment guardrail context unavailable")
+                    objective_row = None
+                    phases = []
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Week draft persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
@@ -681,6 +770,34 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 logger.warning("Rejected week adjustment over the availability budget")
                 raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_AVAILABILITY_DETAIL)
+            # 2d. Phase-boundary guardrail (#233 AC1 ruling): every moved
+            # session's new date must fall in the SAME phase as the
+            # session's original date in the approved draft (title-identity
+            # detection via moved_session_origins) — a cross-phase move in
+            # either direction is rejected. Sessions edited in place keep
+            # their date and are never moves. A date outside every phase
+            # compares as no phase: two uncovered dates pass, one uncovered
+            # side is a crossing. No phases at all degrades to no gate (the
+            # availability posture — coaching structure, not security).
+            origins = moved_session_origins(payload.week, stored.content, today)
+            if any(
+                _covering_phase(phases, original) is not _covering_phase(phases, moved)
+                for moved, original in origins.items()
+            ):
+                logger.warning("Rejected week adjustment moving a session across a phase boundary")
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL)
+            # 2e. Peak-date guardrail (#233 AC2): every adjusted session date
+            # must not pass the active objective's target/peak date — the
+            # peak lives in the objective and is never modified here. No
+            # objective target date degrades to no gate.
+            if objective_row is not None and objective_row.target_date is not None:
+                peak_date = objective_row.target_date
+                if any(
+                    day.date > peak_date
+                    for day in adjusted_future_days(payload.week, stored.content, today)
+                ):
+                    logger.warning("Rejected week adjustment placing a session after the peak date")
+                    raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PEAK_DATE_DETAIL)
             write_dates = [day.date for day in write_set]
 
         # 3. Persist the draft before any side effect (MADR-008, AC4) — on
@@ -837,10 +954,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         (AC1); the 201 confirmation carries metadata only — the notes are
         never echoed (nLPD). The debrief row is scoped to the request's
         athlete (AC4): derived from the verified session email on auth-enabled
-        lanes, the single local athlete otherwise. When the athlete consented
-        (``mirror_to_icu``), the saved debrief is mirrored to Intervals.icu as
-        a session comment (#190 AC3) — non-blocking: a mirror failure keeps
-        the 201 and rides the fixed soft warning in the response body.
+        lanes, the single local athlete otherwise. The debriefed session's
+        ISO-week adherence metric (#234) is recomputed and upserted on the
+        same path — best-effort, counts/percentages only (C3). When the
+        athlete consented (``mirror_to_icu``), the saved debrief is mirrored
+        to Intervals.icu as a session comment (#190 AC3) — non-blocking: a
+        mirror failure keeps the 201 and rides the fixed soft warning in the
+        response body.
         """
         settings: Settings = request.app.state.settings
         try:
@@ -860,6 +980,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Debrief persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # Weekly adherence metric (#234 AC2): event-driven recompute + upsert
+        # on the debrief-save path — counts/percentages only (C3). Best-effort
+        # by contract: the debrief is already durable and the metric is
+        # derived data (the next save recomputes the whole week), so a
+        # failure degrades to no metric on the response while the 201 stands.
+        week_adherence: WeekAdherenceMetric | None = None
+        try:
+            async with session_factory() as session:
+                week_adherence = await upsert_week_adherence(
+                    session, athlete_id=athlete_id, plan_session_key=payload.plan_session_key
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Week adherence upsert failed: %s", exc)
         # ICU session-comment mirror (#190 AC3): strictly opt-in and
         # NON-BLOCKING on the save — the debrief row is already durable when
         # the mirror starts, and every mirror failure degrades to the fixed
@@ -883,7 +1016,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     message=MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED],
                 )
         return DebriefSaveResponse(
-            status="saved", plan_session_key=row.plan_session_key, rpe=row.rpe, mirror=mirror
+            status="saved",
+            plan_session_key=row.plan_session_key,
+            rpe=row.rpe,
+            mirror=mirror,
+            week_adherence=week_adherence,
         )
 
     @application.get(

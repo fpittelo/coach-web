@@ -239,6 +239,46 @@
                       x-show="plan.rationale"
                       x-text="plan.rationale"
                     ></p>
+                    <!-- AC1 (#235): the structured workout renders as an
+                         inline SVG step profile — one bar per step, height
+                         proportional to the step's target intensity. CSP
+                         posture (#207): bar geometry is bound via SVG
+                         presentation attributes and classes (never inline
+                         style), the visualization carries NO event
+                         handlers, and the whole block carries one
+                         accessible name (role="img") so the interval table
+                         below stays the accessible per-step alternative
+                         (AC3). Alpine templates cannot live inside <svg>
+                         (SVG-namespaced, no .content), so each bar is its
+                         own inline <svg> emitted from this HTML-context
+                         loop. -->
+                    <div
+                      class="step-profile"
+                      role="img"
+                      :aria-label="stepProfileLabel(plan)"
+                      x-show="plan.steps && plan.steps.length > 0"
+                    >
+                      <template x-for="(bar, barIndex) in stepProfileRows(plan)" :key="barIndex">
+                        <div class="step-profile-cell">
+                          <svg
+                            class="step-profile-bar"
+                            viewBox="0 0 24 100"
+                            preserveAspectRatio="none"
+                            aria-hidden="true"
+                          >
+                            <rect
+                              class="step-profile-rect"
+                              x="0"
+                              width="24"
+                              :y="100 - bar.height"
+                              :height="bar.height"
+                            ></rect>
+                          </svg>
+                          <span class="step-profile-target" x-text="bar.target"></span>
+                          <span class="step-profile-cadence" x-text="bar.cadence"></span>
+                        </div>
+                      </template>
+                    </div>
                     <!-- AC3: the 4-column table scrolls inside this wrapper
                          on narrow viewports instead of overflowing the page. -->
                     <div class="plan-table-wrap" x-show="plan.steps && plan.steps.length > 0">
@@ -340,7 +380,20 @@
                             <tr>
                               <td data-label="Day" x-text="weekDayLabel(day)"></td>
                               <td data-label="Session" x-text="day.session_title"></td>
-                              <td data-label="Focus" x-text="weekDayFocus(day)"></td>
+                              <td data-label="Focus">
+                                <!-- AC4 (#235): per-day intensity zone
+                                     chip — the word carries the meaning,
+                                     the color class only reinforces it
+                                     (#165: never color alone). Derived
+                                     purely from the delivered payload
+                                     (no new I/O). -->
+                                <span
+                                  class="zone-chip"
+                                  :class="weekDayIntensityClass(day)"
+                                  x-text="weekDayIntensityText(day)"
+                                ></span>
+                                <span x-text="weekDayFocus(day)"></span>
+                              </td>
                               <td
                                 data-label="TSS"
                                 x-text="day.rest_day ? '—' : day.planned_tss"

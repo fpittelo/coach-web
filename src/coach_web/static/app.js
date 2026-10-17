@@ -161,6 +161,12 @@ const WATCHDOG_TIMEOUT_MS = 90000;
 // back near the bottom re-arms following automatically (AC2).
 const STICK_THRESHOLD_PX = 60;
 
+// Step-profile geometry (#235 AC1): the plan card renders one SVG bar per
+// step with the bar height proportional to the step's target intensity,
+// normalized against the plan peak. A step without any power target
+// renders a neutral stub instead of inventing a value.
+const STEP_PROFILE_STUB_PCT = 15;
+
 // Week-card label vocabulary (#168): static client-side strings for the
 // per-day status chips (word + color, never color alone — #165) and the
 // compact day labels rendered in the day table.
@@ -1463,6 +1469,26 @@ function coachApp() {
       return zones || day.focus || "—";
     },
 
+    weekDayIntensityText(day) {
+      // Per-day intensity badge (#235 AC4): "Rest" for rest days, "Hard"
+      // when the day's delivered zones include Z4 or harder, "Easy"
+      // otherwise. Pure function of the delivered week_plan payload — no
+      // new I/O (AC2). The word carries the meaning; the color class
+      // returned by weekDayIntensityClass() only reinforces it (#165:
+      // never color alone).
+      if (day.rest_day) {
+        return "Rest";
+      }
+      const hard = (day.zones || []).some((zone) => /^Z[4-9]$/i.test(zone));
+      return hard ? "Hard" : "Easy";
+    },
+
+    weekDayIntensityClass(day) {
+      // Chip color class per intensity — always rendered NEXT TO the word,
+      // derived from the same text the chip renders (never color alone).
+      return "zone-chip--" + this.weekDayIntensityText(day).toLowerCase();
+    },
+
     get weekSummaryLine() {
       // Week summary (#165): "520 TSS · 2 hard · 4 easy · 1 rest". The
       // rest count is derived from the day slots (the ground truth).
@@ -1702,6 +1728,19 @@ function coachApp() {
           // saved either way (the message leads with the saved line).
           const body = await response.json().catch(() => ({}));
           let note = "Logged: RPE " + this.rpeValue + " · " + this.rpe.plan_session_key;
+          // Weekly adherence (#234 AC3): the save response carries the
+          // debriefed session's ISO-week metric (counts + percentage, C3) —
+          // rendered on this same card's collapsed summary, no new fetch.
+          if (body.week_adherence) {
+            note +=
+              " · Week adherence " +
+              body.week_adherence.adherence_pct +
+              "% (" +
+              body.week_adherence.completed_count +
+              "/" +
+              body.week_adherence.planned_count +
+              ")";
+          }
           if (body.mirror && body.mirror.status === "mirrored") {
             note += " · Mirrored to Intervals.icu.";
           } else if (body.mirror && body.mirror.status === "failed") {
@@ -1770,6 +1809,96 @@ function coachApp() {
       // no dismissal persistence in 3.1).
       this.pendingDebriefs = this.pendingDebriefs.filter(
         (item) => item.plan_session_key !== key
+      );
+    },
+
+    stepProfileRows(plan) {
+      // Step-profile geometry (#235 AC1): one row per step — the bar
+      // height percent (0–100) proportional to the step's target
+      // intensity, plus the target/cadence label texts for the
+      // x-text labels beside each bar. Pure function of the delivered
+      // payload — no new I/O (AC2).
+      //
+      // Intensity prefers % of FTP (the bounded 0–250 domain; a step
+      // carrying both watts and % maps by its %) and falls back to raw
+      // watts. Each bar is normalized against the plan's peak intensity;
+      // a step without any power target renders a neutral
+      // STEP_PROFILE_STUB_PCT stub instead of inventing a value.
+      if (!plan || !plan.steps) {
+        return [];
+      }
+      const values = plan.steps.map((step) =>
+        step.target_power_pct != null
+          ? step.target_power_pct
+          : step.target_power_watts != null
+            ? step.target_power_watts
+            : null
+      );
+      const peak = values.reduce(
+        (max, value) => (value != null && value > max ? value : max),
+        0
+      );
+      return plan.steps.map((step, stepIndex) => {
+        const value = values[stepIndex];
+        const height =
+          value == null || peak === 0
+            ? STEP_PROFILE_STUB_PCT
+            : Math.max(Math.round((value / peak) * 100), 1);
+        return {
+          height: height,
+          target: this.stepTargetText(step),
+          cadence: step.cadence_rpm ? step.cadence_rpm + " rpm" : "",
+        };
+      });
+    },
+
+    stepTargetText(step) {
+      // Target label mirroring the server's plan_approval._format_target
+      // vocabulary (#235): watts preferred, with the % of FTP alongside
+      // when the step carries both.
+      if (step.target_power_watts != null) {
+        return step.target_power_pct != null
+          ? step.target_power_watts + " W (" + step.target_power_pct + "%)"
+          : step.target_power_watts + " W";
+      }
+      if (step.target_power_pct != null) {
+        return step.target_power_pct + "%";
+      }
+      return "";
+    },
+
+    stepProfileLabel(plan) {
+      // Accessible name for the step-profile image (#235 AC3): a SUMMARY —
+      // step count, total duration and the peak target rendered with the
+      // same stepTargetText() vocabulary as the visible bar labels — never
+      // a per-step repeat, because the interval table below the profile
+      // remains the accessible per-step alternative (AC3).
+      if (!plan || !plan.steps || plan.steps.length === 0) {
+        return "";
+      }
+      let total = 0;
+      let peakValue = 0;
+      let peakText = "";
+      plan.steps.forEach((step) => {
+        total += step.duration_minutes;
+        const value =
+          step.target_power_pct != null
+            ? step.target_power_pct
+            : step.target_power_watts != null
+              ? step.target_power_watts
+              : null;
+        if (value != null && value > peakValue) {
+          peakValue = value;
+          peakText = " · peak " + this.stepTargetText(step);
+        }
+      });
+      return (
+        "Step profile: " +
+        plan.steps.length +
+        " steps, " +
+        total +
+        " min" +
+        peakText
       );
     },
 

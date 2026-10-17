@@ -31,7 +31,7 @@ from coach_web.analysis import (
 )
 from coach_web.config import Settings
 from coach_web.debrief import RpeRequest
-from coach_web.mcp_hub import MCPClientHub
+from coach_web.mcp_hub import COACH_SERVER, MCPClientHub
 from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
 from coach_web.periodization import PeriodizationProposal
@@ -136,18 +136,33 @@ DEFAULT_SYSTEM_PROMPT = (
 TEMPORAL_ANCHOR_FORMAT = "Today is {date} ({weekday})."
 """The stable, parseable anchor line: ISO date + weekday name (#220)."""
 
+ISO_WEEK_ANCHOR_FORMAT = "Current ISO week: {week_id} (Mon {monday} .. Sun {sunday})"
+"""The stable week-bounds anchor line: week_id + Monday/Sunday dates (#247)."""
+
 
 def apply_temporal_anchor(system_prompt: str, today: date) -> str:
-    """Append the server-side temporal anchor line to a base system prompt (#220).
+    """Append the server-side temporal anchor lines to a base system prompt (#220).
 
     The model is never told today's date by any digest — it would otherwise
     infer the date from tool payloads and anchor on the wrong time of year.
     The caller (the request scope in :mod:`coach_web.app`) owns the clock
     boundary (N3, PR #173): ``today`` is injected, never re-read here, so the
     anchor shares the digests' single per-request resolution.
+
+    #247: a second stable line carries the current ISO week's bounds (week_id
+    + Monday/Sunday dates), computed from the SAME injected ``today`` via
+    :meth:`date.isocalendar` — the model dated every day +1 shifted when left
+    to do ISO week arithmetic itself. Only the current week's bounds are
+    emitted: the week-plan proposal targets the current week (#225 flow).
     """
+    iso = today.isocalendar()
     anchor = TEMPORAL_ANCHOR_FORMAT.format(date=today.isoformat(), weekday=today.strftime("%A"))
-    return f"{system_prompt}\n\n{anchor}"
+    week_line = ISO_WEEK_ANCHOR_FORMAT.format(
+        week_id=f"{iso.year}-W{iso.week:02d}",
+        monday=date.fromisocalendar(iso.year, iso.week, 1).isoformat(),
+        sunday=date.fromisocalendar(iso.year, iso.week, 7).isoformat(),
+    )
+    return f"{system_prompt}\n\n{anchor}\n{week_line}"
 
 
 class OpenRouterError(Exception):
@@ -347,6 +362,60 @@ class _WeekAnalysisCollector:
         return [AgentEvent(type="debrief_summary", data={"summary": card.model_dump()})]
 
 
+COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_get_completed_sessions",
+        "icu_get_trends",
+        "icu_get_wellness",
+        "icu_get_workout_compliance",
+        "intervals_get_activity",
+        "intervals_get_activity_intervals",
+        "intervals_get_activity_streams",
+        "intervals_get_athlete_profile",
+        "intervals_get_event",
+        "intervals_get_fitness_summary",
+        "intervals_get_power_curve",
+        "intervals_get_power_model",
+        "intervals_get_readiness_dashboard",
+        "intervals_get_sport_settings",
+        "intervals_get_wellness",
+        "intervals_list_activities",
+        "intervals_list_events",
+        "intervals_list_folders",
+        "intervals_list_workouts",
+    }
+)
+"""Allow-list of coach-mcp tools the model may see (#248 B1, ADR-0010 / #87-C7).
+
+Calendar writes go through the human approval endpoint ONLY: the model
+toolset therefore carries the sidecar's READ family exclusively. The list is
+explicit (allow-list, not deny-list) so a new upstream write tool stays
+invisible by default. github-mcp tools are unaffected — its writes serve the
+designed plan-persistence flow.
+"""
+
+
+def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter the hub catalogue down to the model-allowed toolset (#248 B1).
+
+    coach-mcp contributes its READ allow-list only; every other coach-mcp
+    tool (writes included) is dropped. github-mcp tools pass through
+    untouched, as do the synthetic proposal tools appended after this filter.
+    Schemas without a usable function name are dropped defensively.
+    """
+    allowed: list[dict[str, Any]] = []
+    for schema in hub_tools:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        server, _, raw_name = name.partition(NAMESPACE_SEPARATOR)
+        if server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS:
+            continue
+        allowed.append(schema)
+    return allowed
+
+
 class CoachAgent:
     """Autonomous agent loop bridging OpenRouter and the dual MCP hub."""
 
@@ -379,7 +448,7 @@ class CoachAgent:
         """
         messages = self._build_messages(message, history)
         tools = [
-            *self.hub.list_all_tools(),
+            *filter_model_tools(self.hub.list_all_tools()),
             plan_tool_schema(),
             week_plan_tool_schema(),
             periodization_tool_schema(),
@@ -738,9 +807,11 @@ def week_plan_tool_schema() -> dict[str, Any]:
                 "title, summary, days, total_tss, hard_days, easy_days, ...) as "
                 "top-level tool arguments; never nest them under a params key. "
                 "Each day carries an ISO date inside week_id's ISO week and a "
-                "matching day_of_week; total_tss must equal the sum of the days' "
-                "planned_tss and hard_days + easy_days + rest days must equal the "
-                "day count."
+                "matching day_of_week — copy each day's date verbatim from the "
+                "current ISO week bounds stated in the system prompt (Monday "
+                "through Sunday), never compute dates yourself; total_tss must "
+                "equal the sum of the days' planned_tss and hard_days + "
+                "easy_days + rest days must equal the day count."
             ),
             "parameters": WeeklyPlanDraft.model_json_schema(),
         },

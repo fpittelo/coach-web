@@ -33,6 +33,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from coach_web.db import Base
 from coach_web.models import _validate_iso_week, validate_iso_date
+from coach_web.periodization import PeriodizationPhase
 from coach_web.plan_approval import ToolExecutor
 
 logger = logging.getLogger(__name__)
@@ -202,7 +203,12 @@ class WeeklyPlanDraft(BaseModel):
             raise ValueError("total_tss must equal the sum of the day planned_tss values")
         rest_days = sum(1 for day in self.days if day.rest_day)
         if self.hard_days + self.easy_days + rest_days != len(self.days):
-            raise ValueError("hard_days, easy_days and rest days must partition the week's days")
+            # Static, value-free msg stating the arithmetic explicitly so the
+            # model can self-correct (#247: 3 + 3 + 2 = 8 ≠ 7 burned retries).
+            raise ValueError(
+                "hard_days + easy_days + rest days must sum to the number "
+                "of days in the days array"
+            )
         return self
 
     @model_validator(mode="after")
@@ -417,7 +423,84 @@ def past_days_render_identically(draft: WeeklyPlanDraft, stored_content: str, to
 
 
 # ---------------------------------------------------------------------------
-# Approved-week digest (D4/C5 — #225)
+# Adjustment guardrail comparisons (#233)
+# ---------------------------------------------------------------------------
+
+
+def _day_title_by_date(content: str) -> dict[str, str]:
+    """Key each rendered day-table row's session title by its date cell."""
+    titles: dict[str, str] = {}
+    for line in content.splitlines():
+        match = _DAY_ROW_PATTERN.match(line.strip())
+        if match is not None:
+            titles[match.group("date")] = match.group("title")
+    return titles
+
+
+def adjusted_future_days(draft: WeeklyPlanDraft, stored_content: str, today: date) -> list[DaySlot]:
+    """Return the draft's future days whose rendered row differs from stored.
+
+    The adjustment's actual footprint: a future day counts as adjusted when
+    its rendered day-table row differs from the stored week's row for the
+    same date (or the stored week has no row there). Past days are excluded
+    — they are the past-days immutability gate's business (#225 D3.3) and
+    can never differ on a legal adjustment. ``today`` is ALWAYS injected by
+    the caller — the endpoint owns the clock boundary (D3.5), this helper
+    never reads the clock.
+    """
+    stored_rows = _day_rows_by_date(stored_content)
+    incoming_rows = _day_rows_by_date(build_week_markdown(draft))
+    today_iso = today.isoformat()
+    return [
+        day
+        for day in draft.days
+        if day.date > today_iso and incoming_rows.get(day.date) != stored_rows.get(day.date)
+    ]
+
+
+def moved_session_origins(
+    draft: WeeklyPlanDraft, stored_content: str, today: date
+) -> dict[str, str]:
+    """Map each moved session's new date to its original stored date.
+
+    The same title-identity detection as :func:`moved_session_dates`
+    (#233 AC1): a future day whose session title renders elsewhere in the
+    stored week is a move target, keyed here to the earliest stored date
+    carrying that title — title identity cannot disambiguate a title that
+    renders on several stored dates. Same-date intensity/duration edits
+    keep their title on their own date and never appear; a brand-new
+    title is a same-date session replacement, not a move. ``today`` is
+    ALWAYS injected by the caller (D3.5).
+    """
+    stored_titles = _day_title_by_date(stored_content)
+    origins: dict[str, str] = {}
+    for day in adjusted_future_days(draft, stored_content, today):
+        prior_dates = [
+            day_date for day_date, title in stored_titles.items() if title == day.session_title
+        ]
+        if prior_dates and day.date not in prior_dates:
+            origins[day.date] = min(prior_dates)
+    return origins
+
+
+def moved_session_dates(draft: WeeklyPlanDraft, stored_content: str, today: date) -> list[str]:
+    """Return the dates where an adjusted future day receives a moved session.
+
+    A day is a move target when its session title renders elsewhere in the
+    stored week — the session was relocated onto this date (#233 AC1).
+    Same-date intensity/duration edits keep their title on their own date
+    and are never move targets; a brand-new title is a same-date session
+    replacement, not a move. Title identity is the only session signal the
+    draft model carries, so a move that also retitles its session is not
+    detected (accepted limitation — no session ids exist in the model).
+    The list view of :func:`moved_session_origins`. ``today`` is ALWAYS
+    injected by the caller (D3.5).
+    """
+    return list(moved_session_origins(draft, stored_content, today))
+
+
+# ---------------------------------------------------------------------------
+# Approved-week digest (D4/C5 — #225; guardrail facts #233 AC4)
 # ---------------------------------------------------------------------------
 
 
@@ -457,14 +540,23 @@ def _approved_week_parts(row: PlanDraftRow) -> tuple[str, str, list[tuple[str, s
     return week_id, title, days
 
 
-def approved_week_digest(row: PlanDraftRow) -> str:
+def approved_week_digest(
+    row: PlanDraftRow,
+    *,
+    phase: PeriodizationPhase | None = None,
+    target_date: str | None = None,
+) -> str:
     """Build the token-budgeted approved-week digest for the coach prompt.
 
     The digest carries the week identifier, the collapsed title and one
     line per day (date, session title, planned TSS or the rest-day marker)
     ONLY (D4/C5, #225) — no focus/zone text, no durations, no upstream
-    identifiers. The day lines are appended while the whole digest stays
-    within :data:`APPROVED_WEEK_DIGEST_MAX_CHARS`.
+    identifiers. Since #233 (AC4) the digest optionally leads with the
+    objective-preserving guardrail facts — the current phase window and the
+    objective's peak/target date, metadata only (no health data) — so
+    mid-week adjustment proposals are shaped within the season structure
+    the approval gates enforce. The day lines are appended while the whole
+    digest stays within :data:`APPROVED_WEEK_DIGEST_MAX_CHARS`.
     """
     week_id, title, days = _approved_week_parts(row)
     title_line = _digest_single_line(title) if title else None
@@ -472,6 +564,13 @@ def approved_week_digest(row: PlanDraftRow) -> str:
     lines: list[str] = []
     if head_bits:
         lines.append(" — ".join(head_bits))
+    if phase is not None:
+        lines.append(
+            f"Current phase: {_digest_single_line(phase.name)} ({phase.phase_type}), "
+            f"{phase.start_date} to {phase.end_date}"
+        )
+    if target_date is not None:
+        lines.append(f"Peak/target date: {target_date}")
     for day_date, session_title, load in days:
         collapsed_title = _digest_single_line(session_title)
         if load == _REST_DAY_LOAD:
@@ -485,9 +584,20 @@ def approved_week_digest(row: PlanDraftRow) -> str:
     return "\n".join([_APPROVED_WEEK_DIGEST_HEADER, *lines])
 
 
-def apply_approved_week_digest(system_prompt: str, row: PlanDraftRow) -> str:
-    """Append the approved-week digest to a base system prompt (D4, #225)."""
-    return f"{system_prompt}\n\n{approved_week_digest(row)}"
+def apply_approved_week_digest(
+    system_prompt: str,
+    row: PlanDraftRow,
+    *,
+    phase: PeriodizationPhase | None = None,
+    target_date: str | None = None,
+) -> str:
+    """Append the approved-week digest to a base system prompt (D4, #225).
+
+    ``phase``/``target_date`` carry the #233 AC4 guardrail facts (metadata
+    only) into the adjustment proposal context when the caller resolved
+    them; absent facts keep the digest byte-identical to the #225 output.
+    """
+    return f"{system_prompt}\n\n{approved_week_digest(row, phase=phase, target_date=target_date)}"
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +738,27 @@ def _preview_confirm_token(raw: str) -> str:
     return token
 
 
+def _log_phase1_preview_failure(raw: str) -> None:
+    """Log a token-less phase-1 preview response server-side (#248 AC2).
+
+    The generic ValueError from :func:`_preview_confirm_token` hides the
+    hub's actual failure; this helper distinguishes a hub-error payload from
+    a token-less success-shaped preview and logs the raw response text so
+    the root cause is diagnosable. Server-side only — the UI keeps the
+    static ``CALENDAR_WRITE_FAILED`` per-day error, and a token-less
+    response by definition carries no confirm token to leak (C4).
+    """
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("Calendar batch preview was not JSON: %s", raw)
+        return
+    if isinstance(parsed, dict) and parsed.get("error"):
+        logger.warning("Calendar batch preview returned a hub error: %s", raw)
+    else:
+        logger.warning("Calendar batch preview carried no confirm token: %s", raw)
+
+
 def _batch_outcomes(raw: str) -> dict[str, str]:
     """Extract the external_id → outcome mapping from a batch report.
 
@@ -679,7 +810,14 @@ async def write_week_days(
             COACH_BATCH_CREATE_EVENTS_TOOL,
             {"events": drafts, "response_format": "json"},
         )
-        token = _preview_confirm_token(preview_raw)
+        try:
+            token = _preview_confirm_token(preview_raw)
+        except ValueError:
+            # AC2 (#248): surface the hub's actual failure server-side before
+            # the generic batch-failure log — the token error alone is not
+            # diagnosable.
+            _log_phase1_preview_failure(preview_raw)
+            raise
         report_raw = await hub.execute_tool(
             COACH_BATCH_CREATE_EVENTS_TOOL,
             {"events": drafts, "response_format": "json", "confirm_token": token},

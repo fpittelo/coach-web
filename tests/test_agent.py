@@ -20,6 +20,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
+    COACH_MCP_READ_TOOLS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     PROPOSE_PERIODIZATION_TOOL,
@@ -35,6 +36,7 @@ from coach_web.agent import (
     _parse_arguments,
     apply_temporal_anchor,
     create_agent,
+    filter_model_tools,
     periodization_tool_schema,
     plan_tool_schema,
     rpe_request_tool_schema,
@@ -50,7 +52,16 @@ from coach_web.microcycle import (
     upsert_week_draft,
 )
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
-from coach_web.periodization import PeriodizationApprovalRequest
+from coach_web.objectives import (
+    ObjectiveProfile,
+    get_active_objective_row,
+    save_objective_profile,
+)
+from coach_web.periodization import (
+    PeriodizationApprovalRequest,
+    PeriodizationPlan,
+    replace_phases,
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -814,6 +825,140 @@ class TestCoachAgentPlanProposal:
 
 
 # ---------------------------------------------------------------------------
+# Model toolset least-privilege filter (#248 B1, ADR-0010 / #87-C7)
+# ---------------------------------------------------------------------------
+
+# Frozen copy of the live coach-mcp sidecar registry, enumerated on the dev
+# lane (2026-10-17) via `docker exec coach-web-dev-coach-mcp-1 python -c ...`
+# and classified read vs write against the sidecar's server.py signatures.
+# The contract pins the filter against this frozen catalogue; upstream drift
+# breaks the classification test, not the filter itself.
+FROZEN_COACH_MCP_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_add_session_comment",
+        "icu_batch_create_events",
+        "intervals_create_activity",
+        "intervals_create_event",
+        "intervals_delete_activity",
+        "intervals_delete_event",
+        "intervals_record_wellness",
+        "intervals_record_wellness_bulk",
+        "intervals_update_activity",
+        "intervals_update_event",
+    }
+)
+
+FROZEN_COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_get_completed_sessions",
+        "icu_get_trends",
+        "icu_get_wellness",
+        "icu_get_workout_compliance",
+        "intervals_get_activity",
+        "intervals_get_activity_intervals",
+        "intervals_get_activity_streams",
+        "intervals_get_athlete_profile",
+        "intervals_get_event",
+        "intervals_get_fitness_summary",
+        "intervals_get_power_curve",
+        "intervals_get_power_model",
+        "intervals_get_readiness_dashboard",
+        "intervals_get_sport_settings",
+        "intervals_get_wellness",
+        "intervals_list_activities",
+        "intervals_list_events",
+        "intervals_list_folders",
+        "intervals_list_workouts",
+    }
+)
+
+
+def _hub_schema(raw_name: str) -> dict[str, Any]:
+    """Build a hub tool schema for a namespaced coach-mcp/github-mcp tool."""
+    server = "github-mcp" if raw_name.startswith("gh_") else "coach-mcp"
+    return {"type": "function", "function": {"name": f"{server}__{raw_name}"}}
+
+
+class TestModelToolsetFilter:
+    """The model toolset carries coach-mcp READ tools only (#248 AC1)."""
+
+    def test_frozen_classification_covers_the_whole_registry(self) -> None:
+        """The frozen read/write sets partition the 29-tool live registry."""
+        assert not (FROZEN_COACH_MCP_READ_TOOLS & FROZEN_COACH_MCP_WRITE_TOOLS)
+        assert FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_WRITE_TOOLS == frozenset(
+            FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_WRITE_TOOLS
+        )
+        assert len(FROZEN_COACH_MCP_READ_TOOLS) == 19
+        assert len(FROZEN_COACH_MCP_WRITE_TOOLS) == 10
+
+    def test_production_allow_list_matches_the_frozen_read_registry(self) -> None:
+        """The shipped allow-list equals the frozen read classification."""
+        assert COACH_MCP_READ_TOOLS == FROZEN_COACH_MCP_READ_TOOLS
+
+    def test_filter_drops_every_coach_mcp_write_tool(self) -> None:
+        """No write tool survives the filter (the #248 incident tool first)."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
+        catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        names = {schema["function"]["name"] for schema in filtered}
+        for write_tool in FROZEN_COACH_MCP_WRITE_TOOLS:
+            assert f"coach-mcp__{write_tool}" not in names
+
+    def test_filter_keeps_every_coach_mcp_read_tool(self) -> None:
+        """Every read tool survives the filter."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        names = {schema["function"]["name"] for schema in filtered}
+        assert names == {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+
+    def test_filter_passes_github_mcp_tools_through(self) -> None:
+        """github-mcp tools are unaffected (plan-persistence flow, #248)."""
+        catalogue = [
+            {"type": "function", "function": {"name": "github-mcp__create_or_update_file"}},
+            {"type": "function", "function": {"name": "github-mcp__list_issues"}},
+        ]
+
+        filtered = filter_model_tools(catalogue)
+
+        assert [schema["function"]["name"] for schema in filtered] == [
+            "github-mcp__create_or_update_file",
+            "github-mcp__list_issues",
+        ]
+
+    def test_filter_is_an_allow_list_unknown_coach_mcp_tools_are_dropped(self) -> None:
+        """A future upstream write tool is invisible by default (no leak)."""
+        catalogue = [_hub_schema("icu_delete_everything")]
+
+        filtered = filter_model_tools(catalogue)
+
+        assert filtered == []
+
+    async def test_agent_toolset_exposes_reads_and_proposal_tools_only(self) -> None:
+        """The assembled toolset: 19 reads + 4 proposal tools, zero writes."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
+        catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
+        streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
+        agent = CoachAgent(streamer, FakeHub(tools=catalogue))
+
+        _ = [event async for event in agent.run("hi")]
+
+        names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
+        assert set(names) == (
+            {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+            | {
+                PROPOSE_PLAN_TOOL,
+                PROPOSE_WEEK_PLAN_TOOL,
+                PROPOSE_PERIODIZATION_TOOL,
+                REQUEST_RPE_TOOL,
+            }
+        )
+
+
+# ---------------------------------------------------------------------------
 # Defensive parsing branches
 # ---------------------------------------------------------------------------
 
@@ -954,21 +1099,40 @@ class TestCreateAgent:
 
 
 class TestTemporalAnchor:
-    """Server-side temporal anchor appended to the coach system prompt (#220)."""
+    """Server-side temporal anchor appended to the coach system prompt (#220).
 
-    def test_anchor_renders_the_injected_date_and_weekday(self) -> None:
-        """AC3: a frozen clock (injected ``today``) renders ISO date + weekday."""
-        anchored = apply_temporal_anchor("BASE PROMPT", date(2026, 10, 13))
+    #247: the anchor also carries the current ISO week's bounds (week_id +
+    Monday/Sunday dates) so the model never does ISO week arithmetic itself.
+    """
 
-        assert anchored == "BASE PROMPT\n\nToday is 2026-10-13 (Tuesday)."
+    def test_anchor_renders_the_injected_date_weekday_and_week_bounds(self) -> None:
+        """AC1/AC4 (#247): a frozen clock renders date, weekday and week bounds.
 
-    def test_anchor_composes_with_the_default_prompt_as_one_stable_line(self) -> None:
-        """The anchor is a single stable, parseable trailing line — never duplicated."""
+        The frozen clock is the #247 incident week: 2026-W43, Mon 2026-10-19
+        .. Sun 2026-10-25 — the week the model dated +1 shifted across three
+        retries when it had to compute the bounds itself.
+        """
+        anchored = apply_temporal_anchor("BASE PROMPT", date(2026, 10, 19))
+
+        assert anchored == (
+            "BASE PROMPT\n\n"
+            "Today is 2026-10-19 (Monday).\n"
+            "Current ISO week: 2026-W43 (Mon 2026-10-19 .. Sun 2026-10-25)"
+        )
+
+    def test_anchor_composes_with_the_default_prompt_as_one_stable_block(self) -> None:
+        """The anchor is a stable, parseable trailing block — never duplicated.
+
+        #247: the block is two lines — the temporal anchor line (#220) then
+        the ISO week bounds line, both derived from the same injected today.
+        """
         anchored = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date(2026, 1, 1))
 
         assert anchored.startswith(DEFAULT_SYSTEM_PROMPT)
-        assert anchored.endswith("\n\nToday is 2026-01-01 (Thursday).")
+        assert anchored.endswith("\nCurrent ISO week: 2026-W01 (Mon 2025-12-29 .. Sun 2026-01-04)")
         assert anchored.count("Today is ") == 1
+        assert anchored.count("Current ISO week: ") == 1
+        assert anchored.index("Today is ") < anchored.index("Current ISO week: ")
 
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1599,18 @@ class TestCoachAgentWeekPlanProposal:
         assert "top-level" in description
         assert "params" in description
         assert "total_tss" in description
+
+    async def test_week_plan_schema_documents_the_copy_dont_compute_date_rule(self) -> None:
+        """AC2/AC4 (#247): day dates must be copied from the stated week bounds.
+
+        The #247 incident: the model computed ISO week dates itself and dated
+        every day +1 shifted across three retries — the schema must tell it
+        to copy the bounds' dates instead of doing the arithmetic.
+        """
+        description = week_plan_tool_schema()["function"]["description"]
+
+        assert "week bounds" in description
+        assert "never compute" in description
 
     async def test_system_prompt_advertises_the_weekly_capability(self) -> None:
         """The default system prompt tells the model it CAN propose a weekly plan."""
@@ -2097,6 +2273,83 @@ class TestApprovedWeekDigestEndpoint:
         # Metadata only — no focus/zone or duration leakage.
         assert "Threshold zones" not in prompt
         assert "60m" not in prompt
+
+    async def test_the_adjustment_context_carries_the_guardrail_facts(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """AC4 (#233): the approved-week digest names the phase window and peak date.
+
+        The facts ride the adjustment proposal context (metadata only): the
+        phase line appears AFTER the approved-week header — the objectives
+        digest emits the identical phase line earlier in the prompt, so the
+        ordering proves the adjustment context carries its own copy.
+        """
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 8)  # Thursday of 2026-W41
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        async with db_session_factory() as session:
+            await save_objective_profile(
+                session,
+                ObjectiveProfile.model_validate(
+                    {
+                        "primary_goal": {
+                            "objective_type": "outcome",
+                            "title": "A mountain finish",
+                            "target_date": "2026-10-14",
+                        },
+                        "weekly_availability_hours": 20.0,
+                    }
+                ),
+            )
+            objective_row = await get_active_objective_row(session)
+            assert objective_row is not None
+            await replace_phases(
+                session,
+                objective_row.id,
+                PeriodizationPlan.model_validate(
+                    {
+                        "phases": [
+                            {
+                                "phase_type": "build",
+                                "name": "Build",
+                                "start_date": "2026-09-28",
+                                "end_date": "2026-10-10",
+                            },
+                            {
+                                "phase_type": "taper",
+                                "name": "Taper",
+                                "start_date": "2026-10-11",
+                                "end_date": "2026-10-18",
+                            },
+                        ]
+                    }
+                ),
+            )
+        await self._seed_approved_week(db_session_factory, _week_2026_w41())
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent, db_session_factory)
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert "event: done" in body
+        prompt = agent.system_prompt
+        phase_line = "Current phase: Build (build), 2026-09-28 to 2026-10-10"
+        assert phase_line in prompt
+        # The adjustment context's own copy sits after the approved-week
+        # header (the objectives digest emits the identical line earlier).
+        adjustment_context = prompt.index("Approved current week")
+        assert prompt.index(phase_line, adjustment_context) > adjustment_context
+        assert "Peak/target date: 2026-10-14" in prompt
 
     async def test_persistence_failure_yields_no_digest_and_the_turn_survives(
         self,
