@@ -963,21 +963,40 @@ class TestCreateAgent:
 
 
 class TestTemporalAnchor:
-    """Server-side temporal anchor appended to the coach system prompt (#220)."""
+    """Server-side temporal anchor appended to the coach system prompt (#220).
 
-    def test_anchor_renders_the_injected_date_and_weekday(self) -> None:
-        """AC3: a frozen clock (injected ``today``) renders ISO date + weekday."""
-        anchored = apply_temporal_anchor("BASE PROMPT", date(2026, 10, 13))
+    #247: the anchor also carries the current ISO week's bounds (week_id +
+    Monday/Sunday dates) so the model never does ISO week arithmetic itself.
+    """
 
-        assert anchored == "BASE PROMPT\n\nToday is 2026-10-13 (Tuesday)."
+    def test_anchor_renders_the_injected_date_weekday_and_week_bounds(self) -> None:
+        """AC1/AC4 (#247): a frozen clock renders date, weekday and week bounds.
 
-    def test_anchor_composes_with_the_default_prompt_as_one_stable_line(self) -> None:
-        """The anchor is a single stable, parseable trailing line — never duplicated."""
+        The frozen clock is the #247 incident week: 2026-W43, Mon 2026-10-19
+        .. Sun 2026-10-25 — the week the model dated +1 shifted across three
+        retries when it had to compute the bounds itself.
+        """
+        anchored = apply_temporal_anchor("BASE PROMPT", date(2026, 10, 19))
+
+        assert anchored == (
+            "BASE PROMPT\n\n"
+            "Today is 2026-10-19 (Monday).\n"
+            "Current ISO week: 2026-W43 (Mon 2026-10-19 .. Sun 2026-10-25)"
+        )
+
+    def test_anchor_composes_with_the_default_prompt_as_one_stable_block(self) -> None:
+        """The anchor is a stable, parseable trailing block — never duplicated.
+
+        #247: the block is two lines — the temporal anchor line (#220) then
+        the ISO week bounds line, both derived from the same injected today.
+        """
         anchored = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date(2026, 1, 1))
 
         assert anchored.startswith(DEFAULT_SYSTEM_PROMPT)
-        assert anchored.endswith("\n\nToday is 2026-01-01 (Thursday).")
+        assert anchored.endswith("\nCurrent ISO week: 2026-W01 (Mon 2025-12-29 .. Sun 2026-01-04)")
         assert anchored.count("Today is ") == 1
+        assert anchored.count("Current ISO week: ") == 1
+        assert anchored.index("Today is ") < anchored.index("Current ISO week: ")
 
 
 # ---------------------------------------------------------------------------
@@ -1444,6 +1463,18 @@ class TestCoachAgentWeekPlanProposal:
         assert "top-level" in description
         assert "params" in description
         assert "total_tss" in description
+
+    async def test_week_plan_schema_documents_the_copy_dont_compute_date_rule(self) -> None:
+        """AC2/AC4 (#247): day dates must be copied from the stated week bounds.
+
+        The #247 incident: the model computed ISO week dates itself and dated
+        every day +1 shifted across three retries — the schema must tell it
+        to copy the bounds' dates instead of doing the arithmetic.
+        """
+        description = week_plan_tool_schema()["function"]["description"]
+
+        assert "week bounds" in description
+        assert "never compute" in description
 
     async def test_system_prompt_advertises_the_weekly_capability(self) -> None:
         """The default system prompt tells the model it CAN propose a weekly plan."""

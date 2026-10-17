@@ -136,18 +136,33 @@ DEFAULT_SYSTEM_PROMPT = (
 TEMPORAL_ANCHOR_FORMAT = "Today is {date} ({weekday})."
 """The stable, parseable anchor line: ISO date + weekday name (#220)."""
 
+ISO_WEEK_ANCHOR_FORMAT = "Current ISO week: {week_id} (Mon {monday} .. Sun {sunday})"
+"""The stable week-bounds anchor line: week_id + Monday/Sunday dates (#247)."""
+
 
 def apply_temporal_anchor(system_prompt: str, today: date) -> str:
-    """Append the server-side temporal anchor line to a base system prompt (#220).
+    """Append the server-side temporal anchor lines to a base system prompt (#220).
 
     The model is never told today's date by any digest — it would otherwise
     infer the date from tool payloads and anchor on the wrong time of year.
     The caller (the request scope in :mod:`coach_web.app`) owns the clock
     boundary (N3, PR #173): ``today`` is injected, never re-read here, so the
     anchor shares the digests' single per-request resolution.
+
+    #247: a second stable line carries the current ISO week's bounds (week_id
+    + Monday/Sunday dates), computed from the SAME injected ``today`` via
+    :meth:`date.isocalendar` — the model dated every day +1 shifted when left
+    to do ISO week arithmetic itself. Only the current week's bounds are
+    emitted: the week-plan proposal targets the current week (#225 flow).
     """
+    iso = today.isocalendar()
     anchor = TEMPORAL_ANCHOR_FORMAT.format(date=today.isoformat(), weekday=today.strftime("%A"))
-    return f"{system_prompt}\n\n{anchor}"
+    week_line = ISO_WEEK_ANCHOR_FORMAT.format(
+        week_id=f"{iso.year}-W{iso.week:02d}",
+        monday=date.fromisocalendar(iso.year, iso.week, 1).isoformat(),
+        sunday=date.fromisocalendar(iso.year, iso.week, 7).isoformat(),
+    )
+    return f"{system_prompt}\n\n{anchor}\n{week_line}"
 
 
 class OpenRouterError(Exception):
@@ -738,9 +753,11 @@ def week_plan_tool_schema() -> dict[str, Any]:
                 "title, summary, days, total_tss, hard_days, easy_days, ...) as "
                 "top-level tool arguments; never nest them under a params key. "
                 "Each day carries an ISO date inside week_id's ISO week and a "
-                "matching day_of_week; total_tss must equal the sum of the days' "
-                "planned_tss and hard_days + easy_days + rest days must equal the "
-                "day count."
+                "matching day_of_week — copy each day's date verbatim from the "
+                "current ISO week bounds stated in the system prompt (Monday "
+                "through Sunday), never compute dates yourself; total_tss must "
+                "equal the sum of the days' planned_tss and hard_days + "
+                "easy_days + rest days must equal the day count."
             ),
             "parameters": WeeklyPlanDraft.model_json_schema(),
         },
