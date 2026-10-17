@@ -66,8 +66,14 @@ class TestSettings:
 class TestDataEncryptionKey:
     """The C2 field-encryption key setting (MADR-0008 C5, #189)."""
 
-    def test_defaults_to_empty_secret(self) -> None:
-        """Absent env var → empty SecretStr (fail-safe: saves answer 503)."""
+    def test_defaults_to_empty_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Absent env var → empty SecretStr (fail-safe: saves answer 503).
+
+        #243: the absence is pinned explicitly (the shared test environment
+        injects a default key for the migration gate — this pin is about the
+        Settings default when the variable is genuinely absent).
+        """
+        monkeypatch.delenv("DATA_ENCRYPTION_KEY", raising=False)
         get_settings.cache_clear()
 
         settings = get_settings()

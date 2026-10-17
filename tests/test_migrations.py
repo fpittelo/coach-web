@@ -12,11 +12,13 @@ from ``COACH_DB_PATH`` — the same wiring the container entrypoint uses at
 startup (MADR-008: a failed migration aborts startup).
 """
 
+import os
 import sqlite3
 from pathlib import Path
 
 import pytest
 from alembic import command
+from cryptography.fernet import Fernet
 
 from tests.conftest import alembic_config
 
@@ -427,18 +429,20 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0005.
+        """Re-running upgrade head is a no-op and the version stays at 0006.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
         Superseded for #189: migration 0004 (debriefs) extends the chain.
         Superseded for #234: migration 0005 (week_adherence) extends the chain.
+        Superseded for #243: migration 0006 (encrypted debrief RPE) extends
+        the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0005"
+        assert version == "0006"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -619,11 +623,14 @@ class TestDebriefMigration:
     """Migration 0004 adds the debriefs table (MADR-008 C2, #189).
 
     The debrief is health data (nLPD Art. 5(c)): the notes column is
-    Fernet ciphertext by contract (``notes_encrypted``), the RPE is a
-    CHECK-bounded integer per the story schema, and the athlete dimension
-    plus the plan-session key are indexed for the per-athlete pending
-    derivation. The contract pins the exact column set, the CHECK
-    constraint, the indexes and the downgrade path.
+    Fernet ciphertext by contract (``notes_encrypted``), and — since the
+    #243 classification-drift fix (migration 0006) — the RPE column is a
+    nullable Text carrying the Fernet token too (the plaintext-integer
+    CHECK was dropped: a ciphertext column cannot carry a numeric range
+    CHECK; the 1–10 bound is enforced at the Pydantic boundary). The
+    athlete dimension plus the plan-session key are indexed for the
+    per-athlete pending derivation. The contract pins the exact column
+    set, the nullable flags, the indexes and the downgrade path.
     """
 
     def test_debrief_table_columns_match_the_story_schema(self, db_path: Path) -> None:
@@ -636,25 +643,33 @@ class TestDebriefMigration:
         assert tuple(columns) == EXPECTED_DEBRIEF_COLUMNS
 
     def test_debrief_required_columns_are_not_null(self, db_path: Path) -> None:
-        """athlete_id, plan_session_key, rpe and timestamps are NOT NULL."""
+        """athlete_id, plan_session_key and timestamps are NOT NULL.
+
+        #243: ``rpe`` left the NOT NULL set — the column now stores the
+        Fernet token under the ``notes_encrypted`` typing/nullable pattern.
+        """
         command.upgrade(alembic_config(), "head")
 
         flags = _debrief_column_flags(db_path)
         for column in (
             "athlete_id",
             "plan_session_key",
-            "rpe",
             "created_at",
             "updated_at",
         ):
             assert flags[column][0] is True, column
 
     def test_debrief_optional_columns_are_nullable(self, db_path: Path) -> None:
-        """session_external_id (ICU link, 3.2) and notes allow NULL."""
+        """session_external_id (ICU link, 3.2), notes and rpe allow NULL.
+
+        #243: ``rpe`` is nullable like ``notes_encrypted`` — the Fernet
+        token pattern's typing (a tampered/absent value stays NULL instead
+        of failing the row write).
+        """
         command.upgrade(alembic_config(), "head")
 
         flags = _debrief_column_flags(db_path)
-        for column in ("session_external_id", "notes_encrypted"):
+        for column in ("session_external_id", "notes_encrypted", "rpe"):
             assert flags[column][0] is False, column
 
     def test_debrief_id_is_the_primary_key(self, db_path: Path) -> None:
@@ -665,28 +680,31 @@ class TestDebriefMigration:
         assert flags["id"][1] is True
         assert [name for name, (_, pk) in flags.items() if pk] == ["id"]
 
-    def test_debrief_rpe_check_constraint_is_declared(self, db_path: Path) -> None:
-        """The RPE range CHECK is declared on the table."""
+    def test_debrief_rpe_check_constraint_is_absent(self, db_path: Path) -> None:
+        """#243: the numeric RPE range CHECK is gone from the schema.
+
+        A Fernet token cannot satisfy ``rpe BETWEEN 1 AND 10`` — the CHECK
+        was dropped with the plaintext column (the 1–10 bound lives at the
+        Pydantic boundary, pinned in ``tests/test_debrief.py``).
+        """
         command.upgrade(alembic_config(), "head")
 
         sql = _debrief_table_sql(db_path)
-        assert DEBRIEF_RPE_RANGE_CHECK in sql
+        assert DEBRIEF_RPE_RANGE_CHECK not in sql
 
-    def test_debrief_rpe_check_rejects_out_of_range_values(self, db_path: Path) -> None:
-        """Inserting an RPE below 1 or above 10 fails the CHECK."""
+    def test_debrief_rpe_column_accepts_fernet_tokens(self, db_path: Path) -> None:
+        """#243: a Fernet token inserts cleanly (no numeric CHECK rejects it)."""
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
-            for sql in (
+            conn.execute(
                 "INSERT INTO debriefs "
                 "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
-                "VALUES (1, '2026-10-10', 0, 't1', 't2')",
-                "INSERT INTO debriefs "
-                "(athlete_id, plan_session_key, rpe, created_at, updated_at) "
-                "VALUES (1, '2026-10-10', 11, 't1', 't2')",
-            ):
-                with pytest.raises(sqlite3.IntegrityError, match="rpe"):
-                    conn.execute(sql)
+                "VALUES (1, '2026-10-10', 'gAAAAABmXk3test-token-shape', 't1', 't2')"
+            )
+            stored = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
+
+        assert stored == "gAAAAABmXk3test-token-shape"
 
     def test_debrief_athlete_and_session_key_are_indexed(self, db_path: Path) -> None:
         """athlete_id and plan_session_key carry indexes (pending derivation)."""
@@ -815,3 +833,77 @@ class TestWeekAdherenceMigration:
         tables = _table_names(db_path)
         assert "week_adherence" not in tables
         assert "debriefs" in tables
+
+
+def _seed_plaintext_debrief(db_path: Path, *, rpe: int) -> int:
+    """Insert one plaintext-RPE debrief row at 0005 (the pre-0006 state).
+
+    Returns the row id. (NULL RPEs cannot exist at 0005 — the column is NOT
+    NULL there — so the migration's NULL filter is defensive only; the
+    nullable-column NULL behavior is pinned at the service level in
+    ``tests/test_debrief.py``.)
+    """
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO debriefs "
+            "(athlete_id, plan_session_key, rpe, notes_encrypted, created_at, updated_at) "
+            "VALUES (1, '2026-10-06', ?, NULL, 't1', 't2')",
+            (rpe,),
+        )
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+
+class TestDebriefRpeEncryptionMigration:
+    """Migration 0006 encrypts the debrief RPE in place (#243, MADR-0008 C2).
+
+    The #236 security review found the RPE column drifting from its
+    MADR-0008 C2 classification (plaintext Integer while the notes were
+    Fernet-encrypted). Migration 0006 closes the drift: upgrade encrypts
+    every existing plaintext RPE in place (NULL stays NULL) and drops the
+    numeric range CHECK; downgrade decrypts back to the plaintext integer
+    and restores the CHECK (dev rollback symmetry).
+    """
+
+    def test_upgrade_encrypts_existing_plaintext_rpes(self, db_path: Path) -> None:
+        """Upgrade 0005→head turns the seeded plaintext RPE into a token."""
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            stored = conn.execute("SELECT rpe FROM debriefs WHERE id = ?", (row_id,)).fetchone()[0]
+        assert stored != 7
+        assert stored != "7"
+        assert str(stored).startswith("gAAAA")
+
+    def test_upgrade_stored_token_decrypts_to_the_plaintext_value(self, db_path: Path) -> None:
+        """The migrated token decrypts to the original RPE with the lane key."""
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+
+        command.upgrade(alembic_config(), "head")
+
+        key = os.environ["DATA_ENCRYPTION_KEY"]
+        with _connect(db_path) as conn:
+            stored = conn.execute("SELECT rpe FROM debriefs WHERE id = ?", (row_id,)).fetchone()[0]
+        plaintext = Fernet(key.encode("ascii")).decrypt(str(stored).encode("ascii"))
+        assert plaintext.decode("utf-8") == "7"
+
+    def test_downgrade_restores_plaintext_integers_and_the_check(self, db_path: Path) -> None:
+        """Downgrade head→0005 decrypts back to the plaintext int + CHECK."""
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+        command.upgrade(alembic_config(), "head")
+
+        command.downgrade(alembic_config(), "0005")
+
+        with _connect(db_path) as conn:
+            stored = conn.execute("SELECT rpe FROM debriefs WHERE id = ?", (row_id,)).fetchone()[0]
+            sql_row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='debriefs'"
+            ).fetchone()
+        assert stored == 7
+        assert isinstance(stored, int)
+        assert DEBRIEF_RPE_RANGE_CHECK in str(sql_row[0])

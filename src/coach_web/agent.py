@@ -416,6 +416,41 @@ def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return allowed
 
 
+def _dispatch_allow_list_refusal(
+    tool_name: str,
+    hub_tools: list[dict[str, Any]],
+) -> str | None:
+    """Return the dispatch refusal for *tool_name*, or ``None`` to proceed (#252).
+
+    The #248 toolset filter hides coach-mcp writes from the advertised
+    tools, but the dispatch path resolves whatever name the model emits —
+    a prompt-injected write call by raw or namespaced name would still
+    reach the sidecar. This guard re-checks the SAME allow-list
+    (``COACH_MCP_READ_TOOLS``) at the dispatch boundary: a coach-mcp tool
+    that is not a read is refused before ``execute_tool`` is ever called.
+    github-mcp tools and the synthetic proposal tools are unaffected.
+    """
+    server, separator, raw_name = tool_name.partition(NAMESPACE_SEPARATOR)
+    if separator:
+        refused = server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS
+    else:
+        # Raw form: mirror the hub's unique-raw-name resolution over the hub
+        # catalogue — refuse only when the name resolves to coach-mcp alone.
+        servers: set[str] = set()
+        for schema in hub_tools:
+            function = schema.get("function") if isinstance(schema, dict) else None
+            name = function.get("name") if isinstance(function, dict) else None
+            if not isinstance(name, str) or not name:
+                continue
+            candidate_server, sep, candidate_raw = name.partition(NAMESPACE_SEPARATOR)
+            if sep and candidate_raw == tool_name:
+                servers.add(candidate_server)
+        refused = servers == {COACH_SERVER} and tool_name not in COACH_MCP_READ_TOOLS
+    if not refused:
+        return None
+    return json.dumps({"error": f"Tool '{tool_name}' is not available"})
+
+
 class CoachAgent:
     """Autonomous agent loop bridging OpenRouter and the dual MCP hub."""
 
@@ -447,8 +482,9 @@ class CoachAgent:
         is reached.
         """
         messages = self._build_messages(message, history)
+        hub_tools = self.hub.list_all_tools()
         tools = [
-            *filter_model_tools(self.hub.list_all_tools()),
+            *filter_model_tools(hub_tools),
             plan_tool_schema(),
             week_plan_tool_schema(),
             periodization_tool_schema(),
@@ -525,28 +561,39 @@ class CoachAgent:
                     for event in rpe_events:
                         yield event
                 else:
-                    cost = icu_tool_get_cost(call["name"])
-                    if cost is not None and budget.would_exceed(cost):
-                        # Budget refusal (PO decision 5a): the call is NOT
-                        # executed — the model is told to summarise from the
-                        # data already fetched. The message carries counts
-                        # and the tool name only (nLPD).
-                        result = json.dumps(
-                            {
-                                "error": BUDGET_EXHAUSTED_MESSAGE.format(
-                                    used=budget.used,
-                                    budget=budget.budget,
-                                    tool=call["name"],
-                                    cost=cost,
-                                )
-                            }
+                    refusal = _dispatch_allow_list_refusal(call["name"], hub_tools)
+                    if refusal is not None:
+                        # Dispatch-boundary allow-list (#252): the model sees a
+                        # static refusal and the call is never executed; the
+                        # tool name is the only detail logged (nLPD).
+                        logger.warning(
+                            "Refused coach-mcp tool outside the read allow-list: %s",
+                            call["name"],
                         )
+                        result = refusal
                     else:
-                        if cost is not None:
-                            budget.consume(cost)
-                        result = await self.hub.execute_tool(call["name"], arguments)
-                        for event in collector.card_events(call["name"], result):
-                            yield event
+                        cost = icu_tool_get_cost(call["name"])
+                        if cost is not None and budget.would_exceed(cost):
+                            # Budget refusal (PO decision 5a): the call is NOT
+                            # executed — the model is told to summarise from the
+                            # data already fetched. The message carries counts
+                            # and the tool name only (nLPD).
+                            result = json.dumps(
+                                {
+                                    "error": BUDGET_EXHAUSTED_MESSAGE.format(
+                                        used=budget.used,
+                                        budget=budget.budget,
+                                        tool=call["name"],
+                                        cost=cost,
+                                    )
+                                }
+                            )
+                        else:
+                            if cost is not None:
+                                budget.consume(cost)
+                            result = await self.hub.execute_tool(call["name"], arguments)
+                            for event in collector.card_events(call["name"], result):
+                                yield event
                 yield AgentEvent(
                     type="tool_result",
                     data={"id": call["id"], "name": call["name"], "result": result},

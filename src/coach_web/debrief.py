@@ -3,9 +3,10 @@
 Story 3.1 (epic #161) completes the capture half of the debrief loop: after a
 completed planned session, the athlete submits an RPE (1–10) with optional
 free-text notes, and the debrief persists in the ``debriefs`` table (MADR-008
-class C2 — SENSITIVE health data, nLPD Art. 5(c)) with the notes as Fernet
-ciphertext. The analysis half (planned-vs-executed + ICU mirror) is Story 3.2;
-this module is deliberately ICU-free.
+class C2 — SENSITIVE health data, nLPD Art. 5(c)) with the notes AND the RPE
+as Fernet ciphertext (the RPE column's encryption was restored by #243 after
+a classification drift). The analysis half (planned-vs-executed + ICU
+mirror) is Story 3.2; this module is deliberately ICU-free.
 
 Encryption posture (MADR-008 X3 + security conditions C5/C6): the Fernet key
 travels in ``DATA_ENCRYPTION_KEY`` (per-lane secret, loaded as
@@ -236,19 +237,24 @@ class RpeRequest(BaseModel):
 
 
 class DebriefRow(Base):
-    """ORM model for the ``debriefs`` table (MADR-008 C2 — encrypted notes)."""
+    """ORM model for the ``debriefs`` table (MADR-008 C2 — encrypted notes & RPE).
+
+    #243 (MADR-0008 classification-drift fix): the RPE column follows the
+    exact ``notes_encrypted`` pattern — a nullable Text carrying the Fernet
+    token of the string-form RPE, encrypted on write and decrypted on read
+    with the same ``DATA_ENCRYPTION_KEY``. The former numeric range CHECK is
+    gone (a ciphertext column cannot carry ``rpe BETWEEN 1 AND 10``); the
+    1–10 bound is enforced at the Pydantic boundary
+    (:class:`DebriefSaveRequest`).
+    """
 
     __tablename__ = "debriefs"
-    # The RPE CHECK below is the ORM mirror of migration 0004's CHECK (both
-    # hardcoded deliberately — migrations stay self-contained, never
-    # importing application symbols); keep the two in sync.
-    __table_args__ = (CheckConstraint("rpe BETWEEN 1 AND 10", name="ck_debriefs_rpe_range"),)
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     athlete_id: Mapped[int] = mapped_column(Integer, nullable=False, index=True)
     session_external_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     plan_session_key: Mapped[str] = mapped_column(Text, nullable=False, index=True)
-    rpe: Mapped[int] = mapped_column(Integer, nullable=False)
+    rpe: Mapped[str | None] = mapped_column(Text, nullable=True)
     notes_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False)
@@ -323,6 +329,27 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def encrypt_rpe(cipher: Fernet, rpe: int) -> str:
+    """Encrypt the RPE to its Fernet token (#243, MADR-0008 C2).
+
+    The exact ``notes_encrypted`` write pattern applied to the string form
+    of the RPE: the plaintext integer never reaches the SQL layer, so no
+    database file (main or WAL) can ever contain it. Fernet is
+    non-deterministic — equal RPEs encrypt to different tokens.
+    """
+    return cipher.encrypt(str(rpe).encode("utf-8")).decode("ascii")
+
+
+def decrypt_rpe(cipher: Fernet, token: str) -> int:
+    """Decrypt a stored RPE token back to its integer value (#243).
+
+    The read-side mirror of :func:`encrypt_rpe`: the API surface keeps
+    consuming INTEGER RPE — decryption happens server-side, and neither the
+    token nor the plaintext value is ever logged.
+    """
+    return int(cipher.decrypt(token.encode("ascii")).decode("utf-8"))
+
+
 async def save_debrief(
     session: AsyncSession,
     *,
@@ -332,10 +359,11 @@ async def save_debrief(
 ) -> DebriefRow:
     """Persist one debrief (upsert per athlete + session key) and commit.
 
-    The notes are encrypted HERE — the plaintext never reaches the SQL layer,
-    so no database file (main or WAL) can ever contain it (AC1). A
-    re-submission for the same athlete + session key updates the stored RPE
-    and notes (idempotent retries; one debrief per session per athlete).
+    The notes AND the RPE are encrypted HERE (#243) — the plaintext never
+    reaches the SQL layer, so no database file (main or WAL) can ever
+    contain it (AC1). A re-submission for the same athlete + session key
+    updates the stored RPE and notes (idempotent retries; one debrief per
+    session per athlete).
     """
     result = await session.execute(
         select(DebriefRow).where(
@@ -349,20 +377,21 @@ async def save_debrief(
         if payload.notes is not None
         else None
     )
+    rpe_token = encrypt_rpe(cipher, payload.rpe)
     now = _utc_now_iso()
     if row is None:
         row = DebriefRow(
             athlete_id=athlete_id,
             session_external_id=None,
             plan_session_key=payload.plan_session_key,
-            rpe=payload.rpe,
+            rpe=rpe_token,
             notes_encrypted=notes_ciphertext,
             created_at=now,
             updated_at=now,
         )
         session.add(row)
     else:
-        row.rpe = payload.rpe
+        row.rpe = rpe_token
         row.notes_encrypted = notes_ciphertext
         row.updated_at = now
     await session.commit()
@@ -626,19 +655,33 @@ class DivergenceDigest(BaseModel):
         return self
 
 
-async def list_debrief_rpes(session: AsyncSession, *, athlete_id: int) -> dict[str, int]:
-    """Map this athlete's debrief session keys to their stored RPE (#236).
+async def list_debrief_rpes(
+    session: AsyncSession,
+    *,
+    athlete_id: int,
+    cipher: Fernet,
+) -> dict[str, int]:
+    """Map this athlete's debrief session keys to their stored RPE (#236, #243).
 
     The projection selects ONLY ``plan_session_key`` and ``rpe`` — the
     ``notes_encrypted`` ciphertext column is never selected and never
     decrypted on this path (C-S2-2), so no note text can reach the digest.
+    Since #243 the ``rpe`` column stores the Fernet token: each token is
+    decrypted SERVER-SIDE here, so the digest keeps consuming INTEGER RPE.
+    A tampered NULL-rpe row fails safe — it yields no entry (the session
+    counts as missed) instead of crashing the turn.
     """
     result = await session.execute(
         select(DebriefRow.plan_session_key, DebriefRow.rpe).where(
             DebriefRow.athlete_id == athlete_id
         )
     )
-    return {key: rpe for key, rpe in result.all()}
+    rpes: dict[str, int] = {}
+    for key, token in result.all():
+        if token is None:
+            continue
+        rpes[key] = decrypt_rpe(cipher, token)
+    return rpes
 
 
 def build_divergence_digest(
