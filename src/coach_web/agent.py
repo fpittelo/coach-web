@@ -31,7 +31,7 @@ from coach_web.analysis import (
 )
 from coach_web.config import Settings
 from coach_web.debrief import RpeRequest
-from coach_web.mcp_hub import MCPClientHub
+from coach_web.mcp_hub import COACH_SERVER, MCPClientHub
 from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
 from coach_web.periodization import PeriodizationProposal
@@ -362,6 +362,60 @@ class _WeekAnalysisCollector:
         return [AgentEvent(type="debrief_summary", data={"summary": card.model_dump()})]
 
 
+COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
+    {
+        "icu_get_completed_sessions",
+        "icu_get_trends",
+        "icu_get_wellness",
+        "icu_get_workout_compliance",
+        "intervals_get_activity",
+        "intervals_get_activity_intervals",
+        "intervals_get_activity_streams",
+        "intervals_get_athlete_profile",
+        "intervals_get_event",
+        "intervals_get_fitness_summary",
+        "intervals_get_power_curve",
+        "intervals_get_power_model",
+        "intervals_get_readiness_dashboard",
+        "intervals_get_sport_settings",
+        "intervals_get_wellness",
+        "intervals_list_activities",
+        "intervals_list_events",
+        "intervals_list_folders",
+        "intervals_list_workouts",
+    }
+)
+"""Allow-list of coach-mcp tools the model may see (#248 B1, ADR-0010 / #87-C7).
+
+Calendar writes go through the human approval endpoint ONLY: the model
+toolset therefore carries the sidecar's READ family exclusively. The list is
+explicit (allow-list, not deny-list) so a new upstream write tool stays
+invisible by default. github-mcp tools are unaffected — its writes serve the
+designed plan-persistence flow.
+"""
+
+
+def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter the hub catalogue down to the model-allowed toolset (#248 B1).
+
+    coach-mcp contributes its READ allow-list only; every other coach-mcp
+    tool (writes included) is dropped. github-mcp tools pass through
+    untouched, as do the synthetic proposal tools appended after this filter.
+    Schemas without a usable function name are dropped defensively.
+    """
+    allowed: list[dict[str, Any]] = []
+    for schema in hub_tools:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        server, _, raw_name = name.partition(NAMESPACE_SEPARATOR)
+        if server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS:
+            continue
+        allowed.append(schema)
+    return allowed
+
+
 class CoachAgent:
     """Autonomous agent loop bridging OpenRouter and the dual MCP hub."""
 
@@ -394,7 +448,7 @@ class CoachAgent:
         """
         messages = self._build_messages(message, history)
         tools = [
-            *self.hub.list_all_tools(),
+            *filter_model_tools(self.hub.list_all_tools()),
             plan_tool_schema(),
             week_plan_tool_schema(),
             periodization_tool_schema(),
