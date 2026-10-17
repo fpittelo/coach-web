@@ -907,3 +907,50 @@ class TestDebriefRpeEncryptionMigration:
         assert stored == 7
         assert isinstance(stored, int)
         assert DEBRIEF_RPE_RANGE_CHECK in str(sql_row[0])
+
+    def test_upgrade_leaves_no_ascii_plaintext_rpe_residue_in_db_or_wal(
+        self, db_path: Path
+    ) -> None:
+        """The migration path gets the DB+WAL residue scan (#259 AC3).
+
+        The engine connections checkpoint and REMOVE the ``-wal`` side file
+        when they close, so the migration's transient WAL would never
+        survive to scan time and the residue claim would pass vacuously.
+        Holding a second WAL-mode connection open across the upgrade keeps
+        the migration's page images materialized — the scan below is
+        unconditional (the WAL genuinely materialized in this path; there
+        is no skip branch).
+
+        Scan scope, documented: the seeded plaintext is the INTEGER 7 — its
+        SQLite record encoding is a binary varint with no distinctive byte
+        pattern, so the byte scan targets the ASCII leak forms (the JSON
+        API shape the encrypted-at-rest tests pin). Residue of the binary
+        form in SQLite free space is residual risk R4, owned by the
+        encrypted-backup story (MADR-0008) — deliberately out of scope here.
+        """
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+
+        holder = _connect(db_path)
+        try:
+            holder.execute("PRAGMA journal_mode=WAL").fetchone()
+            holder.execute("SELECT count(*) FROM debriefs").fetchone()
+
+            command.upgrade(alembic_config(), "head")
+
+            with _connect(db_path) as conn:
+                stored = conn.execute(
+                    "SELECT rpe FROM debriefs WHERE id = ?", (row_id,)
+                ).fetchone()[0]
+            assert str(stored).startswith("gAAAA")
+            db_raw = db_path.read_bytes()
+            assert b'"rpe": 7' not in db_raw
+            wal_path = Path(str(db_path) + "-wal")
+            assert wal_path.exists()
+            wal_raw = wal_path.read_bytes()
+            # Positive control: the migration's own write product is inside
+            # the scanned window — the residue scan can never pass vacuously.
+            assert str(stored).encode("ascii") in wal_raw
+            assert b'"rpe": 7' not in wal_raw
+        finally:
+            holder.close()
