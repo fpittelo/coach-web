@@ -46,10 +46,14 @@ from coach_web.debrief import (
     DebriefSaveRequest,
     DebriefSaveResponse,
     PendingDebriefResponse,
+    apply_divergence_digest,
     apply_pending_debrief_digest,
     athlete_id_from_email,
     build_debrief_cipher,
+    build_divergence_digest,
+    list_debrief_rpes,
     list_pending_debriefs,
+    parse_plan_day_rows,
     save_debrief,
     upsert_week_adherence,
 )
@@ -527,6 +531,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # boundary applies: an unreadable store yields no digest at all and
         # never breaks the turn.
         #
+        # Divergence digest (#236 AC1): when the current week has an
+        # approved draft, the prompt also gains the plan-vs-reality
+        # divergence facts — missed sessions (planned slots so far without
+        # a debrief row) and flagged-exertion sessions (the debrief RPE
+        # mapped to a severity band server-side; only the band label is
+        # emitted — the numeric RPE and the notes never leave the
+        # database). Read-only context (MADR-0010 pull model): the digest
+        # proposes nothing itself. Same failure boundary: an unreadable
+        # store yields no digest and never breaks the turn.
+        #
         # Temporal anchor (#220): the model is never told today's date by any
         # digest, so it infers the date from tool payloads and can anchor on
         # the wrong time of year. The anchor is applied to the base prompt
@@ -542,7 +556,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         agent.system_prompt = apply_temporal_anchor(base_prompt, today)
         iso_year, iso_week, _ = today.isocalendar()
         current_week_start, _ = week_bounds(f"{iso_year}-W{iso_week:02d}")
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
         approved_week_row: PlanDraftRow | None = None
+        debrief_rpes: dict[str, int] = {}
         try:
             async with request.app.state.db_session_factory() as session:
                 profile = await get_objective_profile(session)
@@ -554,11 +570,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
                 pending_debriefs = await list_pending_debriefs(
                     session,
-                    athlete_id=_athlete_id_for_session(
-                        settings, request.cookies.get(SESSION_COOKIE)
-                    ),
+                    athlete_id=athlete_id,
                     today=today,
                 )
+                # The divergence digest's executed side (#236): key → RPE
+                # only — the notes_encrypted column is never selected (C-S2-2).
+                debrief_rpes = await list_debrief_rpes(session, athlete_id=athlete_id)
                 approved_rows = [
                     row
                     for row in await list_drafts_by_week(session, current_week_start)
@@ -594,6 +611,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 phase=adjustment_phase,
                 target_date=adjustment_target,
             )
+            # Divergence digest (#236 AC1): the approved week's day slots vs
+            # this athlete's debrief RPEs — a pure function of the rows
+            # already read in this request scope. Missed sessions (no
+            # debrief recorded) and flagged-exertion sessions (RPE mapped to
+            # a severity band server-side; the numeric RPE and the notes
+            # never leave the database — C-S2-1/C-S2-2) reach the prompt as
+            # metadata facts + severity chips only. Read-only context (pull
+            # model): the digest proposes nothing itself.
+            divergence = build_divergence_digest(
+                planned=parse_plan_day_rows(approved_week_row.content),
+                debrief_rpes=debrief_rpes,
+                today=today,
+            )
+            agent.system_prompt = apply_divergence_digest(agent.system_prompt, divergence)
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:

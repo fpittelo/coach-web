@@ -37,12 +37,12 @@ health content; the pure computation lives in :mod:`coach_web.analysis`).
 
 import hashlib
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime
 from typing import Literal
 
 from cryptography.fernet import Fernet
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import CheckConstraint, Float, Integer, Text, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
@@ -56,7 +56,12 @@ from coach_web.errors import (
     EncryptionUnavailableError,
     MirrorReason,
 )
-from coach_web.microcycle import MAX_SESSION_TITLE_LENGTH, PlanDraftRow, week_bounds
+from coach_web.microcycle import (
+    MAX_SESSION_TITLE_LENGTH,
+    PlanDraftRow,
+    _digest_single_line,
+    week_bounds,
+)
 from coach_web.models import validate_iso_date
 
 DEFAULT_ATHLETE_ID = 1
@@ -515,3 +520,211 @@ def apply_pending_debrief_digest(
     if digest is None:
         return system_prompt
     return f"{system_prompt}\n\n{digest}"
+
+
+# ---------------------------------------------------------------------------
+# Divergence digest (#236, epic #213 S2) — plan-vs-reality context
+# ---------------------------------------------------------------------------
+
+
+DIVERGENCE_DIGEST_MAX_CHARS = 600
+"""Hard character budget for the divergence digest (~150 tokens, C5)."""
+
+DIVERGENCE_DIGEST_HEADER = (
+    "Divergence digest for the approved week (plan vs executed — read-only "
+    "facts; ground any mid-week adjustment the athlete requests in these):"
+)
+"""System-prompt header for the divergence digest (#236 AC1).
+
+The digest is READ-ONLY context (MADR-0010 pull model, ADR-0010): it
+proposes nothing itself — the coach uses the facts when the athlete asks
+for a mid-week adjustment.
+"""
+
+SeverityBand = Literal["low", "moderate", "high"]
+"""The fixed-vocabulary severity-chip labels (C-S2-3): a closed enum, never
+free text. Mapped server-side from the stored RPE — the numeric value never
+leaves the database (C-S2-1)."""
+
+
+def rpe_severity_band(rpe: int) -> SeverityBand:
+    """Map a stored RPE to its fixed-vocabulary severity band (C-S2-1).
+
+    The mapping is total over the RPE domain (the ``debriefs`` CHECK bounds
+    it to 1-10) and runs SERVER-SIDE: only the band label is ever emitted —
+    the numeric RPE value stays in the database. Bands: 1-3 low, 4-6
+    moderate, 7-10 high (7+ is the classic flagged-exertion range).
+    """
+    if rpe <= 3:
+        return "low"
+    if rpe <= 6:
+        return "moderate"
+    return "high"
+
+
+class FlaggedExertionFact(BaseModel):
+    """One flagged-exertion divergence fact (#236 AC1/AC4).
+
+    Metadata + severity chip only: the session's ISO date, the planned
+    title (collapsed to one safe line at build time, C-S2-7) and the
+    server-mapped RPE severity band label. The numeric RPE value has no
+    slot in the fact (C-S2-1) and no note text can ever reach it (C-S2-2).
+    """
+
+    plan_session_key: str = Field(..., description="The session's ISO date (YYYY-MM-DD).")
+    session_title: str = Field(
+        ...,
+        description="Planned session title (single-line collapsed at build time).",
+    )
+    severity: SeverityBand = Field(
+        ...,
+        description="Server-mapped RPE severity band label (the severity chip).",
+    )
+
+
+class DivergenceDigest(BaseModel):
+    """Plan-vs-reality divergence digest for the approved week (#236 AC1).
+
+    A pure function of DB rows (the approved draft's day slots + this
+    athlete's debrief rows) and the request-scoped ``today`` — the agent
+    cannot influence the facts. Counts and severity chips only: no numeric
+    RPE, no note text, no wellness values (C-S2-1/C-S2-2).
+    """
+
+    missed_count: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description=(
+            "Planned sessions so far (strictly before today) without a "
+            "debrief row for this athlete."
+        ),
+    )
+    flagged_count: int = Field(
+        ...,
+        ge=0,
+        strict=True,
+        description="Debriefed sessions whose RPE maps to the high severity band.",
+    )
+    flagged_sessions: list[FlaggedExertionFact] = Field(
+        default_factory=list,
+        description="Per-day flagged-exertion facts, chronological.",
+    )
+
+    @model_validator(mode="after")
+    def _check_digest_invariants(self) -> "DivergenceDigest":
+        """Counts are server-verified, never trusted (#165 posture).
+
+        ``flagged_count`` must equal the fact list's length, and a digest
+        with zero divergence is never constructed — the builder returns
+        ``None`` for that case (no noise section in the prompt).
+        """
+        if self.flagged_count != len(self.flagged_sessions):
+            raise ValueError("flagged_count must equal the number of flagged sessions")
+        if self.missed_count == 0 and self.flagged_count == 0:
+            raise ValueError("a divergence digest requires at least one divergence fact")
+        return self
+
+
+async def list_debrief_rpes(session: AsyncSession, *, athlete_id: int) -> dict[str, int]:
+    """Map this athlete's debrief session keys to their stored RPE (#236).
+
+    The projection selects ONLY ``plan_session_key`` and ``rpe`` — the
+    ``notes_encrypted`` ciphertext column is never selected and never
+    decrypted on this path (C-S2-2), so no note text can reach the digest.
+    """
+    result = await session.execute(
+        select(DebriefRow.plan_session_key, DebriefRow.rpe).where(
+            DebriefRow.athlete_id == athlete_id
+        )
+    )
+    return {key: rpe for key, rpe in result.all()}
+
+
+def build_divergence_digest(
+    *,
+    planned: Sequence[PendingDebrief],
+    debrief_rpes: Mapping[str, int],
+    today: date,
+) -> DivergenceDigest | None:
+    """Derive the approved week's plan-vs-reality divergence digest (#236 AC1).
+
+    ``planned`` carries the approved week's non-rest day slots (date + title
+    — the :func:`parse_plan_day_rows` output for the approved draft's
+    content); ``debrief_rpes`` maps this athlete's debrief session keys to
+    their stored RPE. The diff is DATE-KEYED (C-S2-8, the
+    ``adjusted_future_days``-style row-diff primitive — never title
+    identity): a planned slot strictly before ``today`` without a debrief
+    row is missed; a debriefed slot whose RPE maps to the ``high`` severity
+    band is flagged. Debrief keys outside the planned slots never count
+    (intersection semantics — a debrief for a session the plan no longer
+    contains is not this week's divergence). ``today`` is ALWAYS injected by
+    the caller — the request scope owns the clock boundary (N3).
+
+    Returns ``None`` when the week shows no divergence (graceful empty
+    state: no digest section at all).
+    """
+    today_iso = today.isoformat()
+    past = [slot for slot in planned if slot.plan_session_key < today_iso]
+    missed_count = sum(1 for slot in past if slot.plan_session_key not in debrief_rpes)
+    flagged_sessions = [
+        FlaggedExertionFact(
+            plan_session_key=slot.plan_session_key,
+            session_title=_digest_single_line(slot.session_title),
+            severity=rpe_severity_band(debrief_rpes[slot.plan_session_key]),
+        )
+        for slot in past
+        if slot.plan_session_key in debrief_rpes
+        and rpe_severity_band(debrief_rpes[slot.plan_session_key]) == "high"
+    ]
+    if not missed_count and not flagged_sessions:
+        return None
+    return DivergenceDigest(
+        missed_count=missed_count,
+        flagged_count=len(flagged_sessions),
+        flagged_sessions=flagged_sessions,
+    )
+
+
+def divergence_digest_text(digest: DivergenceDigest) -> str:
+    """Render the token-budgeted divergence digest text for the coach prompt.
+
+    Fact strings are assembled SERVER-SIDE from counts + enum labels only
+    (C-S2-3): the counts line mirrors AC1's shape ("N sessions missed · M
+    sessions flagged <band> exertion", the band label joined from the
+    facts' severity chips) and each flagged session renders one line with
+    its own chip. The per-day lines are appended while the whole digest
+    stays within :data:`DIVERGENCE_DIGEST_MAX_CHARS` (DoS bound).
+    """
+    counts: list[str] = []
+    if digest.missed_count:
+        counts.append(
+            f"{digest.missed_count} session{'s' if digest.missed_count != 1 else ''} missed"
+        )
+    if digest.flagged_count:
+        bands = " and ".join(sorted({fact.severity for fact in digest.flagged_sessions}))
+        counts.append(
+            f"{digest.flagged_count} session{'s' if digest.flagged_count != 1 else ''} "
+            f"flagged {bands} exertion"
+        )
+    lines = ["- " + " · ".join(counts)]
+    for fact in digest.flagged_sessions:
+        candidate = (
+            f"- {fact.plan_session_key}: {fact.session_title} — flagged {fact.severity} exertion"
+        )
+        candidate_digest = "\n".join([DIVERGENCE_DIGEST_HEADER, *lines, candidate])
+        if len(candidate_digest) > DIVERGENCE_DIGEST_MAX_CHARS:
+            break
+        lines.append(candidate)
+    return "\n".join([DIVERGENCE_DIGEST_HEADER, *lines])
+
+
+def apply_divergence_digest(system_prompt: str, digest: DivergenceDigest | None) -> str:
+    """Append the divergence digest to a base system prompt (#236 AC5).
+
+    A no-op when the week shows no divergence — the prompt stays
+    byte-identical, so the digest can never degrade an unrelated turn.
+    """
+    if digest is None:
+        return system_prompt
+    return f"{system_prompt}\n\n{divergence_digest_text(digest)}"
