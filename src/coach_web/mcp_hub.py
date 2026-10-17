@@ -189,6 +189,7 @@ class MCPClientHub:
         if server == COACH_SERVER:
             for key, value in COACH_DEFAULT_ARGUMENTS.items():
                 args.setdefault(key, value)
+        args = self._wrap_flat_params(namespaced, args)
 
         try:
             result = await asyncio.wait_for(
@@ -204,6 +205,24 @@ class MCPClientHub:
 
         return self._serialize(result)
 
+    def _wrap_flat_params(self, namespaced: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Wrap flat arguments for tools whose schema requires a ``params`` object.
+
+        The coach-mcp sidecar (mcp 2.x ``MCPServer``) exposes every tool as a
+        single ``params`` Pydantic-model argument, so its advertised schema is
+        ``required: ["params"]``. Server-side call sites speak the flat legacy
+        shape while the model speaks the wrapped shape it reads from the
+        schema; normalizing here — at the single transport boundary — makes
+        both shapes work and keeps the sidecar contract out of every call
+        site (#248 B2b). A payload already carrying ``params`` (the model's
+        shape) is never double-wrapped.
+        """
+        schema = self._tools[namespaced].input_schema or {}
+        properties = schema.get("properties") or {}
+        if "params" in properties and "params" not in args:
+            return {"params": args}
+        return args
+
     def _resolve_tool(self, name: str) -> str | None:
         """Resolve a namespaced or unique raw tool name to its registry key."""
         if name in self._tool_servers:
@@ -213,11 +232,14 @@ class MCPClientHub:
     @classmethod
     def _serialize(cls, result: Any) -> str:
         """Serialise an MCP tool result into a JSON string."""
-        structured = getattr(result, "structured_content", None)
-        if isinstance(structured, dict) and structured:
-            return json.dumps(structured)
-
         text = cls._extract_text(result)
+        structured = getattr(result, "structured_content", None)
+        if isinstance(structured, dict) and structured and structured != {"result": text}:
+            # A genuine structured payload. mcp 2.x wraps a string-returning
+            # tool's text as ``{"result": <text>}`` — serialising that
+            # envelope would double-encode the payload and every downstream
+            # JSON parser would see a foreign ``result`` key (#248 B2b).
+            return json.dumps(structured)
         if getattr(result, "is_error", False):
             return cls._error(text or "Unknown MCP tool error")
         return text or "{}"
