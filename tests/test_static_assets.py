@@ -569,10 +569,17 @@ class TestSwissMinimalistContract:
         assert "plan_proposal" in script
 
     def test_stream_payload_carries_message_and_history_in_body(self) -> None:
-        """Message and history travel in the POST body — never in a URL (AC4)."""
+        """Message and history travel in the POST body — never in a URL (AC4).
+
+        Rewritten by #262: the body gains the client-derived briefing flag
+        (R3 — a boolean, never message content); message and history still
+        travel in the body only.
+        """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        assert "JSON.stringify({ message: message, history: history })" in script
+        assert "message: message," in script
+        assert "history: history," in script
+        assert "briefing: requestBriefing," in script
         # Regression guards for the access-log privacy leak (#79): the stream
         # URL is bare and no query-string encoding helper remains.
         assert "/api/agent/stream?" not in script
@@ -844,10 +851,21 @@ class TestIdentityBarContract:
         assert "sendBeacon" not in reset
 
     def test_no_persistent_client_storage(self) -> None:
-        """The transcript lives only in memory — no browser persistence."""
+        """The transcript lives only in memory — no browser persistence.
+
+        Rewritten by #262 (R3, accepted): the ONE sanctioned localStorage
+        key is the morning-briefing date flag — a bare YYYY-MM-DD string,
+        no athlete content (a forged flag only re-renders the same
+        read-only card). sessionStorage, indexedDB and cookies stay banned.
+        """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
 
-        assert "localStorage" not in script
+        assert 'localStorage.getItem("coachBriefingDate")' in script
+        assert 'localStorage.setItem("coachBriefingDate"' in script
+        # No other localStorage use: every occurrence must be the flag key.
+        for line in script.splitlines():
+            if "localStorage" in line:
+                assert "coachBriefingDate" in line
         assert "sessionStorage" not in script
         assert "indexedDB" not in script
         assert "document.cookie" not in script
