@@ -203,7 +203,12 @@ class WeeklyPlanDraft(BaseModel):
             raise ValueError("total_tss must equal the sum of the day planned_tss values")
         rest_days = sum(1 for day in self.days if day.rest_day)
         if self.hard_days + self.easy_days + rest_days != len(self.days):
-            raise ValueError("hard_days, easy_days and rest days must partition the week's days")
+            # Static, value-free msg stating the arithmetic explicitly so the
+            # model can self-correct (#247: 3 + 3 + 2 = 8 ≠ 7 burned retries).
+            raise ValueError(
+                "hard_days + easy_days + rest days must sum to the number "
+                "of days in the days array"
+            )
         return self
 
     @model_validator(mode="after")

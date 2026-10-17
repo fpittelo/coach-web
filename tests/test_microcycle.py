@@ -182,9 +182,26 @@ class TestWeeklyPlanDraft:
         assert WeeklyPlanDraft.model_validate(payload).total_tss == 350.03
 
     def test_rejects_a_partition_violation(self) -> None:
-        """hard_days + easy_days + rest days must partition the day count."""
-        with pytest.raises(ValidationError, match="partition"):
-            WeeklyPlanDraft.model_validate(_raw_week(hard_days=3))
+        """hard_days + easy_days + rest days must sum to the day count (#247).
+
+        Incident fixture (#247): a consistent 7-day array (2 rest days) with
+        declared counts 3 hard + 3 easy + 2 rest = 8 ≠ 7 — the static msg
+        must state the arithmetic so the model can self-correct.
+        """
+        days = [_raw_day(i) for i in range(7)]
+        days[5] = _raw_day(
+            5,
+            rest_day=True,
+            session_title="Rest day",
+            focus=None,
+            zones=[],
+            planned_tss=0.0,
+            duration_minutes=0.0,
+        )
+        with pytest.raises(ValidationError, match="must sum to"):
+            WeeklyPlanDraft.model_validate(
+                _raw_week(days=days, hard_days=3, easy_days=3, total_tss=305.0)
+            )
 
     def test_rejects_a_day_outside_the_week(self) -> None:
         """Every day date must fall inside week_id's ISO week."""
