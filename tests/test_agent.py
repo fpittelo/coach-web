@@ -50,7 +50,16 @@ from coach_web.microcycle import (
     upsert_week_draft,
 )
 from coach_web.models import ChatMessage, PlanProposal, WorkoutStep
-from coach_web.periodization import PeriodizationApprovalRequest
+from coach_web.objectives import (
+    ObjectiveProfile,
+    get_active_objective_row,
+    save_objective_profile,
+)
+from coach_web.periodization import (
+    PeriodizationApprovalRequest,
+    PeriodizationPlan,
+    replace_phases,
+)
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -2097,6 +2106,83 @@ class TestApprovedWeekDigestEndpoint:
         # Metadata only — no focus/zone or duration leakage.
         assert "Threshold zones" not in prompt
         assert "60m" not in prompt
+
+    async def test_the_adjustment_context_carries_the_guardrail_facts(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """AC4 (#233): the approved-week digest names the phase window and peak date.
+
+        The facts ride the adjustment proposal context (metadata only): the
+        phase line appears AFTER the approved-week header — the objectives
+        digest emits the identical phase line earlier in the prompt, so the
+        ordering proves the adjustment context carries its own copy.
+        """
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 8)  # Thursday of 2026-W41
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        async with db_session_factory() as session:
+            await save_objective_profile(
+                session,
+                ObjectiveProfile.model_validate(
+                    {
+                        "primary_goal": {
+                            "objective_type": "outcome",
+                            "title": "A mountain finish",
+                            "target_date": "2026-10-14",
+                        },
+                        "weekly_availability_hours": 20.0,
+                    }
+                ),
+            )
+            objective_row = await get_active_objective_row(session)
+            assert objective_row is not None
+            await replace_phases(
+                session,
+                objective_row.id,
+                PeriodizationPlan.model_validate(
+                    {
+                        "phases": [
+                            {
+                                "phase_type": "build",
+                                "name": "Build",
+                                "start_date": "2026-09-28",
+                                "end_date": "2026-10-10",
+                            },
+                            {
+                                "phase_type": "taper",
+                                "name": "Taper",
+                                "start_date": "2026-10-11",
+                                "end_date": "2026-10-18",
+                            },
+                        ]
+                    }
+                ),
+            )
+        await self._seed_approved_week(db_session_factory, _week_2026_w41())
+        agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
+        client = self._client_with(settings, agent, db_session_factory)
+
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            body = response.read().decode("utf-8")
+
+        assert "event: done" in body
+        prompt = agent.system_prompt
+        phase_line = "Current phase: Build (build), 2026-09-28 to 2026-10-10"
+        assert phase_line in prompt
+        # The adjustment context's own copy sits after the approved-week
+        # header (the objectives digest emits the identical line earlier).
+        adjustment_context = prompt.index("Approved current week")
+        assert prompt.index(phase_line, adjustment_context) > adjustment_context
+        assert "Peak/target date: 2026-10-14" in prompt
 
     async def test_persistence_failure_yields_no_digest_and_the_turn_survives(
         self,

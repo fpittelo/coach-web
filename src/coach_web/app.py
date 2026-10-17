@@ -66,9 +66,11 @@ from coach_web.microcycle import (
     PlanDraftRow,
     WeekApprovalRequest,
     WeekApprovalResponse,
+    adjusted_future_days,
     apply_approved_week_digest,
     build_week_markdown,
     list_drafts_by_week,
+    moved_session_dates,
     past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
@@ -94,6 +96,7 @@ from coach_web.periodization import (
     PeriodizationPlanResponse,
     list_phases,
     replace_phases,
+    resolve_phase_status,
     validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
@@ -138,6 +141,18 @@ WEEK_ADJUSTMENT_AVAILABILITY_DETAIL = "Week adjustment rejected: weekly availabi
 
 WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL = "Week adjustment rejected: no future days to adjust"
 """Static 422 detail for an adjustment whose write set is empty (#225 C2, D3.4)."""
+
+WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL = (
+    "Week adjustment rejected: session moved across a phase boundary"
+)
+"""Static 422 detail for an adjustment moving a session out of the approved
+week's phase (#233 AC1). Value-free like the other adjustment bodies."""
+
+WEEK_ADJUSTMENT_PEAK_DATE_DETAIL = (
+    "Week adjustment rejected: session scheduled after the objective peak date"
+)
+"""Static 422 detail for an adjustment placing a session past the active
+objective's target date (#233 AC2). Value-free like the other bodies."""
 
 _SIGNIN_SLOT = (
     "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
@@ -493,9 +508,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # has an approved draft, the prompt gains its compact metadata
         # digest (week id, title, per-day date/title/TSS/rest marker) so a
         # mid-week adjustment request can be grounded in what is already on
-        # the calendar (past days are locked server-side). The identical
-        # failure boundary applies: an unreadable store yields no digest at
-        # all and never breaks the turn.
+        # the calendar (past days are locked server-side). Since #233 (AC4)
+        # the digest also carries the guardrail facts (current phase window,
+        # peak/target date — metadata only) so adjustment proposals are
+        # shaped within the season structure. The identical failure
+        # boundary applies: an unreadable store yields no digest at all and
+        # never breaks the turn.
         #
         # Temporal anchor (#220): the model is never told today's date by any
         # digest, so it infers the date from tool payloads and can anchor on
@@ -552,7 +570,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 agent.system_prompt, pending_debriefs
             )
         if approved_week_row is not None:
-            agent.system_prompt = apply_approved_week_digest(agent.system_prompt, approved_week_row)
+            # Adjustment guardrail facts (#233 AC4): the proposal context
+            # carries the current phase window and the objective's peak date
+            # (metadata only — no health data) so mid-week proposals are
+            # shaped within the season structure the approval gates enforce.
+            adjustment_target = profile.primary_goal.target_date if profile is not None else None
+            adjustment_phase = resolve_phase_status(phases, adjustment_target, today).phase
+            agent.system_prompt = apply_approved_week_digest(
+                agent.system_prompt,
+                approved_week_row,
+                phase=adjustment_phase,
+                target_date=adjustment_target,
+            )
 
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
@@ -612,9 +641,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         captured BEFORE the upsert supersedes it, and a changed incoming
         draft is validated as a mid-week adjustment — past days must render
         byte-identically to the stored rows, the write set is restricted to
-        days strictly after today (both 422 with a static body, C2), and the
+        days strictly after today (both 422 with a static body, C2), the
         adjusted week must fit the active objective's weekly availability
-        budget (D2). ``today`` is resolved ONCE here and passed down (D3.5).
+        budget (D2), and the season structure is preserved (#233): a moved
+        session's new date must stay within the phase containing the
+        approved week (AC1) and no adjusted session may be placed after the
+        objective's target/peak date (AC2) — both 422 with a static body.
+        ``today`` is resolved ONCE here and passed down (D3.5).
         The explicit POST is the approval gate — human-in-the-loop preserved
         (#87 C7).
         """
@@ -629,9 +662,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         # 1. Capture the CURRENT approved draft BEFORE the upsert supersedes
         # it (D3.1), plus the active objective profile for the availability
-        # gate (D2). The profiles read degrades to None on failure (graceful,
-        # same posture as the agent_stream digests); the drafts read is
-        # required — a persistence outage answers the static 503.
+        # gate (D2) and the objective row + phase plan for the season-
+        # structure guardrails (#233). The profile and guardrail reads
+        # degrade to None/[] on failure (graceful, same posture as the
+        # agent_stream digests); the drafts read is required — a persistence
+        # outage answers the static 503.
         week_start, _ = week_bounds(payload.week.week_id)
         try:
             async with session_factory() as session:
@@ -641,6 +676,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 except (OSError, SQLAlchemyError, ValidationError):
                     logger.warning("Week adjustment availability gate unavailable")
                     profile = None
+                try:
+                    objective_row = await get_active_objective_row(session)
+                    phases = (
+                        await list_phases(session, objective_row.id)
+                        if objective_row is not None
+                        else []
+                    )
+                except (OSError, SQLAlchemyError, ValidationError):
+                    logger.warning("Week adjustment guardrail context unavailable")
+                    objective_row = None
+                    phases = []
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Week draft persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
@@ -681,6 +727,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 logger.warning("Rejected week adjustment over the availability budget")
                 raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_AVAILABILITY_DETAIL)
+            # 2d. Phase-boundary guardrail (#233 AC1): a moved session's new
+            # date must remain within the date range of the phase containing
+            # the currently approved week (resolved from the week's start
+            # date). Sessions edited in place keep their date and are never
+            # moves. No phase covering the week degrades to no gate (the
+            # availability posture — coaching structure, not security).
+            boundary_phase = next(
+                (phase for phase in phases if phase.start_date <= week_start <= phase.end_date),
+                None,
+            )
+            if boundary_phase is not None:
+                moved = moved_session_dates(payload.week, stored.content, today)
+                if any(
+                    moved_date < boundary_phase.start_date or moved_date > boundary_phase.end_date
+                    for moved_date in moved
+                ):
+                    logger.warning(
+                        "Rejected week adjustment moving a session across a phase boundary"
+                    )
+                    raise HTTPException(
+                        status_code=422, detail=WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL
+                    )
+            # 2e. Peak-date guardrail (#233 AC2): every adjusted session date
+            # must not pass the active objective's target/peak date — the
+            # peak lives in the objective and is never modified here. No
+            # objective target date degrades to no gate.
+            if objective_row is not None and objective_row.target_date is not None:
+                peak_date = objective_row.target_date
+                if any(
+                    day.date > peak_date
+                    for day in adjusted_future_days(payload.week, stored.content, today)
+                ):
+                    logger.warning("Rejected week adjustment placing a session after the peak date")
+                    raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PEAK_DATE_DETAIL)
             write_dates = [day.date for day in write_set]
 
         # 3. Persist the draft before any side effect (MADR-008, AC4) — on

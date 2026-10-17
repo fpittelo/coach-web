@@ -30,17 +30,20 @@ from coach_web.microcycle import (
     WeekApprovalRequest,
     WeekApprovalResponse,
     WeeklyPlanDraft,
+    adjusted_future_days,
     apply_approved_week_digest,
     approved_week_digest,
     build_batch_event_draft,
     build_week_markdown,
     list_drafts_by_week,
+    moved_session_dates,
     past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
     week_bounds,
     write_week_days,
 )
+from coach_web.periodization import PeriodizationPhase
 
 WEEK_START = "2026-10-05"
 """Monday of ISO week 2026-W41 (pinned literal — the tests' calendar anchor)."""
@@ -697,6 +700,133 @@ class TestPastDayImmutability:
 
 
 # ---------------------------------------------------------------------------
+# Adjustment guardrail comparisons (#233)
+# ---------------------------------------------------------------------------
+
+
+class TestAdjustedSessionDetection:
+    """Draft-vs-stored comparison powering the #233 guardrails."""
+
+    TODAY = date(2026, 10, 8)
+    """Thursday of 2026-W41 — mon–thu locked, fri/sat/sun adjustable."""
+
+    @staticmethod
+    def _distinct_days() -> list[dict[str, Any]]:
+        """Seven day slots with a distinct session title per day."""
+        titles = (
+            "Monday endurance",
+            "Tuesday intervals",
+            "Wednesday endurance",
+            "Thursday intervals",
+            "Friday endurance",
+            "Saturday endurance",
+        )
+        days = [_raw_day(index, session_title=titles[index]) for index in range(6)]
+        days.append(
+            _raw_day(
+                6,
+                session_title="Sunday spin",
+                focus="Endurance zones",
+                zones=["Z1", "Z2"],
+                planned_tss=30.0,
+                duration_minutes=45.0,
+                rest_day=False,
+            )
+        )
+        return days
+
+    def _distinct_week(self, **overrides: Any) -> WeeklyPlanDraft:
+        """A validated draft over the distinct-title days (380 TSS)."""
+        payload = _raw_week(total_tss=380.0, easy_days=5)
+        payload["days"] = self._distinct_days()
+        payload.update(overrides)
+        return WeeklyPlanDraft.model_validate(payload)
+
+    def _stored_content(self, **overrides: Any) -> str:
+        """The pristine stored rendition of the distinct-title week."""
+        return build_week_markdown(self._distinct_week(**overrides))
+
+    def test_an_unchanged_draft_reports_no_adjusted_days(self) -> None:
+        """Identical content yields no adjusted days."""
+        assert adjusted_future_days(_week(), build_week_markdown(_week()), self.TODAY) == []
+
+    def test_a_changed_future_day_is_reported(self) -> None:
+        """A future day whose row differs is reported by date."""
+        days = [_raw_day(i) for i in range(7)]
+        days[5] = _raw_day(5, session_title="Recovery roll")
+
+        adjusted = adjusted_future_days(_week(days=days), build_week_markdown(_week()), self.TODAY)
+
+        assert [day.date for day in adjusted] == ["2026-10-10"]
+
+    def test_past_and_current_days_are_never_reported(self) -> None:
+        """Past and current days belong to the #225 immutability gate, not here."""
+        days = [_raw_day(i) for i in range(7)]
+        days[0] = _raw_day(0, session_title="Rewritten Monday")
+        days[3] = _raw_day(3, session_title="Tweaked Thursday")
+
+        adjusted = adjusted_future_days(_week(days=days), build_week_markdown(_week()), self.TODAY)
+
+        assert adjusted == []
+
+    def test_a_moved_session_title_is_reported_on_its_new_date(self) -> None:
+        """A stored title re-appearing on another date is a move target."""
+        days = self._distinct_days()
+        days[4] = _raw_day(
+            4,
+            session_title="Rest day",
+            focus=None,
+            zones=[],
+            planned_tss=0.0,
+            duration_minutes=0.0,
+            rest_day=True,
+        )
+        days[6] = _raw_day(
+            6,
+            session_title="Friday endurance",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=45.0,
+            duration_minutes=60.0,
+            rest_day=False,
+        )
+        draft = self._distinct_week(days=days, total_tss=350.0, easy_days=4)
+
+        moved = moved_session_dates(draft, self._stored_content(), self.TODAY)
+
+        assert moved == ["2026-10-11"]
+
+    def test_a_same_date_edit_is_not_a_move(self) -> None:
+        """An intensity edit keeping the title on its date is not a move."""
+        days = self._distinct_days()
+        days[6] = _raw_day(
+            6,
+            session_title="Sunday spin",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=20.0,
+            duration_minutes=45.0,
+            rest_day=False,
+        )
+        draft = self._distinct_week(days=days, total_tss=370.0)
+
+        moved = moved_session_dates(draft, self._stored_content(), self.TODAY)
+
+        assert moved == []
+
+    def test_a_brand_new_title_is_not_a_move(self) -> None:
+        """A same-date session replacement (new title) is not a move."""
+        days = self._distinct_days()
+        days[5] = _raw_day(5, session_title="Brand new session")
+
+        draft = self._distinct_week(days=days)
+
+        moved = moved_session_dates(draft, self._stored_content(), self.TODAY)
+
+        assert moved == []
+
+
+# ---------------------------------------------------------------------------
 # Approved-week digest (D4/C5, #225)
 # ---------------------------------------------------------------------------
 
@@ -759,12 +889,81 @@ class TestApprovedWeekDigest:
 
         assert len(digest) <= APPROVED_WEEK_DIGEST_MAX_CHARS
 
+    @staticmethod
+    def _build_phase() -> PeriodizationPhase:
+        """The build phase of the guardrail season (#233 scenarios)."""
+        return PeriodizationPhase.model_validate(
+            {
+                "phase_type": "build",
+                "name": "Build",
+                "start_date": "2026-09-28",
+                "end_date": "2026-10-10",
+            }
+        )
+
+    def test_the_digest_carries_the_phase_window_and_peak_date(self) -> None:
+        """AC4 (#233): the adjustment context names the phase window and peak date."""
+        digest = approved_week_digest(
+            self._approved_row(), phase=self._build_phase(), target_date="2026-10-14"
+        )
+
+        assert "Current phase: Build (build), 2026-09-28 to 2026-10-10" in digest
+        assert "Peak/target date: 2026-10-14" in digest
+        assert len(digest) <= APPROVED_WEEK_DIGEST_MAX_CHARS
+
+    def test_the_digest_facts_are_metadata_only(self) -> None:
+        """The guardrail facts carry no health data — no RPE, no wellness."""
+        digest = approved_week_digest(
+            self._approved_row(), phase=self._build_phase(), target_date="2026-10-14"
+        )
+
+        assert "RPE" not in digest
+        assert "rpe" not in digest
+        assert "wellness" not in digest
+
+    def test_without_facts_the_digest_keeps_the_225_output(self) -> None:
+        """No phase/target facts → the digest is byte-identical to #225's."""
+        digest = approved_week_digest(self._approved_row())
+
+        assert "Current phase:" not in digest
+        assert "Peak/target date:" not in digest
+
+    def test_a_line_broken_phase_name_collapses_to_one_safe_line(self) -> None:
+        """A phase name carrying control characters collapses to one safe line (C5).
+
+        Unlike stored titles (split at the markdown-line level), the phase
+        name arrives from the persisted plan, so the digest's single-line
+        hygiene collapses it in place — no control characters survive.
+        """
+        phase = PeriodizationPhase.model_validate(
+            {
+                "phase_type": "build",
+                "name": "Bad\r\nInjected\x1b",
+                "start_date": "2026-09-28",
+                "end_date": "2026-10-10",
+            }
+        )
+        digest = approved_week_digest(self._approved_row(), phase=phase)
+
+        assert "\r" not in digest
+        assert "\x1b" not in digest
+        assert "Current phase: Bad Injected (build), 2026-09-28 to 2026-10-10" in digest
+
     def test_apply_appends_the_digest_to_the_prompt(self) -> None:
         """apply_approved_week_digest composes the base prompt with the digest."""
         prompt = apply_approved_week_digest("BASE PROMPT", self._approved_row())
 
         assert prompt.startswith("BASE PROMPT\n\n")
         assert "2026-W41" in prompt
+
+    def test_apply_forwards_the_guardrail_facts(self) -> None:
+        """apply_approved_week_digest passes the phase/peak facts through (#233)."""
+        prompt = apply_approved_week_digest(
+            "BASE PROMPT", self._approved_row(), phase=self._build_phase(), target_date="2026-10-14"
+        )
+
+        assert "Current phase: Build (build), 2026-09-28 to 2026-10-10" in prompt
+        assert "Peak/target date: 2026-10-14" in prompt
 
 
 # ---------------------------------------------------------------------------
