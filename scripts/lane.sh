@@ -81,8 +81,9 @@ case "${LANE}" in
         error "lane 'prod' is not automated by lane.sh — the prod lane is a manual procedure:"
         error "  cp .env.prod.example .env.prod  # then fill in secrets + the release digest"
         error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull"
-        error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d"
-        error "  ./scripts/e2e-preflight.sh prod"
+        error "  ./scripts/e2e-preflight.sh prod  # validates, then tears its lane down on exit"
+        error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d  # FINAL step — lane left serving"
+        error "The pre-flight tears its lane down on exit, so the final 'up -d' is what leaves the lane serving."
         error "See the usage header in compose.prod.yml and docs/admin_guide.md (Promotion Runbook)."
         exit 2
         ;;
