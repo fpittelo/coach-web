@@ -25,6 +25,8 @@ from coach_web.app import (
     WEEK_ADJUSTMENT_AVAILABILITY_DETAIL,
     WEEK_ADJUSTMENT_EMPTY_WRITE_SET_DETAIL,
     WEEK_ADJUSTMENT_PAST_DAYS_DETAIL,
+    WEEK_ADJUSTMENT_PEAK_DATE_DETAIL,
+    WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL,
     create_app,
 )
 from coach_web.config import Settings
@@ -764,3 +766,347 @@ class TestWeekAdjustmentApproval:
         rows = _draft_rows(migrated_db)
         assert len(rows) == 2
         assert rows[1]["status"] == "approved"
+
+
+# ---------------------------------------------------------------------------
+# Objective-preserving guardrails (#233 — AC1/AC2/AC3)
+# ---------------------------------------------------------------------------
+
+
+def _season_week() -> dict[str, Any]:
+    """A 2026-W41 week with a distinct session title per day (guardrails).
+
+    2 hard / 5 easy / 0 rest, 380 TSS — unique titles make moved sessions
+    unambiguous for the guardrail scenarios.
+    """
+    return {
+        "week_id": "2026-W41",
+        "title": "Build week 41",
+        "summary": "Two hard days inside the build phase.",
+        "rationale": "Key sessions land inside the phase window.",
+        "days": [
+            _raw_day(0, session_title="Monday endurance"),
+            _raw_day(1, session_title="Tuesday intervals"),
+            _raw_day(2, session_title="Wednesday endurance"),
+            _raw_day(3, session_title="Thursday intervals"),
+            _raw_day(4, session_title="Friday endurance"),
+            _raw_day(5, session_title="Saturday endurance"),
+            _raw_day(
+                6,
+                session_title="Sunday spin",
+                focus="Endurance zones",
+                zones=["Z1", "Z2"],
+                planned_tss=30.0,
+                duration_minutes=45.0,
+                rest_day=False,
+            ),
+        ],
+        "total_tss": 380.0,
+        "hard_days": 2,
+        "easy_days": 5,
+    }
+
+
+def _rest_day(index: int) -> dict[str, Any]:
+    """A rest-day slot for the i-th day of 2026-W41."""
+    return _raw_day(
+        index,
+        session_title="Rest day",
+        focus=None,
+        zones=[],
+        planned_tss=0.0,
+        duration_minutes=0.0,
+        rest_day=True,
+    )
+
+
+def _seed_season(
+    client: TestClient,
+    *,
+    build_end: str,
+    taper_start: str,
+    taper_end: str,
+    target_date: str,
+) -> None:
+    """Seed an active objective and a build→taper season via the owner APIs.
+
+    The build phase always starts 2026-09-28 so it contains the approved
+    week's Monday (2026-10-05); the taper follows contiguously.
+    """
+    saved = client.put(
+        "/api/objectives",
+        json={
+            "primary_goal": {
+                "objective_type": "outcome",
+                "title": "A mountain finish",
+                "target_date": target_date,
+            },
+            "weekly_availability_hours": 20.0,
+        },
+    )
+    assert saved.status_code == 200
+    plan = client.post(
+        "/api/periodization/approve",
+        json={
+            "plan": {
+                "phases": [
+                    {
+                        "phase_type": "build",
+                        "name": "Build",
+                        "start_date": "2026-09-28",
+                        "end_date": build_end,
+                    },
+                    {
+                        "phase_type": "taper",
+                        "name": "Taper",
+                        "start_date": taper_start,
+                        "end_date": taper_end,
+                    },
+                ]
+            }
+        },
+    )
+    assert plan.status_code == 200
+
+
+class TestObjectiveGuardrails:
+    """Adjustment guardrails against the season structure (#233)."""
+
+    def test_a_session_moved_across_the_phase_boundary_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC1 ruling: a moved session may not leave its original phase.
+
+        The build phase ends Saturday 2026-10-10; Friday's session
+        (2026-10-09, the build) moved onto Sunday (2026-10-11, the taper)
+        leaves its original date's phase → 422 with the static body,
+        before any calendar write or draft supersede.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-10",
+            taper_start="2026-10-11",
+            taper_end="2026-10-18",
+            target_date="2026-10-14",
+        )
+        adjusted = _season_week()
+        adjusted["days"][4] = _rest_day(4)
+        adjusted["days"][6] = _raw_day(
+            6,
+            session_title="Friday endurance",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=45.0,
+            duration_minutes=60.0,
+            rest_day=False,
+        )
+        adjusted["total_tss"] = 350.0
+        adjusted["easy_days"] = 4
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_a_session_moved_back_across_the_phase_boundary_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC1 ruling: a cross-phase move is rejected in EITHER direction.
+
+        The week spans the season — Monday–Saturday sit in the build phase,
+        Sunday (2026-10-11) in the taper. Moving Sunday's session back onto
+        Saturday (2026-10-10, the build) leaves the session's original
+        date's phase: the new date must fall in the SAME phase as the
+        original date → 422 with the static body, before any calendar
+        write or draft supersede.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-10",
+            taper_start="2026-10-11",
+            taper_end="2026-10-18",
+            target_date="2026-10-14",
+        )
+        adjusted = _season_week()
+        adjusted["days"][5] = _raw_day(
+            5,
+            session_title="Sunday spin",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=30.0,
+            duration_minutes=45.0,
+            rest_day=False,
+        )
+        adjusted["days"][6] = _rest_day(6)
+        adjusted["total_tss"] = 335.0
+        adjusted["easy_days"] = 4
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_a_session_moved_within_the_phase_is_accepted(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC1: swapping two future sessions inside the phase window approves."""
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-10",
+            taper_start="2026-10-11",
+            taper_end="2026-10-18",
+            target_date="2026-10-14",
+        )
+        adjusted = _season_week()
+        adjusted["days"][4] = _raw_day(4, session_title="Saturday endurance")
+        adjusted["days"][5] = _raw_day(5, session_title="Friday endurance")
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 200
+        results = response.json()["results"]
+        assert [result["date"] for result in results] == [
+            "2026-10-09",
+            "2026-10-10",
+            "2026-10-11",
+        ]
+        assert all(result["success"] for result in results)
+
+    def test_a_same_date_intensity_edit_is_not_a_boundary_violation(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC1 ruling: same-date intensity edits are not moves — unaffected.
+
+        Sunday (2026-10-11) lies in the taper portion, outside the build
+        phase containing the week's start; lowering its TSS in place keeps
+        the session on its date, so the boundary rule never fires.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-10",
+            taper_start="2026-10-11",
+            taper_end="2026-10-18",
+            target_date="2026-10-14",
+        )
+        adjusted = _season_week()
+        adjusted["days"][6] = _raw_day(
+            6,
+            session_title="Sunday spin",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=20.0,
+            duration_minutes=45.0,
+            rest_day=False,
+        )
+        adjusted["total_tss"] = 370.0
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 200
+        assert all(result["success"] for result in response.json()["results"])
+
+    def test_a_session_placed_after_the_peak_date_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC2: an adjustment placing a session past the target date is rejected.
+
+        The whole week sits inside the build phase (no boundary crossing),
+        but the objective's peak date is Friday 2026-10-09: moving Friday's
+        session onto Saturday (2026-10-10) places it after the peak → 422
+        with the static body, before any calendar write.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-11",
+            taper_start="2026-10-12",
+            taper_end="2026-10-18",
+            target_date="2026-10-09",
+        )
+        adjusted = _season_week()
+        adjusted["days"][4] = _rest_day(4)
+        adjusted["days"][5] = _raw_day(
+            5,
+            session_title="Friday endurance",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=45.0,
+            duration_minutes=60.0,
+            rest_day=False,
+        )
+        adjusted["total_tss"] = 335.0
+        adjusted["easy_days"] = 4
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PEAK_DATE_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_an_adjustment_with_a_tampered_total_tss_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC3 pin: the weekly TSS is re-derived server-side on the adjustment path.
+
+        The declared ``total_tss`` never reaches approval: the draft model
+        re-verifies it against the day sum at the request boundary (the #165
+        posture), so a tampered total is rejected with the generic static
+        body before any gate or write runs.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _raw_week())
+        adjusted = _adjusted_week()
+        adjusted["total_tss"] = 999.0
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == "Invalid request payload"
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
