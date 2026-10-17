@@ -102,17 +102,20 @@ body {
 .masthead {
   max-width: 72rem;
   margin: 0 auto;
-  padding: var(--space-6) var(--space-5) var(--space-5);
+  /* #249 chrome compaction: the vertical padding drops one space step
+     per side (was space-6/space-5) — the masthead is chrome above the
+     height-bounded chat panel, not a landing hero. */
+  padding: var(--space-4) var(--space-5) var(--space-4);
 }
 
 .rule {
   height: 2px;
   background: var(--accent);
-  margin-bottom: var(--space-5);
+  margin-bottom: var(--space-3); /* #249: was space-5 */
 }
 
 .kicker {
-  margin: 0 0 var(--space-3);
+  margin: 0 0 var(--space-2); /* #249: was space-3 */
   font-size: 0.75rem;
   font-weight: 600;
   letter-spacing: 0.18em;
@@ -121,8 +124,11 @@ body {
 }
 
 .masthead h1 {
-  margin: 0 0 var(--space-3);
-  font-size: clamp(2rem, 5vw, 3.25rem);
+  margin: 0 0 var(--space-2); /* #249: was space-3 */
+  /* #249: the clamp tops out at 2rem (was 3.25rem) — the identity bar
+     already carries the brand, so the display-size headline is
+     non-value chrome that starved the chat log below. */
+  font-size: clamp(1.5rem, 3vw, 2rem);
   font-weight: 700;
   letter-spacing: -0.03em;
   line-height: 1.05;
@@ -141,7 +147,7 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
-  margin-bottom: var(--space-5);
+  margin-bottom: var(--space-3); /* #249: was space-5 */
 }
 
 .identity-brand {
@@ -195,41 +201,52 @@ body {
 
 /* --- Chat console ------------------------------------------------------ */
 
-/* Definite viewport height (#83 AC3, PR 130 review; #207 recomputation):
+/* Definite viewport height (#83 AC3, PR 130 review; #207/#249 recomputations):
    flex: 1 + overflow-y: auto on the log only scroll against a container
    with a DEFINITE main size — an auto-height column grows with the
    transcript and pushes the composer below the fold. The panel is
    therefore height-bounded to the viewport minus the masthead chrome
-   (26rem covers the worst case: narrow viewports where the lede wraps to
-   five lines); the layout padding and footer sit below the panel and may
+   allowance; the layout padding and footer sit below the panel and may
    scroll out of view without affecting the composer. dvh tracks mobile
    browser chrome, with the vh declaration as the fallback; max-height
-   caps the panel on very tall monitors. The v0.5 min-height: 32rem floor
-   is superseded: on phones it exceeds the space below the masthead, and
-   a floor taller than the computed height would win and un-pin the
-   composer exactly there. A 14rem floor (issue 150) guards only the
-   degenerate case: on viewports shorter than the 26rem masthead allowance
-   (landscape phones) the calc clamps to 0 and the panel vanishes — the
-   floor resolves the used height to max(calc(100dvh - 26rem), 14rem) and
-   stays below the computed height on typical portrait phones (≥ 40rem
-   tall), leaving the #83 behavior there unchanged.
+   caps the panel on very tall monitors. A 14rem floor (issue 150) guards
+   only the degenerate case: on viewports shorter than the masthead
+   allowance (landscape phones) the calc clamps to 0 and the panel
+   vanishes — the floor resolves the used height to
+   max(calc(100dvh - 20rem), 14rem).
 
-   #207 recomputation (floating capsule): the values are re-derived, not
-   assumed. (1) The greeting renders INSIDE the scrolling log and the
-   capsule INSIDE the panel — neither adds fixed chrome above the panel,
-   so the 26rem masthead allowance is unchanged. (2) The capsule's fixed
-   interior (panel padding 3rem + panel-title ≈ 2.1rem + capsule ≈ 8rem
-   with its dock row) totals ≈ 13.1rem ≤ the 14rem floor, so the composer
-   stays pinned even in the floor's degenerate case. (3) The floor still
-   satisfies floor ≤ 40rem − 26rem allowance, so on ≥ 40rem portrait
-   viewports the computed height always wins and the #83/#150 behavior is
-   unchanged. */
+   #207 recomputation (floating capsule): the capsule lives INSIDE the
+   panel and the greeting INSIDE the scrolling log — neither adds fixed
+   chrome above the panel. The capsule's fixed interior (panel padding
+   3rem + panel-title ≈ 2.1rem + capsule ≈ 8rem with its dock row) totals
+   ≈ 13.1rem ≤ the 14rem floor, so the composer stays pinned even in the
+   floor's degenerate case.
+
+   #249 recomputation (chrome compaction — PO feedback 2026-10-17): the
+   v0.9.7 26rem allowance starved the log. Measured per-block footprints
+   above the panel and the compaction applied (content preserved):
+   - masthead padding 3.5rem → 2rem (space-6/space-5 → space-4/space-4)
+   - identity bar 2.7rem + margin 1.5rem → 2.7rem + 0.75rem (space-3)
+   - rule + margin 1.625rem → 0.875rem (margin space-3)
+   - kicker 1.875rem → 1.625rem (margin space-2)
+   - h1 4.15rem → 2.6rem (clamp max 3.25rem → 2rem, margin space-2)
+   - lede unchanged (content): 4.5rem at 1280px, ~7.5rem worst case
+     (five wrapped lines on ~375px viewports)
+   Old above-panel chrome: 19.85rem @1280 (22.85rem worst case) under the
+   26rem allowance (≈ 3.1rem headroom). New: 15.05rem @1280 (17.53rem
+   worst case) under the 20rem allowance (≈ 2.5rem headroom) — the
+   allowance drops 26rem → 20rem and the log's computed height at
+   1280×800 rises 24rem → 30rem (+25%). Floor/cap mechanics unchanged:
+   14rem ≤ 40rem − 20rem allowance, so the floor still loses to the
+   computed height on portrait phones (≥ 34rem tall) and only rescues
+   landscape phones; the capsule interior (≈ 13.1rem) still fits under
+   the 14rem floor. */
 
 .chat {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 26rem);
-  height: calc(100dvh - 26rem);
+  height: calc(100vh - 20rem);
+  height: calc(100dvh - 20rem);
   min-height: 14rem;
   max-height: 40rem;
 }
@@ -283,30 +300,35 @@ body {
    static starter chips, centered as a column. Replaces the v0.5
    one-liner. Chips prefill the composer — they never send (PO Q8) — and
    introduce no animation or transition of their own, so the
-   prefers-reduced-motion contract from #85 needs no chip exception. */
+   prefers-reduced-motion contract from #85 needs no chip exception.
+   #249 AC3: the block is slimmed to a compact rhythm (space-4 vertical
+   padding, space-2 gap — was space-6/space-4, ≈ 16.2rem → ≈ 11.2rem
+   footprint); the monogram, salutation, welcome line and chips are all
+   preserved. */
 
 .empty-state {
   margin: 0;
-  padding: var(--space-6) var(--space-4);
+  padding: var(--space-4);
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: var(--space-4);
+  gap: var(--space-2);
   text-align: center;
 }
 
 .monogram--hero {
-  width: 48px;
-  height: 48px;
+  width: 32px; /* #249: was 48px */
+  height: 32px;
 }
 
 /* Time-of-day salutation (#207 AC 1.2): the greeting headline above the
    #86 welcome line — bound via x-text (greetingLine), never an HTML
-   path (ADR-006 §9). */
+   path (ADR-006 §9). #249 AC3: the size drops 1.5rem → 1.15rem; the
+   x-text content is unchanged. */
 
 .greeting-line {
   margin: 0;
-  font-size: 1.5rem;
+  font-size: 1.15rem;
   font-weight: 600;
   letter-spacing: -0.02em;
   color: var(--ink);
@@ -445,13 +467,17 @@ body {
 
 /* --- Agent activity ---------------------------------------------------- */
 
+/* Slim transient status row (#249 AC2): the v0.9.7 band geometry
+   (border-top + space-4 padding + space-4 margin ≈ 3.2rem when visible)
+   is compacted to a slim inline row (≈ 1.7rem). The band is x-show
+   gated in the markup, so it never reserves a permanent row when idle —
+   the compaction only shrinks the transient footprint. */
+
 .activity {
-  margin-top: var(--space-4);
-  border-top: 1px solid var(--line);
-  padding-top: var(--space-4);
+  margin-top: var(--space-2);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
+  gap: var(--space-2);
 }
 
 .status-line {

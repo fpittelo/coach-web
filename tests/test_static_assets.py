@@ -178,6 +178,23 @@ Issue #200 removes the stale "Local VIDAR" codename from every
     zones/rest flags (AC4) — word + color, never color alone (#165
     posture). No new I/O anywhere (AC2): both features are pure functions
     of the data the SSE payloads already deliver.
+
+    Issue #249 compresses the chat chrome — PO feedback on the dev lane
+    (2026-10-17): the console is height-starved, the fixed chrome above
+    the log (masthead, greeting block, status band) consuming too much
+    vertical space without value. The masthead paddings/margins are
+    trimmed and the h1 clamp capped at 2rem (the identity bar already
+    carries the brand), the transient status band becomes a slim inline
+    row (band border/padding geometry removed), and the greeting block
+    drops to a compact rhythm (space-4 padding, space-2 gap, 32px hero
+    monogram, 1.15rem salutation) — content preserved everywhere. The
+    measured arithmetic (old 19.85rem @1280 / ~22.9rem worst case under a
+    26rem allowance → new 15.05rem @1280 / ~17.5rem worst case under a
+    20rem allowance) is documented in the .chat comment per the #207
+    honest-recomputation precedent, and the log's computed height at
+    1280×800 rises 24rem → 30rem. The composer capsule, single-dispatch
+    path, stop-morph and _SIGNIN_SLOT pins are untouched; the floor/cap
+    mechanics are rewritten to the new allowance, never deleted.
 """
 
 import re
@@ -1800,7 +1817,8 @@ class TestComposerErgonomicsContract:
         transcript and pushes the composer below the fold (PR #130 review
         blocker). The panel is therefore viewport-height-bounded: a dvh
         declaration (tracks mobile browser chrome) overriding a vh
-        fallback, plus a max-height cap for very tall monitors.
+        fallback, plus a max-height cap for very tall monitors. The
+        masthead allowance is the #249 compaction value (20rem).
         """
         html = self._html()
         css = self._css()
@@ -1818,18 +1836,18 @@ class TestComposerErgonomicsContract:
         # height on the flex column (dvh over vh fallback) + a cap for
         # very tall monitors. Without it the panel grows with the
         # transcript and the footer scrolls away.
-        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
         assert "max-height:" in chat, "tall-monitor cap missing"
 
     def test_chat_has_a_short_viewport_height_floor(self) -> None:
-        """AC1 (#150): the panel keeps a usable floor on very short viewports.
+        """AC1 (#150, #249 rewrite): the panel keeps a usable floor on short viewports.
 
-        On viewports shorter than the 26rem masthead allowance (landscape
-        phones), ``calc(100dvh - 26rem)`` clamps to 0 and the panel — log
+        On viewports shorter than the 20rem masthead allowance (landscape
+        phones), ``calc(100dvh - 20rem)`` clamps to 0 and the panel — log
         AND composer — degenerates. A min-height floor resolves the used
-        height to ``max(calc(100dvh - 26rem), floor)``; at 14rem it stays
-        below the computed height on typical portrait phones (≥ 40rem
+        height to ``max(calc(100dvh - 20rem), floor)``; at 14rem it stays
+        below the computed height on typical portrait phones (≥ 34rem
         tall), so the #83 portrait behavior is unchanged there.
         """
         chat = _rule_block(self._css(), ".chat")
@@ -1940,30 +1958,31 @@ class TestFloatingComposerContract:
         assert "margin: 0 auto" in layout
 
     def test_height_budget_is_preserved_with_an_honest_comment(self) -> None:
-        """AC 1.1: the .chat height budget survives the redesign.
+        """AC 1.1 (#249 rewrite): the .chat height budget survives compaction.
 
         The pinned-footer mechanism is untouched: the panel stays
-        viewport-height-bounded (dvh over vh fallback, 26rem masthead
-        allowance, 14rem floor, 40rem tall-monitor cap) and the capsule is
-        its last flex child. The budget comment carries the honest
-        recomputation: the capsule's dock row lives INSIDE the panel
-        budget, and the greeting renders inside the scrolling log — no new
-        fixed chrome above the panel.
+        viewport-height-bounded (dvh over vh fallback, the 20rem masthead
+        allowance re-derived by the #249 chrome compaction, 14rem floor,
+        40rem tall-monitor cap) and the capsule is its last flex child.
+        The budget comment carries the honest recomputation — the #207
+        capsule arithmetic AND the #249 old-vs-new allowance arithmetic.
         """
         css = self._css()
         chat = _rule_block(css, ".chat")
 
-        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
         assert "min-height: 14rem" in chat, "short-viewport floor missing"
         assert "max-height: 40rem" in chat, "tall-monitor cap missing"
 
-        # The comment above the .chat rule documents the #207 recomputation.
+        # The comment above the .chat rule documents the #207 recomputation
+        # and the #249 chrome-compaction arithmetic.
         css_raw = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
         comment_at = css_raw.index(".chat {")
         comment_start = css_raw.rindex("/*", 0, comment_at)
         comment = css_raw[comment_start:comment_at]
         assert "#207" in comment, "height-budget comment must carry the #207 recomputation"
+        assert "#249" in comment, "height-budget comment must carry the #249 arithmetic"
 
     # --- AC 1.4: action dock — single row inside the capsule --------------------
 
@@ -2156,6 +2175,132 @@ class TestFloatingComposerContract:
             "/api/debrief/pending",
             "/api/objectives",
         }, sorted(endpoints)
+
+
+class TestConsoleChromeCompactionContract:
+    """Chat chrome compaction — reclaim log height (#249).
+
+    PO feedback on the dev lane (2026-10-17): the chat console is
+    height-starved — the fixed chrome above the log (masthead, greeting
+    block, status band) consumes too much vertical space without value.
+    #207 set the log height to ``calc(100dvh - 26rem)``; #249 compresses
+    the chrome and re-derives the masthead allowance to 20rem, with the
+    honest per-block arithmetic documented in the .chat comment (the #207
+    recomputation precedent).
+
+    Compaction contract (content preserved, footprint reduced):
+
+    - masthead: paddings/margins trimmed one space step, the h1 clamp
+      capped at 2rem (the identity bar already carries the brand);
+    - status band (``.activity``): a slim inline row — band border/padding
+      geometry removed, space-2 rhythm — and transient (x-show), so it
+      never reserves a permanent band;
+    - greeting (``.empty-state``): space-4 vertical padding, space-2 gap,
+      32px hero monogram, 1.15rem salutation — monogram, salutation,
+      welcome line and chips all stay (pinned by
+      TestOnboardingEmptyStateContract);
+    - composer capsule: UNTOUCHED — the #207 pins in
+      TestFloatingComposerContract keep guarding it; the floor/cap
+      mechanics (14rem floor, 40rem cap) are rewritten to the new
+      allowance, never deleted.
+    """
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _css_raw(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    # --- AC1: masthead chrome trimmed -----------------------------------------
+
+    def test_masthead_padding_is_trimmed(self) -> None:
+        """AC1: the masthead vertical padding drops a full space step per side."""
+        masthead = _rule_block(self._css(), ".masthead")
+
+        assert "padding: var(--space-4) var(--space-5) var(--space-4)" in masthead
+
+    def test_masthead_margins_are_trimmed(self) -> None:
+        """AC1: identity bar, rule and kicker margins drop to the slim rhythm."""
+        css = self._css()
+
+        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".identity-bar")
+        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".rule")
+        # The kicker keeps its margin shorthand (0 0 <token>).
+        assert "margin: 0 0 var(--space-2)" in _rule_block(css, ".kicker")
+
+    def test_masthead_h1_is_capped_at_two_rem(self) -> None:
+        """AC1: the h1 clamp tops out at 2rem — the identity bar owns the brand."""
+        h1 = _rule_block(self._css(), ".masthead h1")
+
+        assert "font-size: clamp(1.5rem, 3vw, 2rem)" in h1
+        assert "margin: 0 0 var(--space-2)" in h1
+
+    # --- AC1: the height budget re-derivation -----------------------------------
+
+    def test_chat_allowance_is_compacted_to_20rem(self) -> None:
+        """AC1: the masthead allowance drops 26rem → 20rem; floor/cap unchanged."""
+        chat = _rule_block(self._css(), ".chat")
+
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
+        assert "min-height: 14rem" in chat, "short-viewport floor must survive"
+        assert "max-height: 40rem" in chat, "tall-monitor cap must survive"
+
+    def test_height_budget_comment_carries_the_249_arithmetic(self) -> None:
+        """AC1: the .chat comment documents the old vs new budget arithmetic."""
+        css_raw = self._css_raw()
+        comment_at = css_raw.index(".chat {")
+        comment_start = css_raw.rindex("/*", 0, comment_at)
+        comment = css_raw[comment_start:comment_at]
+
+        assert "#249" in comment, "the #249 recomputation must be documented"
+        assert "#207" in comment, "the #207 precedent must stay referenced"
+        assert "26rem" in comment, "the old allowance must be stated"
+        assert "20rem" in comment, "the new allowance must be stated"
+
+    # --- AC2: slim transient status band -----------------------------------------
+
+    def test_status_band_is_a_slim_inline_row(self) -> None:
+        """AC2: the activity band loses its border/padding band geometry."""
+        activity = _rule_block(self._css(), ".activity")
+
+        assert "margin-top: var(--space-2)" in activity, "slim top margin missing"
+        assert "border-top" not in activity, "the band separator must go"
+        assert "padding-top" not in activity, "the band padding must go"
+        assert "gap: var(--space-2)" in activity, "slim inner rhythm missing"
+
+    def test_status_band_stays_transient(self) -> None:
+        """AC2: the band is x-show gated — it never reserves a permanent row."""
+        html = self._html()
+        activity_at = html.index('<div class="activity"')
+        tag = html[activity_at : html.index(">", activity_at) + 1]
+
+        assert "x-show=" in tag, "the band must stay transient (x-show)"
+
+    # --- AC3: slimmed greeting block ------------------------------------------------
+
+    def test_greeting_block_padding_and_gap_are_slimmed(self) -> None:
+        """AC3: the greeting column drops to the space-4/space-2 rhythm."""
+        empty = _rule_block(self._css(), ".empty-state")
+
+        assert "padding: var(--space-4)" in empty
+        assert "gap: var(--space-2)" in empty
+
+    def test_hero_monogram_is_compacted(self) -> None:
+        """AC3: the hero monogram shrinks 48px → 32px (content preserved)."""
+        hero = _rule_block(self._css(), ".monogram--hero")
+
+        assert "width: 32px" in hero
+        assert "height: 32px" in hero
+
+    def test_salutation_is_compacted(self) -> None:
+        """AC3: the salutation drops 1.5rem → 1.15rem (x-text content unchanged)."""
+        line = _rule_block(self._css(), ".greeting-line")
+
+        assert "font-size: 1.15rem" in line
 
 
 class TestOnboardingEmptyStateContract:
