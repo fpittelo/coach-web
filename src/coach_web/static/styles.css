@@ -1066,6 +1066,54 @@ body {
   color: var(--error);
 }
 
+/* --- Step profile (issue 235) --------------------------------------------------- */
+
+/* AC1 (#235, epic #214-A): the structured workout renders as an inline SVG
+   step profile — one bar per step, bar height proportional to the step's
+   target intensity, with the per-step target/cadence labels bound via
+   x-text below each bar. CSP-clean (#207 posture): the bars are sized by
+   classes and positioned via SVG presentation attributes (never inline
+   style), the visualization carries no event handlers, and the whole block
+   carries one accessible name (role="img") while the interval table stays
+   the accessible per-step alternative (AC3). */
+
+.step-profile {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin-bottom: var(--space-4);
+}
+
+.step-profile-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 2.5rem;
+}
+
+/* All bar boxes share one fixed height, so the per-bar SVG rects (bound as
+   presentation attributes: :y / :height against the shared 0–100 viewBox)
+   line up on one baseline across the row. */
+
+.step-profile-bar {
+  width: 1.5rem;
+  height: 4rem;
+}
+
+.step-profile-rect {
+  fill: var(--accent);
+}
+
+.step-profile-target,
+.step-profile-cadence {
+  font-size: 0.6rem;
+  font-weight: 600;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
 /* --- Weekly plan card (issue 168) --------------------------------------------- */
 
 /* The proposed 7-day microcycle renders as a conversation card beneath the
@@ -1100,6 +1148,26 @@ body {
 
 .day-chip--failed {
   color: var(--error);
+}
+
+/* Per-day intensity zone chip (#235 AC4): the rendered word carries the
+   meaning and the color class only reinforces it (#165 posture — never
+   color alone). "Hard" picks up the accent; Easy/Rest keep the muted
+   base. */
+
+.zone-chip {
+  display: inline-block;
+  margin-right: var(--space-2);
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.zone-chip--hard {
+  color: var(--accent);
 }
 
 /* --- Narrow viewports (#82 AC3, issue 168) ------------------------------------ */
