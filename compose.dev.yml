@@ -7,9 +7,9 @@
 #
 # Usage:
 #   cp .env.dev.example .env.dev    # then fill in your secrets
+#   ./scripts/e2e-preflight.sh dev  # validates, then tears its lane down on exit
 #   docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml \
-#       --env-file .env.dev up -d --build
-#   ./scripts/e2e-preflight.sh dev
+#       --env-file .env.dev up -d --build   # FINAL step — lane left serving
 
 name: coach-web-dev
 

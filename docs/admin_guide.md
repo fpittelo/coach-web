@@ -117,15 +117,18 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 1. **dev → qa** (requires @fpittelo approval on the promotion PR): merge `dev` into `qa` via PR. CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
    ```bash
    docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
-   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
    ./scripts/e2e-preflight.sh qa
+   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
    ```
+   The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
 2. **qa → main** (requires @fpittelo approval): merge `qa` into `main` via PR, then tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
    ```bash
    docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
-   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
    ./scripts/e2e-preflight.sh prod
+   docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
+   curl -fsS http://127.0.0.1:8000/health
    ```
+   The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
 3. **Rollback:** set the previous digest in `.env.prod` and `docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d` — no cloud console involved.
 
 ---

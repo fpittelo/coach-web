@@ -21,6 +21,9 @@
 # Usage:
 #   ./scripts/e2e-preflight.sh [dev|qa|prod]
 #
+# Teardown: this script validates the lane and then TEARS IT DOWN on exit
+# (validate-then-clean CI semantics — the EXIT trap runs `compose down`). A
+# runbook that must leave the lane serving runs `up -d` AFTER this script.
 # Teardown is scoped to the lane's own compose project (-p coach-web-<lane>);
 # other lanes running concurrently are never touched.
 
