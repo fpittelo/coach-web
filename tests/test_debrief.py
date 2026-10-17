@@ -2,9 +2,10 @@
 
 Story 3.1 completes the capture half of the debrief loop (epic #161): the
 athlete rates a completed planned session (RPE 1–10) with optional free-text
-notes, and the debrief persists in the ``debriefs`` table with the notes as
-Fernet ciphertext — NEVER plaintext at rest (MADR-008 C2, Swiss nLPD Art.
-5(c) health data).
+notes, and the debrief persists in the ``debriefs`` table with the notes AND
+the RPE as Fernet ciphertext — NEVER plaintext at rest (MADR-008 C2, Swiss
+nLPD Art. 5(c) health data; the RPE column's encryption was restored by
+#243 after a classification drift).
 
 The contract pinned here:
 
@@ -15,6 +16,9 @@ The contract pinned here:
 - saves are per-athlete (``athlete_id`` scoping on every query — athlete B
   cannot read or write athlete A's debriefs) and idempotent per session key
   (a re-submission upserts, never duplicates);
+- the RPE is encrypted on write and decrypted on read (#243): a raw DB read
+  of the column never yields the plaintext value, and equal RPEs encrypt to
+  different tokens (Fernet non-determinism, AC3);
 - the pending derivation is a pure function of (approved plan drafts,
   today, the athlete's debrief rows): completed (strictly past) non-rest
   day slots of approved drafts without a debrief row for THIS athlete;
@@ -34,12 +38,15 @@ from coach_web.config import get_settings
 from coach_web.debrief import (
     DEFAULT_ATHLETE_ID,
     MAX_DEBRIEF_NOTES_LENGTH,
+    DebriefRow,
     DebriefSaveRequest,
     PendingDebrief,
     RpeRequest,
     apply_pending_debrief_digest,
     athlete_id_from_email,
     build_debrief_cipher,
+    decrypt_rpe,
+    list_debrief_rpes,
     list_pending_debriefs,
     parse_plan_day_rows,
     pending_debrief_digest,
@@ -277,10 +284,14 @@ class TestDebriefSaveRequest:
 
 
 class TestSaveDebrief:
-    """The encrypted persistence path (#189 AC1/AC2/AC4)."""
+    """The encrypted persistence path (#189 AC1/AC2/AC4, #243 AC1/AC3)."""
 
     async def test_save_persists_an_encrypted_row(self, db_session_factory, db_path: Path) -> None:
-        """The debrief row lands with Fernet ciphertext, never plaintext notes."""
+        """The debrief row lands with Fernet ciphertext — notes AND RPE (#243).
+
+        MADR-0008 classifies the RPE as C2 health data: like the notes, it is
+        stored as a Fernet token, never as the plaintext integer (AC1/AC3).
+        """
         payload = _save_payload(notes="SECRET-NOTE-CONTENT-XYZ")
 
         async with db_session_factory() as session:
@@ -289,14 +300,41 @@ class TestSaveDebrief:
         assert row.id is not None
         assert row.athlete_id == 1
         assert row.plan_session_key == "2026-10-06"
-        assert row.rpe == 7
+        # The ORM attribute carries the Fernet token, not the plaintext RPE.
+        assert isinstance(row.rpe, str)
+        assert row.rpe.startswith("gAAAA")
+        assert row.rpe != "7"
         assert row.notes_encrypted is not None
         assert row.notes_encrypted.startswith("gAAAA")
-        # AC1: NO plaintext notes bytes exist anywhere in the database files
-        # (main file and WAL side file alike — the plaintext never enters SQL).
+        # The stored token decrypts back to the submitted RPE with the same key.
+        assert decrypt_rpe(TEST_CIPHER, row.rpe) == 7
+        # AC1/AC3: NO plaintext health-data bytes exist anywhere in the
+        # database files (main file and WAL side file alike — the plaintext
+        # never enters SQL). The raw column read yields the token, never 7.
         for candidate in (db_path, Path(str(db_path) + "-wal")):
             if candidate.exists():
-                assert b"SECRET-NOTE-CONTENT-XYZ" not in candidate.read_bytes()
+                raw = candidate.read_bytes()
+                assert b"SECRET-NOTE-CONTENT-XYZ" not in raw
+                assert b'"rpe": 7' not in raw
+        with sqlite3.connect(db_path) as conn:
+            stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
+        assert stored_rpe != 7
+        assert stored_rpe != "7"
+        assert str(stored_rpe).startswith("gAAAA")
+
+    async def test_rpe_ciphertext_differs_per_save(self, db_session_factory) -> None:
+        """AC3: Fernet is non-deterministic — equal RPEs encrypt differently."""
+        first = _save_payload(rpe=7, notes=None)
+        second = _save_payload(rpe=7, notes=None)
+
+        async with db_session_factory() as session:
+            row_one = await save_debrief(session, athlete_id=1, payload=first, cipher=TEST_CIPHER)
+            row_two = await save_debrief(session, athlete_id=2, payload=second, cipher=TEST_CIPHER)
+
+        assert row_one.rpe is not None
+        assert row_two.rpe is not None
+        assert row_one.rpe != row_two.rpe
+        assert decrypt_rpe(TEST_CIPHER, row_one.rpe) == decrypt_rpe(TEST_CIPHER, row_two.rpe) == 7
 
     async def test_saved_notes_decrypt_round_trip(self, db_session_factory, db_path: Path) -> None:
         """The stored ciphertext decrypts to the original notes with the same key."""
@@ -329,7 +367,8 @@ class TestSaveDebrief:
             await save_debrief(session, athlete_id=1, payload=first, cipher=TEST_CIPHER)
             row = await save_debrief(session, athlete_id=1, payload=second, cipher=TEST_CIPHER)
 
-        assert row.rpe == 8
+        assert row.rpe is not None
+        assert decrypt_rpe(TEST_CIPHER, row.rpe) == 8
         assert row.notes_encrypted is not None
         assert TEST_CIPHER.decrypt(row.notes_encrypted.encode("ascii")).decode("utf-8") == (
             "Re-rated after reflection"
@@ -579,3 +618,69 @@ class TestRpeRequestModel:
             RpeRequest.model_validate(
                 {"plan_session_key": "2026-10-06", "session_title": "x" * 201}
             )
+
+
+class TestListDebriefRpes:
+    """The divergence digest's executed side — decrypt-on-read (#236, #243 AC2)."""
+
+    async def _save_rpe(self, session, *, key: str, rpe: int) -> None:
+        """Persist one debrief through the save path (encrypted on write)."""
+        await save_debrief(
+            session,
+            athlete_id=DEFAULT_ATHLETE_ID,
+            payload=_save_payload(plan_session_key=key, rpe=rpe, notes=None),
+            cipher=TEST_CIPHER,
+        )
+
+    async def test_rpes_decrypt_to_integers(self, db_session_factory) -> None:
+        """The projection returns key → INTEGER rpe, decrypted server-side."""
+        async with db_session_factory() as session:
+            await self._save_rpe(session, key="2026-10-05", rpe=3)
+            await self._save_rpe(session, key="2026-10-06", rpe=9)
+
+            rpes = await list_debrief_rpes(
+                session, athlete_id=DEFAULT_ATHLETE_ID, cipher=TEST_CIPHER
+            )
+
+        assert rpes == {"2026-10-05": 3, "2026-10-06": 9}
+
+    async def test_rpes_are_scoped_per_athlete(self, db_session_factory) -> None:
+        """Athlete B's rows never appear in athlete A's projection (#189 AC4)."""
+        other = athlete_id_from_email("other@example.com")
+        async with db_session_factory() as session:
+            await self._save_rpe(session, key="2026-10-05", rpe=3)
+            await save_debrief(
+                session,
+                athlete_id=other,
+                payload=_save_payload(plan_session_key="2026-10-06", rpe=9, notes=None),
+                cipher=TEST_CIPHER,
+            )
+
+            rpes = await list_debrief_rpes(
+                session, athlete_id=DEFAULT_ATHLETE_ID, cipher=TEST_CIPHER
+            )
+
+        assert rpes == {"2026-10-05": 3}
+
+    async def test_a_null_rpe_row_is_skipped_not_crashed(self, db_session_factory) -> None:
+        """A tampered NULL-rpe row fails safe: no entry, never a crash/leak."""
+        async with db_session_factory() as session:
+            await self._save_rpe(session, key="2026-10-05", rpe=3)
+            session.add(
+                DebriefRow(
+                    athlete_id=DEFAULT_ATHLETE_ID,
+                    session_external_id=None,
+                    plan_session_key="2026-10-06",
+                    rpe=None,
+                    notes_encrypted=None,
+                    created_at="2026-10-06T10:00:00+00:00",
+                    updated_at="2026-10-06T10:00:00+00:00",
+                )
+            )
+            await session.commit()
+
+            rpes = await list_debrief_rpes(
+                session, athlete_id=DEFAULT_ATHLETE_ID, cipher=TEST_CIPHER
+            )
+
+        assert rpes == {"2026-10-05": 3}

@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.fernet import Fernet
 from pydantic import ValidationError
 
 from coach_web.analysis import (
@@ -44,6 +45,11 @@ from coach_web.microcycle import (
 
 METRIC_ATHLETE_ID = 1
 OTHER_ATHLETE_ID = 42
+
+TEST_ENCRYPTION_KEY = Fernet.generate_key()
+"""Per-module Fernet key — generated, never a committed literal (gitleaks)."""
+
+TEST_CIPHER = Fernet(TEST_ENCRYPTION_KEY)
 
 
 def _day(**overrides: object) -> DaySlot:
@@ -105,14 +111,18 @@ async def _seed_approved_draft(session: Any, draft: WeeklyPlanDraft) -> None:
 
 
 async def _seed_debrief(session: Any, *, athlete_id: int, plan_session_key: str) -> None:
-    """Persist one debrief row directly (the upsert reads keys only)."""
+    """Persist one debrief row directly (the upsert reads keys only).
+
+    #243: the RPE is seeded the way the save path stores it — the Fernet
+    token (the metric itself never reads the column; C3 counts only).
+    """
     now = datetime.now(UTC).isoformat()
     session.add(
         DebriefRow(
             athlete_id=athlete_id,
             session_external_id=None,
             plan_session_key=plan_session_key,
-            rpe=5,
+            rpe=TEST_CIPHER.encrypt(b"5").decode("ascii"),
             notes_encrypted=None,
             created_at=now,
             updated_at=now,

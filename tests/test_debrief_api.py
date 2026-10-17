@@ -71,6 +71,8 @@ OTHER_EMAIL = "other-athlete@example.com"
 TEST_ENCRYPTION_KEY = Fernet.generate_key()
 """Per-module Fernet key — generated, never a committed literal (gitleaks)."""
 
+TEST_CIPHER = Fernet(TEST_ENCRYPTION_KEY)
+
 
 @pytest.fixture
 def encryption_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,15 +154,28 @@ def _debrief_count(db_path: Path) -> int:
         return int(conn.execute("SELECT COUNT(*) FROM debriefs").fetchone()[0])
 
 
-def _debrief_rows(db_path: Path) -> list[tuple[int, str, int]]:
-    """Return (athlete_id, plan_session_key, rpe) for every debrief row."""
+def _debrief_rows(db_path: Path) -> list[tuple[int, str, str]]:
+    """Return (athlete_id, plan_session_key, raw rpe column) for every row.
+
+    #243: the raw column value is the stored Fernet token — the plaintext
+    RPE never exists in the database (decrypt with the module cipher to
+    compare values).
+    """
     with sqlite3.connect(db_path) as conn:
         return [
-            (int(row[0]), str(row[1]), int(row[2]))
+            (int(row[0]), str(row[1]), str(row[2]))
             for row in conn.execute(
                 "SELECT athlete_id, plan_session_key, rpe FROM debriefs ORDER BY id"
             ).fetchall()
         ]
+
+
+def _stored_rpes(db_path: Path) -> list[int]:
+    """Decrypt every stored RPE token with the module cipher (#243 AC2)."""
+    return [
+        int(TEST_CIPHER.decrypt(token.encode("ascii")).decode("utf-8"))
+        for _, _, token in _debrief_rows(db_path)
+    ]
 
 
 class _SystemPromptProbeAgent:
@@ -236,7 +251,7 @@ class TestPostDebrief:
     def test_save_persists_ciphertext_never_plaintext(
         self, migrated_db: Path, encryption_key
     ) -> None:
-        """The notes land as Fernet ciphertext — no plaintext bytes in the DB file."""
+        """The notes AND the RPE land as Fernet ciphertext (#243 AC1/AC3)."""
         client = TestClient(create_app())
 
         response = client.post(
@@ -248,10 +263,17 @@ class TestPostDebrief:
         assert _debrief_count(migrated_db) == 1
         for candidate in (migrated_db, Path(str(migrated_db) + "-wal")):
             if candidate.exists():
-                assert b"SECRET-NOTE-XYZ" not in candidate.read_bytes()
+                raw = candidate.read_bytes()
+                assert b"SECRET-NOTE-XYZ" not in raw
+                assert b'"rpe": 7' not in raw
         with sqlite3.connect(migrated_db) as conn:
-            stored = conn.execute("SELECT notes_encrypted FROM debriefs").fetchone()[0]
-        assert str(stored).startswith("gAAAA")
+            stored_notes = conn.execute("SELECT notes_encrypted FROM debriefs").fetchone()[0]
+            stored_rpe = conn.execute("SELECT rpe FROM debriefs").fetchone()[0]
+        assert str(stored_notes).startswith("gAAAA")
+        # The RPE column carries the token too — never the plaintext value.
+        assert stored_rpe != 7
+        assert stored_rpe != "7"
+        assert str(stored_rpe).startswith("gAAAA")
 
     def test_save_without_notes_persists_null(self, migrated_db: Path, encryption_key) -> None:
         """An optional-notes debrief persists a NULL notes column."""
@@ -265,14 +287,16 @@ class TestPostDebrief:
         assert stored is None
 
     def test_resave_upserts_the_existing_row(self, migrated_db: Path, encryption_key) -> None:
-        """A re-submission updates the row — never a duplicate."""
+        """A re-submission updates the row — never a duplicate (value decrypts)."""
         client = TestClient(create_app())
         client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 7})
 
         response = client.post("/api/debrief", json={"plan_session_key": "2026-10-06", "rpe": 9})
 
         assert response.status_code == 201
-        assert _debrief_rows(migrated_db) == [(1, "2026-10-06", 9)]
+        rows = _debrief_rows(migrated_db)
+        assert [(row[0], row[1]) for row in rows] == [(1, "2026-10-06")]
+        assert _stored_rpes(migrated_db) == [9]
 
     def test_missing_key_answers_503_and_persists_nothing(
         self, migrated_db: Path, monkeypatch
@@ -742,8 +766,7 @@ class TestDebriefAuth:
         assert saved.status_code == 201
         rows = _debrief_rows(migrated_db)
         assert len(rows) == 2
-        assert rows[0][2] == 7  # athlete A's RPE untouched
-        assert rows[1][2] == 3
+        assert _stored_rpes(migrated_db) == [7, 3]  # A's RPE untouched, B's isolated
         assert rows[0][0] != rows[1][0]
 
     def test_non_whitelisted_email_answers_403(self, monkeypatch) -> None:
