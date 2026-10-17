@@ -30,6 +30,7 @@ from coach_web.agent import (
     apply_temporal_anchor,
     create_agent,
 )
+from coach_web.analysis import WeekAdherenceMetric
 from coach_web.auth.middleware import (
     SESSION_COOKIE,
     AuthMiddleware,
@@ -50,6 +51,7 @@ from coach_web.debrief import (
     build_debrief_cipher,
     list_pending_debriefs,
     save_debrief,
+    upsert_week_adherence,
 )
 from coach_web.errors import (
     MIRROR_REASON_MESSAGES,
@@ -921,10 +923,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         (AC1); the 201 confirmation carries metadata only — the notes are
         never echoed (nLPD). The debrief row is scoped to the request's
         athlete (AC4): derived from the verified session email on auth-enabled
-        lanes, the single local athlete otherwise. When the athlete consented
-        (``mirror_to_icu``), the saved debrief is mirrored to Intervals.icu as
-        a session comment (#190 AC3) — non-blocking: a mirror failure keeps
-        the 201 and rides the fixed soft warning in the response body.
+        lanes, the single local athlete otherwise. The debriefed session's
+        ISO-week adherence metric (#234) is recomputed and upserted on the
+        same path — best-effort, counts/percentages only (C3). When the
+        athlete consented (``mirror_to_icu``), the saved debrief is mirrored
+        to Intervals.icu as a session comment (#190 AC3) — non-blocking: a
+        mirror failure keeps the 201 and rides the fixed soft warning in the
+        response body.
         """
         settings: Settings = request.app.state.settings
         try:
@@ -944,6 +949,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Debrief persistence failed: %s", exc)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # Weekly adherence metric (#234 AC2): event-driven recompute + upsert
+        # on the debrief-save path — counts/percentages only (C3). Best-effort
+        # by contract: the debrief is already durable and the metric is
+        # derived data (the next save recomputes the whole week), so a
+        # failure degrades to no metric on the response while the 201 stands.
+        week_adherence: WeekAdherenceMetric | None = None
+        try:
+            async with session_factory() as session:
+                week_adherence = await upsert_week_adherence(
+                    session, athlete_id=athlete_id, plan_session_key=payload.plan_session_key
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Week adherence upsert failed: %s", exc)
         # ICU session-comment mirror (#190 AC3): strictly opt-in and
         # NON-BLOCKING on the save — the debrief row is already durable when
         # the mirror starts, and every mirror failure degrades to the fixed
@@ -967,7 +985,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     message=MIRROR_REASON_MESSAGES[MirrorReason.POST_FAILED],
                 )
         return DebriefSaveResponse(
-            status="saved", plan_session_key=row.plan_session_key, rpe=row.rpe, mirror=mirror
+            status="saved",
+            plan_session_key=row.plan_session_key,
+            rpe=row.rpe,
+            mirror=mirror,
+            week_adherence=week_adherence,
         )
 
     @application.get(

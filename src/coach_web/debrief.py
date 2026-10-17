@@ -26,6 +26,13 @@ Per-athlete isolation (#189 AC4): every query is scoped by ``athlete_id`` —
 derived from the authenticated session email (auth-enabled lanes) or the
 single local athlete default (auth-disabled dev/qa lanes). Athlete B cannot
 read or write athlete A's debriefs.
+
+Weekly adherence metric (#234, epic #213 S4): the debrief-save path is also
+the metric's event-driven write trigger — :func:`upsert_week_adherence`
+recomputes the ISO week of the debriefed session from the existing DB
+compliance data (approved drafts' day rows vs the athlete's debriefs) and
+upserts the C3 ``week_adherence`` row (COUNTS AND PERCENTAGES ONLY — no
+health content; the pure computation lives in :mod:`coach_web.analysis`).
 """
 
 import hashlib
@@ -36,10 +43,11 @@ from typing import Literal
 
 from cryptography.fernet import Fernet
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import CheckConstraint, Integer, Text, select
+from sqlalchemy import CheckConstraint, Float, Integer, Text, UniqueConstraint, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, mapped_column
 
+from coach_web.analysis import WeekAdherenceMetric, compute_week_adherence, iso_week_key
 from coach_web.auth.whitelist import normalize_email
 from coach_web.config import Settings
 from coach_web.db import Base
@@ -48,7 +56,7 @@ from coach_web.errors import (
     EncryptionUnavailableError,
     MirrorReason,
 )
-from coach_web.microcycle import MAX_SESSION_TITLE_LENGTH, PlanDraftRow
+from coach_web.microcycle import MAX_SESSION_TITLE_LENGTH, PlanDraftRow, week_bounds
 from coach_web.models import validate_iso_date
 
 DEFAULT_ATHLETE_ID = 1
@@ -133,6 +141,11 @@ class DebriefSaveResponse(BaseModel):
     ``mirror`` outcome rides along when the athlete asked for the ICU
     session-comment mirror (#190 AC3): ``None`` when no mirror was
     requested, so the pre-#190 body shape is byte-identical on that path.
+    The optional ``week_adherence`` (#234 AC3) rides along when the
+    debriefed session's ISO week has planned sessions — the metric computed
+    and upserted on this same save path; ``None`` (excluded from the body)
+    keeps the pre-#234 shape byte-identical when the week has no planned
+    sessions or the best-effort upsert degraded.
     """
 
     status: Literal["saved"] = Field(..., description="Fixed confirmation status")
@@ -144,6 +157,14 @@ class DebriefSaveResponse(BaseModel):
             "ICU session-comment mirror outcome (#190 AC3) — present only when "
             "the athlete asked for the mirror; None keeps the body shape "
             "byte-identical to the pre-#190 contract."
+        ),
+    )
+    week_adherence: WeekAdherenceMetric | None = Field(
+        default=None,
+        description=(
+            "The debriefed session's ISO-week plan adherence (#234) — counts "
+            "and percentage only (C3); None when the week has no planned "
+            "sessions (no metric row) or the best-effort upsert degraded."
         ),
     )
 
@@ -226,6 +247,33 @@ class DebriefRow(Base):
     notes_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class WeekAdherenceRow(Base):
+    """ORM model for the ``week_adherence`` table (#234, MADR-008 C3).
+
+    One ISO week's plan-adherence metric per athlete — COUNTS AND
+    PERCENTAGES ONLY: no RPE, no notes, no wellness values ever join this
+    row (the C3 classification stays honest; health content remains in the
+    C2 ``debriefs`` table).
+    """
+
+    __tablename__ = "week_adherence"
+    # The percentage CHECK below is the ORM mirror of migration 0005's CHECK
+    # (both hardcoded deliberately — migrations stay self-contained, never
+    # importing application symbols); keep the two in sync.
+    __table_args__ = (
+        CheckConstraint("adherence_pct BETWEEN 0 AND 100", name="ck_week_adherence_pct_range"),
+        UniqueConstraint("athlete_id", "week_key", name="uq_week_adherence_athlete_week"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    athlete_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    week_key: Mapped[str] = mapped_column(Text, nullable=False)
+    planned_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    adherence_pct: Mapped[float] = mapped_column(Float, nullable=False)
+    computed_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 def athlete_id_from_email(email: str | None) -> int:
@@ -378,6 +426,67 @@ async def list_pending_debriefs(
     pending = [candidate for candidate in completed if candidate.plan_session_key not in done_keys]
     pending.sort(key=lambda item: item.plan_session_key)
     return pending
+
+
+async def upsert_week_adherence(
+    session: AsyncSession,
+    *,
+    athlete_id: int,
+    plan_session_key: str,
+) -> WeekAdherenceMetric | None:
+    """Recompute and persist the debriefed session's ISO-week adherence (#234).
+
+    Event-driven on the debrief-save path (no background jobs, no new
+    endpoints): the ISO week of ``plan_session_key`` is recomputed from the
+    source rows — planned sessions from APPROVED plan drafts' day rows,
+    completed sessions from THIS athlete's debrief rows — and upserted into
+    ``week_adherence`` (counts/percentages only, C3). Idempotent per
+    (athlete, week): a re-save updates the row, never duplicates it. A week
+    with zero planned sessions writes no row (0/0 noise avoided) and the
+    metric stays unclaimed.
+    """
+    week_key = iso_week_key(date.fromisoformat(plan_session_key))
+    monday, sunday = week_bounds(week_key)
+    drafts = await session.execute(select(PlanDraftRow).where(PlanDraftRow.status == "approved"))
+    planned = {
+        item.plan_session_key
+        for draft in drafts.scalars().all()
+        for item in parse_plan_day_rows(draft.content)
+        if monday <= item.plan_session_key <= sunday
+    }
+    debriefed = await session.execute(
+        select(DebriefRow.plan_session_key).where(DebriefRow.athlete_id == athlete_id)
+    )
+    metric = compute_week_adherence(week_key, planned, (key for (key,) in debriefed.all()))
+    if metric is None:
+        return None
+    row = (
+        await session.execute(
+            select(WeekAdherenceRow).where(
+                WeekAdherenceRow.athlete_id == athlete_id,
+                WeekAdherenceRow.week_key == week_key,
+            )
+        )
+    ).scalar_one_or_none()
+    now = _utc_now_iso()
+    if row is None:
+        session.add(
+            WeekAdherenceRow(
+                athlete_id=athlete_id,
+                week_key=metric.week_key,
+                planned_count=metric.planned_count,
+                completed_count=metric.completed_count,
+                adherence_pct=metric.adherence_pct,
+                computed_at=now,
+            )
+        )
+    else:
+        row.planned_count = metric.planned_count
+        row.completed_count = metric.completed_count
+        row.adherence_pct = metric.adherence_pct
+        row.computed_at = now
+    await session.commit()
+    return metric
 
 
 def pending_debrief_digest(pending: Sequence[PendingDebrief]) -> str | None:

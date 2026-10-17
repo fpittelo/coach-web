@@ -3603,6 +3603,22 @@ class TestDebriefUiContract:
         assert 'state: "submitted"' in log
         assert "Logged: RPE" in log
 
+    def test_log_rpe_note_carries_the_week_adherence(self) -> None:
+        """The collapsed note appends the ISO-week adherence when present (#234 AC3).
+
+        The debrief-save response is the payload that already carries the
+        metric (computed on the same save path), so the check-in card's
+        collapsed summary renders it — counts and percentage, no new route
+        and no new fetch.
+        """
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert "body.week_adherence" in log
+        assert "Week adherence" in log
+        assert "body.week_adherence.adherence_pct" in log
+        assert "body.week_adherence.completed_count" in log
+        assert "body.week_adherence.planned_count" in log
+
     def test_skip_rpe_dismisses_the_card(self) -> None:
         """Skip clears the card and its pin without persisting anything."""
         skip = _rule_block(self._script(), "skipRpe()")
