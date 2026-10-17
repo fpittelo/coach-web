@@ -82,6 +82,18 @@ EXPECTED_DEBRIEF_COLUMNS = (
 
 DEBRIEF_RPE_RANGE_CHECK = "rpe BETWEEN 1 AND 10"
 
+EXPECTED_WEEK_ADHERENCE_COLUMNS = (
+    "id",
+    "athlete_id",
+    "week_key",
+    "planned_count",
+    "completed_count",
+    "adherence_pct",
+    "computed_at",
+)
+
+WEEK_ADHERENCE_PCT_RANGE_CHECK = "adherence_pct BETWEEN 0 AND 100"
+
 
 def _connect(db_path: Path) -> sqlite3.Connection:
     """Open the per-test database file with the stdlib driver."""
@@ -252,11 +264,13 @@ class TestPeriodizationMigration:
     """Migration 0002 adds the MADR-008 periodization_phases table (#167)."""
 
     def test_upgrade_head_creates_both_domain_tables(self, db_path: Path) -> None:
-        """After upgrade head, the MADR-008 C1 tables exist (#167).
+        """After upgrade head, the MADR-008 domain tables exist (#167).
 
         Superseded for #168: migration 0003 adds the C3 ``plan_drafts``
         table. Superseded for #189: migration 0004 adds the C2 ``debriefs``
-        table, so head now carries four domain tables.
+        table. Superseded for #234: migration 0005 adds the C3
+        ``week_adherence`` metric table, so head now carries five domain
+        tables.
         """
         command.upgrade(alembic_config(), "head")
 
@@ -266,6 +280,7 @@ class TestPeriodizationMigration:
             "periodization_phases",
             "plan_drafts",
             "debriefs",
+            "week_adherence",
         }
 
     def test_phase_table_columns_match_the_madr008_schema(self, db_path: Path) -> None:
@@ -412,17 +427,18 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0004.
+        """Re-running upgrade head is a no-op and the version stays at 0005.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
         Superseded for #189: migration 0004 (debriefs) extends the chain.
+        Superseded for #234: migration 0005 (week_adherence) extends the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0004"
+        assert version == "0005"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -688,3 +704,114 @@ class TestDebriefMigration:
         tables = _table_names(db_path)
         assert "debriefs" not in tables
         assert "plan_drafts" in tables
+
+
+def _week_adherence_column_flags(db_path: Path) -> dict[str, tuple[bool, bool]]:
+    """Return ``(notnull, is_pk)`` flags per column of week_adherence."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(week_adherence)").fetchall()
+    return {row[1]: (bool(row[3]), bool(row[5])) for row in rows}
+
+
+def _week_adherence_table_sql(db_path: Path) -> str:
+    """Return the CREATE TABLE statement text of week_adherence."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='week_adherence'"
+        ).fetchone()
+    assert row is not None, "week_adherence table is missing"
+    return str(row[0])
+
+
+class TestWeekAdherenceMigration:
+    """Migration 0005 adds the week_adherence table (#234, C3).
+
+    The metric row carries COUNTS AND PERCENTAGES ONLY (AC2): the exact
+    column set is pinned so no health content (RPE, notes, wellness values)
+    can ever join the C3 metric row. The (athlete_id, week_key) pair is
+    UNIQUE — the debrief-save upsert is idempotent per athlete and week —
+    and the percentage is CHECK-bounded to 0..100.
+    """
+
+    def test_week_adherence_table_columns_match_the_story_schema(self, db_path: Path) -> None:
+        """The column set is exactly the metric columns, in order (C3 pin)."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(week_adherence)").fetchall()
+            ]
+
+        assert tuple(columns) == EXPECTED_WEEK_ADHERENCE_COLUMNS
+
+    def test_week_adherence_required_columns_are_not_null(self, db_path: Path) -> None:
+        """athlete_id, week_key, both counts, the percentage and computed_at are NOT NULL."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _week_adherence_column_flags(db_path)
+        for column in (
+            "athlete_id",
+            "week_key",
+            "planned_count",
+            "completed_count",
+            "adherence_pct",
+            "computed_at",
+        ):
+            assert flags[column][0] is True, column
+
+    def test_week_adherence_id_is_the_primary_key(self, db_path: Path) -> None:
+        """id is the single INTEGER primary key (AUTOINCREMENT rowid alias)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _week_adherence_column_flags(db_path)
+        assert flags["id"][1] is True
+        assert [name for name, (_, pk) in flags.items() if pk] == ["id"]
+
+    def test_week_adherence_pct_check_is_declared(self, db_path: Path) -> None:
+        """The percentage range CHECK is declared on the table."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _week_adherence_table_sql(db_path)
+        assert WEEK_ADHERENCE_PCT_RANGE_CHECK in sql
+
+    def test_week_adherence_pct_check_rejects_out_of_range_values(self, db_path: Path) -> None:
+        """Inserting a percentage below 0 or above 100 fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            for sql in (
+                "INSERT INTO week_adherence "
+                "(athlete_id, week_key, planned_count, completed_count, adherence_pct, "
+                "computed_at) VALUES (1, '2026-W41', 2, 1, -0.5, 't1')",
+                "INSERT INTO week_adherence "
+                "(athlete_id, week_key, planned_count, completed_count, adherence_pct, "
+                "computed_at) VALUES (1, '2026-W41', 2, 1, 100.5, 't1')",
+            ):
+                with pytest.raises(sqlite3.IntegrityError, match="pct_range"):
+                    conn.execute(sql)
+
+    def test_week_adherence_athlete_week_pair_is_unique(self, db_path: Path) -> None:
+        """A second metric row for the same (athlete, week) fails the UNIQUE."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO week_adherence "
+                "(athlete_id, week_key, planned_count, completed_count, adherence_pct, "
+                "computed_at) VALUES (1, '2026-W41', 2, 1, 50.0, 't1')"
+            )
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO week_adherence "
+                    "(athlete_id, week_key, planned_count, completed_count, adherence_pct, "
+                    "computed_at) VALUES (1, '2026-W41', 2, 2, 100.0, 't2')"
+                )
+
+    def test_downgrade_to_0004_drops_the_week_adherence_table(self, db_path: Path) -> None:
+        """Downgrade to 0004 removes week_adherence (data-destructive; documented)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "0004")
+
+        tables = _table_names(db_path)
+        assert "week_adherence" not in tables
+        assert "debriefs" in tables

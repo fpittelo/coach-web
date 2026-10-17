@@ -336,6 +336,66 @@ class TestPostDebrief:
         assert response.json() == {"detail": GENERIC_422_DETAIL}
 
 
+class TestDebriefWeekAdherence:
+    """POST /api/debrief — the weekly adherence metric on the save path (#234).
+
+    The debrief save is the metric's event-driven write trigger (AC2): the
+    ISO week of the debriefed session is recomputed from the existing DB
+    compliance data (approved drafts' day rows vs the athlete's debriefs)
+    and upserted — counts/percentages only (C3). The 201 body carries the
+    metric when the week has planned sessions; a week without planned
+    sessions keeps the pre-#234 body byte-identical (no metric field), and a
+    failed best-effort upsert never breaks the saved debrief.
+    """
+
+    def test_save_answers_201_with_the_week_metric(self, migrated_db: Path, encryption_key) -> None:
+        """AC1/AC3: the 201 body carries the ISO-week adherence when planned."""
+        _seed_approved_draft(migrated_db, _week_draft())
+        client = TestClient(create_app())
+
+        response = client.post("/api/debrief", json={"plan_session_key": "2026-10-05", "rpe": 7})
+
+        assert response.status_code == 201
+        assert response.json()["week_adherence"] == {
+            "week_key": "2026-W41",
+            "planned_count": 2,
+            "completed_count": 1,
+            "adherence_pct": 50.0,
+        }
+
+    def test_resave_keeps_a_single_metric_row(self, migrated_db: Path, encryption_key) -> None:
+        """AC2: the upsert is idempotent — a re-save never duplicates the row."""
+        _seed_approved_draft(migrated_db, _week_draft())
+        client = TestClient(create_app())
+        client.post("/api/debrief", json={"plan_session_key": "2026-10-05", "rpe": 7})
+        client.post("/api/debrief", json={"plan_session_key": "2026-10-05", "rpe": 9})
+
+        with sqlite3.connect(migrated_db) as conn:
+            rows = conn.execute(
+                "SELECT athlete_id, week_key, planned_count, completed_count " "FROM week_adherence"
+            ).fetchall()
+
+        assert rows == [(DEFAULT_ATHLETE_ID, "2026-W41", 2, 1)]
+
+    def test_upsert_failure_degrades_and_keeps_the_save(
+        self, migrated_db: Path, encryption_key, monkeypatch
+    ) -> None:
+        """The metric is best-effort: a failed upsert keeps the 201 + the row."""
+
+        async def _raising_upsert(*args: Any, **kwargs: Any) -> None:
+            raise SQLAlchemyError("metric store exploded")
+
+        monkeypatch.setattr("coach_web.app.upsert_week_adherence", _raising_upsert)
+        _seed_approved_draft(migrated_db, _week_draft())
+        client = TestClient(create_app())
+
+        response = client.post("/api/debrief", json={"plan_session_key": "2026-10-05", "rpe": 7})
+
+        assert response.status_code == 201
+        assert "week_adherence" not in response.json()
+        assert _debrief_count(migrated_db) == 1
+
+
 class TestDebriefIcuMirror:
     """POST /api/debrief — the opt-in ICU session-comment mirror (#190 AC3).
 

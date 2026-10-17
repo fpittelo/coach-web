@@ -12,9 +12,9 @@
 #   cp .env.qa.example .env.qa      # then fill in your secrets
 #   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml \
 #       --env-file .env.qa pull
+#   ./scripts/e2e-preflight.sh qa   # validates, then tears its lane down on exit
 #   docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml \
-#       --env-file .env.qa up -d
-#   ./scripts/e2e-preflight.sh qa
+#       --env-file .env.qa up -d    # FINAL step — lane left serving
 
 name: coach-web-qa
 

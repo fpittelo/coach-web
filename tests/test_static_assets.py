@@ -156,9 +156,45 @@ nLPD / #142 posture); the typed-error and transport-error paths are
 untouched, so failures stay visible (AC3).
 
 Issue #200 removes the stale "Local VIDAR" codename from every
-user-visible string of the main page (masthead kicker, footer privacy
-line, settings lede) — leftover internal hostname meaningless to the
-athlete. The privacy statements themselves stay; only the codename goes.
+    user-visible string of the main page (masthead kicker, footer privacy
+    line, settings lede) — leftover internal hostname meaningless to the
+    athlete. The privacy statements themselves stay; only the codename goes.
+
+    Issue #235 (epic #214-A) adds the SVG interval step profile to the plan
+    card and the weekly-card zone chips. The profile renders one inline SVG
+    bar per step — height proportional to the step's target intensity, %
+    of FTP preferred over raw watts, normalized against the plan peak,
+    targetless steps rendered as a neutral stub — from an HTML-context
+    x-for loop: Alpine ``<template>`` directives cannot live INSIDE
+    ``<svg>`` (the parser creates an SVG-namespaced element without a
+    ``content`` fragment; verified against the vendored 3.14.9 build), so
+    each bar is its own inline ``<svg>``. CSP-clean by construction
+    (precedent #207): bar geometry rides presentation attributes and
+    classes — no inline style attributes, no event handlers — and the
+    profile block carries ONE accessible name (role="img") summarizing
+    steps/duration/peak while the interval table stays as the accessible
+    per-step alternative (AC3). The week card gains a per-day intensity
+    zone chip (Rest/Hard/Easy) derived purely from the delivered
+    zones/rest flags (AC4) — word + color, never color alone (#165
+    posture). No new I/O anywhere (AC2): both features are pure functions
+    of the data the SSE payloads already deliver.
+
+    Issue #249 compresses the chat chrome — PO feedback on the dev lane
+    (2026-10-17): the console is height-starved, the fixed chrome above
+    the log (masthead, greeting block, status band) consuming too much
+    vertical space without value. The masthead paddings/margins are
+    trimmed and the h1 clamp capped at 2rem (the identity bar already
+    carries the brand), the transient status band becomes a slim inline
+    row (band border/padding geometry removed), and the greeting block
+    drops to a compact rhythm (space-4 padding, space-2 gap, 32px hero
+    monogram, 1.15rem salutation) — content preserved everywhere. The
+    measured arithmetic (old 19.85rem @1280 / ~22.9rem worst case under a
+    26rem allowance → new 15.05rem @1280 / ~17.5rem worst case under a
+    20rem allowance) is documented in the .chat comment per the #207
+    honest-recomputation precedent, and the log's computed height at
+    1280×800 rises 24rem → 30rem. The composer capsule, single-dispatch
+    path, stop-morph and _SIGNIN_SLOT pins are untouched; the floor/cap
+    mechanics are rewritten to the new allowance, never deleted.
 """
 
 import re
@@ -1781,7 +1817,8 @@ class TestComposerErgonomicsContract:
         transcript and pushes the composer below the fold (PR #130 review
         blocker). The panel is therefore viewport-height-bounded: a dvh
         declaration (tracks mobile browser chrome) overriding a vh
-        fallback, plus a max-height cap for very tall monitors.
+        fallback, plus a max-height cap for very tall monitors. The
+        masthead allowance is the #249 compaction value (20rem).
         """
         html = self._html()
         css = self._css()
@@ -1799,18 +1836,18 @@ class TestComposerErgonomicsContract:
         # height on the flex column (dvh over vh fallback) + a cap for
         # very tall monitors. Without it the panel grows with the
         # transcript and the footer scrolls away.
-        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
         assert "max-height:" in chat, "tall-monitor cap missing"
 
     def test_chat_has_a_short_viewport_height_floor(self) -> None:
-        """AC1 (#150): the panel keeps a usable floor on very short viewports.
+        """AC1 (#150, #249 rewrite): the panel keeps a usable floor on short viewports.
 
-        On viewports shorter than the 26rem masthead allowance (landscape
-        phones), ``calc(100dvh - 26rem)`` clamps to 0 and the panel — log
+        On viewports shorter than the 20rem masthead allowance (landscape
+        phones), ``calc(100dvh - 20rem)`` clamps to 0 and the panel — log
         AND composer — degenerates. A min-height floor resolves the used
-        height to ``max(calc(100dvh - 26rem), floor)``; at 14rem it stays
-        below the computed height on typical portrait phones (≥ 40rem
+        height to ``max(calc(100dvh - 20rem), floor)``; at 14rem it stays
+        below the computed height on typical portrait phones (≥ 34rem
         tall), so the #83 portrait behavior is unchanged there.
         """
         chat = _rule_block(self._css(), ".chat")
@@ -1921,30 +1958,31 @@ class TestFloatingComposerContract:
         assert "margin: 0 auto" in layout
 
     def test_height_budget_is_preserved_with_an_honest_comment(self) -> None:
-        """AC 1.1: the .chat height budget survives the redesign.
+        """AC 1.1 (#249 rewrite): the .chat height budget survives compaction.
 
         The pinned-footer mechanism is untouched: the panel stays
-        viewport-height-bounded (dvh over vh fallback, 26rem masthead
-        allowance, 14rem floor, 40rem tall-monitor cap) and the capsule is
-        its last flex child. The budget comment carries the honest
-        recomputation: the capsule's dock row lives INSIDE the panel
-        budget, and the greeting renders inside the scrolling log — no new
-        fixed chrome above the panel.
+        viewport-height-bounded (dvh over vh fallback, the 20rem masthead
+        allowance re-derived by the #249 chrome compaction, 14rem floor,
+        40rem tall-monitor cap) and the capsule is its last flex child.
+        The budget comment carries the honest recomputation — the #207
+        capsule arithmetic AND the #249 old-vs-new allowance arithmetic.
         """
         css = self._css()
         chat = _rule_block(css, ".chat")
 
-        assert "height: calc(100vh - 26rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 26rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
         assert "min-height: 14rem" in chat, "short-viewport floor missing"
         assert "max-height: 40rem" in chat, "tall-monitor cap missing"
 
-        # The comment above the .chat rule documents the #207 recomputation.
+        # The comment above the .chat rule documents the #207 recomputation
+        # and the #249 chrome-compaction arithmetic.
         css_raw = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
         comment_at = css_raw.index(".chat {")
         comment_start = css_raw.rindex("/*", 0, comment_at)
         comment = css_raw[comment_start:comment_at]
         assert "#207" in comment, "height-budget comment must carry the #207 recomputation"
+        assert "#249" in comment, "height-budget comment must carry the #249 arithmetic"
 
     # --- AC 1.4: action dock — single row inside the capsule --------------------
 
@@ -2137,6 +2175,132 @@ class TestFloatingComposerContract:
             "/api/debrief/pending",
             "/api/objectives",
         }, sorted(endpoints)
+
+
+class TestConsoleChromeCompactionContract:
+    """Chat chrome compaction — reclaim log height (#249).
+
+    PO feedback on the dev lane (2026-10-17): the chat console is
+    height-starved — the fixed chrome above the log (masthead, greeting
+    block, status band) consumes too much vertical space without value.
+    #207 set the log height to ``calc(100dvh - 26rem)``; #249 compresses
+    the chrome and re-derives the masthead allowance to 20rem, with the
+    honest per-block arithmetic documented in the .chat comment (the #207
+    recomputation precedent).
+
+    Compaction contract (content preserved, footprint reduced):
+
+    - masthead: paddings/margins trimmed one space step, the h1 clamp
+      capped at 2rem (the identity bar already carries the brand);
+    - status band (``.activity``): a slim inline row — band border/padding
+      geometry removed, space-2 rhythm — and transient (x-show), so it
+      never reserves a permanent band;
+    - greeting (``.empty-state``): space-4 vertical padding, space-2 gap,
+      32px hero monogram, 1.15rem salutation — monogram, salutation,
+      welcome line and chips all stay (pinned by
+      TestOnboardingEmptyStateContract);
+    - composer capsule: UNTOUCHED — the #207 pins in
+      TestFloatingComposerContract keep guarding it; the floor/cap
+      mechanics (14rem floor, 40rem cap) are rewritten to the new
+      allowance, never deleted.
+    """
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _css_raw(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    # --- AC1: masthead chrome trimmed -----------------------------------------
+
+    def test_masthead_padding_is_trimmed(self) -> None:
+        """AC1: the masthead vertical padding drops a full space step per side."""
+        masthead = _rule_block(self._css(), ".masthead")
+
+        assert "padding: var(--space-4) var(--space-5) var(--space-4)" in masthead
+
+    def test_masthead_margins_are_trimmed(self) -> None:
+        """AC1: identity bar, rule and kicker margins drop to the slim rhythm."""
+        css = self._css()
+
+        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".identity-bar")
+        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".rule")
+        # The kicker keeps its margin shorthand (0 0 <token>).
+        assert "margin: 0 0 var(--space-2)" in _rule_block(css, ".kicker")
+
+    def test_masthead_h1_is_capped_at_two_rem(self) -> None:
+        """AC1: the h1 clamp tops out at 2rem — the identity bar owns the brand."""
+        h1 = _rule_block(self._css(), ".masthead h1")
+
+        assert "font-size: clamp(1.5rem, 3vw, 2rem)" in h1
+        assert "margin: 0 0 var(--space-2)" in h1
+
+    # --- AC1: the height budget re-derivation -----------------------------------
+
+    def test_chat_allowance_is_compacted_to_20rem(self) -> None:
+        """AC1: the masthead allowance drops 26rem → 20rem; floor/cap unchanged."""
+        chat = _rule_block(self._css(), ".chat")
+
+        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
+        assert "min-height: 14rem" in chat, "short-viewport floor must survive"
+        assert "max-height: 40rem" in chat, "tall-monitor cap must survive"
+
+    def test_height_budget_comment_carries_the_249_arithmetic(self) -> None:
+        """AC1: the .chat comment documents the old vs new budget arithmetic."""
+        css_raw = self._css_raw()
+        comment_at = css_raw.index(".chat {")
+        comment_start = css_raw.rindex("/*", 0, comment_at)
+        comment = css_raw[comment_start:comment_at]
+
+        assert "#249" in comment, "the #249 recomputation must be documented"
+        assert "#207" in comment, "the #207 precedent must stay referenced"
+        assert "26rem" in comment, "the old allowance must be stated"
+        assert "20rem" in comment, "the new allowance must be stated"
+
+    # --- AC2: slim transient status band -----------------------------------------
+
+    def test_status_band_is_a_slim_inline_row(self) -> None:
+        """AC2: the activity band loses its border/padding band geometry."""
+        activity = _rule_block(self._css(), ".activity")
+
+        assert "margin-top: var(--space-2)" in activity, "slim top margin missing"
+        assert "border-top" not in activity, "the band separator must go"
+        assert "padding-top" not in activity, "the band padding must go"
+        assert "gap: var(--space-2)" in activity, "slim inner rhythm missing"
+
+    def test_status_band_stays_transient(self) -> None:
+        """AC2: the band is x-show gated — it never reserves a permanent row."""
+        html = self._html()
+        activity_at = html.index('<div class="activity"')
+        tag = html[activity_at : html.index(">", activity_at) + 1]
+
+        assert "x-show=" in tag, "the band must stay transient (x-show)"
+
+    # --- AC3: slimmed greeting block ------------------------------------------------
+
+    def test_greeting_block_padding_and_gap_are_slimmed(self) -> None:
+        """AC3: the greeting column drops to the space-4/space-2 rhythm."""
+        empty = _rule_block(self._css(), ".empty-state")
+
+        assert "padding: var(--space-4)" in empty
+        assert "gap: var(--space-2)" in empty
+
+    def test_hero_monogram_is_compacted(self) -> None:
+        """AC3: the hero monogram shrinks 48px → 32px (content preserved)."""
+        hero = _rule_block(self._css(), ".monogram--hero")
+
+        assert "width: 32px" in hero
+        assert "height: 32px" in hero
+
+    def test_salutation_is_compacted(self) -> None:
+        """AC3: the salutation drops 1.5rem → 1.15rem (x-text content unchanged)."""
+        line = _rule_block(self._css(), ".greeting-line")
+
+        assert "font-size: 1.15rem" in line
 
 
 class TestOnboardingEmptyStateContract:
@@ -3584,6 +3748,22 @@ class TestDebriefUiContract:
         assert 'state: "submitted"' in log
         assert "Logged: RPE" in log
 
+    def test_log_rpe_note_carries_the_week_adherence(self) -> None:
+        """The collapsed note appends the ISO-week adherence when present (#234 AC3).
+
+        The debrief-save response is the payload that already carries the
+        metric (computed on the same save path), so the check-in card's
+        collapsed summary renders it — counts and percentage, no new route
+        and no new fetch.
+        """
+        log = _rule_block(self._script(), "logRpe()")
+
+        assert "body.week_adherence" in log
+        assert "Week adherence" in log
+        assert "body.week_adherence.adherence_pct" in log
+        assert "body.week_adherence.completed_count" in log
+        assert "body.week_adherence.planned_count" in log
+
     def test_skip_rpe_dismisses_the_card(self) -> None:
         """Skip clears the card and its pin without persisting anything."""
         skip = _rule_block(self._script(), "skipRpe()")
@@ -3838,3 +4018,257 @@ class TestDebriefSummaryCardContract:
     def test_mirror_field_is_styled(self) -> None:
         """The consent checkbox carries a stylesheet rule (tokens only)."""
         assert ".rpe-mirror-field" in self._css()
+
+
+class TestSvgStepProfileContract:
+    """SVG interval step profile & week-card zone chips (#235, epic #214-A).
+
+    The structured workout plan renders as an inline SVG step profile inside
+    the existing plan card — one bar per step, bar height proportional to
+    the step's target intensity, with the target watts/% and cadence labels
+    bound as x-text beside each bar. The weekly plan card gains a per-day
+    intensity zone chip derived from the already-delivered payload.
+
+    Hard repo posture pinned here:
+
+    1. CSP (precedent #207): the profile is sized/positioned via SVG
+       presentation attributes and classes — NO inline style attributes and
+       NO event handlers anywhere in the new markup; the visualization is
+       static.
+    2. No new I/O (AC2): the profile derives every value from the plan data
+       already carried by the SSE plan payloads — no fetch, no new
+       endpoint, no CSP change.
+    3. Accessibility (AC3): the profile block carries ONE accessible name
+       (role="img" + aria-label summary); the existing interval table stays
+       as the accessible per-step alternative.
+    4. Word + color chips (AC4 / #165 posture): the zone chip renders its
+       word via x-text next to its color class — never color alone.
+
+    Alpine SVG limitation (verified against the vendored Alpine 3.14.9
+    build): ``<template>`` directives cannot live INSIDE ``<svg>`` — the
+    HTML parser creates an SVG-namespaced element without a ``content``
+    document fragment, so Alpine cannot iterate it. The profile therefore
+    renders one inline ``<svg>`` bar per step from an HTML-context x-for
+    loop, with rect geometry bound via Alpine attribute bindings
+    (SVG presentation attributes — CSP-clean).
+
+    Source-level assertions only (ADR-006 §5 — no Node toolchain).
+    """
+
+    WEEK_CARD_TEMPLATE = (
+        "<template x-if=\"message.role === 'assistant' && weekPlan && "
+        'weekMessageIndex === index">'
+    )
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _plan_card(self) -> str:
+        html = self._html()
+        card_at = html.index(PLAN_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    def _week_card(self) -> str:
+        html = self._html()
+        card_at = html.index(self.WEEK_CARD_TEMPLATE)
+        return html[card_at : html.index("</article>", card_at)]
+
+    def _profile_block(self) -> str:
+        """The step-profile region: from its container to the action row."""
+        card = self._plan_card()
+        start = card.index('class="step-profile"')
+        return card[start : card.index('class="plan-actions"', start)]
+
+    # --- AC1: inline SVG step profile inside the plan card ----------------------
+
+    def test_step_profile_renders_inline_svg_bars_in_the_plan_card(self) -> None:
+        """AC1: one inline SVG bar per step inside the plan card markup."""
+        profile = self._profile_block()
+
+        assert 'class="step-profile"' in profile
+        assert 'x-for="(bar, barIndex) in stepProfileRows(plan)"' in profile
+        assert 'class="step-profile-bar"' in profile
+        assert "<rect" in profile
+        assert 'viewBox="0 0 24 100"' in profile
+        assert 'preserveAspectRatio="none"' in profile
+        # Bar geometry rides SVG presentation attributes (CSP-clean) —
+        # never the style attribute.
+        assert 'x="0"' in profile
+        assert 'width="24"' in profile
+        assert ':y="100 - bar.height"' in profile
+        assert ':height="bar.height"' in profile
+        # The profile hides itself when the payload carries no steps.
+        assert 'x-show="plan.steps && plan.steps.length > 0"' in profile
+
+    def test_step_profile_sits_above_the_existing_step_table(self) -> None:
+        """AC1/AC3: visual profile first, detailed table second; both stay."""
+        card = self._plan_card()
+
+        profile_at = card.index('class="step-profile"')
+        wrap_at = card.index('class="plan-table-wrap"')
+        table_at = card.index('<table class="interval-table"')
+        assert profile_at < wrap_at < table_at
+
+    def test_step_profile_height_is_proportional_to_target_intensity(self) -> None:
+        """AC1: bar height ∝ target intensity via the stepProfileRows helper.
+
+        % of FTP is the primary signal (the bounded 0–250 domain; a step
+        carrying both watts and % maps by its %). Explicit watts are the
+        fallback. Steps without any target render a neutral stub instead of
+        inventing a value, and heights normalize against the plan's peak
+        intensity.
+        """
+        rows = _rule_block(self._script(), "stepProfileRows(plan)")
+        assert rows, "stepProfileRows(plan) helper must exist"
+
+        # Reads the delivered payload only (AC2) ...
+        assert "plan.steps" in rows
+        assert "fetch" not in rows
+        # ... prefers % of FTP, with watts as the fallback ...
+        assert rows.index("target_power_pct") < rows.index("target_power_watts")
+        # ... normalizes each bar against the plan peak ...
+        assert "/ peak" in rows
+        # ... and stubs targetless steps without inventing a value.
+        assert "STEP_PROFILE_STUB_PCT" in rows
+
+    def test_step_profile_labels_render_target_and_cadence(self) -> None:
+        """AC1: the per-bar labels carry the target watts/% and cadence."""
+        profile = self._profile_block()
+        rows = _rule_block(self._script(), "stepProfileRows(plan)")
+
+        assert 'x-text="bar.target"' in profile
+        assert 'x-text="bar.cadence"' in profile
+
+        target = _rule_block(self._script(), "stepTargetText(step)")
+        assert target, "stepTargetText(step) helper must exist"
+        # Mirrors the server's plan_approval._format_target vocabulary:
+        # watts preferred, with the % of FTP alongside when both are present.
+        assert '" W ("' in target
+        assert '" W"' in target
+        assert '"%"' in target
+        # Cadence labels ride the rows helper (same payload, no new I/O).
+        assert "cadence_rpm" in rows
+        assert '" rpm"' in rows
+
+    # --- AC2: no new I/O, CSP untouched ------------------------------------------
+
+    def test_step_profile_introduces_no_new_io_or_transport(self) -> None:
+        """AC2: the profile derives from SSE payload state — no new transport.
+
+        The fetch surface of the component is pinned by
+        TestFloatingComposerContract (the known endpoint set); this pin
+        brings the profile helpers under the same no-transport posture.
+        """
+        script = self._script()
+        rules = (
+            _rule_block(script, "stepProfileRows(plan)"),
+            _rule_block(script, "stepTargetText(step)"),
+            _rule_block(script, "stepProfileLabel(plan)"),
+        )
+        assert all(rules), rules
+
+        for transport in ("fetch", "EventSource", "XMLHttpRequest"):
+            for block in rules:
+                assert transport not in block, transport
+
+    def test_step_profile_adds_no_inline_style_or_event_handlers(self) -> None:
+        """CSP (precedent #207): the profile is style-attribute and handler free.
+
+        Inline style attributes are blocked by style-src — bar geometry must
+        ride presentation attributes and classes. The visualization is
+        static: no Alpine event bindings inside the profile markup at all.
+        """
+        profile = self._profile_block()
+
+        assert 'style="' not in profile
+        # No event handlers anywhere in the profile markup (static SVG).
+        assert "@" not in profile
+
+    # --- AC3: accessible name + retained table ------------------------------------
+
+    def test_step_profile_carries_an_accessible_name(self) -> None:
+        """AC3: the profile block is one image with one summarizing name."""
+        profile = self._profile_block()
+
+        assert 'role="img"' in profile
+        assert ':aria-label="stepProfileLabel(plan)"' in profile
+        # The decorative bars are hidden from the accessibility tree; the
+        # block-level name is the single summary (never per-bar noise).
+        assert 'aria-hidden="true"' in profile
+
+    def test_step_profile_label_summarizes_the_workout(self) -> None:
+        """AC3: the aria-label summarizes steps, duration and peak target."""
+        label = _rule_block(self._script(), "stepProfileLabel(plan)")
+        assert label, "stepProfileLabel(plan) helper must exist"
+
+        assert '"Step profile: "' in label
+        assert "plan.steps.length" in label
+        assert "duration_minutes" in label
+        assert '" · peak "' in label
+        # An empty plan yields no name — the block hides anyway.
+        assert 'return ""' in label
+
+    def test_step_table_remains_the_accessible_alternative(self) -> None:
+        """AC3: the interval table stays inside the card; the SVG is additive."""
+        card = self._plan_card()
+
+        assert '<table class="interval-table"' in card
+        assert '<th scope="col">Interval</th>' in card
+        assert '<th scope="col">Cadence</th>' in card
+        # The approve/reject contract is untouched.
+        assert '@click="approvePlan()"' in card
+        assert '@click="rejectPlan()"' in card
+
+    # --- AC4: weekly-card zone chips ------------------------------------------------
+
+    def test_week_card_renders_per_day_zone_chips(self) -> None:
+        """AC4: every day row carries a per-day intensity zone chip."""
+        card = self._week_card()
+
+        assert 'class="zone-chip"' in card
+        assert ':class="weekDayIntensityClass(day)"' in card
+        assert 'x-text="weekDayIntensityText(day)"' in card
+        # The chip rides the Focus/Zones cell — that header already owns the
+        # zone semantics (no new table column, KIS).
+        focus_at = card.index('data-label="Focus"')
+        chip_at = card.index('class="zone-chip"', focus_at)
+        assert chip_at < card.index("</td>", focus_at)
+
+    def test_week_day_intensity_is_derived_from_the_delivered_payload(self) -> None:
+        """AC4/AC2: intensity derives from zones/rest flags — no new I/O."""
+        script = self._script()
+        text = _rule_block(script, "weekDayIntensityText(day)")
+        klass = _rule_block(script, "weekDayIntensityClass(day)")
+
+        assert text, "weekDayIntensityText(day) helper must exist"
+        assert "day.rest_day" in text
+        assert "day.zones" in text
+        assert "fetch" not in text
+        assert klass, "weekDayIntensityClass(day) helper must exist"
+        # Word + color (never color alone, #165): the color class is derived
+        # from the SAME word the chip renders.
+        assert '"zone-chip--" +' in klass
+
+    # --- styling contract ------------------------------------------------------------
+
+    def test_step_profile_and_zone_chips_are_styled_with_tokens(self) -> None:
+        """The new surfaces carry stylesheet rules (tokens only — hex guard)."""
+        css = self._css()
+
+        profile = _rule_block(css, ".step-profile")
+        assert "display: flex" in profile
+
+        rect = _rule_block(css, ".step-profile-rect")
+        assert "var(--accent)" in rect
+
+        chip = _rule_block(css, ".zone-chip")
+        assert "text-transform: uppercase" in chip
+
+        hard = _rule_block(css, ".zone-chip--hard")
+        assert "var(--accent)" in hard
