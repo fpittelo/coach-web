@@ -37,6 +37,7 @@ from coach_web.microcycle import (
     build_week_markdown,
     list_drafts_by_week,
     moved_session_dates,
+    moved_session_origins,
     past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
@@ -795,6 +796,39 @@ class TestAdjustedSessionDetection:
         moved = moved_session_dates(draft, self._stored_content(), self.TODAY)
 
         assert moved == ["2026-10-11"]
+
+    def test_a_moved_session_maps_its_new_date_to_its_original(self) -> None:
+        """The origins view keys each moved session's new date to its stored date.
+
+        The same title-identity detection as :func:`moved_session_dates`,
+        exposing the original date the gate compares phases against (#233
+        AC1 ruling): the Friday endurance session moved onto Sunday maps
+        the new date 2026-10-11 to its original 2026-10-09.
+        """
+        days = self._distinct_days()
+        days[4] = _raw_day(
+            4,
+            session_title="Rest day",
+            focus=None,
+            zones=[],
+            planned_tss=0.0,
+            duration_minutes=0.0,
+            rest_day=True,
+        )
+        days[6] = _raw_day(
+            6,
+            session_title="Friday endurance",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=45.0,
+            duration_minutes=60.0,
+            rest_day=False,
+        )
+        draft = self._distinct_week(days=days, total_tss=350.0, easy_days=4)
+
+        origins = moved_session_origins(draft, self._stored_content(), self.TODAY)
+
+        assert origins == {"2026-10-11": "2026-10-09"}
 
     def test_a_same_date_edit_is_not_a_move(self) -> None:
         """An intensity edit keeping the title on its date is not a move."""

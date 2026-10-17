@@ -878,11 +878,12 @@ class TestObjectiveGuardrails:
         frozen_today: None,
         migrated_db: Path,
     ) -> None:
-        """AC1: a moved session's new date must stay in the approved week's phase.
+        """AC1 ruling: a moved session may not leave its original phase.
 
-        The build phase ends Saturday 2026-10-10; moving Friday's session
-        onto Sunday (2026-10-11, the taper) crosses the boundary → 422 with
-        the static body, before any calendar write or draft supersede.
+        The build phase ends Saturday 2026-10-10; Friday's session
+        (2026-10-09, the build) moved onto Sunday (2026-10-11, the taper)
+        leaves its original date's phase → 422 with the static body,
+        before any calendar write or draft supersede.
         """
         hub = WeekHub()
         client = _client_with(hub, settings)
@@ -906,6 +907,54 @@ class TestObjectiveGuardrails:
             rest_day=False,
         )
         adjusted["total_tss"] = 350.0
+        adjusted["easy_days"] = 4
+
+        response = client.post("/api/week/approve", json={"week": adjusted})
+
+        assert response.status_code == 422
+        assert response.json()["detail"] == WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL
+        assert hub.execute_batches == []
+        rows = _draft_rows(migrated_db)
+        assert len(rows) == 1
+        assert rows[0]["status"] == "approved"
+
+    def test_a_session_moved_back_across_the_phase_boundary_is_rejected(
+        self,
+        settings: Settings,
+        frozen_today: None,
+        migrated_db: Path,
+    ) -> None:
+        """AC1 ruling: a cross-phase move is rejected in EITHER direction.
+
+        The week spans the season — Monday–Saturday sit in the build phase,
+        Sunday (2026-10-11) in the taper. Moving Sunday's session back onto
+        Saturday (2026-10-10, the build) leaves the session's original
+        date's phase: the new date must fall in the SAME phase as the
+        original date → 422 with the static body, before any calendar
+        write or draft supersede.
+        """
+        hub = WeekHub()
+        client = _client_with(hub, settings)
+        _seed_approved_week(migrated_db, _season_week())
+        _seed_season(
+            client,
+            build_end="2026-10-10",
+            taper_start="2026-10-11",
+            taper_end="2026-10-18",
+            target_date="2026-10-14",
+        )
+        adjusted = _season_week()
+        adjusted["days"][5] = _raw_day(
+            5,
+            session_title="Sunday spin",
+            focus="Endurance zones",
+            zones=["Z1", "Z2"],
+            planned_tss=30.0,
+            duration_minutes=45.0,
+            rest_day=False,
+        )
+        adjusted["days"][6] = _rest_day(6)
+        adjusted["total_tss"] = 335.0
         adjusted["easy_days"] = 4
 
         response = client.post("/api/week/approve", json={"week": adjusted})

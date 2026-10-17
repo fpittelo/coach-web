@@ -453,6 +453,31 @@ def adjusted_future_days(draft: WeeklyPlanDraft, stored_content: str, today: dat
     ]
 
 
+def moved_session_origins(
+    draft: WeeklyPlanDraft, stored_content: str, today: date
+) -> dict[str, str]:
+    """Map each moved session's new date to its original stored date.
+
+    The same title-identity detection as :func:`moved_session_dates`
+    (#233 AC1): a future day whose session title renders elsewhere in the
+    stored week is a move target, keyed here to the earliest stored date
+    carrying that title — title identity cannot disambiguate a title that
+    renders on several stored dates. Same-date intensity/duration edits
+    keep their title on their own date and never appear; a brand-new
+    title is a same-date session replacement, not a move. ``today`` is
+    ALWAYS injected by the caller (D3.5).
+    """
+    stored_titles = _day_title_by_date(stored_content)
+    origins: dict[str, str] = {}
+    for day in adjusted_future_days(draft, stored_content, today):
+        prior_dates = [
+            day_date for day_date, title in stored_titles.items() if title == day.session_title
+        ]
+        if prior_dates and day.date not in prior_dates:
+            origins[day.date] = min(prior_dates)
+    return origins
+
+
 def moved_session_dates(draft: WeeklyPlanDraft, stored_content: str, today: date) -> list[str]:
     """Return the dates where an adjusted future day receives a moved session.
 
@@ -463,17 +488,10 @@ def moved_session_dates(draft: WeeklyPlanDraft, stored_content: str, today: date
     replacement, not a move. Title identity is the only session signal the
     draft model carries, so a move that also retitles its session is not
     detected (accepted limitation — no session ids exist in the model).
-    ``today`` is ALWAYS injected by the caller (D3.5).
+    The list view of :func:`moved_session_origins`. ``today`` is ALWAYS
+    injected by the caller (D3.5).
     """
-    stored_titles = _day_title_by_date(stored_content)
-    moved: list[str] = []
-    for day in adjusted_future_days(draft, stored_content, today):
-        prior_dates = {
-            day_date for day_date, title in stored_titles.items() if title == day.session_title
-        }
-        if prior_dates and day.date not in prior_dates:
-            moved.append(day.date)
-    return moved
+    return list(moved_session_origins(draft, stored_content, today))
 
 
 # ---------------------------------------------------------------------------

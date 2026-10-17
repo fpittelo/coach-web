@@ -70,7 +70,7 @@ from coach_web.microcycle import (
     apply_approved_week_digest,
     build_week_markdown,
     list_drafts_by_week,
-    moved_session_dates,
+    moved_session_origins,
     past_days_render_identically,
     transition_draft_status,
     upsert_week_draft,
@@ -93,6 +93,7 @@ from coach_web.objectives import (
 )
 from coach_web.periodization import (
     PeriodizationApprovalRequest,
+    PeriodizationPhase,
     PeriodizationPlanResponse,
     list_phases,
     replace_phases,
@@ -232,6 +233,15 @@ async def _default_debrief_mirror(
         notes=notes,
     )
     return outcome
+
+
+def _covering_phase(phases: list[PeriodizationPhase], day: str) -> PeriodizationPhase | None:
+    """The phase whose date range covers ``day``, or None when uncovered.
+
+    ISO date strings compare lexicographically, so the range check works
+    directly on the phase model's string dates (#233 AC1).
+    """
+    return next((phase for phase in phases if phase.start_date <= day <= phase.end_date), None)
 
 
 # Minimal v0.7 Content-Security-Policy (STRIDE #87 sign-off, conditions
@@ -727,28 +737,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ):
                 logger.warning("Rejected week adjustment over the availability budget")
                 raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_AVAILABILITY_DETAIL)
-            # 2d. Phase-boundary guardrail (#233 AC1): a moved session's new
-            # date must remain within the date range of the phase containing
-            # the currently approved week (resolved from the week's start
-            # date). Sessions edited in place keep their date and are never
-            # moves. No phase covering the week degrades to no gate (the
+            # 2d. Phase-boundary guardrail (#233 AC1 ruling): every moved
+            # session's new date must fall in the SAME phase as the
+            # session's original date in the approved draft (title-identity
+            # detection via moved_session_origins) — a cross-phase move in
+            # either direction is rejected. Sessions edited in place keep
+            # their date and are never moves. A date outside every phase
+            # compares as no phase: two uncovered dates pass, one uncovered
+            # side is a crossing. No phases at all degrades to no gate (the
             # availability posture — coaching structure, not security).
-            boundary_phase = next(
-                (phase for phase in phases if phase.start_date <= week_start <= phase.end_date),
-                None,
-            )
-            if boundary_phase is not None:
-                moved = moved_session_dates(payload.week, stored.content, today)
-                if any(
-                    moved_date < boundary_phase.start_date or moved_date > boundary_phase.end_date
-                    for moved_date in moved
-                ):
-                    logger.warning(
-                        "Rejected week adjustment moving a session across a phase boundary"
-                    )
-                    raise HTTPException(
-                        status_code=422, detail=WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL
-                    )
+            origins = moved_session_origins(payload.week, stored.content, today)
+            if any(
+                _covering_phase(phases, original) is not _covering_phase(phases, moved)
+                for moved, original in origins.items()
+            ):
+                logger.warning("Rejected week adjustment moving a session across a phase boundary")
+                raise HTTPException(status_code=422, detail=WEEK_ADJUSTMENT_PHASE_BOUNDARY_DETAIL)
             # 2e. Peak-date guardrail (#233 AC2): every adjusted session date
             # must not pass the active objective's target/peak date — the
             # peak lives in the objective and is never modified here. No
