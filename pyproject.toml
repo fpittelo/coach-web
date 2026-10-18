@@ -74,6 +74,13 @@ testpaths = ["tests"]
 # listed alongside: aiosqlite executes SQL on background threads, and naming
 # any concurrency switches off coverage's default thread tracing.
 concurrency = ["thread", "greenlet"]
+# Coverage measures the shipped package only (#302). The CI gate scopes to
+# `--cov=src/coach_web`; the shared harness gate runs the repo-agnostic
+# `--cov=.`, which also swept in the test suite itself (~11k near-fully-covered
+# statements) and scripts/, inflating the total to 99.47% vs CI's 98.64% on the
+# same tree. Omitting non-shipped paths makes both invocations report the
+# identical figure and keeps the >=80% gate measuring production code.
+omit = ["tests/*", "scripts/*"]
 
 [tool.ruff]
 line-length = 100
