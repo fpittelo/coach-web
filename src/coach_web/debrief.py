@@ -305,6 +305,25 @@ def athlete_id_from_email(email: str | None) -> int:
     return int.from_bytes(digest[:4], "big")
 
 
+def resolve_data_encryption_key(settings: Settings) -> bytes:
+    """Resolve the raw ``DATA_ENCRYPTION_KEY`` bytes — the single key path (#301 SEC-296-04).
+
+    Both :func:`build_debrief_cipher` (C2 field encryption) and the
+    maintenance backup/restore CLI read the key through this one resolver,
+    so exactly one place touches the secret.
+
+    Raises:
+        EncryptionUnavailableError: when the key is missing (empty). The
+            message names the env var, never its value (nLPD).
+    """
+    key = settings.DATA_ENCRYPTION_KEY.get_secret_value()
+    if not key:
+        raise EncryptionUnavailableError(
+            EncryptionReason.KEY_UNAVAILABLE, "DATA_ENCRYPTION_KEY is not configured"
+        )
+    return key.encode("utf-8")
+
+
 def build_debrief_cipher(settings: Settings) -> Fernet:
     """Build the Fernet cipher from ``DATA_ENCRYPTION_KEY`` (#189 AC2).
 
@@ -314,11 +333,7 @@ def build_debrief_cipher(settings: Settings) -> Fernet:
             its value; the boundary maps the typed reason to the fixed 503
             vocabulary. There is no plaintext fallback.
     """
-    key = settings.DATA_ENCRYPTION_KEY.get_secret_value()
-    if not key:
-        raise EncryptionUnavailableError(
-            EncryptionReason.KEY_UNAVAILABLE, "DATA_ENCRYPTION_KEY is not configured"
-        )
+    key = resolve_data_encryption_key(settings)
     try:
         return Fernet(key)
     except ValueError as exc:
