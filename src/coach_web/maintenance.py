@@ -62,7 +62,14 @@ def vacuum_database(db_path: str) -> None:
     free pages that deleted plaintext rows (e.g. migration 0006's in-place
     rewrite residue) leave behind. Requires a brief exclusive lock — run it
     while the lane is stopped or idle.
+
+    Raises:
+        FileNotFoundError: when *db_path* does not exist — a missing database
+            is refused, never silently created empty (#301 F-01, same N1
+            class AC1 closes for backup/restore).
     """
+    if not Path(db_path).is_file():
+        raise FileNotFoundError(f"database not found: {db_path} — nothing to vacuum")
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("VACUUM")

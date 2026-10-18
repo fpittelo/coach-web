@@ -194,7 +194,15 @@ class TestEncryptedBackupRestore:
 
 
 class TestBackupRefusesMissingPaths:
-    """AC1 (N1) — backup/restore refuse a missing path instead of failing silently."""
+    """AC1 (N1) — backup/restore/vacuum refuse a missing path instead of failing silently."""
+
+    def test_vacuum_refuses_missing_db(self, tmp_path: Path) -> None:
+        """A missing DB path must raise — never ``sqlite3.connect`` an empty DB into being."""
+        missing_db = tmp_path / "nope.db"
+        with pytest.raises(FileNotFoundError, match="database not found"):
+            vacuum_database(str(missing_db))
+        # The refusal must not have created anything (no empty DB).
+        assert not missing_db.exists()
 
     def test_backup_refuses_missing_db(self, tmp_path: Path) -> None:
         """A missing DB path must raise — never ``sqlite3.connect`` an empty DB into being."""
