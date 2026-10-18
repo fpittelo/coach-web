@@ -75,35 +75,39 @@ Client heuristics propose pills locally. **Rejected upfront (#280):** not contex
 
 **Validation (defense in depth):** Pydantic model `SuggestionsPayload` (`list[str]` root, `max_length=4`, items `constr(min_length=1, max_length=48)`, stripped, control-character-free via field validator). Enforced **at the emission site** (C-3: the choke point validates via `SuggestionsPayload` — no raw dict passthrough, no model-dict shortcut); the constant tables are additionally validated at module load (fail-fast).
 
-**Lifecycle / suppression rules (C-4: server-authoritative, per-turn, monotonic):** suppression is decided server-side per turn and is **monotonic across tool iterations** — once a suppressing outcome occurs anywhere in the turn (cards may be emitted mid-turn; `done` is always last), the turn carries no suggestions. The stream endpoint's own server-rendered `morning_briefing` emission (app.py) feeds the same decision — it is a turn outcome like any card. Precedence: if both a suppressing card outcome and a non-suppressing outcome occur in one turn, **suppression wins** (`rpe_request` + `debrief_summary` in one turn → none).
+**Lifecycle / suppression rules (C-4: server-authoritative, per-turn, monotonic):** suppression is decided server-side per turn and is **monotonic across tool iterations** — once a suppressing outcome occurs anywhere in the turn (cards may be emitted mid-turn; `done` is always last), the turn carries no suggestions, even if the final completion is plain prose. The stream endpoint's own server-rendered `morning_briefing` emission (app.py, before `agent.run()`) feeds the same decision — it is a **suppressing** turn outcome like any card. Precedence: if both a suppressing card outcome and a non-suppressing outcome occur in one turn, **suppression wins** (`rpe_request` + `debrief_summary` in one turn → none).
 
 | Turn outcome | Suggestions |
 |:---|:---|
 | Plain conversational answer (no structured card) | default set (below) |
 | `debrief_summary` card | debrief set (below) |
-| `morning_briefing` card | briefing set (below) |
-| `plan_proposal` / `week_plan` / `periodization_plan` / `rpe_request` cards | **none** — these cards carry their own explicit action affordances; pills would duplicate them |
+| `plan_proposal` / `week_plan` / `periodization_plan` / `rpe_request` / `morning_briefing` cards | **none** — these cards carry their own explicit action affordances; pills would duplicate them |
 | `error` (any path) or max-iterations exhaustion | **none** — the `done` events that follow errors carry no suggestions |
 
 Initial server-owned sets (constants in `suggestions.py`, extended by ordinary PRs):
 
 - default: `["Show this week's plan", "How did my last session go?", "What should I focus on?"]`
 - debrief: `["That matches how it felt", "Not quite — let's adjust", "What's next week's focus?"]`
-- briefing: `["What's today's session?", "I'm ready to train"]`
 
 **Client contract (consumable by #281 without further design):** in the `done` handler, if `event.data.suggestions` is present, render the strings as pill `<button>` elements beneath the completed assistant message, inside a container with `role="group"` and `aria-label="Suggested replies"`. A click sends the string **verbatim** as a user message through the existing send path. Pills are cleared when the next send/stream starts (C-5d: absent/suppressed field renders nothing; clear-on-start is explicit). Pill state is **volatile client memory only** — never persisted to localStorage/IndexedDB or any store (C-6). Rendering is **`x-text` only — never `x-html`** (C-5a); pills are **siblings of the assistant bubble, never nested inside it** (C-5b: load-bearing containment invariant, contract-tested). Styling is classes-only under CSP `style-src 'self'`, no new dependencies (C-7).
 
 ## Security Review (MADR-0008 routing — recorded before acceptance)
 
-**@cyber-security verdict: APPROVED-WITH-CONTROLS** (2026-10-18, review recorded on fpittelo/coach-web#280). Binding controls:
+**@cyber-security verdict: APPROVED-WITH-CONTROLS** (2026-10-18, review recorded on fpittelo/coach-web#280). Acceptance is conditional on the following controls being reflected **verbatim** in this record and enforced downstream (#281):
 
-- **C-1:** any future source change (e.g., the model-generated source swap sketched under Consequences) **re-triggers MADR-0008** security review before merge — the wire shape may stay, the trust model may not silently change.
-- **C-2:** single construction choke point; mapping keyed on server-known constants, never model text.
-- **C-3:** emission-site `SuggestionsPayload` validation; no model-dict passthrough.
-- **C-4:** server-authoritative, per-turn, monotonic suppression — including the endpoint-emitted `morning_briefing` and the precedence rule above.
-- **C-5:** regression tests — (a) x-text-only rendering, (b) pills are siblings not nested in the assistant bubble, (c) error/max-iterations `done` events carry no suggestions, (d) absent/suppressed field renders nothing and clear-on-start is explicit.
-- **C-6:** pill state is volatile client memory; no localStorage/IndexedDB persistence.
-- **C-7:** classes-only CSP-safe styling; no new dependencies (no pip-audit/trivy/gitleaks delta).
+**C-1 — Source-change re-triggers MADR-0008.** Any change to the *source* of `suggestions` (from server-owned constants to model- or tool-derived) constitutes a NEW untrusted-input surface and MUST re-trigger MADR-0008 security review, **regardless of an unchanged wire shape**. The claim "the untrusted-input class is eliminated at the source" holds only while the source is server-owned constants.
+
+**C-2 — Single construction choke point.** The `suggestions` value MUST be produced exclusively by a pure function in `src/coach_web/suggestions.py` that maps a **server-known outcome/card-type constant** (the `AgentEventType`/card-type vocabulary, never a model-provided tool name, card title, or any model/tool-derived string) to a copy of the constant sets. No parameter of that function may accept free text.
+
+**C-3 — Emission-site validation.** `SuggestionsPayload` (Pydantic v2: `list[str]`, `max_length=4`, items stripped, 1–48 chars, control-char-free) MUST be enforced at the **emission site** on every `done` that carries the field — not only at module load — and the `done` payload MUST NOT inherit `suggestions` from a model-derived dict (no `data.update()`, no passthrough of model JSON).
+
+**C-4 — Server-authoritative, per-turn, monotonic suppression.** The outcome tracker MUST span all iterations of a turn and be monotonic: if any suppressing card (`plan_proposal`, `week_plan`, `periodization_plan`, `rpe_request`, `morning_briefing`) was emitted anywhere in the turn, the field MUST be suppressed (no default pills), even if the final completion is plain prose. The endpoint-emitted `morning_briefing` fact MUST feed the decision. Precedence when `rpe_request` and `debrief_summary` co-occur MUST be defined (suppression wins).
+
+**C-5 — Security regression tests (zero-warning gate).** Add contract tests asserting: **(a)** the pill path renders strings via `x-text` only and no `x-html` anywhere in the pill rendering; **(b)** the pill container is a **sibling** of the assistant message element, never nested inside its `x-html` bubble; **(c)** the `error` and max-iterations `done` events carry no `suggestions` key; **(d)** absent `suggestions` and each suppressed outcome render no pills, and any prior pills are cleared on the next send/stream start.
+
+**C-6 — Client state is volatile.** Pill state MUST live in in-memory Alpine state only — no `localStorage`, no `IndexedDB` — preserving `security.md` nLPD checklist item 8 ("No persistent browser storage of personal data").
+
+**C-7 — CSP-safe pill styling.** Pill styling MUST be classes-only (existing stylesheet), no inline `style` attributes, and MUST NOT require any new CSP directive or relaxation (`style-src 'self'`, `script-src` unchanged). No new runtime dependency may be added for the pill path.
 
 ## Security & Privacy (Swiss nLPD)
 
