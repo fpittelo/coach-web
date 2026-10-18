@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
+import aiosqlite
 import jwt
 import pytest
 from alembic import command
@@ -24,6 +25,81 @@ from coach_web.models import ReadinessMetrics, TrainingPlan
 
 TEST_DATA_ENCRYPTION_KEY = Fernet.generate_key()
 """Generated Fernet key backing the default test environment (never committed)."""
+
+
+# ---------------------------------------------------------------------------
+# aiosqlite worker teardown tolerance (#293)
+#
+# aiosqlite runs every connection's SQL on a private worker thread and
+# delivers each result through ``future.get_loop().call_soon_threadsafe()``.
+# When a connection's event loop closes before the worker delivers, that
+# call raises ``RuntimeError("Event loop is closed")``; aiosqlite's
+# ``except BaseException`` handler then calls ``call_soon_threadsafe`` a
+# SECOND time (to deliver the exception), which raises again and kills the
+# worker thread. pytest's threadexception plugin surfaces the death as
+# ``PytestUnhandledThreadExceptionWarning`` — fatal under the zero-warning
+# gate (``-W error``). Fired once in CI (#292 run #332, diagnosed on #293):
+# the unwritable-database degrade tests leave aiosqlite's failed-connect
+# stop sentinel queued with a future bound to the TestClient portal loop,
+# which closes at the ``with`` exit; under CI scheduling the worker processes
+# the sentinel only after the loop closed.
+#
+# This suite creates and tears down many short-lived event loops (TestClient
+# portals, pytest-asyncio runners), so the race window is real here. The
+# remedy makes the worker's teardown DETERMINISTIC: a delivery to a closed
+# loop is dropped — the future is orphaned (nobody can await it), so dropping
+# is safe, while killing the worker is not. The worker always drains its
+# queue and exits cleanly, so the warning can no longer occur at all.
+# Test-process only: production aiosqlite behavior is untouched, and the
+# ``-W error`` gate itself is never weakened.
+# ---------------------------------------------------------------------------
+
+
+def _deliver_to_future(setter: Any, future: Any, value: Any) -> None:
+    """Deliver *value* through *setter* to *future*, tolerating a closed loop.
+
+    A future whose loop closed before delivery can never be awaited by
+    anyone, so the delivery is dropped instead of killing the worker thread
+    (the #293 race). Live-loop deliveries are untouched.
+    """
+    try:
+        future.get_loop().call_soon_threadsafe(setter, future, value)
+    except RuntimeError:
+        # RuntimeError("Event loop is closed") — the only failure mode of
+        # call_soon_threadsafe on a loop that died mid-flight.
+        pass
+
+
+def _tolerant_connection_worker_thread(tx: Any) -> None:
+    """aiosqlite's ``_connection_worker_thread`` with closed-loop tolerance.
+
+    Mirrors aiosqlite 0.22.x ``core._connection_worker_thread`` exactly, with
+    the two ``call_soon_threadsafe`` delivery sites routed through
+    :func:`_deliver_to_future`.
+    """
+    while True:
+        # Continues running until all queue items are processed, even after
+        # connection is closed (so we can finalize all futures).
+        future, function = tx.get()
+        try:
+            result = function()
+            if future:
+                _deliver_to_future(aiosqlite.core.set_result, future, result)
+            if result is aiosqlite.core._STOP_RUNNING_SENTINEL:
+                break
+        except BaseException as e:  # noqa: BLE001 - mirrors aiosqlite's worker contract
+            if future:
+                _deliver_to_future(aiosqlite.core.set_exception, future, e)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """Install the tolerant aiosqlite worker before any connection exists.
+
+    ``Connection.__init__`` resolves the worker target from the module
+    global at thread creation, so patching at configure time (before any
+    test opens a connection) covers every connection in the process.
+    """
+    aiosqlite.core._connection_worker_thread = _tolerant_connection_worker_thread
 
 
 @pytest.fixture(autouse=True)
