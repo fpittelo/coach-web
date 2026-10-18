@@ -146,6 +146,19 @@
  * in flight the submit handler branches to stopStreaming() instead: the
  * textarea is disabled then, so the keydown route is dead and the Stop
  * click is the only submit event source.
+ *
+ * Message bubble grammar (#279): the terminal-style role labels give way
+ * to a Sendbird-inspired grammar — assistant messages render as
+ * left-aligned rounded neutral cards with the coach monogram avatar, a
+ * "Coach" sender label and a client-side receipt time (HH:MM); user
+ * messages render as right-aligned accent bubbles. Every message is
+ * stamped with a client-clock receipt at push time (stampReceipt); the
+ * receipt drives the bubble timestamp and the centered date dividers
+ * between messages whose receipt days differ (dateDividerLabel). The
+ * stamps are CLIENT-SIDE ONLY (nLPD AC2): in-memory state, stripped from
+ * the history replay by stripReceipt (the wire contract stays {role,
+ * content} pairs), never persisted, never transmitted. No chat component
+ * library — pure CSS + markup restructuring over the vendored stack.
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -305,6 +318,20 @@ function stripMarkdown(text) {
     .replace(/^[ \t]{0,3}\d+\.[ \t]+/gm, "") // ordered list markers
     .replace(/^[ \t]{0,3}>[ \t]?/gm, "") // blockquote markers
     .trim();
+}
+
+// Receipt timestamp helpers (#279): client-side only (nLPD AC2).
+// stampReceipt records the client clock at push time into the in-memory
+// message; stripReceipt rebuilds the {role, content} wire shape for the
+// history replay so the timestamp is never transmitted. Nothing is
+// persisted — the transcript stays ephemeral client state.
+function stampReceipt(message) {
+  message.receipt = Date.now();
+  return message;
+}
+
+function stripReceipt(message) {
+  return { role: message.role, content: message.content };
 }
 
 function blankGoalForm() {
@@ -624,6 +651,40 @@ function coachApp() {
       return "Good evening";
     },
 
+    receiptTime(message) {
+      // Client-side receipt time (#279 AC1): HH:MM in the viewer's locale,
+      // derived from the in-memory receipt stamp — never persisted, never
+      // transmitted (nLPD AC2).
+      if (!message.receipt) {
+        return "";
+      }
+      return new Date(message.receipt).toLocaleTimeString(undefined, {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+    },
+
+    dateDividerLabel(index) {
+      // Date divider (#279 AC3): a plain localized date labels the first
+      // message and every message whose client receipt day differs from
+      // the previous one. Client-side only (nLPD AC2) — derived from the
+      // in-memory receipt stamps.
+      const message = this.messages[index];
+      if (!message || !message.receipt) {
+        return "";
+      }
+      const day = new Date(message.receipt).toDateString();
+      const previous = this.messages[index - 1];
+      if (previous && previous.receipt && new Date(previous.receipt).toDateString() === day) {
+        return "";
+      }
+      return new Date(message.receipt).toLocaleDateString(undefined, {
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      });
+    },
+
     announce(text) {
       // Write the visually-hidden status region (#86 AC3). The only two
       // call sites are announcePhase (phase labels) and the done handler
@@ -873,7 +934,9 @@ function coachApp() {
       if (!message || this.streaming) {
         return;
       }
-      this.messages.push({ role: "user", content: message });
+      // Receipt stamp (#279 AC2): client clock at push time — in-memory
+      // only, stripped from the history replay (never transmitted).
+      this.messages.push(this.stampReceipt({ role: "user", content: message }));
       this.input = "";
       this.startStream(message);
     },
@@ -967,11 +1030,17 @@ function coachApp() {
       // just-submitted user message travels as `message` (never duplicated in
       // history) and the empty placeholder is never replayed. The server
       // caps history at 10 entries; mirror the cap here so oversized
-      // transcripts are trimmed client-side first.
-      const history = this.messages.slice(0, -1).slice(-10);
+      // transcripts are trimmed client-side first. Receipt stamps (#279
+      // AC2) are stripped: the wire contract stays {role, content} pairs —
+      // client-side timestamps are never transmitted (nLPD).
+      const history = this.messages.slice(0, -1).slice(-10).map(stripReceipt);
 
       this.messages.push({ role: "assistant", content: "" });
       const index = this.messages.length - 1;
+      // Receipt stamp (#279 AC2): client clock at push time, recorded after
+      // the history snapshot — the placeholder is never replayed and the
+      // stamp never travels.
+      this.stampReceipt(this.messages[index]);
 
       const controller = new AbortController();
       this.controller = controller;

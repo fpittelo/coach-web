@@ -248,22 +248,102 @@ body {
   gap: var(--space-4);
 }
 
+/* Message bubble grammar (#279): each loop iteration is an entry column —
+   an optional centered date divider above the message article. The
+   article is a two-track grid (avatar | content); the six structured
+   cards auto-place beneath the bubble row spanning both tracks. All
+   surfaces are tokenized classes only (CSP style-src 'self') and animate
+   nothing (prefers-reduced-motion, #85). */
+
+.message-entry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.date-divider {
+  align-self: center;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius);
+  background: var(--surface);
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+
 .message {
-  border-left: 2px solid var(--line);
-  padding-left: var(--space-4);
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  column-gap: var(--space-3);
+  align-items: start;
 }
 
-.message--user {
-  border-left-color: var(--accent);
+.message-avatar {
+  grid-column: 1;
+  width: 28px;
+  height: 28px;
+  color: var(--accent);
 }
 
-.message-role {
-  display: block;
-  margin-bottom: var(--space-1);
-  font-size: 0.7rem;
+/* Explicit track placement: a user message's avatar is display:none, and
+   an auto-placed .message-main would then fall into the collapsed first
+   track — pinning the content column to track 2 keeps the user bubble
+   right-aligned (the empty track collapses to zero). */
+
+.message-main {
+  grid-column: 2;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.message-sender {
+  font-size: 0.75rem;
   font-weight: 600;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.message-bubble {
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
+}
+
+/* User messages (#279 AC1): right-aligned accent bubble with high text
+   contrast (accent-ink on accent ≈ 5.5:1). The role split is structural,
+   never color alone (#165): the column right-aligns and the avatar and
+   sender label are absent — color only reinforces it. */
+
+.message--user .message-main {
+  align-items: flex-end;
+}
+
+.message--user .message-bubble {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.message--user .message-avatar {
+  display: none;
+}
+
+.message--user .message-sender {
+  display: none;
+}
+
+/* Structured cards (#279 AC5): the six single-active cards keep rendering
+   beneath the bubble row, spanning both grid tracks (#82 rule unchanged). */
+
+.message .plan-card {
+  grid-column: 1 / -1;
+}
+
+.message-time {
+  font-size: 0.7rem;
   color: var(--muted);
 }
 
@@ -393,9 +473,11 @@ body {
 }
 
 .message-body--markdown code {
+  /* Paper chip (#279): visible against the surface bubble — the
+     pre-#279 surface background would blend into the card. */
   font-family: var(--font-mono);
   font-size: 0.85em;
-  background: var(--surface);
+  background: var(--paper);
   padding: 0.1em 0.35em;
   border-radius: 4px;
 }
@@ -403,8 +485,17 @@ body {
 .message-body--markdown pre {
   margin: 0 0 var(--space-3);
   padding: var(--space-3);
-  background: var(--surface);
+  background: var(--paper); /* paper block: visible inside the surface bubble (#279) */
   border-radius: 4px;
+  overflow-x: auto;
+}
+
+.message-body--markdown table {
+  /* Wide GFM tables (#279 AC4): the table scrolls internally instead of
+     overflowing the bubble — same mechanism as the pre blocks above. */
+  display: block;
+  max-width: 100%;
+  margin: 0 0 var(--space-3);
   overflow-x: auto;
 }
 
