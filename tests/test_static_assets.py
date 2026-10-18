@@ -4462,8 +4462,12 @@ class TestMessageBubbleGrammarContract:
         assert stamp, "stampReceipt(message) helper must exist"
         assert "Date.now()" in stamp
 
-        assert "this.stampReceipt(" in _rule_block(script, "send()")
-        assert "this.stampReceipt(" in _rule_block(script, "startStream(message)")
+        # #308: stampReceipt is a standalone helper, not a component method —
+        # the push sites must call it bare (this.stampReceipt threw
+        # TypeError at runtime and killed every send).
+        assert "stampReceipt(" in _rule_block(script, "send()")
+        assert "stampReceipt(" in _rule_block(script, "startStream(message)")
+        assert "this.stampReceipt(" not in script
 
     def test_history_replay_strips_receipts_before_transmission(self) -> None:
         """AC2/nLPD: the history replay transmits {role, content} pairs only."""

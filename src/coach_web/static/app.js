@@ -988,7 +988,7 @@ function coachApp() {
       }
       // Receipt stamp (#279 AC2): client clock at push time — in-memory
       // only, stripped from the history replay (never transmitted).
-      this.messages.push(this.stampReceipt({ role: "user", content: message }));
+      this.messages.push(stampReceipt({ role: "user", content: message }));
       this.input = "";
       this.startStream(message);
     },
@@ -1097,7 +1097,7 @@ function coachApp() {
       // Receipt stamp (#279 AC2): client clock at push time, recorded after
       // the history snapshot — the placeholder is never replayed and the
       // stamp never travels.
-      this.stampReceipt(this.messages[index]);
+      stampReceipt(this.messages[index]);
 
       const controller = new AbortController();
       this.controller = controller;
