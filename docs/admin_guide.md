@@ -112,6 +112,45 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 
 ---
 
+## 💾 Database Maintenance (VACUUM + encrypted backup/restore, #274)
+
+The coach database (`COACH_DB_PATH`, default `/data/coach.db` in the lane volume) is C2-classified health data (MADR-0008). Two maintenance commands ship in the `coach-web` image (`python -m coach_web.maintenance …`, run inside the container):
+
+### VACUUM — reclaim deleted plaintext pages
+
+Migration 0006 rewrote the debrief RPEs in place; the plaintext values they replaced persist in SQLite free space until a `VACUUM` rebuilds the file. Run after any encryption migration (and e.g. monthly):
+
+```bash
+# stop the lane first (VACUUM needs a brief exclusive lock)
+./scripts/lane.sh dev down    # or the compose down command for qa/prod
+docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml --env-file .env.dev \
+  run --rm coach-web python -m coach_web.maintenance vacuum
+./scripts/lane.sh dev up
+```
+
+**Verification:** `PRAGMA freelist_count` must be `0` afterwards — e.g.
+`docker compose -p coach-web-dev … run --rm coach-web python -c "import sqlite3; print(sqlite3.connect('/data/coach.db').execute('PRAGMA freelist_count').fetchone())"`.
+
+### Encrypted backup / restore
+
+The backup artifact is a **Fernet-encrypted envelope around the SQLite file bytes** — encrypted at rest with the lane's `DATA_ENCRYPTION_KEY` (the same key the app and migration 0006 use; no second key). The key comes from the lane env file (`chmod 600`, never committed, never logged). The artifact is C2-derived: store it with the same care as the database itself.
+
+```bash
+# backup (lane stopped or idle; folds the WAL into the main file first)
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod \
+  run --rm coach-web python -m coach_web.maintenance backup --output /data/backups/coach-$(date +%F).backup
+
+# restore into a fresh database file (e.g. disaster recovery)
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod \
+  run --rm coach-web python -m coach_web.maintenance restore /data/backups/coach-2026-10-18.backup --output /data/coach-restored.db
+```
+
+- **Wrong/missing key → fail closed:** a restore with the wrong key fails with `maintenance failed: …` (Fernet `InvalidToken`) and leaves no half-written database behind; a backup without `DATA_ENCRYPTION_KEY` refuses to run (never writes plaintext).
+- **Verification step (after every backup):** restore the artifact into a scratch path and confirm the row counts match the live DB before deleting the scratch file.
+- **Schedule suggestion:** weekly `backup` (before the weekly `VACUUM`), keep at least the last 4 artifacts on a separate volume/host; each artifact is only decryptable with the lane's `DATA_ENCRYPTION_KEY` — losing that key loses every backup.
+
+---
+
 ## 🚀 Release Runbook (approve + tag)
 
 1. **Staging validation** (release candidate on trunk `main`): dispatch the deploy workflow on `main` with `environment=qa` — CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
@@ -246,4 +285,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-10 (issue #170 — lane env-file `chmod 600` enforcement: pre-flight permission assertion + creation docs, MADR-0008 C3)_
+_Last updated: 2026-10-18 (issue #274 — database maintenance: VACUUM reclaim + encrypted backup/restore, MADR-0008)_
