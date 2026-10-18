@@ -202,6 +202,36 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
    docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
    ```
    The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
+
+   **Intervals.icu CRUD gate** (pre-release, #311): with the lane serving, prove the full
+   event write path through the coach-mcp sidecar — the gate creates, reads, updates and
+   deletes one unmistakably-marked, future-dated (+7 days) test event via the sidecar's MCP
+   tools (never direct Intervals.icu API calls), guarantees the delete even when a
+   mid-lifecycle step fails, and fails loudly if an orphan test event remains. The
+   `INTERVALS_API_KEY` stays inside the sidecar; the script needs no secret:
+   ```bash
+   docker run --rm --network coach-web-qa_coach-net \
+       -v "$PWD:/workspace:ro" --entrypoint python \
+       ghcr.io/fpittelo/coach-web:qa \
+       /workspace/scripts/verify_icu_crud.py --mcp-url http://coach-mcp:8000/sse
+   ```
+   Expected output — one evidence line per lifecycle step, all `PASS`, exit code `0`:
+   ```
+   PASS create: event id=145755481
+   PASS read: fields match (name, date)
+   PASS update: title set to 'COACH-WEB RELEASE GATE — 2026-10-25 [UPDATED]'
+   PASS read-after-update: fields match (name, date)
+   PASS delete: event id=145755481
+   PASS absent: event id=145755481 not listed
+   GATE PASS
+   ```
+   Any `FAIL` line (or exit code `1`) blocks the release. On `FAIL absent: orphan event
+   id=... still listed` the test event is still on the calendar — delete it manually in
+   Intervals.icu (title prefix `COACH-WEB RELEASE GATE — `) before re-running. On
+   `FAIL create:`/`FAIL connect:` the sidecar is unreachable or its upstream is failing —
+   check `docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa ps`
+   and the sidecar healthcheck, then re-run. The same command shape runs against any lane
+   (dev: `--network coach-web-dev_coach-net` with the `:dev` image).
 2. **Release** (requires the single @fpittelo approval per release): tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
    ```bash
    docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
