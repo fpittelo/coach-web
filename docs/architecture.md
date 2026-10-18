@@ -356,7 +356,7 @@ The v0.7 UI/UX Overhaul epic (Sprint 09, #88 — groomed 2026-09-19 through a co
    - *Amended 2026-10-13 (#207, PR #216):* the layout column band widens to `max-width: 72rem` to host the floating composer capsule (Epic #206 Phase 1); the message reading measure itself is unchanged. Contract tests superseded accordingly (`TestFloatingComposerContract`).
 2. **Deliberate test supersession:** `test_stylesheet_uses_swiss_tokens` is rewritten to assert the v0.7 token contract instead of forbidding shadows/radii. No test is deleted without a replacement assertion (zero-warning gate unchanged).
 3. **Rendering posture (assistant-only):** assistant messages render `DOMPurify.sanitize(marked.parse(text))` via `x-html` — vendored, self-hosted, zero CDN. User messages remain `x-text` forever. `test_index_uses_text_interpolation_only` is rewritten to allow `x-html` only on assistant messages via the sanitizer helper. **This reversal is security-gated:** STRIDE review #87 (@cyber-security) must sign off before #81 merges.
-4. **Transport & conversation:** `GET /api/agent/stream` is replaced by `POST /api/agent/stream` (Pydantic v2 body `{message, history}`; history capped at 10 entries; roles `user`/`assistant` only) — client-owned history, no server session store (nLPD ephemeral posture), and message content no longer leaks into access-log query strings (#79).
+4. **Transport & conversation:** `GET /api/agent/stream` is replaced by `POST /api/agent/stream` (Pydantic v2 body `{message, history}`; history capped at 10 entries; roles `user`/`assistant` only) — client-owned history, no server session store (nLPD ephemeral posture), and message content no longer leaks into access-log query strings (#79). *Amended 2026-10-18 (MADR-0011, #280):* the terminal `done` SSE event data carries an optional `suggestions` field (server-owned outcome-mapped constants, 1–4 × 1–48 chars, Pydantic-validated at emission; client renders `x-text` only).
 5. **Styling strategy:** hand-written CSS + design tokens. No Tailwind, no Node toolchain, no icon library (single inline SVG monogram). The KIS/YAGNI cut list and locked product decisions are recorded in epic #88.
 
 ### Rationale
@@ -467,4 +467,19 @@ On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely*
 
 ---
 
-_Last updated: 2026-10-10 (MADR-0010 proactivity model — session-greeting pull + pending-debrief banner, #164)_
+## 13. MADR-0011: Quick-Reply Suggestions — Server-Owned Outcome Mapping on the `done` SSE Event
+
+| Field | Value |
+|:---|:---|
+| **Status** | Accepted (2026-10-18) |
+| **Date** | 2026-10-18 |
+| **Deciders** | @architect |
+| **Reviewed by** | @cyber-security (APPROVED-WITH-CONTROLS, C-1…C-7 — MADR-0008 routing, review on #280) |
+| **Tracked in** | Epic #206 (chat modernization); spike #280; unblocks story #281 |
+| **Record** | [docs/adr/0011-quick-reply-suggestions.md](adr/0011-quick-reply-suggestions.md) |
+
+**Wire-contract delta (ADR-006):** the terminal `done` SSE event data gains an **optional** `suggestions` field — `list[str]`, 1–4 items, each 1–48 chars, server-owned constants resolved from a turn-outcome mapping (suppression table in the MADR). Absent/invalid = no pills; older clients ignore the field. Emission-site Pydantic validation (`SuggestionsPayload`); client renders `x-text` only, pills as siblings of the assistant bubble, volatile client state.
+
+---
+
+_Last updated: 2026-10-18 (MADR-0011 quick-reply suggestions contract — server-owned outcome mapping on the `done` SSE event, #280)_
