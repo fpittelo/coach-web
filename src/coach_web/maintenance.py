@@ -28,6 +28,7 @@ see ``docs/admin_guide.md`` for the runbook.
 
 import argparse
 import os
+import sqlite3
 import sys
 import tempfile
 from pathlib import Path
@@ -35,22 +36,23 @@ from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 
 from coach_web.config import get_settings
+from coach_web.debrief import resolve_data_encryption_key
+from coach_web.errors import EncryptionUnavailableError
 
 _BACKUP_SUFFIX = ".backup"
 """Suffix appended to the default backup artifact path."""
 
 
 def _backup_key() -> bytes:
-    """Resolve the backup key from ``DATA_ENCRYPTION_KEY`` (settings, #274 AC2).
+    """Resolve the backup key via the shared key resolver (#301 SEC-296-04).
 
-    The same Fernet key that encrypts the C2 fields at rest also encrypts the
-    backup artifact — no second key to manage (KIS). Missing or invalid key
-    fails closed with a message naming the env var, never its value.
+    Delegates to :func:`coach_web.debrief.resolve_data_encryption_key` — the
+    same single key-handling path ``build_debrief_cipher`` uses — so exactly
+    one place reads ``DATA_ENCRYPTION_KEY``. A missing key raises
+    :class:`~coach_web.errors.EncryptionUnavailableError` naming the env var,
+    never its value.
     """
-    key = get_settings().DATA_ENCRYPTION_KEY.get_secret_value()
-    if not key:
-        raise ValueError("DATA_ENCRYPTION_KEY is not configured — cannot derive the backup key")
-    return key.encode("ascii")
+    return resolve_data_encryption_key(get_settings())
 
 
 def vacuum_database(db_path: str) -> None:
@@ -61,8 +63,6 @@ def vacuum_database(db_path: str) -> None:
     rewrite residue) leave behind. Requires a brief exclusive lock — run it
     while the lane is stopped or idle.
     """
-    import sqlite3
-
     conn = sqlite3.connect(db_path)
     try:
         conn.execute("VACUUM")
@@ -74,24 +74,47 @@ def vacuum_database(db_path: str) -> None:
 def backup_database(db_path: str, output_path: str, key: bytes) -> None:
     """Write a Fernet-encrypted backup of the database at *db_path* (#274 AC2).
 
-    The SQLite file bytes (WAL already checkpointed by the read) are sealed
-    into a single Fernet token written to *output_path*. The plaintext bytes
-    exist only in this process's memory; the artifact is encrypted at rest
-    (MADR-0008 — C2-derived material never lands on disk in the clear).
-    """
-    import sqlite3
+    The SQLite file bytes (WAL folded in by a status-checked
+    ``PRAGMA wal_checkpoint(TRUNCATE)``, #301 SEC-296-04) are sealed into a
+    single Fernet token written to *output_path* with owner-only ``0600``
+    permissions, independent of the process umask (#301 SEC-296-05). The
+    plaintext bytes exist only in this process's memory; the artifact is
+    encrypted at rest (MADR-0008 — C2-derived material never lands on disk
+    in the clear).
 
+    Raises:
+        FileNotFoundError: when *db_path* does not exist — a missing database
+            is refused, never silently replaced by an empty one (#301 N1).
+        sqlite3.Error: when the checkpoint reports busy/failed (a partial
+            artifact would silently miss WAL pages) or the file is not a
+            database.
+    """
     if not key:
         raise ValueError("backup key is empty — refusing to write a plaintext backup")
-    # Ensure any WAL content is folded into the main file before reading it.
+    db_file = Path(db_path)
+    if not db_file.is_file():
+        raise FileNotFoundError(f"database not found: {db_path} — nothing to back up")
+    # Ensure any WAL content is folded into the main file before reading it,
+    # and refuse a busy/failed checkpoint — a silently incomplete artifact
+    # would look exactly like a good backup (#301 SEC-296-04).
     conn = sqlite3.connect(db_path)
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        busy, _log, _checkpointed = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy != 0:
+            raise sqlite3.OperationalError(
+                f"wal_checkpoint(TRUNCATE) did not complete (busy={busy}) — backup would "
+                "miss WAL pages; retry while the lane is stopped or idle"
+            )
     finally:
         conn.close()
-    plaintext = Path(db_path).read_bytes()
+    plaintext = db_file.read_bytes()
     token = Fernet(key).encrypt(plaintext)
-    Path(output_path).write_bytes(token)
+    # Create-with-0600 then fchmod: the artifact is owner-only even under a
+    # loose umask, with no window at wider permissions (#301 SEC-296-05).
+    fd = os.open(output_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(token)
 
 
 def restore_database(backup_path: str, output_path: str, key: bytes) -> None:
@@ -101,8 +124,14 @@ def restore_database(backup_path: str, output_path: str, key: bytes) -> None:
     then the plaintext bytes are written via a temp file that is renamed
     into place only on success — a failed restore never leaves a
     half-written database behind (fail-closed, mirroring migration 0006).
+
+    Raises:
+        FileNotFoundError: when *backup_path* does not exist (#301 N1).
     """
-    token = Path(backup_path).read_bytes()
+    backup_file = Path(backup_path)
+    if not backup_file.is_file():
+        raise FileNotFoundError(f"backup artifact not found: {backup_path}")
+    token = backup_file.read_bytes()
     plaintext = Fernet(key).decrypt(token)  # raises InvalidToken on a wrong key
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(Path(output_path).parent), suffix=_BACKUP_SUFFIX)
     try:
@@ -147,13 +176,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "backup":
             output = args.output or f"{db_path}{_BACKUP_SUFFIX}"
             backup_database(db_path, output, _backup_key())
-            print(f"Encrypted backup written to {output}")  # noqa: T201
+            print(f"Encrypted backup written to {output}")
         elif args.command == "restore":
             output = args.output or f"{db_path}.restored"
             restore_database(args.backup, output, _backup_key())
-            print(f"Database restored to {output}")  # noqa: T201
-    except (ValueError, InvalidToken, OSError) as exc:
-        print(f"maintenance failed: {exc}", file=sys.stderr)  # noqa: T201
+            print(f"Database restored to {output}")
+    except (ValueError, InvalidToken, OSError, sqlite3.Error, EncryptionUnavailableError) as exc:
+        # Clean single-line failure — no traceback, no key material (nLPD;
+        # redaction pinned by tests/test_maintenance.py, #301 SEC-296-06).
+        print(f"maintenance failed: {exc}", file=sys.stderr)
         return 1
     return 0
 

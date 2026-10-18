@@ -9,12 +9,16 @@ Covers the #274 acceptance criteria at the unit level:
 - CLI: ``python -m coach_web.maintenance`` dispatches the three verbs.
 """
 
+import os
 import sqlite3
+import stat
+from functools import partial
 from pathlib import Path
 
 import pytest
 from cryptography.fernet import Fernet, InvalidToken
 
+from coach_web.config import get_settings
 from coach_web.maintenance import (
     backup_database,
     restore_database,
@@ -187,6 +191,197 @@ class TestEncryptedBackupRestore:
         command.upgrade(alembic_config(), "head")
         with pytest.raises(ValueError, match="backup key"):
             backup_database(str(db_path), str(tmp_path / "b"), b"")
+
+
+class TestBackupRefusesMissingPaths:
+    """AC1 (N1) — backup/restore refuse a missing path instead of failing silently."""
+
+    def test_backup_refuses_missing_db(self, tmp_path: Path) -> None:
+        """A missing DB path must raise — never ``sqlite3.connect`` an empty DB into being."""
+        missing_db = tmp_path / "nope.db"
+        with pytest.raises(FileNotFoundError, match="database not found"):
+            backup_database(str(missing_db), str(tmp_path / "o.backup"), Fernet.generate_key())
+        # The refusal must not have created anything (no empty DB, no artifact).
+        assert not missing_db.exists()
+        assert not (tmp_path / "o.backup").exists()
+
+    def test_backup_cli_reports_missing_db_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from coach_web.maintenance import main
+
+        monkeypatch.setenv("COACH_DB_PATH", str(tmp_path / "nope.db"))
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+        out = tmp_path / "o.backup"
+        assert main(["backup", "--output", str(out)]) == 1
+        err = capsys.readouterr().err
+        assert "maintenance failed" in err
+        assert "Traceback" not in err
+        assert not out.exists()
+
+    def test_restore_cli_reports_missing_artifact_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from coach_web.maintenance import main
+
+        monkeypatch.setenv("COACH_DB_PATH", str(tmp_path / "coach.db"))
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+        restored = tmp_path / "restored.db"
+        assert main(["restore", str(tmp_path / "missing.backup"), "--output", str(restored)]) == 1
+        err = capsys.readouterr().err
+        assert "maintenance failed" in err
+        assert "Traceback" not in err
+        assert not restored.exists()
+
+
+class TestCliSqliteErrorHandling:
+    """AC2 (N2) — ``sqlite3.Error`` surfaces as a clean CLI message, no traceback."""
+
+    def test_corrupt_db_file_reports_cleanly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        corrupt = tmp_path / "corrupt.db"
+        corrupt.write_bytes(b"this is not a sqlite database")
+        monkeypatch.setenv("COACH_DB_PATH", str(corrupt))
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
+        from coach_web.maintenance import main
+
+        assert main(["backup", "--output", str(tmp_path / "o.backup")]) == 1
+        captured = capsys.readouterr()
+        assert "maintenance failed" in captured.err
+        assert "Traceback" not in captured.err
+        assert "Traceback" not in captured.out
+
+
+class TestBackupCapturesWalPages:
+    """AC3 (N3) — the WAL checkpoint folds uncheckpointed pages into the artifact."""
+
+    def test_backup_round_trips_rows_living_only_in_the_wal(
+        self, db_path: Path, tmp_path: Path
+    ) -> None:
+        from alembic import command
+
+        command.upgrade(alembic_config(), "head")
+        backup_path = tmp_path / "wal.backup"
+        key = Fernet.generate_key()
+        conn = _connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO debriefs (athlete_id, plan_session_key, created_at, updated_at, "
+                "rpe, notes_encrypted) VALUES (1, 'wal-k', '2026-09-03T00:00:00+00:00', "
+                "'2026-09-03T00:00:00+00:00', '8', 'wal-note')"
+            )
+            conn.commit()
+            # Premise: the row's pages sit in the WAL, uncheckpointed (writer still open).
+            wal_file = db_path.parent / f"{db_path.name}-wal"
+            assert wal_file.exists() and wal_file.stat().st_size > 0
+            backup_database(str(db_path), str(backup_path), key)
+        finally:
+            conn.close()
+        restored_path = tmp_path / "restored.db"
+        restore_database(str(backup_path), str(restored_path), key)
+        conn = _connect(restored_path)
+        try:
+            rows = conn.execute("SELECT plan_session_key, notes_encrypted FROM debriefs").fetchall()
+        finally:
+            conn.close()
+        assert rows == [("wal-k", "wal-note")]
+
+
+class TestCheckpointStatusChecked:
+    """AC5 (SEC-296-04) — a busy/failed checkpoint is a loud error, not a partial artifact."""
+
+    def test_busy_checkpoint_fails_the_backup(
+        self, db_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from alembic import command
+
+        command.upgrade(alembic_config(), "head")
+        backup_path = tmp_path / "busy.backup"
+        key = Fernet.generate_key()
+        conn = _connect(db_path)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute(
+                "INSERT INTO debriefs (athlete_id, plan_session_key, created_at, updated_at, "
+                "rpe, notes_encrypted) VALUES (1, 'busy-k', '2026-09-03T00:00:00+00:00', "
+                "'2026-09-03T00:00:00+00:00', '8', 'busy-note')"
+            )
+            conn.commit()
+            # An open read transaction blocks the TRUNCATE checkpoint (busy=1);
+            # shrink the busy timeout so the refusal is fast, not the 5s default.
+            conn.execute("BEGIN")
+            conn.execute("SELECT COUNT(*) FROM debriefs").fetchone()
+            monkeypatch.setattr(sqlite3, "connect", partial(sqlite3.connect, timeout=0.05))
+            with pytest.raises(sqlite3.Error, match="checkpoint"):
+                backup_database(str(db_path), str(backup_path), key)
+        finally:
+            conn.rollback()
+            conn.close()
+        # No silently incomplete artifact may exist.
+        assert not backup_path.exists()
+
+
+class TestBackupArtifactPermissions:
+    """AC6 (SEC-296-05) — the artifact is written 0600, independent of the umask."""
+
+    def test_artifact_mode_is_0600_under_restrictive_umask(
+        self, db_path: Path, tmp_path: Path
+    ) -> None:
+        from alembic import command
+
+        command.upgrade(alembic_config(), "head")
+        backup_path = tmp_path / "mode.backup"
+        key = Fernet.generate_key()
+        # A umask that would strip bits off a naive create — the artifact must
+        # be exactly 0600 regardless of the process umask.
+        old_umask = os.umask(0o027)
+        try:
+            backup_database(str(db_path), str(backup_path), key)
+        finally:
+            os.umask(old_umask)
+        assert stat.S_IMODE(backup_path.stat().st_mode) == 0o600
+
+
+class TestCliFailureRedaction:
+    """AC7 (SEC-296-06) — CLI failure paths never emit key material or tracebacks."""
+
+    def test_failure_paths_do_not_leak_key_material(
+        self,
+        db_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from alembic import command
+
+        command.upgrade(alembic_config(), "head")
+        marker_key = Fernet.generate_key().decode("ascii")
+        monkeypatch.setenv("COACH_DB_PATH", str(db_path))
+        from coach_web.maintenance import main
+
+        # (a) restore with the wrong key → InvalidToken failure path.
+        artifact = tmp_path / "a.backup"
+        backup_database(str(db_path), str(artifact), Fernet.generate_key())
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", marker_key)
+        assert main(["restore", str(artifact), "--output", str(tmp_path / "r.db")]) == 1
+
+        # (b) backup with the key missing entirely.
+        monkeypatch.delenv("DATA_ENCRYPTION_KEY")
+        get_settings.cache_clear()
+        assert main(["backup", "--output", str(tmp_path / "b.backup")]) == 1
+
+        # (c) backup with the DB missing.
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", marker_key)
+        monkeypatch.setenv("COACH_DB_PATH", str(tmp_path / "nope.db"))
+        get_settings.cache_clear()
+        assert main(["backup", "--output", str(tmp_path / "c.backup")]) == 1
+
+        captured = capsys.readouterr()
+        combined = captured.out + captured.err
+        assert marker_key not in combined
+        assert "Traceback" not in combined
 
 
 class TestMaintenanceCli:
