@@ -2300,6 +2300,64 @@ class TestCompactStickyHeaderContract:
         assert 'aria-label="Conversation with your coach"' in log_tag
 
 
+class TestConsoleChromeCompactionContract:
+    """Chat chrome compaction — reclaim log height (#249).
+
+    #278 removes the masthead kicker/h1/lede and folds the identity bar into
+    the sticky conversation header, so the masthead-specific #249 assertions
+    are superseded by TestCompactStickyHeaderContract. The status band and
+    empty-state greeting compaction from #249 are untouched by #278 and are
+    retained here to keep their specific value-based regression protection.
+    """
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    # --- AC2: slim transient status band -------------------------------------
+
+    def test_status_band_is_a_slim_inline_row(self) -> None:
+        """AC2: the activity band loses its border/padding band geometry."""
+        activity = _rule_block(self._css(), ".activity")
+
+        assert "margin-top: var(--space-2)" in activity, "slim top margin missing"
+        assert "border-top" not in activity, "the band separator must go"
+        assert "padding-top" not in activity, "the band padding must go"
+        assert "gap: var(--space-2)" in activity, "slim inner rhythm missing"
+
+    def test_status_band_stays_transient(self) -> None:
+        """AC2: the band is x-show gated — it never reserves a permanent row."""
+        html = self._html()
+        activity_at = html.index('<div class="activity"')
+        tag = html[activity_at : html.index(">", activity_at) + 1]
+
+        assert "x-show=" in tag, "the band must stay transient (x-show)"
+
+    # --- AC3: slimmed greeting block -----------------------------------------
+
+    def test_greeting_block_padding_and_gap_are_slimmed(self) -> None:
+        """AC3: the greeting column drops to the space-4/space-2 rhythm."""
+        empty = _rule_block(self._css(), ".empty-state")
+
+        assert "padding: var(--space-4)" in empty
+        assert "gap: var(--space-2)" in empty
+
+    def test_hero_monogram_is_compacted(self) -> None:
+        """AC3: the hero monogram shrinks 48px → 32px (content preserved)."""
+        hero = _rule_block(self._css(), ".monogram--hero")
+
+        assert "width: 32px" in hero
+        assert "height: 32px" in hero
+
+    def test_salutation_is_compacted(self) -> None:
+        """AC3: the salutation drops 1.5rem → 1.15rem (x-text content unchanged)."""
+        line = _rule_block(self._css(), ".greeting-line")
+
+        assert "font-size: 1.15rem" in line
+
+
 class TestOnboardingEmptyStateContract:
     """Onboarding empty state, starter chips & accessibility pass (#86).
 

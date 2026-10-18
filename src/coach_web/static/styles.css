@@ -212,8 +212,8 @@ body {
 
    #278 recomputation (compact sticky header): the #249 masthead (kicker,
    h1, lede, rule) is removed entirely. The identity bar becomes the
-   sticky conversation header (≈2.75rem content + 0.5rem header padding
-   per side), so the allowance drops 20rem → 3rem and the log's computed
+    sticky conversation header (≈2rem content + 0.5rem header padding per
+    side), so the allowance drops 20rem → 3rem and the log's computed
    height at 1280×800 rises to ≈(100dvh - 3rem). Floor/cap mechanics
    unchanged: 14rem ≤ 40rem − 3rem allowance, so the floor still loses
    to the computed height on portrait phones and only rescues landscape
