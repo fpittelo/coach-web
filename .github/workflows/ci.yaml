@@ -82,6 +82,16 @@ jobs:
           COACH_WEB_IMAGE: ghcr.io/fpittelo/coach-web@sha256:0000000000000000000000000000000000000000000000000000000000000000
         run: docker compose -f compose.yaml -f compose.prod.yml config --quiet
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Sidecar pin drift guard (#275): the coach-mcp sidecar is published by a
+      # separate pipeline (fpittelo/coach); each lane pins it by digest. This
+      # step fails loudly when an upstream lane tag moves away from the pin, so
+      # a sidecar change is a deliberate act, not a silent one.
+      - name: Check coach-mcp sidecar pin drift (#275)
+        run: ./scripts/check_sidecar_drift.sh
+
   secret-scan:
     name: Secret Scanning (gitleaks)
     runs-on: ubuntu-latest
