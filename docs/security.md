@@ -309,6 +309,16 @@ The conversation is client-owned: the browser replays the last ≤ 10 turns in t
 - **C6** — `ChatMessage.role` remains `Literal["user", "assistant"]` (never widened to `system`/`tool`): `src/coach_web/models.py`, pinned by `tests/test_models.py` (`TestChatMessage` rejects a forged `system` role).
 - **C7** — The history entry/length caps (`AgentStreamRequest`: 10 entries × 8,000 chars per entry, `src/coach_web/models.py`) and the human approval gate (`POST /api/plan/approve` re-validates the exact `PlanProposal`; `AGENT_MAX_TOOL_ITERATIONS` bounds tool loops) remain, pinned by `tests/test_models.py` and `tests/test_plan_approval.py`; any future server-side persistence requires a new STRIDE review.
 
+### Boundary B11 — Encrypted backup artifacts (MADR-0008 C2, #296/#297)
+
+The backup boundary is the one that actually matters (MADR-0008): the Fernet-encrypted DB artifact (`coach_web.maintenance backup`, #296) leaves the lane volume for a separate/off-host target, and the `DATA_ENCRYPTION_KEY` escrow must never be co-located with it.
+
+| STRIDE | Threat | Mitigation |
+|:---|:---|:---|
+| **Information Disclosure** | A stolen or copied backup artifact leaks health data | The artifact is a Fernet-encrypted whole-file envelope (ciphertext at rest, #296); the key is never co-located with the backups (C2), so the artifact alone is inert. |
+| **Tampering** | A backup artifact is modified or corrupted undetected | Fernet is an authenticated construction (AES-128-CBC + HMAC-SHA256) — a tampered artifact fails decryption with `InvalidToken` at restore, fail-closed with no half-written DB; post-backup verification restores into a scratch path and compares row counts. |
+| **Denial of Service** | The `DATA_ENCRYPTION_KEY` is lost — every backup becomes undecryptable | Key escrow per C2: password manager **plus** one offline copy on a separate encrypted medium, never co-located with the DB backups; key recovery is an explicit restore-runbook step, exercised in the quarterly restore rehearsal. |
+
 ### CSP Posture (v0.7)
 
 The minimal CSP decided in the #87 sign-off is **shipped as ASGI middleware** — `ContentSecurityPolicyMiddleware` in `src/coach_web/app.py` (#84, STRIDE conditions **C2/C5**) — and stamped on every response: pages, static assets, API/SSE routes and middleware-generated error responses (TrustedHost 400, auth 401/403) alike, pinned by `TestCspMiddleware` in `tests/test_app.py`. The vendored Alpine 3.14.9 is the **standard build**: it compiles `x-` expressions at runtime via `Object.getPrototypeOf(async function(){}).constructor` (`AsyncFunction`), so `script-src` must include `'unsafe-eval'`. **Decision (KIS): ship the minimal defensible CSP**, not the Alpine CSP build — the latter would require rewriting every inline `x-` expression to `Alpine.bind`/`x-data` methods, disproportionate churn for v0.7.
@@ -326,10 +336,10 @@ Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-eval'; st
 | STRIDE | Primary vector (local topology) | Mitigation (anchor) |
 |:---|:---|:---|
 | **Spoofing** | Any local process reaches loopback; DNS rebinding; forged session; replayed OIDC state; forged replayed history (B10) | Loopback binding primary + OIDC whitelist (prod); `TrustedHostMiddleware` Host allowlist (#118); HS256 session with pinned iss/aud; single-use OIDC state/nonce; history role `Literal` + human approval gate (B10) |
-| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9 — implemented, #81); CSP middleware stamps the minimal policy on every response (#84) |
+| **Tampering** | Cookie/API tampering; container escape; cross-origin mutation; untrusted LLM/MCP content → DOM (B9); tampered backup artifact (B11) | HS256 signature + algorithm pinning; non-root/read-only/`cap_drop: ALL` containers; `SameSite=Lax` + lane-scoped CORS; DOMPurify sanitization of assistant-only `x-html` (B9 — implemented, #81); CSP middleware stamps the minimal policy on every response (#84); Fernet authenticated envelope — tampered backups fail closed at restore (B11) |
 | **Repudiation** | Owner denies an approval | GitHub commits + Intervals.icu records + local structured logs (secret-redacted); single whitelisted identity |
-| **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112) |
-| **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap |
+| **Information Disclosure** | Plaintext env secrets; sidecar secret leakage; biometric data to OpenRouter; backup artifact leaving the host (B11) | `chmod 600` gitignored env files + LUKS; per-service secret scoping; OpenRouter assessment (#112); Fernet-encrypted whole-file backup envelope, key never co-located with backups (B11) |
+| **Denial of Service** | Sidecar crash silently passing the gate; upstream stalls; lost `DATA_ENCRYPTION_KEY` (B11) | Pre-flight exact service-set assertion via `ps -a` (#113); upstream timeouts; agent tool-iteration cap; key escrow (password manager + offline copy) + rehearsed key recovery (B11) |
 | **Elevation of Privilege** | `docker` group = root-equivalent; leaked lane file; path traversal; Alpine directive injection (B9) | Documented accepted local trust assumption; per-service secret scoping; default-deny path normalization; non-root containers; DOMPurify strips `x-` directives + CSP `script-src 'self'` (B9 — implemented, #81/#84) |
 
 ---
@@ -510,7 +520,7 @@ Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in 
 |:---|:---|:---|:---|
 | 1 | Loopback-only binding as the primary access control | ✅ | All lanes publish `127.0.0.1` only; sidecars publish no host ports; pre-flight asserts it (`scripts/e2e-preflight.sh`) |
 | 2 | Local encryption at rest | ✅ | LUKS full-disk encryption on the workstation (expectation); per-lane env files `chmod 600` and gitignored |
-| 3 | Backup policy for persisted biometric data | ✅ (N/A) | The app persists **no** biometric data server-side (ephemeral posture); no backup of personal data exists. Any future persistence must add an encrypted-backup policy before shipping |
+| 3 | Backup policy for persisted biometric data | ✅ | Encrypted backups exist since #296: the `coach_web.maintenance` backup produces a Fernet-encrypted envelope of the SQLite file under the per-lane `DATA_ENCRYPTION_KEY`. Non-co-location of artifact and key escrow + key-recovery/escrow runbook are MADR-0008 C2 requirements (admin guide "Database Maintenance", B11) |
 | 4 | Workstation access control | ✅ | Single-user workstation; OS screen lock; `docker` group membership is the documented root-equivalent trust assumption (B3) |
 | 5 | Local log retention with secret redaction | ✅ | Container stdout captured by the Docker host with bounded log rotation; secrets never logged; Cloud Logging retired (#111) |
 | 6 | OpenRouter cross-border assessment | ✅ | Documented in the OpenRouter Cross-Border Assessment (#112) — accepted residual risk for a single self-controller |
@@ -549,4 +559,4 @@ Current acceptances (2026-10-03): 8 unfixed debian 13.7 (trixie) OS packages in 
 
 ---
 
-_Last updated: 2026-10-10 (issue #148 — CSP stamped outside the whole ASGI stack incl. unhandled-exception 500s, SSE/401 CSP regression pins, B10 C6/C7 recorded IMPLEMENTED; prior: issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
+_Last updated: 2026-10-18 (issue #297 — backup boundary B11 added + nLPD row #3 refreshed for the #296 encrypted backup; prior: issue #148 — CSP stamped outside the whole ASGI stack incl. unhandled-exception 500s, SSE/401 CSP regression pins, B10 C6/C7 recorded IMPLEMENTED; prior: issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
