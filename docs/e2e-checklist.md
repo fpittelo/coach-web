@@ -168,4 +168,4 @@ docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file 
 | Result | ☐ pass ☐ fail |
 | Notes | |
 
-> Record the sign-off in the v0.8.0 promotion PR. A failed step blocks the release gate (see `docs/admin_guide.md` § Release Gate).
+> Record the sign-off in the v0.8.0 release issue. A failed step blocks the release gate (see `docs/admin_guide.md` § Release Gate).

@@ -172,10 +172,10 @@ graph TD
 | Lane | Compose files | coach-web image | Host port | Auth | Purpose |
 |:---|:---|:---|:---|:---|:---|
 | **dev** | `compose.yaml` + `compose.dev.yml` | build from source (`target: runtime`) | `127.0.0.1:8100` | `AUTH_ENABLED=false` | active development |
-| **qa** | `compose.yaml` + `compose.qa.yml` | `ghcr.io/fpittelo/coach-web:qa` | `127.0.0.1:8200` | `AUTH_ENABLED=false` | staging validation of promoted `dev` |
+| **qa** | `compose.yaml` + `compose.qa.yml` | `ghcr.io/fpittelo/coach-web:qa` | `127.0.0.1:8200` | `AUTH_ENABLED=false` | staging validation of the trunk release candidate |
 | **prod** | `compose.yaml` + `compose.prod.yml` | digest-pinned `vX.Y.Z` | `127.0.0.1:8000` | `AUTH_ENABLED=true` (OIDC defense-in-depth) | daily-use deployment |
 
-**Properties (all lanes):** per-lane compose project name (`coach-web-dev|qa|prod`) and network; sidecars publish no host ports; hardening parity (`read_only`, `cap_drop: ALL`, `no-new-privileges`, tmpfs, resource limits, non-root UID 10001). Promotion stays PR-approval-gated (`dev` → `qa` → `main`); the local lane pull is the procedural rollout step. Lane files delivered by #109 (`compose.yaml` + `compose.dev.yml|qa.yml|prod.yml`; per-lane env templates `.env.<lane>.example`).
+**Properties (all lanes):** per-lane compose project name (`coach-web-dev|qa|prod`) and network; sidecars publish no host ports; hardening parity (`read_only`, `cap_drop: ALL`, `no-new-privileges`, tmpfs, resource limits, non-root UID 10001). Releases are tag-from-trunk (MADR-0017): the qa lane validates the release candidate on `main` before tagging, and the local lane pull is the procedural rollout step. Lane files delivered by #109 (`compose.yaml` + `compose.dev.yml|qa.yml|prod.yml`; per-lane env templates `.env.<lane>.example`).
 
 ---
 
@@ -218,7 +218,7 @@ The product owner (@fpittelo) requested a modern web application to interactivel
 
 - `coach` repo stays focused on MCP server development
 - `coach-web` repo handles all frontend concerns
-- Both repos independently follow the HOME 3-branch lifecycle (`dev` → `qa` → `main`)
+- Both repos independently follow the HOME trunk+tag lifecycle (`main` + `vX.Y.Z` tags, MADR-0017)
 - Both repos use the same Python 3.12 + `uv` + `ruff` + `mypy` + `pytest` quality gates
 - Communication between repos is via the MCP protocol contract, not shared source code
 
@@ -408,7 +408,7 @@ On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely*
 **Local Docker on the workstation becomes the deployment target for dev, qa, and prod.**
 
 1. **Lanes:** base `compose.yaml` + per-lane override files (`compose.dev.yml`, `compose.qa.yml`, `compose.prod.yml`) with per-lane compose project names and networks, so lanes run concurrently without collisions. All host bindings are `127.0.0.1` only — **loopback binding is the primary access control**. Compose *profiles* were rejected: they select which services run, not variants of the same service.
-2. **Promotion artifact:** GHCR lane-tag images (`:dev`, `:qa`, `:prod`/`vX.Y.Z`) remain the promotion artifact — the qa and prod lanes pull CI-built, zero-warning-gated images rather than building locally; the prod lane is digest-pinned. Promotion `dev` → `qa` → `main` stays PR-approval-gated by @fpittelo; the local lane pull is the procedural rollout step.
+2. **Release artifact:** GHCR lane-tag images (`:dev`, `:qa`, `:prod`/`vX.Y.Z`) remain the release artifact — the qa and prod lanes pull CI-built, zero-warning-gated images rather than building locally; the prod lane is digest-pinned. Releases are tag-from-trunk (MADR-0017): the qa lane validates the release candidate on `main` before tagging, under the single @fpittelo release approval; the local lane pull is the procedural rollout step.
 3. **Auth:** loopback binding is the primary boundary; the Google OIDC email whitelist (#65) is **defense-in-depth**, enabled on the prod lane (`AUTH_ENABLED=true`, redirect `http://localhost:8000/auth/callback`); dev/qa run `AUTH_ENABLED=false`.
 4. **Cloud retirement:** `infra/` OpenTofu IaC, the `deploy-gcp` CI stage, the GCP repo variables, and the `production` GitHub environment are removed (#110 — in the same PR as the `ci.yaml` `opentofu` job, or CI breaks); all GCP resources are decommissioned with explicit @fpittelo approval and captured evidence (#111).
 5. **Secrets:** per-lane, per-service env files replace the shared `.env` — each container receives only the secrets it needs, with distinct `AUTH_SESSION_SECRET` per lane (#112).
@@ -433,7 +433,7 @@ On 2026-10-03, @fpittelo decided to **abandon the GCP cloud deployment entirely*
 ### Consequences
 
 - `docs/security.md` access-control framing changes: **loopback binding is primary, the OIDC whitelist is defense-in-depth** (no residual "edge is the boundary" language); the cloud STRIDE model is rewritten for the local topology in #113.
-- `docs/admin_guide.md` documents per-lane operations, GHCR pull prerequisites, and the promotion runbook.
+- `docs/admin_guide.md` documents per-lane operations, GHCR pull prerequisites, and the release runbook.
 - The `deploy-gcp` stage and the `ci.yaml` `opentofu` job are removed in #110; GCP resources are destroyed in #111 (state backups captured first, bootstrap bucket last).
 - The v0.7.0 `qa → main` promotion is **held** until #109 + #110 merge — `main` must not ship a deploy stage targeting infrastructure slated for destruction.
 - Version order follows release order: if Sprint 10 completes first, local-first releases as v0.7.0 and the v0.7 UI epic becomes v0.8.0 (decided at release time).

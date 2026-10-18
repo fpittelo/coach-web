@@ -72,7 +72,7 @@ docker login ghcr.io
 # dev — build from source
 docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml --env-file .env.dev up -d --build
 
-# qa — pull the promoted :qa image
+# qa — pull the CI-built :qa image
 docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
 docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
 
@@ -92,7 +92,7 @@ docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env
 
 The pre-flight asserts: every existing lane env file is **mode 600** (MADR-0008 C3, #170), the **exact service set** (`coach-web`, `coach-mcp`, `github-mcp`) is present and healthy — it uses `docker compose ps -a`, so a crashed/exited sidecar fails the gate instead of being silently absent — coach-web is published on `127.0.0.1` only, sidecars have no published ports, and (prod) `/api/*` returns 401 without a session. It fails fast with a clear message when a lane image is not yet published to GHCR.
 
-> **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change `dev` → `qa` promotion (same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
+> **Precondition:** `ghcr.io/fpittelo/coach-web:qa` exists only after the first post-change qa-lane build (a `workflow_dispatch` on `main` with `environment=qa`; same for the `coach` repo's `coach-mcp:qa` sidecar tag). The runbook below states when each pull becomes possible.
 
 ### Local lane lifecycle (`scripts/lane.sh`)
 
@@ -106,22 +106,22 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 ```
 
 - `up` prints the lane URL (`http://127.0.0.1:8100` dev / `:8200` qa) and the per-service states once every service reports healthy.
-- Scope is **dev/qa only**: `prod` is rejected with a pointer to the manual procedure (usage header in `compose.prod.yml`, Promotion Runbook below) — prod stays a human-owned, digest-pinned + OIDC operation.
+- Scope is **dev/qa only**: `prod` is rejected with a pointer to the manual procedure (usage header in `compose.prod.yml`, Release Runbook below) — prod stays a human-owned, digest-pinned + OIDC operation.
 - Every action is scoped to the lane's own compose project (`coach-web-<lane>`); concurrent lanes and unrelated compose projects are never touched.
 - `scripts/e2e-preflight.sh` remains the validation gate — `lane.sh up` gets the lane running for browser-based verification, it does not replace the pre-flight assertions.
 
 ---
 
-## 🚀 Promotion Runbook (dev → qa → main)
+## 🚀 Release Runbook (approve + tag)
 
-1. **dev → qa** (requires @fpittelo approval on the promotion PR): merge `dev` into `qa` via PR. CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
+1. **Staging validation** (release candidate on trunk `main`): dispatch the deploy workflow on `main` with `environment=qa` — CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
    ```bash
    docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
    ./scripts/e2e-preflight.sh qa
    docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa up -d
    ```
    The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
-2. **qa → main** (requires @fpittelo approval): merge `qa` into `main` via PR, then tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
+2. **Release** (requires the single @fpittelo approval per release): tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
    ```bash
    docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
    ./scripts/e2e-preflight.sh prod
@@ -135,11 +135,11 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 
 ## 🚦 Release Gate (v0.8.0)
 
-The v0.8.0 release is gated on **all** of the following. No `dev → qa → main` promotion may proceed until every item is green:
+The v0.8.0 release is gated on **all** of the following. No release tag may be cut until every item is green:
 
 | # | Gate | Owner | Evidence |
 |:---|:---|:---|:---|
-| 1 | **All CI checks green** — `test`, `compose-validation`, `secret-scan` (gitleaks full history), `dependency-scan` (`pip-audit --strict`), **`image-scan` (trivy HIGH/CRITICAL)** | @developer / @devops | GitHub Actions run on the promotion PR |
+| 1 | **All CI checks green** — `test`, `compose-validation`, `secret-scan` (gitleaks full history), `dependency-scan` (`pip-audit --strict`), **`image-scan` (trivy HIGH/CRITICAL)** | @developer / @devops | GitHub Actions run on the PR merged into `main` |
 | 2 | **Pre-flight green on all three lanes** — `./scripts/e2e-preflight.sh dev`, `qa`, `prod` | @fpittelo | Local terminal output |
 | 3 | **Manual E2E checklist signed off** — OIDC login → agent chat → tool calls → plan approval on the prod lane | @fpittelo | [`docs/e2e-checklist.md`](e2e-checklist.md), signed in the PR |
 | 4 | **Security audit report** — STRIDE + nLPD review recorded in the #113 closing comment | @cyber-security | Issue #113 closing comment |
@@ -185,20 +185,19 @@ The automatable parts of the prod happy path (401 without a session, healthcheck
 
 ### `.github/workflows/deploy.yaml`
 
-- **Trigger:** push to `dev`, PR closed into `qa`, `v*` tags, `workflow_dispatch`
+- **Trigger:** push to `main`, `v*` tags, `workflow_dispatch` (`environment=qa` for staging validation)
 - **Registry:** `ghcr.io/fpittelo/coach-web` — lane tags `dev`, `qa`, `prod`, `latest`, `<sha>`, `vX.Y.Z`
 - **Sidecar verification:** the digest-resolution step proves `ghcr.io/fpittelo/coach:<lane>` and the digest-pinned `github-mcp-server` release resolve before a lane image is declared good
-- **GCP deploy stage:** removed by #110 (ADR-007); the @fpittelo promotion approval lives in the promotion PRs
+- **GCP deploy stage:** removed by #110 (ADR-007); the single @fpittelo release approval anchors the tag-from-trunk release (MADR-0017)
 
 ---
 
 ## 🌳 Branch Lifecycle
 
-Coach Web follows the HOME Governance 3-branch lifecycle:
+Coach Web follows the HOME Governance trunk+tag lifecycle (MADR-0017):
 
-1. **`dev`** — active integration branch (all feature branches merge here via squash PR)
-2. **`qa`** — staging branch (promoted from `dev` with @fpittelo approval)
-3. **`main`** — production release branch (promoted from `qa` with @fpittelo approval)
+1. **`main`** — the single persistent trunk: all feature branches merge here via squash PR, and releases are cut from it as `vX.Y.Z` tags
+2. **`dev` / `qa`** — retired at the #286 cutover; there are no promotion branches and no promotion PRs
 
 ### Local Pre-Flight Gate
 
@@ -214,8 +213,8 @@ ruff check . && black --check . && isort --check-only . && mypy --strict src/coa
 
 | Trigger | Tag |
 |:---|:---|
-| Push to `dev` | `coach-web:dev`, `coach-web:<sha>` |
-| PR merged to `qa` | `coach-web:qa`, `coach-web:<sha>` |
+| Push to `main` | `coach-web:dev`, `coach-web:<sha>` |
+| `workflow_dispatch` (`environment=qa`) on `main` | `coach-web:qa`, `coach-web:<sha>` |
 | `v*` tag on `main` | `coach-web:latest`, `coach-web:prod`, `coach-web:<sha>`, `coach-web:vX.Y.Z` |
 
 The qa/prod lanes pull these CI-built images — a local build for qa/prod would bypass the zero-warning CI gate (ADR-007).
@@ -236,7 +235,7 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 | Problem | Cause | Fix |
 |:---|:---|:---|
-| **qa/prod lane pull fails** | Lane image not yet published (first promotion pending) or no GHCR auth | Check the promotion ran; `docker login ghcr.io` with a `read:packages` PAT |
+| **qa/prod lane pull fails** | Lane image not yet published (first qa-lane build pending) or no GHCR auth | Check the lane build ran; `docker login ghcr.io` with a `read:packages` PAT |
 | **Blank dashboard / agent errors** | coach-mcp sidecar unhealthy | `docker compose -p coach-web-<lane> ps -a` — check healthchecks; verify `INTERVALS_API_KEY` |
 | **Pre-flight fails on service set** | A sidecar crashed or never started | `docker compose -p coach-web-<lane> ps -a` and `logs`; the gate uses `ps -a` so exited containers are visible |
 | **Plans empty** | GitHub token missing or wrong scope | Verify `GITHUB_TOKEN` reaches the sidecars with the lane's env file |
