@@ -195,6 +195,24 @@ Issue #200 removes the stale "Local VIDAR" codename from every
     1280×800 rises 24rem → 30rem. The composer capsule, single-dispatch
     path, stop-morph and _SIGNIN_SLOT pins are untouched; the floor/cap
     mechanics are rewritten to the new allowance, never deleted.
+
+Issue #279 replaces the terminal-style message presentation (uppercase
+USER/ASSISTANT role labels, thin left-border separators) with a
+Sendbird-inspired bubble grammar: assistant messages render as
+left-aligned rounded neutral cards with the coach monogram avatar on the
+left margin, a "Coach" sender label above the bubble and a client-side
+receipt time (HH:MM) below it; user messages render as right-aligned
+accent bubbles with high text contrast; date dividers render as centered
+chips between messages whose client receipt dates differ. The architect
+decision is binding: NO chat component library — the vendored CSP-hardened
+stack is retained, bubbles are pure CSS + markup restructuring. nLPD
+posture: receipt timestamps are client-side only — stamped from the client
+clock into in-memory message state at push time, stripped from the history
+replay (the wire contract stays {role, content} pairs), never persisted
+and never transmitted. Markdown rendering (renderMarkdown + DOMPurify) is
+untouched; user messages stay x-text-only (ADR-006 §9, STRIDE #87); all
+six structured cards keep rendering beneath/inside the assistant bubble
+per the #82 single-active-card rule.
 """
 
 import re
@@ -4327,3 +4345,220 @@ class TestSvgStepProfileContract:
 
         hard = _rule_block(css, ".zone-chip--hard")
         assert "var(--accent)" in hard
+
+
+class TestMessageBubbleGrammarContract:
+    """Message bubble grammar — bubbles, avatars, timestamps, dividers (#279).
+
+    The terminal-style presentation (uppercase USER/ASSISTANT role labels,
+    thin left-border separators) is replaced by a Sendbird-inspired bubble
+    grammar: assistant messages render as left-aligned rounded neutral cards
+    with the coach monogram avatar on the left margin, a "Coach" sender label
+    above the bubble and a client-side receipt time (HH:MM) below it; user
+    messages render as right-aligned accent bubbles with high text contrast.
+    Date dividers render as centered chips between messages whose client
+    receipt dates differ.
+
+    Architect decision (binding): NO chat component library — the vendored
+    CSP-hardened stack is retained (supply-chain + CSP posture); bubbles are
+    pure CSS + markup restructuring.
+
+    nLPD posture (AC2): receipt timestamps are client-side only — stamped
+    from the client clock into in-memory message state at push time,
+    stripped from the history replay (the wire contract stays {role,
+    content} pairs), never persisted and never transmitted.
+
+    Source-level assertions only (ADR-006 §5 — no Node toolchain).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _message_loop(self) -> str:
+        """The message loop region: from the x-for template to the composer."""
+        html = self._html()
+        loop_at = html.index('<template x-for="(message, index) in messages"')
+        return html[loop_at : html.index('<form class="composer"')]
+
+    # --- AC1: bubble grammar structure ---------------------------------------
+
+    def test_assistant_messages_render_avatar_sender_and_bubble(self) -> None:
+        """AC1: the assistant grammar carries avatar, sender label, bubble."""
+        loop = self._message_loop()
+
+        assert 'class="message-avatar"' in loop
+        assert 'class="message-sender"' in loop
+        assert ">Coach</span>" in loop
+        assert 'class="message-bubble"' in loop
+        # The sanitized markdown body renders inside the assistant bubble.
+        assert loop.index('class="message-bubble"') < loop.index(
+            'x-html="renderMarkdown(message.content)"'
+        )
+
+    def test_user_messages_render_right_aligned_distinct_bubbles(self) -> None:
+        """AC1: user messages keep x-text and right-align as accent bubbles."""
+        html = self._html()
+        css = self._css()
+
+        assert "message--user" in html
+        assert "align-items: flex-end" in _rule_block(css, ".message--user .message-main")
+        user_bubble = _rule_block(css, ".message--user .message-bubble")
+        assert "background: var(--accent)" in user_bubble
+        assert "color: var(--accent-ink)" in user_bubble
+
+    def test_uppercase_role_label_is_removed(self) -> None:
+        """AC1: the uppercase .message-role label is gone (markup + styles)."""
+        html = self._html()
+        css = self._css()
+
+        assert "message-role" not in html
+        assert "message-role" not in css
+
+    def test_assistant_bubble_is_a_rounded_neutral_card(self) -> None:
+        """AC1: the assistant bubble is a rounded, tokenized neutral card."""
+        css = self._css()
+        bubble = _rule_block(css, ".message-bubble")
+
+        assert "border-radius" in bubble
+        assert "background: var(--surface)" in bubble
+        assert "padding" in bubble
+
+    # --- AC2: client-side receipts (nLPD) --------------------------------------
+
+    def test_receipts_are_stamped_from_the_client_clock_at_push(self) -> None:
+        """AC2: both push sites stamp a client-clock receipt at push time."""
+        script = self._script()
+
+        stamp = _rule_block(script, "stampReceipt(message)")
+        assert stamp, "stampReceipt(message) helper must exist"
+        assert "Date.now()" in stamp
+
+        assert "this.stampReceipt(" in _rule_block(script, "send()")
+        assert "this.stampReceipt(" in _rule_block(script, "startStream(message)")
+
+    def test_history_replay_strips_receipts_before_transmission(self) -> None:
+        """AC2/nLPD: the history replay transmits {role, content} pairs only."""
+        script = self._script()
+
+        # The #79 snapshot expression is preserved and every replayed entry
+        # is mapped through the receipt-stripping helper before the POST.
+        assert "this.messages.slice(0, -1).slice(-10).map(stripReceipt)" in script
+        strip = _rule_block(script, "stripReceipt(message)")
+        assert "{ role: message.role, content: message.content }" in strip
+
+    def test_receipt_helpers_touch_no_storage_and_no_network(self) -> None:
+        """AC2/nLPD: the receipt/divider helpers are pure client formatters."""
+        script = self._script()
+
+        for signature in (
+            "stampReceipt(message)",
+            "stripReceipt(message)",
+            "receiptTime(message)",
+            "dateDividerLabel(index)",
+        ):
+            block = _rule_block(script, signature)
+            assert block, signature
+            for banned in (
+                "fetch",
+                "localStorage",
+                "sessionStorage",
+                "indexedDB",
+                "document.cookie",
+                "sendBeacon",
+                "XMLHttpRequest",
+            ):
+                assert banned not in block, f"{signature}: {banned}"
+
+    # --- AC3: date dividers ------------------------------------------------------
+
+    def test_date_divider_renders_as_a_centered_chip(self) -> None:
+        """AC3: a centered divider chip renders inside the message loop."""
+        loop = self._message_loop()
+        css = self._css()
+
+        assert 'class="date-divider"' in loop
+        divider = _rule_block(css, ".date-divider")
+        assert "align-self: center" in divider
+
+    def test_date_divider_label_is_a_plain_localized_date(self) -> None:
+        """AC3: the divider text is a plain localized date of the receipt day."""
+        helper = _rule_block(self._script(), "dateDividerLabel(index)")
+
+        assert "toLocaleDateString" in helper
+        assert 'month: "long"' in helper
+        # The divider renders only when the previous message's receipt day
+        # differs (or there is no previous message).
+        assert "this.messages[index - 1]" in helper
+        assert "toDateString" in helper
+
+    # --- AC4: markdown unchanged, long content scrolls internally ----------------
+
+    def test_markdown_tables_scroll_inside_the_bubble(self) -> None:
+        """AC4: wide markdown tables scroll internally, never overflow."""
+        table = _rule_block(self._css(), ".message-body--markdown table")
+        assert "overflow-x: auto" in table
+
+    def test_bubble_chain_keeps_the_shrink_to_scroll_contract(self) -> None:
+        """AC4: min-width: 0 on the bubble chain lets long content scroll."""
+        css = self._css()
+
+        assert "min-width: 0" in _rule_block(css, ".message-main")
+        assert "min-width: 0" in _rule_block(css, ".message-bubble")
+
+    # --- AC5: structured cards keep rendering -------------------------------------
+
+    def test_all_six_structured_cards_still_render_in_the_loop(self) -> None:
+        """AC5: all six structured cards stay pinned inside the message loop."""
+        loop = self._message_loop()
+
+        for pin in (
+            "plan && planMessageIndex === index",
+            "weekPlan && weekMessageIndex === index",
+            "periodizationPlan && periodizationMessageIndex === index",
+            "debriefSummary && debriefSummaryMessageIndex === index",
+            "morningBriefing && morningBriefingMessageIndex === index",
+            "rpe && rpeMessageIndex === index",
+        ):
+            assert pin in loop, pin
+
+    def test_cards_span_the_full_width_beneath_the_bubble(self) -> None:
+        """AC5: cards render beneath the bubble across the full message row."""
+        card = _rule_block(self._css(), ".message .plan-card")
+        assert "grid-column: 1 / -1" in card
+
+    # --- AC6: CSP-safe, never-color-alone, reduced motion -------------------------
+
+    def test_bubble_grammar_introduces_no_inline_styles(self) -> None:
+        """AC6: the bubble grammar is class-only (CSP style-src 'self')."""
+        assert "style=" not in self._message_loop()
+
+    def test_bubble_grammar_introduces_no_animation(self) -> None:
+        """AC6/#85: the new surfaces animate nothing (reduced-motion safe)."""
+        css = self._css()
+
+        for selector in (
+            ".message-bubble",
+            ".date-divider",
+            ".message-avatar",
+            ".message-sender",
+            ".message-time",
+        ):
+            block = _rule_block(css, selector)
+            assert block, selector
+            assert "animation" not in block, selector
+            assert "transition" not in block, selector
+
+    def test_sender_identity_is_never_color_alone(self) -> None:
+        """AC6/#165: sender identity rides position + label, not color alone."""
+        css = self._css()
+
+        # The user variant is structurally distinct: right-aligned column,
+        # no avatar and no sender label — color only reinforces the split.
+        assert "display: none" in _rule_block(css, ".message--user .message-avatar")
+        assert "display: none" in _rule_block(css, ".message--user .message-sender")

@@ -188,23 +188,74 @@
             </div>
 
             <template x-for="(message, index) in messages" :key="index">
-              <article class="message" :class="{ 'message--user': message.role === 'user' }">
-                <span class="message-role" x-text="message.role"></span>
-                <!-- User messages stay x-text forever: untrusted input is
-                     never HTML-rendered (ADR-006 §9, STRIDE #87 C4). -->
-                <template x-if="message.role === 'user'">
-                  <p class="message-body" x-text="message.content"></p>
-                </template>
-                <!-- Assistant messages are the sole HTML-rendered surface,
-                     bound to the renderMarkdown sanitizer helper over the
-                     accumulated raw content (re-sanitized on every token
-                     render). -->
-                <template x-if="message.role === 'assistant'">
-                  <div
-                    class="message-body message-body--markdown"
-                    x-html="renderMarkdown(message.content)"
-                  ></div>
-                </template>
+              <!-- #279 bubble grammar: each iteration renders an optional
+                   centered date divider above the message article. The
+                   divider and every receipt time derive client-side from
+                   the in-memory receipt stamp — never persisted, never
+                   transmitted (nLPD AC2). -->
+              <div class="message-entry">
+                <div
+                  class="date-divider"
+                  x-show="dateDividerLabel(index)"
+                  x-text="dateDividerLabel(index)"
+                ></div>
+                <article
+                  class="message"
+                  :class="message.role === 'user' ? 'message--user' : 'message--assistant'"
+                >
+                  <!-- Coach monogram avatar (#279 AC1): decorative — the
+                       sender label carries the identity in words (#165);
+                       hidden on user messages by the .message--user rules
+                       (pure CSS, no per-role evaluation). -->
+                  <svg
+                    class="message-avatar"
+                    viewBox="0 0 32 32"
+                    fill="none"
+                    aria-hidden="true"
+                  >
+                    <rect
+                      x="1.5"
+                      y="1.5"
+                      width="29"
+                      height="29"
+                      rx="9"
+                      stroke="currentColor"
+                      stroke-width="2.5"
+                    />
+                    <path
+                      d="M22.4 11.2a8 8 0 1 0 0 9.6"
+                      stroke="currentColor"
+                      stroke-width="2.5"
+                      stroke-linecap="round"
+                    />
+                  </svg>
+                  <div class="message-main">
+                    <!-- Sender label (#279 AC1): replaces the uppercase
+                         role label; user messages carry none (alignment
+                         carries the role, never color alone #165). -->
+                    <span class="message-sender">Coach</span>
+                    <div class="message-bubble">
+                      <!-- User messages stay x-text forever: untrusted input is
+                           never HTML-rendered (ADR-006 §9, STRIDE #87 C4). -->
+                      <template x-if="message.role === 'user'">
+                        <p class="message-body" x-text="message.content"></p>
+                      </template>
+                      <!-- Assistant messages are the sole HTML-rendered surface,
+                           bound to the renderMarkdown sanitizer helper over the
+                           accumulated raw content (re-sanitized on every token
+                           render). -->
+                      <template x-if="message.role === 'assistant'">
+                        <div
+                          class="message-body message-body--markdown"
+                          x-html="renderMarkdown(message.content)"
+                        ></div>
+                      </template>
+                    </div>
+                    <!-- Client-side receipt time (#279 AC1/AC2): HH:MM from
+                         the in-memory receipt stamp — never persisted,
+                         never transmitted (nLPD). -->
+                    <span class="message-time" x-text="receiptTime(message)"></span>
+                  </div>
                 <!-- Inline plan-approval card (#82): renders beneath the
                      assistant message that proposed it. planMessageIndex
                      pins the single active card to the proposing message —
@@ -776,7 +827,8 @@
                     ></p>
                   </div>
                 </template>
-              </article>
+                </article>
+              </div>
             </template>
           </div>
 
