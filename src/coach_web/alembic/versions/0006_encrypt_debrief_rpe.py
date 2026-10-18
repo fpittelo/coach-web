@@ -60,6 +60,18 @@ def _migration_cipher() -> Fernet:
 
 def upgrade() -> None:
     """Encrypt every stored RPE in place (MADR-0008 C2, #243)."""
+    # Key first (#306): resolve/validate the cipher BEFORE any DDL executes.
+    # A missing/invalid key must fail the migration cleanly — the batch
+    # alter below must never run (and never leave a _alembic_tmp_* residue)
+    # when the key is absent.
+    cipher = _migration_cipher()
+    conn = op.get_bind()
+    # Recovery (#306): the batch alter's transient _alembic_tmp_debriefs
+    # table persisted after previously interrupted (non-atomic) runs and
+    # bricked every subsequent start with "table already exists". The table
+    # is transient by design — dropping a leftover before the batch alter
+    # makes recovery from interrupted runs automatic.
+    conn.execute(sa.text("DROP TABLE IF EXISTS _alembic_tmp_debriefs"))
     # Schema first: the numeric range CHECK must go before a token can be
     # written, and the column adopts the notes_encrypted typing/nullable
     # pattern (batch-rendered per env.py's SQLite ALTER strategy).
@@ -75,8 +87,6 @@ def upgrade() -> None:
     # Data: encrypt each plaintext RPE in place (NULL stays NULL). The
     # plaintext value exists only inside this migration process — never in a
     # log, never in the token.
-    cipher = _migration_cipher()
-    conn = op.get_bind()
     rows = conn.execute(sa.text("SELECT id, rpe FROM debriefs WHERE rpe IS NOT NULL")).all()
     for row_id, plaintext in rows:
         token = cipher.encrypt(str(int(plaintext)).encode("utf-8")).decode("ascii")
