@@ -10,7 +10,7 @@ SSE endpoint serialises verbatim.
 
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import date
 from types import TracebackType
 from typing import Any, Literal, Protocol
@@ -35,6 +35,11 @@ from coach_web.mcp_hub import COACH_SERVER, MCPClientHub
 from coach_web.microcycle import WeeklyPlanDraft
 from coach_web.models import ChatMessage, PlanProposal
 from coach_web.periodization import PeriodizationProposal
+from coach_web.suggestions import (
+    TurnOutcome,
+    outcome_from_event,
+    suggestions_for_outcomes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -477,6 +482,7 @@ class CoachAgent:
         message: str,
         *,
         history: list[ChatMessage] | None = None,
+        pre_emitted_outcomes: Sequence[TurnOutcome] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Run the agent loop for one user turn, yielding typed events.
 
@@ -484,7 +490,33 @@ class CoachAgent:
         requested tool through the MCP hub, feeds the results back, and stops on
         the first assistant message without tool calls or when the iteration cap
         is reached.
+
+        Quick-reply suggestions (MADR-0011, #281): the outcome tracker spans
+        ALL iterations of the turn and is monotonic (C-4) — it is seeded with
+        ``pre_emitted_outcomes`` (the stream endpoint's server-rendered
+        ``morning_briefing`` greeting feeds the same decision) and accumulates
+        every outcome-relevant event the loop emits. The terminal ``done``
+        event gains the validated ``suggestions`` field per the suppression
+        table; the ``done`` events that follow an error — typed failure or
+        max-iterations exhaustion — carry no ``suggestions`` key.
         """
+        outcomes: set[TurnOutcome] = set(pre_emitted_outcomes)
+        async for event in self._stream_turn(message, history):
+            outcome = outcome_from_event(event.type)
+            if outcome is not None:
+                outcomes.add(outcome)
+            elif event.type == "done":
+                payload = suggestions_for_outcomes(outcomes)
+                if payload is not None:
+                    event.data["suggestions"] = payload.model_dump()
+            yield event
+
+    async def _stream_turn(
+        self,
+        message: str,
+        history: list[ChatMessage] | None,
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream one raw agent turn: the loop body behind :meth:`run`."""
         messages = self._build_messages(message, history)
         hub_tools = self.hub.list_all_tools()
         tools = [

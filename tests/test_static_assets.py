@@ -316,6 +316,29 @@ def _has_rule(css: str, selector: str) -> bool:
     return False
 
 
+def _template_block(html: str, marker: str) -> str:
+    """Return the full ``<template>…</template>`` block whose opening tag
+    contains *marker* (nested templates counted, #281 pill assertions)."""
+    anchor = html.index(marker)
+    start = html.rindex("<template", 0, anchor)
+    depth = 0
+    index = start
+    while index < len(html):
+        next_open = html.find("<template", index)
+        next_close = html.find("</template>", index)
+        if next_close == -1:
+            break
+        if next_open != -1 and next_open < next_close:
+            depth += 1
+            index = next_open + len("<template")
+        else:
+            depth -= 1
+            index = next_close + len("</template>")
+            if depth == 0:
+                return html[start:index]
+    raise AssertionError("unbalanced template block")
+
+
 class TestStaticAssetServing:
     """Every frontend asset is served from the FastAPI origin."""
 
@@ -4562,3 +4585,202 @@ class TestMessageBubbleGrammarContract:
         # no avatar and no sender label — color only reinforces the split.
         assert "display: none" in _rule_block(css, ".message--user .message-avatar")
         assert "display: none" in _rule_block(css, ".message--user .message-sender")
+
+
+class TestQuickReplyPillsContract:
+    """Quick-reply action pills beneath coach messages (#281, MADR-0011).
+
+    The pills render the SERVER-OWNED suggestion constants delivered on the
+    terminal ``done`` event's optional ``suggestions`` field (MADR-0011).
+    Security posture pinned here per the accepted controls: x-text only
+    (C-5a), sibling of the assistant bubble never nested inside it (C-5b),
+    cleared on the next send/stream start (C-5d), volatile client memory
+    only (C-6), classes-only styling under CSP ``style-src 'self'`` (C-7).
+
+    Source-level assertions only (ADR-006 §5 — no Node toolchain).
+    """
+
+    PILL_MARKER = "suggestionsMessageIndex === index"
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _message_loop(self) -> str:
+        """The message loop region: from the x-for template to the composer."""
+        html = self._html()
+        loop_at = html.index('<template x-for="(message, index) in messages"')
+        return html[loop_at : html.index('<form class="composer"')]
+
+    def _pill_template(self) -> str:
+        """The pill x-if template block inside the message loop."""
+        return _template_block(self._message_loop(), self.PILL_MARKER)
+
+    # --- AC1: render contract ---------------------------------------------------
+
+    def test_pills_render_beneath_the_assistant_message_in_a_labeled_group(self) -> None:
+        """AC1/C-5: real buttons in a role="group" with the MADR aria-label."""
+        pills = self._pill_template()
+
+        assert 'role="group"' in pills
+        assert 'aria-label="Suggested replies"' in pills
+        assert "<button" in pills
+        assert 'type="button"' in pills
+
+    def test_pill_labels_render_via_x_text_only(self) -> None:
+        """AC1/C-5a: x-text only — never x-html anywhere in the pill path."""
+        pills = self._pill_template()
+
+        assert "x-text=" in pills
+        assert "x-html" not in pills
+
+    def test_at_most_four_pills_render(self) -> None:
+        """AC1: the client caps the rendered pills at four (MADR shape)."""
+        helper = _rule_block(self._script(), "normalizeSuggestions(value)")
+        assert helper, "normalizeSuggestions() helper must exist"
+        assert "slice(0, 4)" in helper
+
+    def test_pills_are_siblings_of_the_assistant_bubble_never_nested_inside_it(self) -> None:
+        """C-5b (load-bearing): the pill container sits outside the bubble.
+
+        The bubble div opens at .message-bubble and closes before the
+        receipt-time span; the pill template must appear AFTER both, i.e. as
+        a sibling within the message article — never inside the x-html
+        bubble's subtree.
+        """
+        loop = self._message_loop()
+        pill_at = loop.index(self.PILL_MARKER)
+
+        assert loop.index('class="message-bubble"') < pill_at
+        assert loop.index('<span class="message-time"') < pill_at
+        pills = self._pill_template()
+        assert "message-bubble" not in pills
+
+    # --- AC2: dispatch contract ---------------------------------------------------
+
+    def test_pill_click_sends_verbatim_through_the_single_dispatch_path(self) -> None:
+        """AC2: the click routes through the form submit event — the ONE
+        send() dispatch path (#207 AC 1.3) — with the pill text verbatim."""
+        script = self._script()
+        send = _rule_block(script, "sendSuggestion(suggestion)")
+        assert send, "sendSuggestion() must exist"
+
+        assert "this.input = suggestion;" in send
+        assert "this.$refs.composerForm.requestSubmit()" in send
+        # No direct send() call: the submit event is the single dispatch path.
+        assert "this.send()" not in send
+
+    def test_pills_are_disabled_while_a_stream_is_in_flight(self) -> None:
+        """AC2/AC3: the streaming disable is respected on the pills."""
+        pills = self._pill_template()
+
+        assert ':disabled="streaming"' in pills
+
+    # --- AC3: interaction contract ---------------------------------------------------
+
+    def test_pills_never_auto_send_on_render(self) -> None:
+        """AC3: rendering only renders — the click handler is the sole trigger."""
+        pills = self._pill_template()
+        script = self._script()
+
+        assert "@click=" in pills
+        assert "x-init" not in pills
+        # Exactly one JS occurrence: the definition. No other call site —
+        # in particular none in the done handler or stream lifecycle.
+        assert script.count("sendSuggestion") == 1
+
+    def test_pill_states_are_outline_default_and_filled_on_hover(self) -> None:
+        """AC3: outline style default, filled on hover (issue spec)."""
+        css = self._css()
+        pill = _rule_block(css, ".quick-reply")
+        hover = _rule_block(css, ".quick-reply:hover")
+
+        assert "border: 1px solid" in pill
+        assert "background: var(--paper)" in pill
+        assert "background: var(--accent)" in hover
+        assert "color: var(--accent-ink)" in hover
+
+    # --- C-5d: lifecycle -----------------------------------------------------------
+
+    def test_done_handler_binds_the_server_suggestions_with_a_shape_guard(self) -> None:
+        """C-5d: the done handler renders only from a valid suggestions shape;
+        an absent/suppressed field renders nothing."""
+        script = self._script()
+        done = _rule_block(script, "done: (event) =>")
+
+        assert "normalizeSuggestions(data.suggestions)" in done
+        assert "this.suggestionsMessageIndex" in done
+
+    def test_pills_are_cleared_when_the_next_stream_starts(self) -> None:
+        """C-5d: clear-on-start is explicit in startStream()."""
+        start = _rule_block(self._script(), "startStream(message)")
+
+        assert "this.suggestions = [];" in start
+        assert "this.suggestionsMessageIndex = -1;" in start
+
+    def test_reset_chat_clears_the_pills(self) -> None:
+        """C-5d: the full client reset clears the pill state too."""
+        reset = _rule_block(self._script(), "resetChat()")
+
+        assert "this.suggestions = [];" in reset
+        assert "this.suggestionsMessageIndex = -1;" in reset
+
+    # --- C-6: volatile state ---------------------------------------------------------
+
+    def test_pill_state_is_volatile_client_memory_only(self) -> None:
+        """C-6: no localStorage/IndexedDB/sessionStorage in the pill path."""
+        script = self._script()
+        banned = ("localStorage", "sessionStorage", "indexedDB", "document.cookie")
+
+        for signature in (
+            "normalizeSuggestions(value)",
+            "sendSuggestion(suggestion)",
+            "done: (event) =>",
+            "startStream(message)",
+        ):
+            block = _rule_block(script, signature)
+            assert block, signature
+            for token in banned:
+                assert token not in block, (signature, token)
+
+    # --- C-7: CSP-safe styling ---------------------------------------------------------
+
+    def test_pill_styling_is_classes_only(self) -> None:
+        """C-7: classes-only styling — no inline style attributes."""
+        pills = self._pill_template()
+
+        assert "style=" not in pills
+
+    def test_pill_styles_are_tokenized_and_present(self) -> None:
+        """C-7: the pill rules exist in the stylesheet and use design tokens."""
+        css = self._css()
+        container = _rule_block(css, ".quick-replies")
+        pill = _rule_block(css, ".quick-reply")
+
+        assert container, "the pill container must be styled"
+        assert "display: flex" in container
+        assert "var(--space-" in container
+        assert pill, "the pill button must be styled"
+        assert "border-radius: var(--radius)" in pill
+
+    def test_pills_have_a_visible_focus_ring(self) -> None:
+        """AC4: keyboard focus is visible on the pills (#165)."""
+        focus = _rule_block(self._css(), ".quick-reply:focus-visible")
+
+        assert focus, "the pill focus-visible rule must exist"
+        assert "outline" in focus
+
+    def test_pill_grammar_introduces_no_animation(self) -> None:
+        """AC6/#85 carry-over: the pills animate nothing (reduced-motion safe)."""
+        css = self._css()
+
+        for selector in (".quick-replies", ".quick-reply"):
+            block = _rule_block(css, selector)
+            assert block, selector
+            assert "animation" not in block, selector
+            assert "transition" not in block, selector

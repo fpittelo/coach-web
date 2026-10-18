@@ -21,7 +21,7 @@ shape — yields no digest at all and never breaks the agent turn.
 import asyncio
 import json
 import sqlite3
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
@@ -161,7 +161,11 @@ class _SystemPromptProbeAgent:
         """Exit the agent context."""
 
     async def run(
-        self, message: str, *, history: list[Any] | None = None
+        self,
+        message: str,
+        *,
+        history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Yield the system prompt so tests can assert on the injected digest."""
         yield AgentEvent(type="token", data={"text": self.system_prompt})

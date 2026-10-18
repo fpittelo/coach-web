@@ -1,6 +1,6 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -36,7 +36,11 @@ class _CspProbeAgent:
         """Exit the agent context."""
 
     async def run(
-        self, message: str, *, history: list[Any] | None = None
+        self,
+        message: str,
+        *,
+        history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Yield a single token event for the supplied message."""
         yield AgentEvent(type="token", data={"text": "hello"})

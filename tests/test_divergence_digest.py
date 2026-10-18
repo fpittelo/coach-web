@@ -31,7 +31,7 @@ so any leak of the stored RPE value introduces a 9 that exists nowhere else.
 """
 
 import ast
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -204,7 +204,11 @@ class _DigestProbeAgent:
         """Exit the agent context."""
 
     async def run(
-        self, message: str, *, history: list[Any] | None = None
+        self,
+        message: str,
+        *,
+        history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Capture the assembled prompt and replay the canned events."""
         self.captured_prompt = self.system_prompt

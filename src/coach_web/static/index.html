@@ -827,6 +827,40 @@
                     ></p>
                   </div>
                 </template>
+                <!-- Quick-reply pills (#281, MADR-0011): the terminal done
+                     event may carry an optional SERVER-OWNED suggestions
+                     array; the pills render beneath the assistant message
+                     that completed the turn. C-5a: the labels bind via
+                     x-text only — never an HTML binding. C-5b
+                     (load-bearing): the pill group is a SIBLING of the
+                     assistant bubble, never nested inside its rendered
+                     subtree. C-5d: an absent or suppressed field renders
+                     nothing, and the pills are cleared when the next
+                     send/stream starts. C-6: the state is volatile client
+                     memory only — never persisted. C-7: classes-only
+                     styling (CSP style-src 'self'). A click submits the
+                     pill text verbatim through the single send() dispatch
+                     path (the form submit event — no double-send) and the
+                     pills are disabled while a stream is in flight; they
+                     never auto-send on render. -->
+                <template
+                  x-if="message.role === 'assistant' && suggestions.length > 0 && suggestionsMessageIndex === index"
+                >
+                  <div class="quick-replies" role="group" aria-label="Suggested replies">
+                    <template
+                      x-for="(suggestion, suggestionIndex) in suggestions"
+                      :key="suggestionIndex"
+                    >
+                      <button
+                        class="quick-reply"
+                        type="button"
+                        x-text="suggestion"
+                        :disabled="streaming"
+                        @click="sendSuggestion(suggestion)"
+                      ></button>
+                    </template>
+                  </div>
+                </template>
                 </article>
               </div>
             </template>

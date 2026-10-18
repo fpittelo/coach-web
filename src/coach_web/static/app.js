@@ -159,6 +159,21 @@
  * the history replay by stripReceipt (the wire contract stays {role,
  * content} pairs), never persisted, never transmitted. No chat component
  * library — pure CSS + markup restructuring over the vendored stack.
+ *
+ * Quick-reply pills (#281, MADR-0011): the terminal done event may carry
+ * an optional server-owned `suggestions` array (1–4 constant strings —
+ * never model output). The pills render beneath the assistant message
+ * that completed the turn: real <button> elements in a role="group"
+ * container with aria-label "Suggested replies", siblings of the
+ * assistant bubble — never nested inside its x-html subtree (C-5b).
+ * Labels bind via x-text only (C-5a); the shape guard
+ * (normalizeSuggestions) renders only from a valid payload, so an
+ * absent/suppressed field renders nothing (C-5d). A click submits the
+ * pill text verbatim through the SINGLE send() dispatch path (the form's
+ * submit event via requestSubmit — no double-send) and the pills are
+ * cleared when the next send/stream starts (C-5d) and by resetChat().
+ * Pill state is volatile client memory only — never persisted (C-6) —
+ * and the styling is classes-only under CSP style-src 'self' (C-7).
  */
 
 // 90 s no-event watchdog (AC3, #84): a backstop ABOVE the server's own
@@ -334,6 +349,20 @@ function stripReceipt(message) {
   return { role: message.role, content: message.content };
 }
 
+// Quick-reply pill shape guard (#281, MADR-0011): the server never emits an
+// invalid suggestions payload (Pydantic-capped server-side), but the client
+// renders only from a valid shape — an array of non-empty strings capped at
+// four. Anything else degrades to no pills (C-5d: absent/suppressed → none).
+// The strings are server-owned constants rendered via x-text only (C-5a).
+function normalizeSuggestions(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .filter((item) => typeof item === "string" && item.trim() !== "")
+    .slice(0, 4);
+}
+
 function blankGoalForm() {
   // Blank goal form factory (N4, PR #171): shared by the initial state, the
   // add-goal action and the empty-profile load path — the settings form is
@@ -438,6 +467,13 @@ function coachApp() {
     // gated by the client-side date flag (R3 — not a security boundary).
     morningBriefing: null,
     morningBriefingMessageIndex: -1,
+    // Quick-reply pills (#281, MADR-0011): the server-owned suggestion
+    // strings delivered on the terminal done event, pinned to the message
+    // that completed the turn (#82 grammar). Volatile client memory only
+    // (C-6) — cleared when the next send/stream starts (C-5d) and by
+    // resetChat(); never persisted.
+    suggestions: [],
+    suggestionsMessageIndex: -1,
     // Visually-hidden live-region text (#86 AC3): phase labels and the
     // completed final message — never per token. Static strings or final
     // message content only (nLPD).
@@ -715,6 +751,22 @@ function coachApp() {
       // textarea to fit the prefilled text.
       this.input = chip;
       this.$refs.composer.focus();
+    },
+
+    sendSuggestion(suggestion) {
+      // Quick-reply pill (#281 AC2, MADR-0011): the click submits the pill
+      // text verbatim as a user turn IMMEDIATELY — through the SINGLE
+      // send() dispatch path (the form's submit event, #207 AC 1.3). The
+      // composer is filled and the form submitted via requestSubmit(), the
+      // same route the Enter key uses; there is no direct send() call here,
+      // so keydown, submit button and pill activation can never double-send.
+      // The submit rides $nextTick so requestSubmit() observes the submit
+      // button AFTER Alpine's reactive DOM write clears its empty-input
+      // :disabled binding (a disabled default button blocks requestSubmit).
+      // The pills are cleared by startStream() when the submit opens the
+      // new stream (C-5d).
+      this.input = suggestion;
+      this.$nextTick(() => this.$refs.composerForm.requestSubmit());
     },
 
     // ------------------------------------------------------------------
@@ -1016,6 +1068,11 @@ function coachApp() {
       // any) re-pins a fresh one.
       this.morningBriefing = null;
       this.morningBriefingMessageIndex = -1;
+      // Quick-reply pills (#281, C-5d): a new send/stream start clears the
+      // previous turn's pills explicitly — the done event of the new turn
+      // (if any) re-pins a fresh set.
+      this.suggestions = [];
+      this.suggestionsMessageIndex = -1;
 
       // Morning briefing request (#262): the FIRST stream of the day
       // carries briefing=true; the flag is marked at request time so
@@ -1394,6 +1451,14 @@ function coachApp() {
           if (!this.messages[index].content && data.message) {
             this.messages[index].content = data.message;
           }
+          // Quick-reply pills (#281, MADR-0011): the terminal done event may
+          // carry the optional server-owned suggestions array. The shape
+          // guard renders only from a valid payload — an absent or
+          // suppressed field renders nothing (C-5d). The pills pin to this
+          // message (#82 grammar); the state is volatile client memory only
+          // (C-6) and is cleared when the next send/stream starts.
+          this.suggestions = normalizeSuggestions(data.suggestions);
+          this.suggestionsMessageIndex = this.suggestions.length > 0 ? index : -1;
           // Announce the completed FINAL message (AC3, #86): the full
           // text, once — never per token. Markdown-stripped (#149 AC2):
           // the status region speaks plain prose — raw markdown source
@@ -1511,6 +1576,10 @@ function coachApp() {
       // was already requested today).
       this.morningBriefing = null;
       this.morningBriefingMessageIndex = -1;
+      // Quick-reply pills (#281, C-5d/C-6): a chat reset clears the pill
+      // state — volatile client memory only.
+      this.suggestions = [];
+      this.suggestionsMessageIndex = -1;
       this.input = "";
       this.errorBanner = "";
       this.errorBannerSignin = false;

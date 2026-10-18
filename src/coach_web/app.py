@@ -4,7 +4,7 @@ import asyncio
 import logging
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import date
 from importlib.metadata import PackageNotFoundError, version
@@ -115,6 +115,7 @@ from coach_web.periodization import (
     validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
+from coach_web.suggestions import TurnOutcome
 
 logger = logging.getLogger("coach_web")
 
@@ -690,6 +691,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 logger.warning("Morning briefing unavailable: %s", exc)
                 briefing = None
 
+        # Quick-reply suggestions (MADR-0011, #281): the endpoint-emitted
+        # morning_briefing greeting is a SUPPRESSING turn outcome (C-4) — the
+        # fact feeds the agent loop's outcome tracker via pre_emitted_outcomes,
+        # so a briefing turn never carries suggestion pills.
+        pre_emitted_outcomes: Sequence[TurnOutcome] = (
+            ("morning_briefing",) if briefing is not None else ()
+        )
+
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
             try:
                 async with agent:
@@ -699,7 +708,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             data={"briefing": briefing.model_dump()},
                         )
                         yield ServerSentEvent(event=greeting.type, data=greeting.model_dump_json())
-                    async for event in agent.run(payload.message, history=payload.history):
+                    async for event in agent.run(
+                        payload.message,
+                        history=payload.history,
+                        pre_emitted_outcomes=pre_emitted_outcomes,
+                    ):
                         yield ServerSentEvent(event=event.type, data=event.model_dump_json())
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)
