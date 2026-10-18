@@ -135,19 +135,33 @@ docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml --env-file .e
 
 The backup artifact is a **Fernet-encrypted envelope around the SQLite file bytes** — encrypted at rest with the lane's `DATA_ENCRYPTION_KEY` (the same key the app and migration 0006 use; no second key). The key comes from the lane env file (`chmod 600`, never committed, never logged). The artifact is C2-derived: store it with the same care as the database itself.
 
+**Backup target — non-co-location is a requirement (MADR-0008 C2):** the artifact must **never** share a volume or host with the live DB volume or with the `DATA_ENCRYPTION_KEY` escrow (the lane env file and its escrowed copies). The backup boundary is the one that actually matters (MADR-0008): a single lost disk or compromised host must not be able to reach both the key and the backups. Write the artifact to an off-host target or a protected separate volume — e.g. an encrypted external disk or network share mounted at `/mnt/coach-backups` — never to `/data`, the lane volume that holds both the database and the key env file.
+
 ```bash
 # backup (lane stopped or idle; folds the WAL into the main file first)
+# --output goes to a host directory mounted from a separate volume/host — never /data
+# (the host directory must be writable by the container user, UID 10001)
 docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod \
-  run --rm coach-web python -m coach_web.maintenance backup --output /data/backups/coach-$(date +%F).backup
-
-# restore into a fresh database file (e.g. disaster recovery)
-docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod \
-  run --rm coach-web python -m coach_web.maintenance restore /data/backups/coach-2026-10-18.backup --output /data/coach-restored.db
+  run --rm -v /mnt/coach-backups:/backup coach-web \
+  python -m coach_web.maintenance backup --output /backup/coach-$(date +%F).backup
 ```
+
+**Restore runbook (disaster recovery):**
+
+1. **Recover the key from escrow (MADR-0008 C2 — explicit step, exercised in every restore rehearsal):** retrieve the lane's `DATA_ENCRYPTION_KEY` from the password manager (primary escrow) or the offline copy on its separate encrypted medium — never from the backup target — and confirm it decrypts a recent artifact by running the restore below against a scratch path before touching the live volume.
+2. Restore into a fresh database file:
+
+```bash
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod \
+  run --rm -v /mnt/coach-backups:/backup:ro coach-web \
+  python -m coach_web.maintenance restore /backup/coach-2026-10-18.backup --output /data/coach-restored.db
+```
+
+3. Verify (row counts vs. the live DB, lane health-check, spot-check a recent debrief decryption), then swap the restored file in and start the lane.
 
 - **Wrong/missing key → fail closed:** a restore with the wrong key fails with `maintenance failed: …` (Fernet `InvalidToken`) and leaves no half-written database behind; a backup without `DATA_ENCRYPTION_KEY` refuses to run (never writes plaintext).
 - **Verification step (after every backup):** restore the artifact into a scratch path and confirm the row counts match the live DB before deleting the scratch file.
-- **Schedule suggestion:** weekly `backup` (before the weekly `VACUUM`), keep at least the last 4 artifacts on a separate volume/host; each artifact is only decryptable with the lane's `DATA_ENCRYPTION_KEY` — losing that key loses every backup.
+- **Schedule:** weekly `backup` (before the weekly `VACUUM`), keep at least the last 4 artifacts on the non-co-located target above; each artifact is only decryptable with the lane's `DATA_ENCRYPTION_KEY` — losing that key loses every backup, which is why key escrow and rehearsed recovery (step 1) are part of this runbook (MADR-0008 C2; restore rehearsed before the first prod release of the persistence story, re-rehearsed quarterly).
 
 ---
 
@@ -311,4 +325,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-18 (issue #275 — coach-mcp sidecar digest pin + upstream drift check)_
+_Last updated: 2026-10-18 (issue #297 — backup non-co-location stated as a MADR-0008 C2 requirement + key-escrow/recovery step in the restore runbook; prior: issue #275 — coach-mcp sidecar digest pin + upstream drift check)_
