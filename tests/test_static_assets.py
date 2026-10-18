@@ -502,15 +502,15 @@ class TestSwissMinimalistContract:
         assert not stray_rgba, f"hard-coded rgba outside tokens: {sorted(stray_rgba)}"
 
     def test_layout_is_single_centered_column(self) -> None:
-        """Masthead, content and footer share one centered column (AC3).
+        """Header, content and footer share one centered column (AC3).
 
-        Rewritten for #207 AC 1.1: the centered column widens from the v0.7
-        760px reading column to the ~72rem chat container — the composer
-        capsule floats inside it. Explicit supersession (ADR-006 §2).
+        Rewritten for #278: the compact sticky conversation header replaces
+        the .masthead; it still sits in the same centered column as the chat
+        panel and footer. Explicit supersession (ADR-006 §2).
         """
         css = (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
 
-        for selector in (".masthead", ".layout", ".footer"):
+        for selector in (".conversation-header", ".layout", ".footer"):
             block = _rule_block(css, selector)
             assert "max-width: 72rem" in block, selector
             assert "margin: 0 auto" in block, selector
@@ -670,13 +670,13 @@ class TestIdentityBarContract:
         assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
 
     def test_identity_bar_sits_inside_centered_column(self) -> None:
-        """The identity bar is a child of the centered 760px masthead."""
+        """The identity bar is the content of the centered sticky header."""
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-        masthead = html.index('<header class="masthead">')
+        header = html.index('<header class="conversation-header"')
         bar = html.index('<div class="identity-bar">')
         close = html.index("</header>")
-        assert masthead < bar < close
+        assert header < bar < close
 
     def test_legacy_session_buttons_are_gone(self) -> None:
         """KIS cut: the single New chat replaces New Session / Clear Context."""
@@ -1836,7 +1836,7 @@ class TestComposerErgonomicsContract:
         blocker). The panel is therefore viewport-height-bounded: a dvh
         declaration (tracks mobile browser chrome) overriding a vh
         fallback, plus a max-height cap for very tall monitors. The
-        masthead allowance is the #249 compaction value (20rem).
+        header allowance is the #278 compact sticky header value (3rem).
         """
         html = self._html()
         css = self._css()
@@ -1854,17 +1854,17 @@ class TestComposerErgonomicsContract:
         # height on the flex column (dvh over vh fallback) + a cap for
         # very tall monitors. Without it the panel grows with the
         # transcript and the footer scrolls away.
-        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 3rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 3rem)" in chat, "dvh override missing"
         assert "max-height:" in chat, "tall-monitor cap missing"
 
     def test_chat_has_a_short_viewport_height_floor(self) -> None:
-        """AC1 (#150, #249 rewrite): the panel keeps a usable floor on short viewports.
+        """AC1 (#150, #278 rewrite): the panel keeps a usable floor on short viewports.
 
-        On viewports shorter than the 20rem masthead allowance (landscape
-        phones), ``calc(100dvh - 20rem)`` clamps to 0 and the panel — log
+        On viewports shorter than the 3rem sticky header allowance (landscape
+        phones), ``calc(100dvh - 3rem)`` clamps to 0 and the panel — log
         AND composer — degenerates. A min-height floor resolves the used
-        height to ``max(calc(100dvh - 20rem), floor)``; at 14rem it stays
+        height to ``max(calc(100dvh - 3rem), floor)``; at 14rem it stays
         below the computed height on typical portrait phones (≥ 34rem
         tall), so the #83 portrait behavior is unchanged there.
         """
@@ -1976,31 +1976,33 @@ class TestFloatingComposerContract:
         assert "margin: 0 auto" in layout
 
     def test_height_budget_is_preserved_with_an_honest_comment(self) -> None:
-        """AC 1.1 (#249 rewrite): the .chat height budget survives compaction.
+        """AC 1.1 (#278 rewrite): the .chat height budget survives compaction.
 
         The pinned-footer mechanism is untouched: the panel stays
-        viewport-height-bounded (dvh over vh fallback, the 20rem masthead
-        allowance re-derived by the #249 chrome compaction, 14rem floor,
-        40rem tall-monitor cap) and the capsule is its last flex child.
-        The budget comment carries the honest recomputation — the #207
-        capsule arithmetic AND the #249 old-vs-new allowance arithmetic.
+        viewport-height-bounded (dvh over vh fallback, the 3rem sticky
+        conversation-header allowance from #278, 14rem floor, 40rem tall-
+        monitor cap) and the capsule is its last flex child. The budget
+        comment carries the honest recomputation — the #207 capsule
+        arithmetic, the #249 old-vs-new allowance arithmetic, and the #278
+        compact-header allowance.
         """
         css = self._css()
         chat = _rule_block(css, ".chat")
 
-        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
+        assert "height: calc(100vh - 3rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 3rem)" in chat, "dvh override missing"
         assert "min-height: 14rem" in chat, "short-viewport floor missing"
         assert "max-height: 40rem" in chat, "tall-monitor cap missing"
 
-        # The comment above the .chat rule documents the #207 recomputation
-        # and the #249 chrome-compaction arithmetic.
+        # The comment above the .chat rule documents the #207, #249 and
+        # #278 recomputations.
         css_raw = (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
         comment_at = css_raw.index(".chat {")
         comment_start = css_raw.rindex("/*", 0, comment_at)
         comment = css_raw[comment_start:comment_at]
         assert "#207" in comment, "height-budget comment must carry the #207 recomputation"
         assert "#249" in comment, "height-budget comment must carry the #249 arithmetic"
+        assert "#278" in comment, "height-budget comment must carry the #278 allowance"
 
     # --- AC 1.4: action dock — single row inside the capsule --------------------
 
@@ -2195,32 +2197,19 @@ class TestFloatingComposerContract:
         }, sorted(endpoints)
 
 
-class TestConsoleChromeCompactionContract:
-    """Chat chrome compaction — reclaim log height (#249).
+class TestCompactStickyHeaderContract:
+    """Compact sticky conversation header — reclaim viewport (#278).
 
-    PO feedback on the dev lane (2026-10-17): the chat console is
-    height-starved — the fixed chrome above the log (masthead, greeting
-    block, status band) consumes too much vertical space without value.
-    #207 set the log height to ``calc(100dvh - 26rem)``; #249 compresses
-    the chrome and re-derives the masthead allowance to 20rem, with the
-    honest per-block arithmetic documented in the .chat comment (the #207
-    recomputation precedent).
+    The masthead kicker ("Endurance Cockpit"), h1 and lede are removed
+    from the chat view. The existing identity bar (monogram + product
+    name + Settings + New chat) becomes the compact sticky conversation
+    header pinned above the chat panel. The empty-state greeting already
+    carries the welcome copy, so the lede is dropped (not duplicated).
 
-    Compaction contract (content preserved, footprint reduced):
-
-    - masthead: paddings/margins trimmed one space step, the h1 clamp
-      capped at 2rem (the identity bar already carries the brand);
-    - status band (``.activity``): a slim inline row — band border/padding
-      geometry removed, space-2 rhythm — and transient (x-show), so it
-      never reserves a permanent band;
-    - greeting (``.empty-state``): space-4 vertical padding, space-2 gap,
-      32px hero monogram, 1.15rem salutation — monogram, salutation,
-      welcome line and chips all stay (pinned by
-      TestOnboardingEmptyStateContract);
-    - composer capsule: UNTOUCHED — the #207 pins in
-      TestFloatingComposerContract keep guarding it; the floor/cap
-      mechanics (14rem floor, 40rem cap) are rewritten to the new
-      allowance, never deleted.
+    The dvh-bounded log+composer layout is preserved; only the header
+    allowance shrinks from the #249 20rem masthead budget to a 3rem
+    sticky-header budget, pushing the primary viewport share to the
+    conversation.
     """
 
     def _css(self) -> str:
@@ -2232,93 +2221,83 @@ class TestConsoleChromeCompactionContract:
     def _html(self) -> str:
         return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
-    # --- AC1: masthead chrome trimmed -----------------------------------------
+    # --- AC1: kicker, h1 and lede removed --------------------------------------
 
-    def test_masthead_padding_is_trimmed(self) -> None:
-        """AC1: the masthead vertical padding drops a full space step per side."""
-        masthead = _rule_block(self._css(), ".masthead")
-
-        assert "padding: var(--space-4) var(--space-5) var(--space-4)" in masthead
-
-    def test_masthead_margins_are_trimmed(self) -> None:
-        """AC1: identity bar, rule and kicker margins drop to the slim rhythm."""
+    def test_masthead_kicker_h1_and_lede_are_removed(self) -> None:
+        """AC1: the static banner chrome above the chat panel is gone."""
+        html = self._html()
         css = self._css()
 
-        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".identity-bar")
-        assert "margin-bottom: var(--space-3)" in _rule_block(css, ".rule")
-        # The kicker keeps its margin shorthand (0 0 <token>).
-        assert "margin: 0 0 var(--space-2)" in _rule_block(css, ".kicker")
+        assert '<header class="masthead"' not in html
+        assert "Endurance Cockpit" not in html
+        assert "<h1>Coach Web</h1>" not in html
+        assert '<p class="lede">' not in html
+        assert ".kicker" not in css
+        assert ".lede" not in css
+        assert ".rule" not in css
+        assert ".masthead h1" not in css
 
-    def test_masthead_h1_is_capped_at_two_rem(self) -> None:
-        """AC1: the h1 clamp tops out at 2rem — the identity bar owns the brand."""
-        h1 = _rule_block(self._css(), ".masthead h1")
+    def test_identity_bar_is_the_conversation_header(self) -> None:
+        """AC1: the identity bar now forms the conversation header."""
+        html = self._html()
+        header = _header_block(html)
 
-        assert "font-size: clamp(1.5rem, 3vw, 2rem)" in h1
-        assert "margin: 0 0 var(--space-2)" in h1
+        assert '<header class="conversation-header"' in html
+        assert 'class="identity-bar"' in header
+        assert 'aria-label="Coach Web"' in header
+        assert 'aria-label="Open objectives settings"' in header
+        assert 'aria-label="New chat' in header
 
-    # --- AC1: the height budget re-derivation -----------------------------------
+    # --- AC2: sticky header + viewport-height chat panel -----------------------
 
-    def test_chat_allowance_is_compacted_to_20rem(self) -> None:
-        """AC1: the masthead allowance drops 26rem → 20rem; floor/cap unchanged."""
+    def test_header_is_sticky_above_the_chat_panel(self) -> None:
+        """AC2: the header stays visible while the page/log scrolls."""
+        css = self._css()
+        header = _rule_block(css, ".conversation-header")
+
+        assert "position: sticky" in header
+        assert "top: 0" in header
+        assert "z-index:" in header
+
+    def test_chat_uses_compact_header_allowance(self) -> None:
+        """AC2: the log+composer budget rises to (viewport - 3rem header)."""
         chat = _rule_block(self._css(), ".chat")
 
-        assert "height: calc(100vh - 20rem)" in chat, "vh fallback missing"
-        assert "height: calc(100dvh - 20rem)" in chat, "dvh override missing"
-        assert "min-height: 14rem" in chat, "short-viewport floor must survive"
-        assert "max-height: 40rem" in chat, "tall-monitor cap must survive"
+        assert "height: calc(100vh - 3rem)" in chat, "vh fallback missing"
+        assert "height: calc(100dvh - 3rem)" in chat, "dvh override missing"
+        assert "min-height: 14rem" in chat, "short-viewport floor missing"
+        assert "max-height: 40rem" in chat, "tall-monitor cap missing"
 
-    def test_height_budget_comment_carries_the_249_arithmetic(self) -> None:
-        """AC1: the .chat comment documents the old vs new budget arithmetic."""
+    def test_height_budget_comment_documents_the_new_allowance(self) -> None:
+        """AC2: the .chat comment documents the #278 allowance change."""
         css_raw = self._css_raw()
         comment_at = css_raw.index(".chat {")
         comment_start = css_raw.rindex("/*", 0, comment_at)
         comment = css_raw[comment_start:comment_at]
 
-        assert "#249" in comment, "the #249 recomputation must be documented"
+        assert "#278" in comment, "the #278 allowance must be documented"
+        assert "#249" in comment, "the #249 precedent must stay referenced"
         assert "#207" in comment, "the #207 precedent must stay referenced"
-        assert "26rem" in comment, "the old allowance must be stated"
-        assert "20rem" in comment, "the new allowance must be stated"
+        assert "20rem" in comment, "the old allowance must be stated"
+        assert "3rem" in comment, "the new allowance must be stated"
 
-    # --- AC2: slim transient status band -----------------------------------------
+    # --- AC5: accessibility landmarks/labels -----------------------------------
 
-    def test_status_band_is_a_slim_inline_row(self) -> None:
-        """AC2: the activity band loses its border/padding band geometry."""
-        activity = _rule_block(self._css(), ".activity")
-
-        assert "margin-top: var(--space-2)" in activity, "slim top margin missing"
-        assert "border-top" not in activity, "the band separator must go"
-        assert "padding-top" not in activity, "the band padding must go"
-        assert "gap: var(--space-2)" in activity, "slim inner rhythm missing"
-
-    def test_status_band_stays_transient(self) -> None:
-        """AC2: the band is x-show gated — it never reserves a permanent row."""
+    def test_header_carries_an_accessible_name(self) -> None:
+        """AC5: the new header landmark has an explicit accessible name."""
         html = self._html()
-        activity_at = html.index('<div class="activity"')
-        tag = html[activity_at : html.index(">", activity_at) + 1]
+        header = _header_block(html)
 
-        assert "x-show=" in tag, "the band must stay transient (x-show)"
+        assert 'aria-label="Coach Web"' in header
 
-    # --- AC3: slimmed greeting block ------------------------------------------------
+    def test_chat_log_keeps_its_log_role(self) -> None:
+        """AC5: role='log' and the conversation label are untouched."""
+        html = self._html()
+        log_at = html.index('<div class="chat-log"')
+        log_tag = html[log_at : html.index(">", log_at) + 1]
 
-    def test_greeting_block_padding_and_gap_are_slimmed(self) -> None:
-        """AC3: the greeting column drops to the space-4/space-2 rhythm."""
-        empty = _rule_block(self._css(), ".empty-state")
-
-        assert "padding: var(--space-4)" in empty
-        assert "gap: var(--space-2)" in empty
-
-    def test_hero_monogram_is_compacted(self) -> None:
-        """AC3: the hero monogram shrinks 48px → 32px (content preserved)."""
-        hero = _rule_block(self._css(), ".monogram--hero")
-
-        assert "width: 32px" in hero
-        assert "height: 32px" in hero
-
-    def test_salutation_is_compacted(self) -> None:
-        """AC3: the salutation drops 1.5rem → 1.15rem (x-text content unchanged)."""
-        line = _rule_block(self._css(), ".greeting-line")
-
-        assert "font-size: 1.15rem" in line
+        assert 'role="log"' in log_tag
+        assert 'aria-label="Conversation with your coach"' in log_tag
 
 
 class TestOnboardingEmptyStateContract:

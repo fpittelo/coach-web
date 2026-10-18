@@ -97,47 +97,20 @@ body {
   white-space: nowrap;
 }
 
-/* --- Masthead ---------------------------------------------------------- */
+/* --- Conversation header ----------------------------------------------- */
 
-.masthead {
+/* Compact sticky header (#278): the former masthead kicker, h1 and lede
+   are removed; the identity bar is now the only chrome above the chat
+   panel and stays pinned while the log scrolls. */
+
+.conversation-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   max-width: 72rem;
   margin: 0 auto;
-  /* #249 chrome compaction: the vertical padding drops one space step
-     per side (was space-6/space-5) — the masthead is chrome above the
-     height-bounded chat panel, not a landing hero. */
-  padding: var(--space-4) var(--space-5) var(--space-4);
-}
-
-.rule {
-  height: 2px;
-  background: var(--accent);
-  margin-bottom: var(--space-3); /* #249: was space-5 */
-}
-
-.kicker {
-  margin: 0 0 var(--space-2); /* #249: was space-3 */
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.18em;
-  text-transform: uppercase;
-  color: var(--muted);
-}
-
-.masthead h1 {
-  margin: 0 0 var(--space-2); /* #249: was space-3 */
-  /* #249: the clamp tops out at 2rem (was 3.25rem) — the identity bar
-     already carries the brand, so the display-size headline is
-     non-value chrome that starved the chat log below. */
-  font-size: clamp(1.5rem, 3vw, 2rem);
-  font-weight: 700;
-  letter-spacing: -0.03em;
-  line-height: 1.05;
-}
-
-.lede {
-  margin: 0;
-  max-width: 62ch;
-  color: var(--muted);
+  padding: var(--space-2) var(--space-5);
+  background: var(--surface);
 }
 
 /* --- Identity bar ------------------------------------------------------ */
@@ -147,7 +120,6 @@ body {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
-  margin-bottom: var(--space-3); /* #249: was space-5 */
 }
 
 .identity-brand {
@@ -201,19 +173,19 @@ body {
 
 /* --- Chat console ------------------------------------------------------ */
 
-/* Definite viewport height (#83 AC3, PR 130 review; #207/#249 recomputations):
+/* Definite viewport height (#83 AC3, PR 130 review; #207/#249/#278 recomputations):
    flex: 1 + overflow-y: auto on the log only scroll against a container
    with a DEFINITE main size — an auto-height column grows with the
    transcript and pushes the composer below the fold. The panel is
-   therefore height-bounded to the viewport minus the masthead chrome
+   therefore height-bounded to the viewport minus the sticky header
    allowance; the layout padding and footer sit below the panel and may
    scroll out of view without affecting the composer. dvh tracks mobile
    browser chrome, with the vh declaration as the fallback; max-height
    caps the panel on very tall monitors. A 14rem floor (issue 150) guards
-   only the degenerate case: on viewports shorter than the masthead
+   only the degenerate case: on viewports shorter than the header
    allowance (landscape phones) the calc clamps to 0 and the panel
    vanishes — the floor resolves the used height to
-   max(calc(100dvh - 20rem), 14rem).
+   max(calc(100dvh - 3rem), 14rem).
 
    #207 recomputation (floating capsule): the capsule lives INSIDE the
    panel and the greeting INSIDE the scrolling log — neither adds fixed
@@ -236,17 +208,23 @@ body {
    26rem allowance (≈ 3.1rem headroom). New: 15.05rem @1280 (17.53rem
    worst case) under the 20rem allowance (≈ 2.5rem headroom) — the
    allowance drops 26rem → 20rem and the log's computed height at
-   1280×800 rises 24rem → 30rem (+25%). Floor/cap mechanics unchanged:
-   14rem ≤ 40rem − 20rem allowance, so the floor still loses to the
-   computed height on portrait phones (≥ 34rem tall) and only rescues
-   landscape phones; the capsule interior (≈ 13.1rem) still fits under
-   the 14rem floor. */
+   1280×800 rises 24rem → 30rem (+25%).
+
+   #278 recomputation (compact sticky header): the #249 masthead (kicker,
+   h1, lede, rule) is removed entirely. The identity bar becomes the
+   sticky conversation header (≈2.75rem content + 0.5rem header padding
+   per side), so the allowance drops 20rem → 3rem and the log's computed
+   height at 1280×800 rises to ≈(100dvh - 3rem). Floor/cap mechanics
+   unchanged: 14rem ≤ 40rem − 3rem allowance, so the floor still loses
+   to the computed height on portrait phones and only rescues landscape
+   phones; the capsule interior (≈ 13.1rem) still fits under the 14rem
+   floor. */
 
 .chat {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 20rem);
-  height: calc(100dvh - 20rem);
+  height: calc(100vh - 3rem);
+  height: calc(100dvh - 3rem);
   min-height: 14rem;
   max-height: 40rem;
 }
