@@ -173,6 +173,19 @@ class TestBaseComposeTopology:
         assert env.get("GITHUB_TOKEN") == "${GITHUB_TOKEN:-}"
         assert "INTERVALS_API_KEY" not in env
 
+    def test_coach_web_encryption_key_scoping(self, base_compose: dict[str, Any]) -> None:
+        """DATA_ENCRYPTION_KEY is declared for coach-web only (MADR-0008 C2/C3, #306).
+
+        The lane env file carries the key, but compose interpolation only
+        injects variables the env map declares — an omitted entry never
+        reaches the container and migration 0006 hard-fails at startup.
+        """
+        env = base_compose["services"]["coach-web"].get("environment", {})
+        assert env.get("DATA_ENCRYPTION_KEY") == "${DATA_ENCRYPTION_KEY:-}"
+        for foreign in ("coach-mcp", "github-mcp"):
+            foreign_env = base_compose["services"][foreign].get("environment", {})
+            assert "DATA_ENCRYPTION_KEY" not in foreign_env
+
     def test_coach_web_security_settings_scoping(self, base_compose: dict[str, Any]) -> None:
         """Cookie/Host settings are scoped to coach-web only (AC5/AC6, #112)."""
         env = base_compose["services"]["coach-web"].get("environment", {})

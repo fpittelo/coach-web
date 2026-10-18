@@ -891,6 +891,54 @@ class TestDebriefRpeEncryptionMigration:
         plaintext = Fernet(key.encode("ascii")).decrypt(str(stored).encode("ascii"))
         assert plaintext.decode("utf-8") == "7"
 
+    def test_upgrade_without_key_fails_before_any_ddl(
+        self, db_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing key → RuntimeError before any DDL; no tmp-table leftover (#306).
+
+        The cipher must be resolved/validated BEFORE the batch alter runs:
+        when the key is absent, the migration fails cleanly with the
+        debriefs table untouched and no ``_alembic_tmp_debriefs`` residue —
+        the lane stays recoverable (a plain re-run with the key present
+        completes the upgrade).
+        """
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+
+        monkeypatch.delenv("DATA_ENCRYPTION_KEY", raising=False)
+        with pytest.raises(RuntimeError, match="DATA_ENCRYPTION_KEY is not configured"):
+            command.upgrade(alembic_config(), "head")
+
+        tables = _table_names(db_path)
+        assert "_alembic_tmp_debriefs" not in tables
+        with _connect(db_path) as conn:
+            stored = conn.execute("SELECT rpe FROM debriefs WHERE id = ?", (row_id,)).fetchone()[0]
+        assert stored == 7
+
+    def test_upgrade_recovers_from_leftover_tmp_table(self, db_path: Path) -> None:
+        """A leftover _alembic_tmp_debriefs no longer blocks the upgrade (#306).
+
+        The batch alter's ``CREATE TABLE _alembic_tmp_debriefs`` persisted
+        after a previously interrupted (non-atomic) run, bricking every
+        subsequent start with ``table already exists``. The migration now
+        drops the transient leftover before the batch alter, so recovery is
+        automatic.
+        """
+        command.upgrade(alembic_config(), "0005")
+        row_id = _seed_plaintext_debrief(db_path, rpe=7)
+
+        # Simulate the interrupted-run residue: the batch alter's tmp table.
+        with _connect(db_path) as conn:
+            conn.execute("CREATE TABLE _alembic_tmp_debriefs (id INTEGER PRIMARY KEY)")
+
+        command.upgrade(alembic_config(), "head")
+
+        tables = _table_names(db_path)
+        assert "_alembic_tmp_debriefs" not in tables
+        with _connect(db_path) as conn:
+            stored = conn.execute("SELECT rpe FROM debriefs WHERE id = ?", (row_id,)).fetchone()[0]
+        assert str(stored).startswith("gAAAA")
+
     def test_downgrade_restores_plaintext_integers_and_the_check(self, db_path: Path) -> None:
         """Downgrade head→0005 decrypts back to the plaintext int + CHECK."""
         command.upgrade(alembic_config(), "0005")
