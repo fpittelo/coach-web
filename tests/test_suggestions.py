@@ -9,6 +9,7 @@ module load (fail-fast).
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -155,5 +156,13 @@ class TestConstantTablesAreValidatedAtModuleLoad:
         spec = importlib.util.spec_from_file_location("suggestions_tampered", module_path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        with pytest.raises(ValidationError):
-            spec.loader.exec_module(module)
+        # Register before exec (the documented importlib pattern): pydantic's
+        # class-creation path resolves the defining module through
+        # sys.modules, so an unregistered module breaks model construction
+        # before the fail-fast validation can even run.
+        sys.modules["suggestions_tampered"] = module
+        try:
+            with pytest.raises(ValidationError):
+                spec.loader.exec_module(module)
+        finally:
+            sys.modules.pop("suggestions_tampered", None)
