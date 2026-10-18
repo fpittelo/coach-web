@@ -1,10 +1,14 @@
 name: CI Test & Lint
 
+# Trunk+tag delivery (MADR-0017): a single persistent trunk `main`. This
+# pipeline runs on every PR targeting `main` and every push to `main`;
+# releases are cut from the trunk as semantic tags (no promotion branches).
+
 on:
   push:
-    branches: [dev, qa, main]
+    branches: [main]
   pull_request:
-    branches: [dev, qa, main]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

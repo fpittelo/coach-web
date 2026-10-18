@@ -112,7 +112,7 @@ Then open [http://localhost:8100](http://localhost:8100) (dev), `:8200` (qa), or
 | qa | `127.0.0.1:8200` | `compose.yaml` + `compose.qa.yml` | `.env.qa` |
 | prod | `127.0.0.1:8000` | `compose.yaml` + `compose.prod.yml` | `.env.prod` |
 
-Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|prod`) with its own network, and sidecars publish no host ports. See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the promotion runbook, and the per-lane pre-flight (`./scripts/e2e-preflight.sh dev|qa|prod`).
+Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|prod`) with its own network, and sidecars publish no host ports. See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the release runbook, and the per-lane pre-flight (`./scripts/e2e-preflight.sh dev|qa|prod`).
 
 ---
 
@@ -180,31 +180,21 @@ The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `
 
 ## 🌳 Branching & Releases
 
-Coach Web follows the [HOME Governance 3-branch lifecycle](https://github.com/fpittelo/coach):
+Coach Web follows the HOME SCRUM trunk+tag lifecycle (MADR-0017): `main` is the single persistent trunk; feature branches squash-merge into `main` only; releases are semantic tags `vX.Y.Z` + GitHub Releases cut from `main` under one explicit PO approval. All merges require 100% clean CI.
 
 ```mermaid
 gitGraph
     commit id: "Init main"
-    branch qa
-    checkout qa
-    commit id: "Init qa"
-    branch dev
-    checkout dev
-    commit id: "Init dev"
     branch feature/59-fastapi-scaffold
     checkout feature/59-fastapi-scaffold
     commit id: "feat: FastAPI scaffold"
-    checkout dev
-    merge feature/59-fastapi-scaffold id: "PR (Clean CI)"
-    checkout qa
-    merge dev id: "Promote to QA"
     checkout main
-    merge qa id: "Release v0.2.0"
+    merge feature/59-fastapi-scaffold id: "PR (Clean CI)"
+    commit id: "Release v0.2.0" tag: "v0.2.0"
 ```
 
-- `dev` — active development integration
-- `qa` — staging validation
-- `main` — production release (`ghcr.io/fpittelo/coach-web:latest`)
+- `main` — the single persistent trunk: integration + production (`ghcr.io/fpittelo/coach-web:latest`)
+- `dev` / `qa` — retired at the #286 cutover; no promotion branches or promotion PRs
 
 ---
 

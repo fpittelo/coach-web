@@ -1,12 +1,14 @@
 name: Deploy Coach Web Image
 
 # ---------------------------------------------------------------------------
-# Trigger → image tag mapping (issue #90):
-#   dev images                 → push to dev
-#   qa images                  → PR closed into qa
+# Trigger → image tag mapping (issue #90, trunk+tag MADR-0017):
+#   dev images                 → push to main (the trunk)
+#   qa images                  → workflow_dispatch (environment=qa) on main:
+#                                staging validation of the release candidate
+#                                before tagging (deploy promotion replaces
+#                                branch promotion, MADR-0017 §5)
 #   prod/latest/vX.Y.Z images  → push of v* tag
-# Main promotions are tag-driven; the PR-closed trigger intentionally
-# excludes main to prevent duplicate concurrent builds racing the GHA cache.
+# No branch-promotion triggers remain — dev/qa are retired.
 #
 # After build/push, the workflow verifies that the sidecar images each lane
 # runs with (the coach-mcp lane tag and the pinned github-mcp release)
@@ -15,13 +17,9 @@ name: Deploy Coach Web Image
 on:
   push:
     branches:
-      - dev
+      - main
     tags:
       - 'v*'
-  pull_request:
-    types: [closed]
-    branches:
-      - qa
   workflow_dispatch:
     inputs:
       environment:
@@ -42,7 +40,6 @@ jobs:
   build-and-push:
     name: Build and Push OCI Container
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.merged == true)
 
     steps:
       - name: Checkout repository
@@ -58,17 +55,17 @@ jobs:
             ENV_TAG="${{ github.event.inputs.environment }}"
           elif [ "${{ github.ref_type }}" == "tag" ]; then
             ENV_TAG="${{ github.ref_name }}"
-          elif [ "${{ github.ref_name }}" == "dev" ]; then
+          elif [ "${{ github.ref_name }}" == "main" ]; then
             ENV_TAG="dev"
-          elif [ "${{ github.base_ref }}" == "qa" ]; then
-            ENV_TAG="qa"
           else
             ENV_TAG="latest"
           fi
-          # Lane mapping (issue #90): dev and qa push their own lane; prod
-          # (the manual-dispatch choice), v* tag pushes and the (unreachable)
-          # latest fallback are the prod lane. deploy_env also selects the
-          # coach-mcp sidecar lane tag verified at the end of this job.
+          # Lane mapping (issue #90, trunk+tag MADR-0017): a push to main is
+          # the dev lane; the qa lane is a manual workflow_dispatch on main
+          # (staging validation of the release candidate before tagging);
+          # prod is the manual-dispatch choice and v* tag pushes. deploy_env
+          # also selects the coach-mcp sidecar lane tag verified at the end
+          # of this job.
           case "${ENV_TAG}" in
             dev)             DEPLOY_ENV="dev" ;;
             qa)              DEPLOY_ENV="qa" ;;
