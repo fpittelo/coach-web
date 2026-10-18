@@ -35,7 +35,7 @@ introduces a match that cannot exist legitimately.
 """
 
 import json
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from datetime import date
 from typing import Any
 from unittest.mock import MagicMock
@@ -271,6 +271,7 @@ class _BriefingProbeAgent:
     def __init__(self, events: list[AgentEvent]) -> None:
         self._events = events
         self.captured_prompt: str | None = None
+        self.captured_pre_emitted: list[list[str]] = []
 
     async def __aenter__(self) -> "_BriefingProbeAgent":
         """Enter the agent context."""
@@ -280,10 +281,15 @@ class _BriefingProbeAgent:
         """Exit the agent context."""
 
     async def run(
-        self, message: str, *, history: list[Any] | None = None
+        self,
+        message: str,
+        *,
+        history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Capture the assembled prompt and replay the canned events."""
         self.captured_prompt = self.system_prompt
+        self.captured_pre_emitted.append(list(pre_emitted_outcomes))
         for event in self._events:
             yield event
 
@@ -620,6 +626,25 @@ class TestBriefingEndpoint:
         assert card.session.date == "2026-10-14"
         # The briefing leads the stream — it is the greeting.
         assert body.index("event: morning_briefing") < body.index("event: done")
+
+    async def test_the_briefing_fact_feeds_the_suggestion_decision(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        db_session_factory: Any,
+    ) -> None:
+        """C-4 (#281): the endpoint-emitted morning_briefing fact reaches the
+        agent loop as a pre-emitted suppressing outcome — and no fact is
+        passed on a turn without the greeting."""
+        hub = _FakeHub(_readiness_payload(_sentinel_metrics(tsb=15.0)))
+        client, agent = await self._seeded_client(settings, monkeypatch, db_session_factory, hub)
+
+        _stream(client, briefing=True)
+        assert agent.captured_pre_emitted == [["morning_briefing"]]
+
+        # A turn without the greeting passes no pre-emitted outcome.
+        _stream(client, briefing=False)
+        assert agent.captured_pre_emitted == [["morning_briefing"], []]
 
     async def test_sentinel_numerics_never_reach_the_stream_or_the_prompt(
         self,

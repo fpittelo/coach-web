@@ -354,6 +354,50 @@ body {
   line-height: 1.6;
 }
 
+/* Quick-reply pills (#281, MADR-0011): tappable one-click replies beneath
+   the completed coach message. Outline style default, filled on hover
+   (issue AC3); the group aligns with the assistant bubble column and the
+   pills are cleared when the next stream starts. Classes-only styling
+   (CSP style-src 'self', C-7) and no animation of their own (#85). */
+
+.quick-replies {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
+.message .quick-replies {
+  grid-column: 2;
+}
+
+.quick-reply {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  padding: var(--space-1) var(--space-3);
+  font-family: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.quick-reply:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+
+.quick-reply:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.quick-reply:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
 /* Onboarding empty state (#86 AC1): hero monogram, one-line welcome and
    static starter chips, centered as a column. Replaces the v0.5
    one-liner. Chips prefill the composer — they never send (PO Q8) — and

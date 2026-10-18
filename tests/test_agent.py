@@ -7,7 +7,7 @@ live API call is ever made.
 
 import json
 import logging
-from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping, Sequence
 from copy import deepcopy
 from datetime import date
 from typing import Any
@@ -62,6 +62,7 @@ from coach_web.periodization import (
     PeriodizationPlan,
     replace_phases,
 )
+from coach_web.suggestions import DEBRIEF_SUGGESTIONS, DEFAULT_SUGGESTIONS
 
 # ---------------------------------------------------------------------------
 # Test doubles
@@ -1150,6 +1151,7 @@ class FakeAgent:
         self._events = events
         self.messages: list[str] = []
         self.histories: list[list[Any]] = []
+        self.pre_emitted: list[list[str]] = []
         self.entered = False
         self.exited = False
 
@@ -1167,10 +1169,12 @@ class FakeAgent:
         message: str,
         *,
         history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
     ) -> AsyncIterator[AgentEvent]:
         """Replay the canned events for the supplied message."""
         self.messages.append(message)
         self.histories.append(list(history or []))
+        self.pre_emitted.append(list(pre_emitted_outcomes))
         for event in self._events:
             yield event
 
@@ -2545,3 +2549,180 @@ class TestApprovedWeekDigestEndpoint:
 
         assert "event: done" in body
         assert "Approved current week" not in agent.system_prompt
+
+
+class TestQuickReplySuggestions:
+    """Quick-reply suggestions on the terminal done event (MADR-0011, #281).
+
+    The outcome tracker spans ALL iterations of a turn and is monotonic
+    (C-4): any suppressing card emitted anywhere in the turn suppresses the
+    field, even when the final completion is plain prose. The ``done``
+    events that follow errors (typed failure or max-iterations exhaustion)
+    carry NO ``suggestions`` key, and the endpoint-emitted
+    ``morning_briefing`` fact feeds the same decision.
+    """
+
+    async def test_plain_answer_done_carries_the_default_set(self) -> None:
+        """A tool-free conversational answer → the server-owned default set."""
+        streamer = FakeStreamer(
+            [[_chunk(content="Hello "), _chunk(content="athlete"), _chunk(finish_reason="stop")]]
+        )
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How am I?")
+
+        done = events[-1]
+        assert done.type == "done"
+        assert done.data["suggestions"] == list(DEFAULT_SUGGESTIONS)
+
+    async def test_debrief_summary_turn_carries_the_debrief_set(self) -> None:
+        """A debrief_summary card → the server-owned debrief set."""
+        streamer = _tool_streamer([(COMPLIANCE_TOOL, {"oldest": "2026-10-05"})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": COMPLIANCE_TOOL}}],
+            results={COMPLIANCE_TOOL: json.dumps(_compliance_report_payload())},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did my week go?")
+
+        assert any(e.type == "debrief_summary" for e in events)
+        done = events[-1]
+        assert done.type == "done"
+        assert done.data["suggestions"] == list(DEBRIEF_SUGGESTIONS)
+
+    async def test_plan_proposal_turn_suppresses_suggestions_despite_plain_prose(
+        self,
+    ) -> None:
+        """C-4: a suppressing card mid-turn wins over plain-prose completion."""
+        streamer = _plan_call_streamer(_plan_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan a session")
+
+        assert any(e.type == "plan_proposal" for e in events)
+        done = events[-1]
+        assert done.type == "done"
+        assert "suggestions" not in done.data
+
+    async def test_suppression_is_monotonic_across_iterations(self) -> None:
+        """C-4: the card lands in iteration 1, the prose completes in
+        iteration 2 — the tracker spans both and still suppresses."""
+        streamer = _plan_call_streamer(_plan_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan a session")
+
+        statuses = [e for e in events if e.type == "status"]
+        assert len(statuses) >= 2, "the turn must span multiple iterations"
+        done = events[-1]
+        assert "suggestions" not in done.data
+
+    async def test_week_plan_turn_suppresses_suggestions(self) -> None:
+        """The week_plan card carries its own action affordances — no pills."""
+        streamer = _week_call_streamer(_week_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Plan my week")
+
+        assert any(e.type == "week_plan" for e in events)
+        assert "suggestions" not in events[-1].data
+
+    async def test_periodization_turn_suppresses_suggestions(self) -> None:
+        """The periodization_plan card carries its own affordances — no pills."""
+        streamer = _periodization_call_streamer(_periodization_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "Structure my season")
+
+        assert any(e.type == "periodization_plan" for e in events)
+        assert "suggestions" not in events[-1].data
+
+    async def test_rpe_request_turn_suppresses_suggestions(self) -> None:
+        """The rpe_request card carries its own affordances — no pills."""
+        streamer = _rpe_request_streamer(_rpe_request_payload())
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = await _collect(agent, "How did my session go?")
+
+        assert any(e.type == "rpe_request" for e in events)
+        assert "suggestions" not in events[-1].data
+
+    async def test_co_occurrence_suppression_wins_over_the_debrief_set(self) -> None:
+        """C-4 precedence: rpe_request + debrief_summary in one turn → none."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(
+                                0,
+                                call_id="a",
+                                name=REQUEST_RPE_TOOL,
+                                arguments=json.dumps(_rpe_request_payload()),
+                            ),
+                            _tool_call_delta(
+                                1,
+                                call_id="b",
+                                name=COMPLIANCE_TOOL,
+                                arguments="{}",
+                            ),
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Here is your summary."), _chunk(finish_reason="stop")],
+            ]
+        )
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": COMPLIANCE_TOOL}}],
+            results={COMPLIANCE_TOOL: json.dumps(_compliance_report_payload())},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "How did it go?")
+
+        types = {e.type for e in events}
+        assert "rpe_request" in types
+        assert "debrief_summary" in types
+        assert "suggestions" not in events[-1].data
+
+    async def test_error_done_carries_no_suggestions_key(self) -> None:
+        """The done event that follows a typed error carries no suggestions."""
+        agent = CoachAgent(RaisingStreamer([]), FakeHub())
+
+        events = await _collect(agent, "boom")
+
+        assert [e.type for e in events] == ["status", "error", "done"]
+        assert "suggestions" not in events[-1].data
+
+    async def test_max_iterations_done_carries_no_suggestions_key(self) -> None:
+        """The done event that follows max-iterations exhaustion carries none."""
+        looping = [
+            [
+                _chunk(
+                    tool_calls=[_tool_call_delta(0, call_id="x", name="t", arguments="{}")],
+                    finish_reason="tool_calls",
+                )
+            ]
+        ]
+        streamer = FakeStreamer([deepcopy(looping[0]) for _ in range(3)])
+        agent = CoachAgent(streamer, FakeHub(), max_tool_iterations=2)
+
+        events = await _collect(agent, "loop")
+
+        assert any(e.type == "error" for e in events)
+        assert events[-1].type == "done"
+        assert "suggestions" not in events[-1].data
+
+    async def test_pre_emitted_briefing_outcome_suppresses_suggestions(self) -> None:
+        """C-4: the endpoint-emitted morning_briefing fact feeds the decision."""
+        streamer = FakeStreamer([[_chunk(content="Hello"), _chunk(finish_reason="stop")]])
+        agent = CoachAgent(streamer, FakeHub())
+
+        events = [
+            event async for event in agent.run("hi", pre_emitted_outcomes=("morning_briefing",))
+        ]
+
+        assert events[-1].type == "done"
+        assert "suggestions" not in events[-1].data
