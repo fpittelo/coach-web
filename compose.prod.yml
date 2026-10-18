@@ -34,7 +34,11 @@ services:
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8000"]}'
 
   coach-mcp:
-    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:prod}
+    # Digest-pinned (#275): the :prod tag floats upstream (fpittelo/coach), so a
+    # silent push would change the topology coach-web is tested against. The CI
+    # drift check (scripts/check_sidecar_drift.sh) fails when :prod moves; update
+    # the pin deliberately (docs/admin_guide.md, "Sidecar Image Pinning").
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach@sha256:d2fcb0a5b588d4ab4c3a39117bcc5a5960ba9c5704c343d8f7750e4feecf85a9}
 
   github-mcp:
     # Digest-pinned (AC7, #113): the v1.12.2 tag is mutable, the digest is not.

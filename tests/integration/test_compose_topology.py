@@ -7,6 +7,7 @@ CI as well as local development.
 """
 
 import datetime
+import os
 import re
 import shutil
 import subprocess
@@ -35,6 +36,8 @@ GITHUB_MCP_DIGEST = "sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617
 GITHUB_MCP_DIGEST_PIN = f"{GITHUB_MCP_PIN}@{GITHUB_MCP_DIGEST}"
 GITHUB_MCP_TAG_DEFAULT = f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_PIN}}}"
 GITHUB_MCP_DIGEST_DEFAULT = f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_DIGEST_PIN}}}"
+COACH_MCP_PIN = "ghcr.io/fpittelo/coach"
+COACH_MCP_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SERVICES = ("coach-web", "coach-mcp", "github-mcp")
 
 
@@ -253,12 +256,20 @@ class TestLaneOverrides:
         assert "build" not in config
 
     @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
-    def test_coach_mcp_lane_tag(
+    def test_coach_mcp_lane_digest_pinned(
         self, effective_compose: dict[str, dict[str, Any]], lane: str
     ) -> None:
-        """The coach-mcp sidecar tag matches the lane via COACH_MCP_IMAGE (AC3)."""
+        """The coach-mcp sidecar is digest-pinned per lane via COACH_MCP_IMAGE (#275, AC1).
+
+        The upstream lane tag floats (fpittelo/coach is a separate pipeline), so
+        the digest is the pin; the CI drift check guards it against upstream
+        movement (scripts/check_sidecar_drift.sh).
+        """
         image = effective_compose[lane]["services"]["coach-mcp"]["image"]
-        assert image == f"${{COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:{lane}}}"
+        prefix = f"${{COACH_MCP_IMAGE:-{COACH_MCP_PIN}@"
+        assert image.startswith(prefix), image
+        assert image.endswith("}"), image
+        assert COACH_MCP_DIGEST_RE.fullmatch(image[len(prefix) : -1]), image
 
     @pytest.mark.parametrize(
         ("lane", "expected"),
@@ -323,10 +334,24 @@ class TestLaneEnvTemplates:
         assert (PROJECT_ROOT / f".env.{lane}.example").is_file()
 
     @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
-    def test_lane_env_template_matches_lane_sidecar_tag(self, lane: str) -> None:
-        """The template's coach-mcp image tag matches the lane (AC3)."""
+    def test_lane_env_template_pins_lane_sidecar_digest(self, lane: str) -> None:
+        """The template's coach-mcp image is digest-pinned (#275, AC1)."""
         text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
-        assert f"COACH_MCP_IMAGE=ghcr.io/fpittelo/coach:{lane}" in text
+        assert f"COACH_MCP_IMAGE={COACH_MCP_PIN}@sha256:" in text
+
+    @pytest.mark.parametrize("lane", ["dev", "qa", "prod"])
+    def test_lane_env_template_matches_compose_pin(
+        self, effective_compose: dict[str, dict[str, Any]], lane: str
+    ) -> None:
+        """The template's coach-mcp digest mirrors the compose default (#275).
+
+        The template is what a lane env file is copied from; if it diverged from
+        the compose pin, the lane would silently run a different sidecar.
+        """
+        image = effective_compose[lane]["services"]["coach-mcp"]["image"]
+        compose_digest = image.rsplit("@", 1)[1].rstrip("}")
+        text = (PROJECT_ROOT / f".env.{lane}.example").read_text(encoding="utf-8")
+        assert f"COACH_MCP_IMAGE={COACH_MCP_PIN}@{compose_digest}" in text
 
     def test_templates_pin_github_mcp_version(self) -> None:
         """dev/qa templates tag-pin github-mcp; prod digest-pins it (AC7)."""
@@ -570,6 +595,124 @@ class TestLaneScript:
         """The script passes the lane env file via --env-file (AC2)."""
         assert "--env-file" in script
         assert ".env.${LANE}" in script
+
+
+class TestSidecarDriftCheck:
+    """The coach-mcp sidecar pin drift guard (#275, AC2)."""
+
+    SCRIPT = "scripts/check_sidecar_drift.sh"
+
+    SHIM_DOCKER_SOURCE = '''#!/usr/bin/env python3
+"""Test shim for the docker CLI: emits a canned imagetools inspect digest."""
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:3] == ["buildx", "imagetools", "inspect"]:
+    print(f"Name:      {args[3]}")
+    print(f"Digest:    {os.environ['DRIFT_SHIM_DIGEST']}")
+sys.exit(0)
+'''
+
+    @pytest.fixture
+    def script(self) -> str:
+        """Return the drift-check script contents."""
+        path = PROJECT_ROOT / self.SCRIPT
+        assert path.is_file(), f"{self.SCRIPT} must exist"
+        return path.read_text(encoding="utf-8")
+
+    def test_script_exists_and_is_executable(self) -> None:
+        """The drift check ships as an executable script."""
+        path = PROJECT_ROOT / self.SCRIPT
+        assert path.is_file()
+        assert path.stat().st_mode & 0o111, "script must be executable"
+
+    def test_script_passes_bash_syntax_check(self) -> None:
+        """bash -n validates the script syntax."""
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(PROJECT_ROOT / self.SCRIPT)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_script_covers_every_lane(self, script: str) -> None:
+        """The check resolves the floating tag of every lane."""
+        assert "LANES=(dev qa prod)" in script
+        for name in LANE_COMPOSE.values():
+            assert name in script
+
+    def test_script_fails_loudly_on_drift(self, script: str) -> None:
+        """A mismatch is reported and exits non-zero (AC2)."""
+        assert "drift" in script
+        assert "status=1" in script
+        assert 'exit "${status}"' in script
+
+    def test_ci_runs_the_drift_check(self) -> None:
+        """The Compose Lane Validation job invokes the drift check (AC2)."""
+        ci = load_yaml(".github/workflows/ci.yaml")
+        steps = ci["jobs"]["compose-validation"]["steps"]
+        runs = [str(step.get("run", "")) for step in steps]
+        assert any("check_sidecar_drift.sh" in run for run in runs)
+
+    def _sandbox(self, tmp_path: Path, pinned: str, upstream: str) -> tuple[Path, dict[str, str]]:
+        """Build a repo copy with a docker shim emitting the upstream digest."""
+        repo = tmp_path / "repo"
+        (repo / "scripts").mkdir(parents=True)
+        script = repo / self.SCRIPT
+        shutil.copy2(PROJECT_ROOT / self.SCRIPT, script)
+        script.chmod(0o755)
+        for name in LANE_COMPOSE.values():
+            (repo / name).write_text(
+                "services:\n"
+                "  coach-mcp:\n"
+                f"    image: ${{COACH_MCP_IMAGE:-{COACH_MCP_PIN}@{pinned}}}\n",
+                encoding="utf-8",
+            )
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        shim = bin_dir / "docker"
+        shim.write_text(self.SHIM_DOCKER_SOURCE, encoding="utf-8")
+        shim.chmod(0o755)
+        env = dict(os.environ)
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+        env["DRIFT_SHIM_DIGEST"] = upstream
+        return repo, env
+
+    def test_matching_pin_exits_zero(self, tmp_path: Path) -> None:
+        """A pin equal to the upstream digest passes."""
+        digest = "sha256:" + "a" * 64
+        repo, env = self._sandbox(tmp_path, pinned=digest, upstream=digest)
+        result = subprocess.run(
+            [str(repo / self.SCRIPT)],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "OK" in result.stdout
+
+    def test_drift_exits_non_zero_and_names_the_lane(self, tmp_path: Path) -> None:
+        """A moved upstream tag fails loudly and names the offending lane (AC2)."""
+        repo, env = self._sandbox(
+            tmp_path, pinned="sha256:" + "a" * 64, upstream="sha256:" + "b" * 64
+        )
+        result = subprocess.run(
+            [str(repo / self.SCRIPT)],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert result.returncode != 0
+        assert "drift" in result.stderr
+        assert "dev" in result.stderr
 
 
 class TestCIContainerScan:

@@ -31,7 +31,11 @@ services:
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8200"]}'
 
   coach-mcp:
-    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:qa}
+    # Digest-pinned (#275): the :qa tag floats upstream (fpittelo/coach), so a
+    # silent push would change the topology coach-web is tested against. The CI
+    # drift check (scripts/check_sidecar_drift.sh) fails when :qa moves; update
+    # the pin deliberately (docs/admin_guide.md, "Sidecar Image Pinning").
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach@sha256:49579bfcfb705bba916e80bf99b9142ebe3e2b2bdb3b636751d9401e20404e0a}
 
   github-mcp:
     image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2}

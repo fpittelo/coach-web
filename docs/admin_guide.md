@@ -151,6 +151,32 @@ docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file 
 
 ---
 
+## 📌 Sidecar Image Pinning (coach-mcp, #275)
+
+The `coach-mcp` sidecar (`ghcr.io/fpittelo/coach`) is built and published by a **separate pipeline** (the `coach` repository). Its lane tags (`:dev`, `:qa`, `:prod`) are mutable, so an upstream push would silently change the topology coach-web is tested against (the #248 incident class — a sidecar tool-schema change can break coach-web's transport assumptions with no coach-web commit).
+
+**Pin:** each lane's compose override pins the sidecar by digest — `ghcr.io/fpittelo/coach@sha256:<digest>` — as the `${COACH_MCP_IMAGE:-…}` default, and the matching `.env.<lane>.example` mirrors it. The digest is the pin; the tag alone is not. `COACH_MCP_IMAGE` remains an optional override (e.g. to test a new sidecar build) — the compose default is the committed pin.
+
+**Drift check:** `scripts/check_sidecar_drift.sh` resolves the current digest of each lane's floating tag and compares it to the pinned digest. It runs as a step in the CI **Compose Lane Validation** job and fails loudly (non-zero exit) on a mismatch, so a sidecar change is a deliberate act, not a silent one.
+
+**Updating the pin deliberately:**
+
+```bash
+# 1. resolve the new upstream digest for the lane
+docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
+
+# 2. set the new digest in the lane's compose override AND its env template
+#    (dev: compose.dev.yml + .env.dev.example; qa/prod likewise)
+
+# 3. re-validate the drift check and the lane
+./scripts/check_sidecar_drift.sh
+./scripts/e2e-preflight.sh dev
+```
+
+`github-mcp` follows the same pattern (tag-pinned on dev/qa, digest-pinned on prod, AC7 / #113).
+
+---
+
 ## 🚀 Release Runbook (approve + tag)
 
 1. **Staging validation** (release candidate on trunk `main`): dispatch the deploy workflow on `main` with `environment=qa` — CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
@@ -285,4 +311,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-18 (issue #274 — database maintenance: VACUUM reclaim + encrypted backup/restore, MADR-0008)_
+_Last updated: 2026-10-18 (issue #275 — coach-mcp sidecar digest pin + upstream drift check)_

@@ -1,9 +1,10 @@
 # Coach Web — dev lane override (ADR-007 / issue #109).
 #
 # Active development lane: coach-web is BUILT from source (target: runtime)
-# and published on 127.0.0.1:8100 only. Auth is disabled. Sidecars track the
-# dev lane tags. Runs concurrently with the qa/prod lanes: the project name
-# below isolates container and network names (coach-web-dev_coach-net).
+# and published on 127.0.0.1:8100 only. Auth is disabled. The coach-mcp
+# sidecar is DIGEST-PINNED (#275) — see the service below. Runs concurrently
+# with the qa/prod lanes: the project name below isolates container and
+# network names (coach-web-dev_coach-net).
 #
 # Usage:
 #   cp .env.dev.example .env.dev    # then fill in your secrets
@@ -30,7 +31,11 @@ services:
       CORS_ORIGINS: '${CORS_ORIGINS:-["http://localhost:8100"]}'
 
   coach-mcp:
-    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach:dev}
+    # Digest-pinned (#275): the :dev tag floats upstream (fpittelo/coach), so a
+    # silent push would change the topology coach-web is tested against. The CI
+    # drift check (scripts/check_sidecar_drift.sh) fails when :dev moves; update
+    # the pin deliberately (docs/admin_guide.md, "Sidecar Image Pinning").
+    image: ${COACH_MCP_IMAGE:-ghcr.io/fpittelo/coach@sha256:1fab8ffb750a7226e2bacc79339bf83a4126414ea66e968f567de3119d059b82}
 
   github-mcp:
     image: ${GITHUB_MCP_IMAGE:-ghcr.io/github/github-mcp-server:v1.12.2}
