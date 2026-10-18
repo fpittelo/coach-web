@@ -141,7 +141,7 @@ The v0.8.0 release is gated on **all** of the following. No release tag may be c
 |:---|:---|:---|:---|
 | 1 | **All CI checks green** — `test`, `compose-validation`, `secret-scan` (gitleaks full history), `dependency-scan` (`pip-audit --strict`), **`image-scan` (trivy HIGH/CRITICAL)** | @developer / @devops | GitHub Actions run on the PR merged into `main` |
 | 2 | **Pre-flight green on all three lanes** — `./scripts/e2e-preflight.sh dev`, `qa`, `prod` | @fpittelo | Local terminal output |
-| 3 | **Manual E2E checklist signed off** — OIDC login → agent chat → tool calls → plan approval on the prod lane | @fpittelo | [`docs/e2e-checklist.md`](e2e-checklist.md), signed in the PR |
+| 3 | **Manual E2E checklist signed off** — OIDC login → agent chat → tool calls → plan approval on the prod lane | @fpittelo | [`docs/e2e-checklist.md`](e2e-checklist.md), signed in the release issue |
 | 4 | **Security audit report** — STRIDE + nLPD review recorded in the #113 closing comment | @cyber-security | Issue #113 closing comment |
 
 > The trivy gate is **not** weakened to pass: a HIGH/CRITICAL finding is a real release blocker. If the base image carries an unfixed HIGH/CRITICAL, it is reported and triaged, not suppressed.

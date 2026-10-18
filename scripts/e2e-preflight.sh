@@ -5,7 +5,7 @@
 #   1. the lane's compose configuration parses (docker compose config)
 #   2. every image the lane must PULL exists in its registry — fails fast with
 #      a clear message when a lane image is absent from GHCR (qa/prod lanes
-#      pull CI-built promotion artifacts; the dev lane builds coach-web locally
+#      pull CI-built release artifacts; the dev lane builds coach-web locally
 #      so only its sidecars are checked)
 #   3. the expected service set (coach-web, coach-mcp, github-mcp) is PRESENT
 #      and all three services turn healthy — `docker compose ps -a` is used so
@@ -139,7 +139,7 @@ if [[ -n "${images_to_pull}" ]]; then
         [[ -z "${image_ref}" ]] && continue
         if ! docker manifest inspect "${image_ref}" >/dev/null 2>&1; then
             error "Lane image '${image_ref}' is not reachable."
-            error "Either the image is not yet published to GHCR (qa/prod lanes require the promotion to have run — see docs/admin_guide.md, Promotion Runbook) or registry access is missing (docker login ghcr.io with a read:packages PAT)."
+            error "Either the image is not yet published to GHCR (qa/prod lanes require the promotion to have run — see docs/admin_guide.md, Release Runbook) or registry access is missing (docker login ghcr.io with a read:packages PAT)."
             exit 1
         fi
         log "Image OK: ${image_ref}"

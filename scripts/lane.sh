@@ -21,7 +21,7 @@
 #
 # The prod lane is intentionally NOT automated here: it is a manual, human-owned
 # procedure (digest-pinned release image + OIDC secrets) — see the usage header
-# in compose.prod.yml and docs/admin_guide.md (Promotion Runbook). Lane
+# in compose.prod.yml and docs/admin_guide.md (Release Runbook). Lane
 # validation remains the job of scripts/e2e-preflight.sh.
 #
 # The lane env file is never read or modified by this script; it is passed to
@@ -53,7 +53,7 @@ Actions:
   down    tear down the lane's compose project (--remove-orphans)
 
 The prod lane is manual-only (digest-pinned image + OIDC secrets): see the
-usage header in compose.prod.yml and docs/admin_guide.md (Promotion Runbook).
+usage header in compose.prod.yml and docs/admin_guide.md (Release Runbook).
 Lane validation gate: ./scripts/e2e-preflight.sh <lane>
 EOF
 }
@@ -84,7 +84,7 @@ case "${LANE}" in
         error "  ./scripts/e2e-preflight.sh prod  # validates, then tears its lane down on exit"
         error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d  # FINAL step — lane left serving"
         error "The pre-flight tears its lane down on exit, so the final 'up -d' is what leaves the lane serving."
-        error "See the usage header in compose.prod.yml and docs/admin_guide.md (Promotion Runbook)."
+        error "See the usage header in compose.prod.yml and docs/admin_guide.md (Release Runbook)."
         exit 2
         ;;
     *)

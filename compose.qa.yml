@@ -6,7 +6,7 @@
 # Runs concurrently with the dev/prod lanes (project coach-web-qa).
 #
 # Precondition: the :qa images exist only after the first post-change
-# dev → qa promotion (coach-web:qa here, coach:qa in the coach repo).
+# qa-lane build (coach-web:qa here, coach:qa in the coach repo).
 #
 # Usage:
 #   cp .env.qa.example .env.qa      # then fill in your secrets
