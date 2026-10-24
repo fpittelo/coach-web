@@ -106,7 +106,7 @@ class TestLoginRedirect:
         params = {key: values[0] for key, values in parse_qs(urlparse(location).query).items()}
         assert params["client_id"] == CLIENT_ID
         assert params["response_type"] == "code"
-        assert params["scope"] == "openid email"
+        assert params["scope"] == "openid email profile"
         assert params["redirect_uri"].endswith("/auth/callback")
         assert params["state"]
         assert params["nonce"] == params["state"]
@@ -158,6 +158,27 @@ class TestCallback:
         claims = verify_session_token(session, SESSION_SECRET)
         assert claims["email"] == OWNER_EMAIL
         assert _state_cookie_cleared(response)
+
+    @respx.mock
+    async def test_session_captures_google_profile_claims(
+        self, auth_client: TestClient, google_test_keys: Any
+    ) -> None:
+        """AC1 (#319): ID-token name + picture ride the issued session cookie."""
+        state = _login_state(auth_client)
+        id_claims = _id_token_claims(nonce=state)
+        id_claims["name"] = "Frederic Pitteloud"
+        id_claims["picture"] = "https://lh3.googleusercontent.com/a/photo-id"
+        id_token = google_test_keys.sign(id_claims)
+        _mock_google_token_exchange(google_test_keys, id_token)
+
+        response = auth_client.get(
+            f"/auth/callback?code=good-code&state={state}", follow_redirects=False
+        )
+
+        assert response.status_code == 302
+        session_claims = verify_session_token(response.cookies["cw_session"], SESSION_SECRET)
+        assert session_claims["name"] == "Frederic Pitteloud"
+        assert session_claims["picture"] == "https://lh3.googleusercontent.com/a/photo-id"
 
     @respx.mock
     async def test_non_whitelisted_email_rejected_with_403(

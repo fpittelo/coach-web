@@ -38,7 +38,7 @@ GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"  # noqa: S105 - pu
 STATE_COOKIE = "cw_oidc_state"
 STATE_COOKIE_TTL_SECONDS = 600
 GOOGLE_TIMEOUT_SECONDS = 10.0
-_OAUTH_SCOPE = "openid email"
+_OAUTH_SCOPE = "openid email profile"
 
 
 def _resolve_redirect_uri(request: Request, settings: Settings) -> str:
@@ -126,6 +126,8 @@ async def callback(
         email,
         settings.AUTH_SESSION_SECRET,
         settings.AUTH_SESSION_TTL_SECONDS,
+        name=claims.get("name"),
+        picture=claims.get("picture"),
     )
     response = RedirectResponse("/", status_code=302)
     response.set_cookie(

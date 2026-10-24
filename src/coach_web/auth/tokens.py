@@ -29,10 +29,21 @@ class TokenError(Exception):
     """A token failed signature, expiry, issuer, audience or claim validation."""
 
 
-def create_session_token(email: str, secret: str, ttl_seconds: int) -> str:
-    """Create a signed, short-lived, stateless session token for *email*."""
+def create_session_token(
+    email: str,
+    secret: str,
+    ttl_seconds: int,
+    name: str | None = None,
+    picture: str | None = None,
+) -> str:
+    """Create a signed, short-lived, stateless session token for *email*.
+
+    The Google profile claims (``name`` / ``picture``, #319) ride the JWT
+    when captured at the callback; falsy values are omitted so tokens minted
+    without profile data stay byte-shape-identical to the pre-#319 ones.
+    """
     now = int(time.time())
-    payload = {
+    payload: dict[str, Any] = {
         "iss": SESSION_ISSUER,
         "aud": SESSION_AUDIENCE,
         "sub": email,
@@ -41,6 +52,10 @@ def create_session_token(email: str, secret: str, ttl_seconds: int) -> str:
         "exp": now + ttl_seconds,
         "jti": uuid.uuid4().hex,
     }
+    if name:
+        payload["name"] = name
+    if picture:
+        payload["picture"] = picture
     return str(jwt.encode(payload, secret, algorithm=_SESSION_ALGORITHM))
 
 

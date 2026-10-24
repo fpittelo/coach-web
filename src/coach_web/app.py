@@ -1,6 +1,7 @@
 """FastAPI application factory for Coach Web."""
 
 import asyncio
+import html
 import logging
 import os
 import time
@@ -183,25 +184,57 @@ auth-disabled lanes stay byte-identical to the pre-#180 page (AC3).
 _SIGNIN_LINK_HTML = '<a class="signin-link" href="/auth/login">Sign in</a>'
 """The unauthenticated identity-bar affordance (#180): a real link, no JS."""
 
+_AVATAR_SLOT = (
+    "<!-- #319 avatar-slot: swapped for the profile avatar by the / route"
+    " when it renders an authenticated session (auth enabled). -->"
+)
+"""Inert marker comment in index.html's identity bar (the injection anchor).
 
-def _has_valid_session(request: Request, settings: Settings) -> bool:
-    """Return True when the request carries a verifiable session cookie (#180).
+The raw static file keeps the comment, so /static/index.html and
+auth-disabled lanes stay byte-identical to the pre-#319 page.
+"""
+
+
+def _avatar_html(claims: dict[str, Any]) -> str:
+    """Build the identity-bar avatar markup from session claims (#319).
+
+    The verified session carries the owner's Google profile claims: a
+    ``picture`` renders as a no-referrer ``<img>``; its absence degrades to
+    a deterministic initial-letter avatar from the email local-part; a
+    missing ``name`` degrades the native ``title`` tooltip to the email
+    address. Every interpolated value is HTML-escaped (Swiss nLPD: no user
+    data is ever rendered as raw HTML) and nothing is logged.
+    """
+    email = str(claims["email"])
+    name = claims.get("name")
+    picture = claims.get("picture")
+    label = html.escape(str(name) if name else email, quote=True)
+    if picture:
+        return (
+            f'<img class="avatar" src="{html.escape(str(picture), quote=True)}"'
+            f' referrerpolicy="no-referrer" alt="{label}" title="{label}">'
+        )
+    initial = html.escape(email.split("@", 1)[0][:1].upper())
+    return f'<span class="avatar avatar--fallback" title="{label}">{initial}</span>'
+
+
+def _verified_session_claims(request: Request, settings: Settings) -> dict[str, Any] | None:
+    """Return the verified session claims, or None when absent/invalid (#180, #319).
 
     Verification reuses the auth session logic (HS256
     :func:`coach_web.auth.tokens.verify_session_token` — the same check the
     whitelist middleware applies). Fail-safe by contract: ANY error reading
     or verifying the cookie (missing cookie, bad signature, expiry, malformed
-    header) resolves to False, so the public landing page renders the
+    header) resolves to None, so the public landing page renders the
     unauthenticated variant instead of ever raising.
     """
     try:
         token = request.cookies.get(SESSION_COOKIE)
         if not token:
-            return False
-        verify_session_token(token, settings.AUTH_SESSION_SECRET)
+            return None
+        return verify_session_token(token, settings.AUTH_SESSION_SECRET)
     except Exception:  # noqa: BLE001 - fail-safe: the landing page must never 500
-        return False
-    return True
+        return None
 
 
 def _athlete_id_for_session(settings: Settings, session_cookie: str | None) -> int:
@@ -267,8 +300,9 @@ def _covering_phase(phases: list[PeriodizationPhase], day: str) -> Periodization
 # (#81). The Alpine CSP build remains a future hardening item.
 CSP_POLICY = (
     "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
-    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    "img-src 'self' data: https://*.googleusercontent.com; font-src 'self'; "
+    "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+    "form-action 'self'"
 )
 
 
@@ -459,25 +493,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/", include_in_schema=False)
     async def index(request: Request) -> Response:
-        """Serve the single-page interface with a conditional sign-in affordance (#180).
+        """Serve the single-page interface with identity-aware chrome (#180, #319).
 
-        The landing page is public (AC4 #65) but must not dead-end an
-        unauthenticated visitor (#180): with auth enabled and no valid
-        session cookie, the identity bar gains a visible "Sign in" link to
-        /auth/login. Authenticated sessions and AUTH_ENABLED=false lanes
-        (dev/qa) get the static file byte-for-byte as today. Fail-safe: any
-        cookie or validation error resolves to the unauthenticated variant —
-        the landing page can never 500. No auto-redirect: the public-landing
-        posture is preserved (rejected-by-default option 3, #180).
+        The landing page is public (AC4 #65). Three render paths: with auth
+        enabled and no valid session cookie, the identity bar gains a visible
+        "Sign in" link to /auth/login (#180); with a valid session, the bar
+        gains the owner's Google profile avatar built from the session's
+        name/picture claims (#319 — deterministic fallbacks, never a broken
+        image); AUTH_ENABLED=false lanes (dev/qa) get the static file
+        byte-for-byte as today. Fail-safe: any cookie or validation error
+        resolves to the unauthenticated variant — the landing page can never
+        500. No auto-redirect: the public-landing posture is preserved
+        (rejected-by-default option 3, #180).
         """
         settings: Settings = request.app.state.settings
-        if settings.AUTH_ENABLED and not _has_valid_session(request, settings):
-            html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        if not settings.AUTH_ENABLED:
+            return FileResponse(STATIC_DIR / "index.html")
+        claims = _verified_session_claims(request, settings)
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        if claims is None:
             if _SIGNIN_SLOT in html:
                 return Response(
                     content=html.replace(_SIGNIN_SLOT, _SIGNIN_LINK_HTML),
                     media_type="text/html",
                 )
+            return FileResponse(STATIC_DIR / "index.html")
+        if _AVATAR_SLOT in html:
+            return Response(
+                content=html.replace(_AVATAR_SLOT, _avatar_html(claims)),
+                media_type="text/html",
+            )
         return FileResponse(STATIC_DIR / "index.html")
 
     @application.get("/health", response_model=HealthResponse, tags=["ops"])

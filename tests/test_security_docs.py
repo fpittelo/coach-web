@@ -16,11 +16,13 @@ DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
 SECURITY_DOC = DOCS_DIR / "security.md"
 
 # The exact minimal policy decided in the STRIDE #87 sign-off (conditions
-# C2/C5) and shipped as middleware in #84.
+# C2/C5) and shipped as middleware in #84, with the single #319 img-src
+# exception for the Google avatar CDN.
 CSP_POLICY = (
     "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
-    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    "img-src 'self' data: https://*.googleusercontent.com; font-src 'self'; "
+    "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+    "form-action 'self'"
 )
 
 

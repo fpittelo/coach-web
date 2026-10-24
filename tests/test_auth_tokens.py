@@ -67,6 +67,38 @@ class TestCreateSessionToken:
         assert claims["exp"] - claims["iat"] == 600
 
 
+class TestSessionProfileClaims:
+    """Google profile claims ride the signed session JWT (#319 AC1).
+
+    A fresh Google sign-in captures ``name`` + ``picture`` into the
+    stateless session token; sessions issued before #319 carry neither
+    claim and must still verify unchanged (require-list untouched).
+    """
+
+    def test_roundtrip_returns_name_and_picture(self) -> None:
+        """Profile claims captured at the callback round-trip the session JWT."""
+        token = create_session_token(
+            OWNER_EMAIL,
+            SECRET,
+            ttl_seconds=600,
+            name="Frederic Pitteloud",
+            picture="https://lh3.googleusercontent.com/a/photo-id",
+        )
+        claims = verify_session_token(token, SECRET)
+
+        assert claims["name"] == "Frederic Pitteloud"
+        assert claims["picture"] == "https://lh3.googleusercontent.com/a/photo-id"
+
+    def test_pre_profile_token_still_verifies_without_the_claims(self) -> None:
+        """A session issued before #319 (no name/picture) verifies unchanged."""
+        token = create_session_token(OWNER_EMAIL, SECRET, ttl_seconds=600)
+        claims = verify_session_token(token, SECRET)
+
+        assert claims["email"] == OWNER_EMAIL
+        assert "name" not in claims
+        assert "picture" not in claims
+
+
 class TestVerifySessionToken:
     """Session token validation rejects every forgery vector."""
 
