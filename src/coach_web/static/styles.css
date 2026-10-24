@@ -1464,6 +1464,31 @@ body {
   gap: var(--space-2);
 }
 
+/* Profile avatar (issue 319): the signed-in owner's Google profile picture,
+   rightmost in the identity bar's actions group — circular, monogram-sized
+   (28px, rhyming with the brand mark). The native title attribute carries
+   the tooltip; no JS. The initial-letter fallback (no picture claim) is a
+   text span styled identically; no animation of its own (#85). */
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  object-fit: cover;
+}
+
+.avatar--fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--paper);
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+}
+
 .settings-overlay {
   position: fixed;
   inset: 0;

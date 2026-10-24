@@ -16,12 +16,14 @@ from coach_web.auth.tokens import create_session_token
 from coach_web.config import Settings
 
 # The exact minimal policy decided in the STRIDE #87 sign-off (conditions
-# C2/C5) and shipped as middleware in #84. Hardcoded here — independent of
+# C2/C5) and shipped as middleware in #84, with the single #319 img-src
+# exception for the Google avatar CDN. Hardcoded here — independent of
 # the application constant — so an accidental policy change fails this test.
 EXPECTED_CSP_POLICY = (
     "default-src 'self'; script-src 'self' 'unsafe-eval'; style-src 'self'; "
-    "img-src 'self' data:; font-src 'self'; connect-src 'self'; object-src 'none'; "
-    "base-uri 'self'; frame-ancestors 'none'; form-action 'self'"
+    "img-src 'self' data: https://*.googleusercontent.com; font-src 'self'; "
+    "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; "
+    "form-action 'self'"
 )
 
 
@@ -239,8 +241,15 @@ class TestSignInAffordance:
         actions_close = html.index("</div>", actions_at)
         assert actions_at < link_at < actions_close
 
-    def test_authenticated_root_is_unchanged(self, auth_client: TestClient) -> None:
-        """A valid session serves the static file byte-for-byte (identity as today)."""
+    def test_authenticated_root_renders_the_fallback_avatar(self, auth_client: TestClient) -> None:
+        """#319 supersedes byte-for-byte: a signed-in session renders the avatar.
+
+        The pre-#319 contract served the static file byte-for-byte to
+        authenticated sessions; #319 AC2 replaces that with the profile
+        avatar injection. A session issued before #319 (no name/picture
+        claims) degrades to the initial-letter fallback with the email as
+        the native tooltip — no broken image, no template error.
+        """
         auth_client.cookies.set(SESSION_COOKIE, self._session_cookie())
 
         response = auth_client.get("/")
@@ -248,7 +257,9 @@ class TestSignInAffordance:
         assert response.status_code == 200
         assert self.INJECTED_SIGNIN_LINK not in response.text
         assert self.SIGNIN_SLOT_PREFIX in response.text
-        assert response.text == (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        assert '<span class="avatar avatar--fallback"' in response.text
+        assert 'title="frederic.pitteloud@gmail.com"' in response.text
+        assert ">F</span>" in response.text
 
     def test_auth_disabled_root_is_unchanged(self) -> None:
         """AC3: AUTH_ENABLED=false lanes (dev/qa) render exactly as today."""
@@ -289,6 +300,120 @@ class TestSignInAffordance:
         # CSP untouched (#180 constraint): the ASGI wrapper stamps the exact
         # policy on the injected variant too.
         assert response.headers["content-security-policy"] == CSP_POLICY
+
+
+class TestProfileAvatarContract:
+    """Google profile avatar in the identity bar (#319).
+
+    A signed-in session renders the owner's Google profile picture
+    rightmost in ``identity-actions`` with the profile name as the native
+    ``title`` tooltip (AC2). Degradation is deterministic (AC3): no
+    ``picture`` claim → initial-letter avatar from the email local-part;
+    no ``name`` claim → the email address as tooltip; a pre-#319 session
+    token (neither claim) exercises both fallbacks. Unauthenticated and
+    auth-disabled lanes render no avatar (unchanged rendering). Interpolated
+    claims are HTML-escaped — no user data is ever rendered as raw HTML.
+    """
+
+    OWNER_EMAIL = "frederic.pitteloud@gmail.com"
+    SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
+    PROFILE_NAME = "Frederic Pitteloud"
+    PICTURE_URL = "https://lh3.googleusercontent.com/a/photo-id"
+    INJECTED_SIGNIN_LINK = '<a class="signin-link" href="/auth/login">Sign in</a>'
+
+    def _session_cookie(
+        self, name: str | None = None, picture: str | None = None, ttl_seconds: int = 600
+    ) -> str:
+        """Craft a session token as if issued by a successful login."""
+        return create_session_token(
+            self.OWNER_EMAIL,
+            self.SESSION_SECRET,
+            ttl_seconds=ttl_seconds,
+            name=name,
+            picture=picture,
+        )
+
+    def _identity_actions(self, html: str) -> str:
+        """Return the identity-actions block of the rendered page."""
+        actions_at = html.index('<div class="identity-actions">')
+        return html[actions_at : html.index("</div>", actions_at)]
+
+    def test_authenticated_root_renders_the_profile_avatar(self, auth_client: TestClient) -> None:
+        """AC2: a signed-in session renders the Google picture as the avatar."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        avatar = '<img class="avatar"'
+        assert avatar in response.text
+        assert f'src="{self.PICTURE_URL}"' in response.text
+        assert 'referrerpolicy="no-referrer"' in response.text
+        assert f'alt="{self.PROFILE_NAME}"' in response.text
+        assert f'title="{self.PROFILE_NAME}"' in response.text
+
+    def test_avatar_sits_rightmost_in_identity_actions(self, auth_client: TestClient) -> None:
+        """AC2: the avatar follows the New chat button inside identity-actions."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+        html = auth_client.get("/").text
+
+        block = self._identity_actions(html)
+        assert '<button\n              class="button button--ghost new-chat"' in block
+        assert '<img class="avatar"' in block
+        assert block.index("New chat") < block.index('<img class="avatar"')
+
+    def test_avatar_falls_back_to_the_initial_without_picture(
+        self, auth_client: TestClient
+    ) -> None:
+        """AC3: no picture claim → initial-letter avatar from the email local-part."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME))
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert '<img class="avatar"' not in response.text
+        assert '<span class="avatar avatar--fallback" title="Frederic Pitteloud">F</span>' in (
+            response.text
+        )
+
+    def test_avatar_tooltip_falls_back_to_the_email_without_name(
+        self, auth_client: TestClient
+    ) -> None:
+        """AC3: no name claim → the email address is the native tooltip."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie(picture=self.PICTURE_URL))
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert '<img class="avatar"' in response.text
+        assert f'src="{self.PICTURE_URL}"' in response.text
+        assert f'alt="{self.OWNER_EMAIL}"' in response.text
+        assert f'title="{self.OWNER_EMAIL}"' in response.text
+
+    def test_avatar_claims_are_html_escaped(self, auth_client: TestClient) -> None:
+        """nLPD: interpolated claims never render as raw HTML (no injection)."""
+        hostile_name = 'Eve"><script>alert(1)</script>'
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=hostile_name, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert "<script>" not in response.text
+        assert 'title="Eve&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"' in response.text
+
+    def test_unauthenticated_root_renders_no_avatar(self, auth_client: TestClient) -> None:
+        """AC3: the unauthenticated variant is unchanged — no avatar markup."""
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.INJECTED_SIGNIN_LINK in response.text
+        assert 'class="avatar' not in response.text
 
 
 class TestLifespan:
