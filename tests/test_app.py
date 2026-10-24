@@ -416,6 +416,160 @@ class TestProfileAvatarContract:
         assert 'class="avatar' not in response.text
 
 
+class TestAvatarSignOutMenu:
+    """Sign-out dropdown on the profile avatar (#323).
+
+    The #319 avatar becomes the toggle of a minimal Alpine dropdown whose
+    single item submits ``POST /auth/logout`` through a native form —
+    POST-only is binding (logout-CSRF, ``auth/router.py``): never a GET
+    link, never a fetch bypass. The dropdown shell is part of the
+    authenticated avatar-slot substitution; the unauthenticated and
+    auth-disabled lanes stay avatar-free (byte-identical — the raw static
+    file keeps the inert #319 marker). The #319 avatar contract (tooltip,
+    no-referrer, fallback) is preserved verbatim inside the toggle.
+    """
+
+    OWNER_EMAIL = "frederic.pitteloud@gmail.com"
+    SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
+    PROFILE_NAME = "Frederic Pitteloud"
+    PICTURE_URL = "https://lh3.googleusercontent.com/a/photo-id"
+    # The exact server-injected toggle markup (multiline, house attribute
+    # style) — pinned through aria-haspopup so the ARIA state is bound to
+    # the avatar toggle, not to any element on the page.
+    TOGGLE_OPEN = (
+        "<button\n"
+        '                class="avatar-menu__toggle"\n'
+        '                type="button"\n'
+        '                aria-haspopup="menu"'
+    )
+    LOGOUT_FORM = '<form method="post" action="/auth/logout">'
+
+    def _session_cookie(
+        self, name: str | None = None, picture: str | None = None, ttl_seconds: int = 600
+    ) -> str:
+        """Craft a session token as if issued by a successful login."""
+        return create_session_token(
+            self.OWNER_EMAIL,
+            self.SESSION_SECRET,
+            ttl_seconds=ttl_seconds,
+            name=name,
+            picture=picture,
+        )
+
+    def _identity_actions(self, html: str) -> str:
+        """Return the identity-actions block of the rendered page."""
+        actions_at = html.index('<div class="identity-actions">')
+        return html[actions_at : html.index("</div>", actions_at)]
+
+    def _toggle_bounds(self, html: str) -> tuple[int, int]:
+        """Return the (open, close) character offsets of the menu toggle."""
+        open_at = html.index(self.TOGGLE_OPEN)
+        return open_at, html.index("</button>", open_at)
+
+    def test_avatar_renders_as_a_menu_toggle(self, auth_client: TestClient) -> None:
+        """AC1: the signed-in avatar is the toggle of a menu (ARIA wired)."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.TOGGLE_OPEN in response.text
+        assert ":aria-expanded=\"open ? 'true' : 'false'\"" in response.text
+        open_at, close_at = self._toggle_bounds(response.text)
+        img_at = response.text.index('<img class="avatar"')
+        assert open_at < img_at < close_at
+
+    def test_sign_out_item_submits_the_logout_form(self, auth_client: TestClient) -> None:
+        """AC2: the menu's single item POSTs /auth/logout via a native form."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.LOGOUT_FORM in response.text
+        assert ">Sign out</button>" in response.text
+        # POST-only (logout-CSRF): no GET affordance may exist for logout.
+        assert 'href="/auth/logout"' not in response.text
+
+    def test_sign_out_form_sits_in_identity_actions(self, auth_client: TestClient) -> None:
+        """The menu lives in the identity bar's actions group, after New chat."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+        html = auth_client.get("/").text
+
+        block = self._identity_actions(html)
+        assert self.LOGOUT_FORM in block
+        assert block.index("New chat") < block.index(self.TOGGLE_OPEN)
+
+    def test_menu_is_hidden_until_opened(self, auth_client: TestClient) -> None:
+        """AC1: the panel is closed by default — x-show + x-cloak (no flash)."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert 'x-data="{ open: false }"' in response.text
+        panel_at = response.text.index('class="avatar-menu__panel"')
+        panel = response.text[panel_at : response.text.index(">", panel_at)]
+        assert 'x-show="open"' in panel
+        assert "x-cloak" in panel
+        assert 'role="menu"' in panel
+
+    def test_click_outside_and_escape_dismiss_the_menu(self, auth_client: TestClient) -> None:
+        """AC1: click-outside and Escape both close the menu."""
+        auth_client.cookies.set(
+            SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME, picture=self.PICTURE_URL)
+        )
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert '@click.outside="open = false"' in response.text
+        assert '@keydown.escape="open = false"' in response.text
+
+    def test_fallback_avatar_renders_inside_the_toggle(self, auth_client: TestClient) -> None:
+        """AC3: the initial-letter fallback keeps the #319 contract in the toggle."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie(name=self.PROFILE_NAME))
+
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert self.TOGGLE_OPEN in response.text
+        open_at, close_at = self._toggle_bounds(response.text)
+        span_at = response.text.index('<span class="avatar avatar--fallback"')
+        assert open_at < span_at < close_at
+        assert 'title="Frederic Pitteloud">F</span>' in response.text
+
+    def test_unauthenticated_root_has_no_sign_out_menu(self, auth_client: TestClient) -> None:
+        """AC3: the unauthenticated variant stays avatar-free and menu-free."""
+        response = auth_client.get("/")
+
+        assert response.status_code == 200
+        assert "avatar-menu" not in response.text
+        assert "/auth/logout" not in response.text
+        assert 'class="avatar' not in response.text
+
+    def test_static_file_keeps_the_inert_avatar_slot(self) -> None:
+        """AC3: the raw static file is untouched — the menu is server-injected.
+
+        /static/index.html and the auth-disabled lanes serve the file
+        byte-for-byte; the dropdown exists only in the authenticated
+        substitution, so those lanes render exactly today's page.
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+        assert "<!-- #319 avatar-slot:" in html
+        assert "avatar-menu" not in html
+        assert "/auth/logout" not in html
+
+
 class TestLifespan:
     """Lifespan startup/shutdown handling."""
 

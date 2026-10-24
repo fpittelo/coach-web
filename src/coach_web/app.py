@@ -196,7 +196,7 @@ auth-disabled lanes stay byte-identical to the pre-#319 page.
 
 
 def _avatar_html(claims: dict[str, Any]) -> str:
-    """Build the identity-bar avatar markup from session claims (#319).
+    """Build the identity-bar avatar markup from session claims (#319, #323).
 
     The verified session carries the owner's Google profile claims: a
     ``picture`` renders as a no-referrer ``<img>``; its absence degrades to
@@ -204,18 +204,51 @@ def _avatar_html(claims: dict[str, Any]) -> str:
     missing ``name`` degrades the native ``title`` tooltip to the email
     address. Every interpolated value is HTML-escaped (Swiss nLPD: no user
     data is ever rendered as raw HTML) and nothing is logged.
+
+    #323 extends the substitution into a minimal Alpine dropdown: the
+    avatar (#319 markup contract preserved verbatim) is the toggle of a
+    hidden menu whose single item submits ``POST /auth/logout`` through a
+    native form — POST-only stays binding (logout-CSRF,
+    :mod:`coach_web.auth.router`). Click-outside and Escape close the menu;
+    the toggle carries ``aria-haspopup``/``aria-expanded``. Unauthenticated
+    and auth-disabled lanes never reach this function and stay byte-identical.
     """
     email = str(claims["email"])
     name = claims.get("name")
     picture = claims.get("picture")
     label = html.escape(str(name) if name else email, quote=True)
     if picture:
-        return (
+        avatar = (
             f'<img class="avatar" src="{html.escape(str(picture), quote=True)}"'
             f' referrerpolicy="no-referrer" alt="{label}" title="{label}">'
         )
-    initial = html.escape(email.split("@", 1)[0][:1].upper())
-    return f'<span class="avatar avatar--fallback" title="{label}">{initial}</span>'
+    else:
+        initial = html.escape(email.split("@", 1)[0][:1].upper())
+        avatar = f'<span class="avatar avatar--fallback" title="{label}">{initial}</span>'
+    return f"""<div
+              class="avatar-menu"
+              x-data="{{ open: false }}"
+              @click.outside="open = false"
+              @keydown.escape="open = false"
+            >
+              <button
+                class="avatar-menu__toggle"
+                type="button"
+                aria-haspopup="menu"
+                :aria-expanded="open ? 'true' : 'false'"
+                @click="open = !open"
+              >{avatar}</button>
+              <div
+                class="avatar-menu__panel"
+                role="menu"
+                x-show="open"
+                x-cloak
+              >
+                <form method="post" action="/auth/logout">
+                  <button type="submit" role="menuitem" class="avatar-menu__item">Sign out</button>
+                </form>
+              </div>
+            </div>"""
 
 
 def _verified_session_claims(request: Request, settings: Settings) -> dict[str, Any] | None:

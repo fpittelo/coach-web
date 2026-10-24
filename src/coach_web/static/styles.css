@@ -1489,6 +1489,69 @@ body {
   font-weight: 600;
 }
 
+/* Avatar sign-out menu (issue 323): the #319 avatar becomes the toggle of
+   a minimal dropdown anchored to the identity bar — the only logout
+   affordance in the UI. The single item submits the POST-only logout form
+   (logout-CSRF, auth/router.py); dismissal is Alpine click-outside/Escape.
+   Token-driven, no animation of its own, so the prefers-reduced-motion
+   contract (#85) is respected trivially. */
+
+.avatar-menu {
+  position: relative;
+}
+
+.avatar-menu__toggle {
+  display: flex;
+  padding: 0;
+  border: none;
+  background: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.avatar-menu__toggle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.avatar-menu__panel {
+  position: absolute;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  z-index: 20;
+  min-width: 8rem;
+  padding: var(--space-1);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+
+.avatar-menu__item {
+  display: block;
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  background: none;
+  color: var(--ink);
+  font-family: inherit;
+  font-size: 0.8rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-align: left;
+  cursor: pointer;
+}
+
+.avatar-menu__item:hover {
+  color: var(--accent);
+}
+
+.avatar-menu__item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 .settings-overlay {
   position: fixed;
   inset: 0;
