@@ -50,6 +50,15 @@ Execute with `BROWSER_*` tools: `browser_navigate` → `browser_snapshot` (acces
 
 **Pass criterion:** every journey's snapshot assertions hold and J9 is clean. A failed journey blocks sign-off and is filed as `type::bug` with the snapshot excerpt.
 
+### Prod-lane auto-update verification (MADR-0024 — signed in the release issue)
+
+| ID | Check | How | Expected |
+|---|---|---|---|
+| U1 | Zero-touch release convergence | Tag + publish the release; poll `/healthz` and `journalctl --user -u coach-web-update` | `/healthz` reports the release version ≤10 min after publishing, 3/3 services healthy, `outcome=success lane=healthy` in the state file |
+| U2 | Reboot recovery | Reboot the host; observe the lane without login | Boot unit starts the lane (checkout guard passes), `/healthz` 200 on the pinned version, no manual step |
+| U3 | Rollback drill | `scripts/prod-update.sh --rollback`, then `--force` (timer stopped during the drill) | `/healthz` shows the previous version, then the pinned version again; 3/3 healthy after each swap; streak reset |
+| U4 | Restore rehearsal | `python -m coach_web.maintenance restore <snapshot> --output <scratch>` inside the container | Snapshot decrypts and restores into the scratch DB (row counts printed); live DB untouched |
+
 ## PR-comment report template (post in the validating agent's PR thread)
 
 ```markdown
