@@ -4,6 +4,9 @@
 #
 # Flow (MADR-0024 §Option 4 steps 1-8, with the image pulled BEFORE the env swap;
 # security conditions C1-C8):
+#   0. #344 checkout guard: refuse to run from anything but a clean checkout of
+#      `main` at origin/main (scripts/repo-clean-check.sh, shared with the boot
+#      unit's ExecStartPre) — before the lock, before any registry or docker call;
 #   1. shared `flock` on the prod-lane lock (C3) — the unattended tick skips with
 #      exit 0 when it is held; --force/--rollback wait up to LOCK_WAIT_SECONDS;
 #   2. C8 pause check: 12 consecutive failures stop the hammering early;
@@ -117,16 +120,36 @@ resolve_digest() {
 }
 
 # C8: record this run's outcome in the state file. Bookkeeping only — a failure
-# to write it is reported and never masks the update outcome.
+# to write it is reported and never masks the update outcome. *reason* (optional)
+# tags a failed run (e.g. checkout-guard, #344) so `cat`-ing the state file names
+# the failed condition.
 record() {
-    local outcome="$1" out=""
-    if ! out="$(python3 "${UPDATER}" state-record --state-file "${STATE_FILE}" \
-            --outcome "${outcome}" 2>&1)"; then
+    local outcome="$1" reason="${2:-}" out=""
+    local args=(state-record --state-file "${STATE_FILE}" --outcome "${outcome}")
+    if [[ -n "${reason}" ]]; then
+        args+=(--reason "${reason}")
+    fi
+    if ! out="$(python3 "${UPDATER}" "${args[@]}" 2>&1)"; then
         error "cannot record the ${outcome} outcome in ${STATE_FILE}: ${out}"
         return 0
     fi
     log "state: ${out}"
     return 0
+}
+
+# #344 checkout guard: the updater runs docker-group-privileged code from the
+# developer working tree, so it must only ever execute the reviewed trunk. The
+# check lives in scripts/repo-clean-check.sh (shared with the boot unit's
+# ExecStartPre) and is fail-safe: any violation aborts before any registry or
+# docker call, records reason=checkout-guard and exits non-zero. --force never
+# bypasses it (unreviewed code must never run, whatever the operator intent) and
+# --rollback needs a clean tree too.
+checkout_guard() {
+    if /bin/bash "${REPO_ROOT}/scripts/repo-clean-check.sh" "${REPO_ROOT}"; then
+        return 0
+    fi
+    record failure checkout-guard
+    return 1
 }
 
 # C8: exit non-zero when the failure streak reached the limit, so the caller can
@@ -403,6 +426,14 @@ main() {
 
     if [[ ! -d "${LOCK_DIR}" ]]; then
         error "runtime directory ${LOCK_DIR} not found — cannot take the shared prod-lane lock (C3)"
+        return 1
+    fi
+
+    # #344 checkout guard: runs BEFORE the lock, so a dirty/foreign checkout is
+    # refused immediately even for --force/--rollback (which would otherwise wait
+    # up to LOCK_WAIT_SECONDS on the lock first). No update, boot or rollback may
+    # run unreviewed code.
+    if ! checkout_guard; then
         return 1
     fi
 
