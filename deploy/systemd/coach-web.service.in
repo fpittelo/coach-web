@@ -1,0 +1,49 @@
+# Coach Web — boot-persistent supervision of the prod lane (systemd USER unit
+# TEMPLATE; MADR-0024, issue #328).
+#
+# This file is the repo-tracked source of truth. scripts/prod-install.sh
+# replaces @REPO_ROOT@ with the absolute path of the checkout and writes the
+# result to ~/.config/systemd/user/coach-web.service — never hand-edit the
+# installed copy; re-run the installer to refresh it.
+#
+# Security conditions binding on this unit (fpittelo/coach-web#327):
+#   C4 — no secret in the unit. .env.prod is handed to compose via --env-file
+#        only (never EnvironmentFile=), and `docker compose config` is never
+#        run or logged.
+#   C5 — the hygiene set below: NoNewPrivileges, PrivateTmp, UMask, explicit
+#        PATH, Restart + StartLimit*, TimeoutStartSec above the retry window.
+#   C7 — linger (set/enforced by the installer) widens boot scope to every
+#        enabled user unit; the installer prints that audit list.
+
+[Unit]
+Description=Coach Web prod lane (docker compose project coach-web-prod)
+Documentation=file://@REPO_ROOT@/docs/admin_guide.md
+# Docker is a *system* unit; a user unit cannot order against it (MADR-0024).
+# The daemon race is handled by the bounded readiness retry in ExecStartPre.
+# StartLimit* live in [Unit] (their modern systemd location).
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@REPO_ROOT@
+# Explicit PATH (C5): the user manager inherits a minimal environment, so the
+# docker CLI and /bin/sh must be found without relying on the login PATH.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+# Bounded docker-readiness wait: 30 attempts x 2 s = 60 s of retrying, which
+# must fit inside TimeoutStartSec below (the default 90 s would SIGTERM the
+# loop and leave the lane down).
+ExecStartPre=/bin/sh -c 'for _ in $(seq 1 30); do /usr/bin/docker info >/dev/null 2>&1 && exit 0; sleep 2; done; echo "coach-web: docker daemon not ready after 60s" >&2; exit 1'
+ExecStart=/usr/bin/docker compose -p coach-web-prod -f @REPO_ROOT@/compose.yaml -f @REPO_ROOT@/compose.prod.yml --env-file @REPO_ROOT@/.env.prod up -d --remove-orphans
+# Honest `systemctl --user stop`: project-scoped teardown, no orphans. Named
+# volumes are kept (no -v), so coach-web-prod_coach-data survives a stop.
+ExecStop=/usr/bin/docker compose -p coach-web-prod -f @REPO_ROOT@/compose.yaml -f @REPO_ROOT@/compose.prod.yml --env-file @REPO_ROOT@/.env.prod down --remove-orphans
+TimeoutStartSec=300
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

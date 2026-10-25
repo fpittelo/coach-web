@@ -98,6 +98,7 @@ ignore = []
 "tests/integration/test_lane_script.py" = ["S603"]
 "tests/integration/test_preflight_loopback.py" = ["S104", "S603"]
 "tests/integration/test_preflight_env_permissions.py" = ["S603"]
+"tests/integration/test_prod_install.py" = ["S603"]
 
 [tool.isort]
 profile = "black"

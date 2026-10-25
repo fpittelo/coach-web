@@ -19,9 +19,11 @@
 #           is strictly the lane's own compose project — concurrent lanes and
 #           unrelated compose projects are never touched
 #
-# The prod lane is intentionally NOT automated here: it is a manual, human-owned
-# procedure (digest-pinned release image + OIDC secrets) — see the usage header
-# in compose.prod.yml and docs/admin_guide.md (Release Runbook). Lane
+# The prod lane lifecycle is owned by systemd (coach-web.service, MADR-0024 /
+# #328): lane.sh exposes only the read-only ops for it (`prod status`,
+# `prod logs [service]`) so there is exactly one supervisor — `prod up|down`
+# are refused with a pointer to the unit. Install/verify it with
+# scripts/prod-install.sh (docs/admin_guide.md, Boot & Supervision). Lane
 # validation remains the job of scripts/e2e-preflight.sh.
 #
 # The lane env file is never read or modified by this script; it is passed to
@@ -44,17 +46,18 @@ error() {
 
 usage() {
     cat >&2 <<'EOF'
-Usage: scripts/lane.sh <dev|qa> <up|status|logs|down> [service]
+Usage: scripts/lane.sh <dev|qa|prod> <up|status|logs|down> [service]
 
 Actions:
-  up      build/start the lane and wait until all services are healthy
+  up      build/start the dev/qa lane and wait until all services are healthy
   status  container state for the lane's compose project (ps -a)
   logs    lane logs (--tail=100), optionally filtered to one service
-  down    tear down the lane's compose project (--remove-orphans)
+  down    tear down the dev/qa lane's compose project (--remove-orphans)
 
-The prod lane is manual-only (digest-pinned image + OIDC secrets): see the
-usage header in compose.prod.yml and docs/admin_guide.md (Release Runbook).
-Lane validation gate: ./scripts/e2e-preflight.sh <lane>
+The prod lane lifecycle is owned by systemd (coach-web.service, MADR-0024/#328):
+only `prod status` and `prod logs [service]` are supported here (read-only).
+Install/verify the unit: ./scripts/prod-install.sh — see docs/admin_guide.md
+(Boot & Supervision). Lane validation gate: ./scripts/e2e-preflight.sh <lane>
 EOF
 }
 
@@ -78,17 +81,11 @@ case "${LANE}" in
         LANE_COMPOSE="compose.qa.yml"
         ;;
     prod)
-        error "lane 'prod' is not automated by lane.sh — the prod lane is a manual procedure:"
-        error "  cp .env.prod.example .env.prod  # then fill in secrets + the release digest"
-        error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull"
-        error "  ./scripts/e2e-preflight.sh prod  # validates, then tears its lane down on exit"
-        error "  docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d  # FINAL step — lane left serving"
-        error "The pre-flight tears its lane down on exit, so the final 'up -d' is what leaves the lane serving."
-        error "See the usage header in compose.prod.yml and docs/admin_guide.md (Release Runbook)."
-        exit 2
+        LANE_PORT=8000
+        LANE_COMPOSE="compose.prod.yml"
         ;;
     *)
-        error "unknown lane '${LANE}' (expected dev|qa)"
+        error "unknown lane '${LANE}' (expected dev|qa|prod)"
         usage
         exit 2
         ;;
@@ -115,6 +112,19 @@ case "${ACTION}" in
         exit 2
         ;;
 esac
+
+# One supervisor only (MADR-0024/#328): the prod lane lifecycle belongs to
+# coach-web.service — starting or tearing it down from here would race the
+# unit. The read-only operations (status, logs) stay available.
+if [[ "${LANE}" == "prod" && "${ACTION}" != "status" && "${ACTION}" != "logs" ]]; then
+    error "lane.sh does not '${ACTION}' the prod lane — its lifecycle is owned by systemd (coach-web.service, MADR-0024/#328):"
+    error "  systemctl --user status coach-web     # unit state"
+    error "  systemctl --user restart coach-web    # re-apply the compose up"
+    error "  systemctl --user stop coach-web       # project-scoped down --remove-orphans"
+    error "Install/verify the unit: ./scripts/prod-install.sh"
+    error "Read-only here: 'prod status', 'prod logs [service]' — see docs/admin_guide.md (Boot & Supervision)."
+    exit 2
+fi
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_BASE="${PROJECT_DIR}/compose.yaml"

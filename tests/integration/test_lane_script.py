@@ -3,11 +3,13 @@
 Two layers, both daemon-free:
 
 - ``TestArgContract`` runs the real script and pins the argument contract
-  (prod rejection with the manual-procedure pointer, unknown lane/action,
-  missing and extra arguments). A PATH-shim ``docker`` stands in for the real
-  CLI so a buggy script can never reach the host daemon from these tests; the
-  shim log staying empty additionally proves rejection happens before any
-  docker invocation.
+  (prod ``up``/``down`` rejection with the systemd pointer, unknown
+  lane/action, missing and extra arguments). A PATH-shim ``docker`` stands in
+  for the real CLI so a buggy script can never reach the host daemon from these
+  tests; the shim log staying empty additionally proves rejection happens
+  before any docker invocation.
+- ``TestProdReadOnly`` pins the read-only ``prod status``/``prod logs`` ops
+  (#328 AC6): the prod lane lifecycle belongs to ``coach-web.service``.
 - ``TestLaneLifecycle`` drives the script against the shim, which records
   argv and emits canned ``compose ps --format json`` output. This pins the
   per-lane ``-p``/``-f``/``--env-file`` flags, the health wait loop, the
@@ -85,7 +87,7 @@ class LaneShim:
         self.script.chmod(0o755)
         # Stand-ins for the compose files the script resolves relative to its
         # own location; the shim never parses them.
-        for name in ("compose.yaml", "compose.dev.yml", "compose.qa.yml"):
+        for name in ("compose.yaml", "compose.dev.yml", "compose.qa.yml", "compose.prod.yml"):
             (self.repo / name).touch()
         self.log.touch()
         shim = self.bin_dir / "docker"
@@ -143,16 +145,16 @@ def run_lane(
 class TestArgContract:
     """Argument validation happens up front, before any docker invocation."""
 
-    @pytest.mark.parametrize("action", ["up", "status", "logs", "down"])
-    def test_prod_lane_is_rejected_with_manual_procedure_pointer(
+    @pytest.mark.parametrize("action", ["up", "down"])
+    def test_prod_writes_are_rejected_with_systemd_pointer(
         self, shim: LaneShim, action: str
     ) -> None:
-        """The prod lane is manual-only; lane.sh refuses it with exit code 2 (AC1)."""
-        result = run_lane(shim, "prod", action)
+        """prod up|down refuse with a pointer to the systemd unit (#328 AC6)."""
+        result = run_lane(shim, "prod", action, lane="prod")
         assert result.returncode == 2
-        assert "manual" in result.stderr.lower()
-        assert "compose.prod.yml" in result.stderr
-        assert shim.invocations() == [], "prod must be rejected before any docker call"
+        assert "systemctl --user" in result.stderr
+        assert "coach-web.service" in result.stderr
+        assert shim.invocations() == [], "prod writes must be rejected before any docker call"
 
     def test_unknown_lane_is_rejected_with_usage(self, shim: LaneShim) -> None:
         """An unknown lane fails with exit code 2 and usage text on stderr."""
@@ -193,6 +195,41 @@ class TestArgContract:
         assert result.returncode == 2
         assert "at most one service" in result.stderr
         assert shim.invocations() == []
+
+
+class TestProdReadOnly:
+    """The prod lane exposes only the read-only ops (#328 AC6, one supervisor)."""
+
+    def test_prod_status_scopes_to_the_prod_project(self, shim: LaneShim) -> None:
+        """prod status runs ps -a for coach-web-prod with the prod file pair."""
+        result = run_lane(shim, "prod", "status", lane="prod")
+        assert result.returncode == 0, result.stderr
+        invocations = shim.invocations()
+        assert len(invocations) == 1
+        assert invocations[0] == [
+            "compose",
+            "-p",
+            "coach-web-prod",
+            "-f",
+            str(shim.repo / "compose.yaml"),
+            "-f",
+            str(shim.repo / "compose.prod.yml"),
+            "--env-file",
+            str(shim.repo / ".env.prod"),
+            "ps",
+            "-a",
+        ]
+
+    def test_prod_logs_supports_an_optional_service(self, shim: LaneShim) -> None:
+        """prod logs tails 100 lines for coach-web-prod, optionally one service."""
+        result = run_lane(shim, "prod", "logs", "coach-web", lane="prod")
+        assert result.returncode == 0, result.stderr
+        assert shim.invocations()[-1][-3:] == ["logs", "--tail=100", "coach-web"]
+        assert "coach-web-prod" in shim.invocations()[-1]
+
+        result = run_lane(shim, "prod", "logs", lane="prod")
+        assert result.returncode == 0, result.stderr
+        assert shim.invocations()[-1][-2:] == ["logs", "--tail=100"]
 
 
 class TestLaneLifecycle:
