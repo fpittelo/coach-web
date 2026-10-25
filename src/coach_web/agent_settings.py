@@ -70,6 +70,22 @@ class AgentSettings(BaseModel):
     )
 
 
+class AgentSettingsSaveRequest(BaseModel):
+    """PUT ``/api/admin/agent-settings`` request body (#362, MADR-0026).
+
+    A FULL representation: all three fields are required (JSON ``null``
+    allowed for "unset") — an omitted field is a malformed payload (422),
+    never an implicit clear. The free text is UNTRUSTED input whose boundary
+    type is deliberately loose (``str | None``): the save-site sanitizer +
+    cap validation live in the API layer (#362), which stores only the
+    sanitized text; the enum fields are CHECK-enum literals.
+    """
+
+    orientation: str | None
+    verbosity: Verbosity | None
+    tone: Tone | None
+
+
 class AgentSettingsRow(Base):
     """ORM model for the MADR-0026 ``agent_settings`` table (C1, plaintext)."""
 
