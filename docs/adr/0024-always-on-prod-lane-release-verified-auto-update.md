@@ -95,7 +95,7 @@ Verdict: **APPROVE-WITH-CONDITIONS**. Conditions C1–C6 are binding on the impl
 | :--- | :--- | :--- |
 | C1 | Never trust the moving `:prod` tag alone: `digest(:prod)` must equal the digest of the latest non-prerelease release tag | binding |
 | C2 | Fail-safe: registry unreachable / rate-limited / tag absent / malformed digest ⇒ exit non-zero without any pull or recreate | binding |
-| C3 | One lock shared by the tick, the lane unit (start/stop), the prod preflight and the operator paths (`--force`/`--rollback`) — the unattended tick skips, every other actor waits (bounded) | binding |
+| C3 | One lock shared by the tick, the lane unit (start/stop), the prod preflight and the operator paths (`--force`/`--rollback`) — contention behaviour differs by actor: the unattended tick **skips** (exit 0), the prod preflight **refuses to start** (exit 1), the lane unit and operator commands **wait** (bounded, 900 s) | binding |
 | C4 | `.env.prod`: `umask 077`, no `set -x`, owner/mode 600 verified before and after, tempfile+rename, exactly one image line, `--env-file` only (never `EnvironmentFile=`), never log `docker compose config` | binding |
 | C5 | Unit hygiene: `NoNewPrivileges`, `PrivateTmp`, `UMask=0077`, explicit `PATH`, `Restart=on-failure` + `StartLimit*`, `TimeoutStartSec` above the boot retry window | binding |
 | C6 | Image rollback ≠ data rollback: pre-swap encrypted snapshot, expand-contract migrations, destructive-migration releases excluded from unattended update | binding |
