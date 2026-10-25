@@ -1,4 +1,4 @@
-# MADR-0025: Admin Orientation and Agent Settings — Prompt Precedence and Sanitizer Contract
+# MADR-0026: Admin Orientation and Agent Settings — Prompt Precedence and Sanitizer Contract
 
 - **Status:** accepted
 - **Date:** 2026-10-25
