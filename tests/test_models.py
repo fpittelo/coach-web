@@ -257,6 +257,29 @@ class TestPlanProposalDate:
         with pytest.raises(ValidationError):
             PlanProposal.model_validate(self._payload(week_id="2026-W99"))
 
+    def test_week_rejection_message_is_value_free(self) -> None:
+        """An impossible week is rejected without echoing the value (#355).
+
+        The 422 log projection drops ``msg`` (#354), but message hygiene must
+        not depend on it: a regression that logs the raw message must not
+        re-open the leak. Only the field name and expected format ride ``msg``.
+        """
+        with pytest.raises(ValidationError) as excinfo:
+            PlanProposal.model_validate(self._payload(week_id="2026-W99"))
+
+        msg = excinfo.value.errors()[0]["msg"]
+        assert "week_id" in msg
+        assert "2026-W99" not in msg
+
+    def test_date_rejection_message_is_value_free(self) -> None:
+        """An impossible date is rejected without echoing the value (#355)."""
+        with pytest.raises(ValidationError) as excinfo:
+            PlanProposal.model_validate(self._payload(date="2026-02-30"))
+
+        msg = excinfo.value.errors()[0]["msg"]
+        assert "date" in msg
+        assert "2026-02-30" not in msg
+
 
 class TestAgentStreamRequest:
     """POST /api/agent/stream payload validation (#79).

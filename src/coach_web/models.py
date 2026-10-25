@@ -20,7 +20,7 @@ def _validate_iso_week(value: str) -> str:
     try:
         date_type.fromisocalendar(int(year), int(week), 1)
     except ValueError as exc:
-        raise ValueError(f"week_id {value!r} is not a valid ISO week") from exc
+        raise ValueError("week_id must be an ISO week (YYYY-Www)") from exc
     return value
 
 
@@ -34,7 +34,7 @@ def validate_iso_date(value: str | None) -> str | None:
     the ``invalid_dates`` reason (#181): the exception stays a ``ValueError``
     (Pydantic wraps it exactly as before), but the settings boundary can map
     it to the owner-safe reason body without string-matching. The technical
-    message is unchanged and stays server-side (nLPD).
+    message stays server-side (nLPD) and value-free (#355).
     """
     if value is None:
         return None
@@ -46,7 +46,7 @@ def validate_iso_date(value: str | None) -> str | None:
         date_type.fromisoformat(value)
     except ValueError as exc:
         raise SettingsValidationError(
-            SettingsReason.INVALID_DATES, f"date {value!r} is not a valid calendar date"
+            SettingsReason.INVALID_DATES, "date must be an ISO date (YYYY-MM-DD)"
         ) from exc
     return value
 

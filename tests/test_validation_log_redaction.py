@@ -129,10 +129,9 @@ class TestValidationLogRedaction:
     ) -> None:
         """The settings path answers the static reason body and logs no values.
 
-        The invalid-date validator interpolates the rejected value into its
-        technical message (``date '...' is not a valid calendar date``), which
-        rides the Pydantic error's ``msg`` — so the pre-#352 log line leaks it
-        even though the response body is already the fixed vocabulary.
+        The invalid-date rejection rides the Pydantic error's ``msg`` — the
+        pre-#352 log line leaked it because the old technical message
+        interpolated the rejected value (made value-free in #355).
         """
         marker = "target-date-secret-marker-7b2c"
         with (
