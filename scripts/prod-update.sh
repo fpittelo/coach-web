@@ -11,7 +11,11 @@
 #      exit 0 when it is held; --force/--rollback wait up to LOCK_WAIT_SECONDS;
 #   2. C8 pause check: 12 consecutive failures stop the hammering early;
 #   3. resolve ghcr.io/fpittelo/coach-web:prod and validate the digest (C2);
-#   4. no-op when it equals the digest already pinned in .env.prod (step 3);
+#   4. no-op when it equals the digest already pinned in .env.prod (step 3) —
+#      and, even then, the #345 per-tick lane check verifies the exact 3/3 set
+#      and makes ONE bounded self-heal with the idempotent project-scoped
+#      `up -d` (no pull) when a service is missing or unhealthy; an unrecovered
+#      lane is recorded outcome=degraded, never success;
 #   5. C1 provenance: digest(:prod) must equal the digest of the latest release
 #      tag, read from the PUBLIC Releases API — never the app's GITHUB_TOKEN;
 #   6. pull that verified digest locally (C2): a pull failure leaves .env.prod
@@ -122,12 +126,16 @@ resolve_digest() {
 # C8: record this run's outcome in the state file. Bookkeeping only — a failure
 # to write it is reported and never masks the update outcome. *reason* (optional)
 # tags a failed run (e.g. checkout-guard, #344) so `cat`-ing the state file names
-# the failed condition.
+# the failed condition. *lane* (optional, #345) records the per-tick lane health
+# (healthy | recovered | degraded) next to the outcome.
 record() {
-    local outcome="$1" reason="${2:-}" out=""
+    local outcome="$1" reason="${2:-}" lane="${3:-}" out=""
     local args=(state-record --state-file "${STATE_FILE}" --outcome "${outcome}")
     if [[ -n "${reason}" ]]; then
         args+=(--reason "${reason}")
+    fi
+    if [[ -n "${lane}" ]]; then
+        args+=(--lane "${lane}")
     fi
     if ! out="$(python3 "${UPDATER}" "${args[@]}" 2>&1)"; then
         error "cannot record the ${outcome} outcome in ${STATE_FILE}: ${out}"
@@ -268,6 +276,65 @@ wait_for_gate() {
     return 1
 }
 
+# #345: bounded wait for the exact 3/3 set, WITHOUT the /healthz version check —
+# the no-change tick has no release tag to compare. Reuses the gate window so the
+# self-heal can never sit in an unbounded loop.
+wait_for_lane_healthy() {
+    local ps_json="${WORK_DIR}/lane-ps.json"
+    local deadline=$((SECONDS + GATE_TIMEOUT_SECONDS))
+    local verdict=""
+    while [[ "${SECONDS}" -lt "${deadline}" ]]; do
+        if dc ps -a --format json >"${ps_json}" 2>/dev/null \
+            && verdict="$(python3 "${UPDATER}" lane-health --ps-json "${ps_json}" 2>&1)"; then
+            log "lane ${verdict}"
+            return 0
+        fi
+        sleep 2
+    done
+    error "lane still not 3/3 healthy after ${GATE_TIMEOUT_SECONDS}s: ${verdict:-no verdict}"
+    return 1
+}
+
+# #345: the per-tick lane health check and its bounded self-heal. During the
+# v0.14.0 incident a sidecar disappeared AFTER the swap gate had passed 3/3 and
+# the no-change ticks recorded success without ever looking at the lane, so the
+# lane served 2/3 for ~20 minutes unnoticed. This runs on every no-change tick:
+# it verifies the exact 3/3 set and, when the set is incomplete or a service is
+# unhealthy, makes ONE self-heal attempt with the idempotent, project-scoped
+# `up -d`. The caller holds the shared lock (C3), the heal recreates only what is
+# missing and NEVER pulls an image, and `up -d` on a complete healthy lane is a
+# no-op — so a healthy lane is never disturbed. The state file gets
+# lane=healthy|recovered|degraded; an unrecovered lane is recorded as
+# outcome=degraded (never success) and the tick exits 0 so the timer keeps trying
+# and the degradation stays visible to the next tick and to journalctl.
+check_and_heal_lane() {
+    local ps_json="${WORK_DIR}/lane-ps.json" verdict=""
+    if dc ps -a --format json >"${ps_json}" 2>/dev/null \
+        && verdict="$(python3 "${UPDATER}" lane-health --ps-json "${ps_json}" 2>&1)"; then
+        log "lane ${verdict}"
+        record success "" healthy
+        return 0
+    fi
+    error "the prod lane is not 3/3 healthy (${verdict:-dc ps failed}) — attempting one self-heal with 'up -d --remove-orphans' (no image pull)"
+    if ! dc up -d --remove-orphans; then
+        error "LANE DEGRADED: the self-heal 'up -d' failed — the lane needs human eyes"
+        error "  inspect: cat ${STATE_FILE}"
+        error "  fix:     docker compose -p ${COMPOSE_PROJECT} -f compose.yaml -f compose.prod.yml --env-file ${ENV_FILE} up -d"
+        record degraded "" degraded
+        return 0
+    fi
+    if wait_for_lane_healthy; then
+        log "LANE RECOVERED: the self-heal restored the missing service(s) — no image was pulled"
+        record success "" recovered
+        return 0
+    fi
+    error "LANE DEGRADED: still not 3/3 healthy after the self-heal and ${GATE_TIMEOUT_SECONDS}s — the lane needs human eyes"
+    error "  inspect: cat ${STATE_FILE}"
+    error "  fix:     docker compose -p ${COMPOSE_PROJECT} -f compose.yaml -f compose.prod.yml --env-file ${ENV_FILE} up -d"
+    record degraded "" degraded
+    return 0
+}
+
 # Step 8: restore the previous digest, bring the previous image back, record the
 # failure. The lane keeps serving the previous release; no pull is needed — the
 # previous image is the one that was running a moment ago.
@@ -309,7 +376,8 @@ do_update() {
     fi
     if [[ "${decision}" == "no-change" && "${force}" != "true" ]]; then
         log "no change: ${ENV_FILE} already pins ${prod_digest} — no pull, no recreate"
-        record success
+        # #345: never assume the lane is healthy just because the digest matched.
+        check_and_heal_lane
         return 0
     fi
     log "update available: ${decision} (${prod_digest})"
@@ -379,7 +447,7 @@ do_update() {
     fi
 
     log "update complete: the prod lane is serving ${tag} (${prod_digest})"
-    record success
+    record success "" healthy
     return 0
 }
 

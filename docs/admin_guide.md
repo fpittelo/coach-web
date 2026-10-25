@@ -188,12 +188,13 @@ Since v0.14.0 a tag is the whole rollout: `coach-web-update.timer` runs `scripts
 | Units | `~/.config/systemd/user/coach-web-update.timer` → `coach-web-update.service` (`Type=oneshot`), rendered from `deploy/systemd/coach-web-update.{service,timer}.in` |
 | Cadence | 5 min after boot and after each completed run (`RandomizedDelaySec=30`) |
 | Convergence | the digest of `ghcr.io/fpittelo/coach-web:prod`, and **only when** it equals the digest of the latest GitHub release tag (provenance gate, C1) |
-| No-op cost | one registry digest resolution — no pull, no container restart |
+| No-op cost | one registry digest resolution **plus** one lane health check (`docker compose ps -a`) — no pull, no container restart; a healthy lane is never recreated (#345) |
 | Order of operations | **checkout guard** → provenance → **pull the verified digest** → measure + snapshot the database → atomic `.env.prod` rewrite → recreate → gate. `.env.prod` is only touched once the image is local, so a registry failure leaves it byte-identical. |
 | Gate | 3/3 services healthy ≤ 120 s **and** `/healthz` reporting the release version; otherwise automatic rollback to the previous digest |
+| Lane health | #345: every tick — a no-change tick included — verifies the exact 3/3 set; a missing or unhealthy service triggers **one** bounded self-heal (`up -d --remove-orphans`, project-scoped, lock held, no image pull). See *Lane health & self-heal* below. |
 | Snapshot | encrypted pre-swap dump (`python -m coach_web.maintenance backup`) in `~/.local/state/coach-web/snapshots/` (mode 600, last 4 kept) |
 | Lock | `/run/user/<uid>/coach-web-prod.lock` (`$XDG_RUNTIME_DIR`, C3). Take it: the update tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop/restart (via `flock -w 900`) and `prod-update.sh --rollback`/`--force`. Contention: the tick **skips** and exits 0 (nothing touched); the preflight **refuses** to start (exit 1); the unit and the operator commands **wait** up to 900 s, then fail. |
-| State | `~/.local/state/coach-web/update-state.json` (mode 600): last run, outcome, consecutive-failure streak |
+| State | `~/.local/state/coach-web/update-state.json` (mode 600): last run, outcome, consecutive-failure streak, failed-run reason, and the #345 `lane` signal (`healthy`/`recovered`/`degraded`) |
 | Secret hygiene | `.env.prod` is only ever passed to compose as `--env-file`; the updater logs the public image digest and never the file, and never runs `docker compose config` (C4) |
 
 ### Checkout guard — why the tree must stay clean (#344)
@@ -240,9 +241,38 @@ After **12 consecutive failures** the updater pauses instead of hammering the re
 ### Inspect the state
 
 ```bash
-cat ~/.local/state/coach-web/update-state.json    # last_run, outcome, consecutive_failures
+cat ~/.local/state/coach-web/update-state.json    # last_run, outcome, lane, consecutive_failures
 ls -l ~/.local/state/coach-web/snapshots/         # pre-swap encrypted snapshots (mode 600, last 4)
 ```
+
+### Lane health & self-heal (#345)
+
+During the v0.14.0 rollout `github-mcp` disappeared **after** the swap gate had passed 3/3. The lane then served **2/3 for ~20 minutes unnoticed**, because the no-change branch of the updater returned before it ever looked at the lane: it recorded `outcome=success` on the strength of the digest alone, and `coach-web.service` is `Type=oneshot`+`RemainAfterExit=yes`, so it converges only at boot and never re-converges a container removed at runtime.
+
+Every tick now measures the lane, a no-change tick included. The state file records a `lane` field next to the outcome:
+
+| `lane` | Meaning | What happened |
+|:---|:---|:---|
+| **`healthy`** | 3/3 services present and healthy | Nothing was touched — no pull, no recreate |
+| **`recovered`** | The set was incomplete/unhealthy and the self-heal fixed it | One `up -d --remove-orphans` recreated the missing service(s) — **no image was pulled** |
+| **`degraded`** | The lane is still not 3/3 after the self-heal (or the `up` itself failed) | The tick exits 0 so the timer keeps trying; the lane needs human eyes |
+
+Where to see it:
+
+```bash
+cat ~/.local/state/coach-web/update-state.json                     # "lane": "healthy|recovered|degraded"
+journalctl --user -u coach-web-update.service -n 30 --no-pager    # LANE RECOVERED / LANE DEGRADED lines
+```
+
+What the self-heal **does** and **does not** do:
+
+- It re-runs the same idempotent, project-scoped convergence command the boot path uses (`docker compose -p coach-web-prod … up -d --remove-orphans`), so it recreates only what is missing. On a complete healthy lane `up -d` is a config-hash no-op: **a healthy lane is never disturbed** (`lane=healthy`, zero `up` calls).
+- It holds the same shared prod-lane lock as every other prod operation (C3) and runs **inside** the tick — there is no new supervisor, timer, unit or cron.
+- It **never pulls an image** and never rewrites `.env.prod`: it cannot change the running version, only restore the service set the pinned image defines.
+- It does **not** run when the digest differs — that path already does the full gated update (pull → snapshot → rewrite → recreate → gate).
+- A `degraded` lane is recorded as `outcome=degraded`, **never** `success`, and does **not** accumulate the C8 failure streak (a paused updater would stop before its lane check and hide the degradation). A lane that stays `degraded` across ticks is **not** self-healing and needs human eyes: inspect `journalctl --user -u coach-web-update.service` and `docker compose -p coach-web-prod … ps -a`, then fix and re-run `up -d` (`scripts/prod-update.sh --force` re-applies the pinned digest).
+
+The image rollback below is the automatic response to a **failed gate**; the lane self-heal above is the automatic response to a **healthy gate whose lane later lost a service**. They are complementary.
 
 ### Rollback (image)
 
@@ -528,4 +558,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-25 (issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-10-25 (issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
