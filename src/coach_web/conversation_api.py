@@ -45,12 +45,16 @@ Retry / duplicate guard (the honest minimal design)
       content — the deterministic-replay duplicate is suppressed.
 
     Documented imprecisions (accepted, n=1): (a) an immediate deliberate
-    re-send of the identical text is recorded as a continuation of the
-    prior turn — its user row is deduplicated, while a differing reply is
-    still appended; (b) a non-deterministic reply to a completed-but-
-    unreceived turn appends a second assistant row (the user row is still
-    deduplicated); (c) the guard is check-then-insert, not atomic — two
-    concurrent identical writers can both pass, consistent with the
+    re-send of the identical text is treated as the same turn — the second
+    user row is NOT written (the exchange merges into the prior turn's
+    user row) while the second reply IS appended whenever it differs, so
+    the transcript can hold two consecutive assistant rows
+    (``user, assistant, assistant``); #350 consumes this transcript
+    as-is, so that shape is what the future memory window will read;
+    (b) a non-deterministic reply to a completed-but-unreceived turn
+    appends a second assistant row (the user row is still deduplicated,
+    same shape as (a)); (c) the guard is check-then-insert, not atomic —
+    two concurrent identical writers can both pass, consistent with the
     best-effort-by-``seq`` posture for concurrent tabs. A client turn-id
     wire field would remove the ambiguity and is deliberately out of
     scope (YAGNI, MADR-0025 rejects wire additions beyond ``thread_id``).
@@ -93,7 +97,7 @@ the ``maintenance purge-conversations`` sweep enforces retention today).
 import logging
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, Protocol, cast
 
 from cryptography.fernet import Fernet, InvalidToken
 from fastapi import HTTPException
@@ -156,19 +160,20 @@ the request (C7) — identical membership to the digest-read boundary in
 :mod:`coach_web.app`. Anything else is a bug and must surface."""
 
 
-class SessionFactory:
+class SessionFactory(Protocol):
     """Structural type of the app's async session factory (duck-typed seam).
 
-    Mirrors :func:`coach_web.db.build_session_factory`'s callable shape:
-    calling it yields an async context manager handing out one
+    Mirrors :func:`coach_web.db.build_session_factory`'s callable shape
+    (``async_sessionmaker[AsyncSession]``): calling it yields an async
+    context manager handing out one
     :class:`~sqlalchemy.ext.asyncio.AsyncSession`. A protocol keeps the
-    boundary honest (test stubs match the real factory's shape) without
-    importing the concrete maker.
+    boundary honest (test stubs must match the real factory's shape)
+    without importing the concrete maker.
     """
 
     def __call__(self) -> AbstractAsyncContextManager[AsyncSession]:
         """Open one async session (the context closes it on exit)."""
-        raise NotImplementedError
+        ...
 
 
 @dataclass(frozen=True)

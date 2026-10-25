@@ -1258,6 +1258,10 @@ class TestAgentStreamEndpoint:
             AgentEvent(type="plan_proposal", data={"plan": {"title": "Plan"}}),
             AgentEvent(type="rpe_request", data={"checkin": {"plan_session_key": "2026-10-06"}}),
             AgentEvent(type="debrief_summary", data={"summary": {"headline": "ok"}}),
+            AgentEvent(
+                type="warning",
+                data={"code": "x", "message": "y"},
+            ),
             AgentEvent(type="error", data={"message": "boom"}),
             AgentEvent(type="done", data={"message": "hi", "iterations": 1}),
         ]
@@ -1280,6 +1284,7 @@ class TestAgentStreamEndpoint:
             "plan_proposal",
             "rpe_request",
             "debrief_summary",
+            "warning",
             "error",
             "done",
         ):
@@ -1304,7 +1309,10 @@ class TestAgentStreamEndpoint:
             "/api/agent/stream",
             json={"message": "make it 20 min instead", "history": history},
         ) as response:
-            assert response.status_code == 200
+            body = response.read().decode("utf-8")
+
+        assert response.status_code == 200
+        assert "event: done" in body
 
         assert agent.messages == ["make it 20 min instead"]
         assert agent.histories == [[]]

@@ -815,10 +815,11 @@ class TestDivergenceDigestEndpoint:
         assert "event: done" in body
         # C-S2-4 for the DIGEST boundary: exactly one session serves every
         # digest read of the turn. Superseded for #349 (MADR-0025): the
-        # conversation persistence boundary opens its own sessions —
-        # thread resolve + user write (one), assistant completion write
-        # (one) — a separate C7 failure posture, deliberately not shared
-        # with the digest reads. One clean turn opens 1 + 3 sessions.
+        # conversation persistence boundary opens its OWN session per step
+        # — thread resolve (1), user-message write (2), assistant
+        # completion write (3) — a separate C7 failure posture, deliberately
+        # not shared with the digest reads. One clean turn opens 4 sessions
+        # in total: 1 digest + 3 persistence.
         assert counting.calls == 4
         prompt = agent.captured_prompt
         assert prompt is not None
