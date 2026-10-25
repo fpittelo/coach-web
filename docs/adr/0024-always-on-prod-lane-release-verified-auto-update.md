@@ -4,7 +4,7 @@
 - **Date:** 2026-10-25
 - **Deciders:** @architect, @fpittelo
 - **Reviewed by:** @cyber-security (MADR-0008 security-impact routing — unattended image replacement on the daily-use lane; APPROVE-WITH-CONDITIONS C1–C8, review recorded on fpittelo/coach-web#327)
-- **Tracked in:** fpittelo/coach-web#327, Sprint 29 marker #331; implemented by #328 (boot supervision) and #326 (auto-update), proven live by #329
+- **Tracked in:** fpittelo/coach-web#327, Sprint 29 marker #331; to be implemented by #328 (boot supervision) and #326 (auto-update), proven live by #329 (all three `status::ready` at time of writing)
 
 > **Acceptance basis:** PO directive 2026-10-25 — "automated continuous deployment in production for each release… the docker image must be up and running all the time when I start my PC, and updated for each release" — plus the PO's instruction to start the Sprint 29 autonomous loop. Presented for PO review at sprint closeout.
 >
@@ -95,12 +95,12 @@ Verdict: **APPROVE-WITH-CONDITIONS**. Conditions C1–C6 are binding on the impl
 | C7 | `enable-linger` widens boot scope to every enabled user unit — audit and record the list | follow-up |
 | C8 | Bounded consecutive failures + visible last-run status | follow-up |
 
-Residual risk accepted (recorded verbatim from the review):
+Residual risk accepted (verbatim from the review comment archived on fpittelo/coach-web#327):
 
-- Anyone holding a GitHub token with `packages:write` can move `:prod`; C1 rejects images that do not correspond to a real release — a *compromised CI workflow publishing a genuine-looking release* would still deploy unattended.
+- Anyone holding a GitHub token with `packages:write` can move `:prod`; C1 makes the lane refuse such an image only if it does not correspond to a real release tag — a *compromised CI workflow publishing a genuine-looking release* would still deploy unattended.
 - Auto-deploy means a bad release reaches the daily-use lane within 5 minutes of tagging, with no human in the loop at that moment; recovery depends on the health gate and the C6 snapshot.
 - The update script executes with docker-group privilege as `frede`; a flaw in it (or in what `:prod` serves) is root-equivalent on VIDAR.
-- Rollback of the image is automatic; rollback of schema/data depends on the C6 snapshot being present and untested in anger until it is actually needed.
+- Rollback of the image is automatic; rollback of schema/data depends on the C6 snapshot being present and untested-in-anger until it is actually needed.
 
 ## Operational Contract
 

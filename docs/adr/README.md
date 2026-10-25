@@ -4,7 +4,7 @@ Single index for the MADRs owned by this repository (created via the `madr-adr` 
 
 **Portfolio-level decisions are not duplicated here.** They live in the HOME portfolio index — `opencode-home-config/docs/adr/README.md` — and apply to this repository (trunk+tag MADR-0017, release publishing MADR-0020, MCP topology MADR-0022, agent roster MADR-0021/0023, security routing MADR-0008).
 
-**Numbering:** one gap-free sequence across the portfolio, so gaps in this table are expected. MADR-0001–0007 remain sections of `docs/architecture.md`; MADR-0009 is the MADR appendix of `docs/e2e-checklist.md`; standalone files start at 0008.
+**Numbering:** numbers are drawn from the single portfolio sequence, so gaps in this table are expected. MADR-0001–0007 remain sections of `docs/architecture.md`; MADR-0009 is the MADR appendix of `docs/e2e-checklist.md`; standalone files start at 0008. The historical records 0008/0010/0011 predate the unified portfolio index and reuse numbers that were later assigned centrally to different decisions — they are kept as-is for link stability (accepted records are never renumbered); every new record takes the next free **portfolio** number (0024 onward).
 
 | # | Title | Status | Date |
 | :--- | :--- | :--- | :--- |
