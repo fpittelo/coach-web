@@ -195,6 +195,8 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
 
 ## 🚀 Release Runbook (approve + tag)
 
+> **Automated rollout (MADR-0024, Sprint 29 #326/#328 — in force from v0.14.0):** tagging is the whole rollout. Within 5 minutes of the GitHub Release the prod lane resolves `:prod`, verifies its digest against the latest release tag, snapshots the database, rewrites `COACH_WEB_IMAGE` atomically, pulls and recreates, then requires 3/3 healthy and `/healthz` on the release version — otherwise it restores the previous digest automatically. Step 2's manual block is the **fallback**, step 3 is **rollback**.
+
 1. **Staging validation** (release candidate on trunk `main`): dispatch the deploy workflow on `main` with `environment=qa` — CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
    ```bash
    docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa pull
@@ -232,15 +234,23 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
    check `docker compose -p coach-web-qa -f compose.yaml -f compose.qa.yml --env-file .env.qa ps`
    and the sidecar healthcheck, then re-run. The same command shape runs against any lane
    (dev: `--network coach-web-dev_coach-net` with the `:dev` image).
-2. **Release** (requires the single @fpittelo approval per release): tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag; record the image digest in the release notes. Then locally: set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, and:
+2. **Release** (requires the single @fpittelo approval per release): tag `vX.Y.Z` on `main`. CI builds and pushes `:prod`, `:latest`, and the `vX.Y.Z` tag. **The rollout is then automatic** (MADR-0024) — verify it landed:
    ```bash
+   systemctl --user list-timers coach-web-update.timer
+   journalctl --user -u coach-web-update.service -n 20 --no-pager
+   curl -fsS http://127.0.0.1:8000/healthz     # JSON version == X.Y.Z
+   ```
+   **Fallback / manual rollout** (automation disabled, or a release carrying a **destructive migration** — those are excluded from unattended update by design): set `COACH_WEB_IMAGE=ghcr.io/fpittelo/coach-web@sha256:<digest>` in `.env.prod`, then:
+   ```bash
+   systemctl --user stop coach-web-update.timer   # keep the timer out of the way
    docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod pull
    ./scripts/e2e-preflight.sh prod
    docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d
    curl -fsS http://127.0.0.1:8000/health
+   systemctl --user start coach-web-update.timer
    ```
    The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
-3. **Rollback:** set the previous digest in `.env.prod` and `docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod up -d` — no cloud console involved.
+3. **Rollback:** automatic when the post-swap gate fails (the updater restores the previous digest before exiting non-zero). Manual: restore the previous digest retained in `.env.prod.prev`, then `systemctl --user restart coach-web` and re-check `/healthz`. Data rollback restores the pre-swap encrypted snapshot (see *Database Maintenance → Encrypted backup / restore*) — image rollback never rolls back a schema. No cloud console involved.
 
 ---
 
@@ -357,4 +367,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-18 (issue #301 — maintenance CLI hardening: missing-path refusal, checked WAL checkpoint, 0600 artifact, single key path, artifact↔key-version rotation note; prior: issue #297 — backup non-co-location stated as a MADR-0008 C2 requirement + key-escrow/recovery step in the restore runbook)_
+_Last updated: 2026-10-25 (issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; prior: issue #301 — maintenance CLI hardening)_
