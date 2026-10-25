@@ -1,16 +1,17 @@
 """FastAPI application factory for Coach Web."""
 
 import asyncio
+import hashlib
 import html
 import logging
 import os
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from datetime import date
+from datetime import UTC, date, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import uvicorn
 from cryptography.fernet import InvalidToken
@@ -33,8 +34,16 @@ from coach_web.agent import (
     apply_temporal_anchor,
     assemble_system_prompt,
     create_agent,
+    sanitize_orientation,
 )
-from coach_web.agent_settings import get_agent_settings
+from coach_web.agent_settings import (
+    AGENT_ORIENTATION_MAX_CHARS,
+    AgentSettings,
+    AgentSettingsSaveRequest,
+    delete_agent_settings,
+    get_agent_settings,
+    save_agent_settings,
+)
 from coach_web.analysis import WeekAdherenceMetric
 from coach_web.auth.middleware import (
     SESSION_COOKIE,
@@ -72,6 +81,7 @@ from coach_web.errors import (
     MIRROR_REASON_MESSAGES,
     EncryptionUnavailableError,
     MirrorReason,
+    SettingsReason,
     SettingsValidationError,
     encryption_reason_payload,
     settings_reason_from_errors,
@@ -134,14 +144,17 @@ Chat/model-facing surfaces keep this strict posture UNCHANGED (#181 AC3);
 the owner-facing settings paths answer with the structured reason body.
 """
 
-SETTINGS_REASON_PATHS = frozenset({"/api/objectives", "/api/periodization/approve"})
+SETTINGS_REASON_PATHS = frozenset(
+    {"/api/objectives", "/api/periodization/approve", "/api/admin/agent-settings"}
+)
 """The owner-facing settings endpoints whose 422s carry the reason body (#181).
 
 The #142 threat model is the LLM/prompt-injection surface — not the
 authenticated owner's own settings form, where the requester IS the data
 owner and a validation reason is not sensitive data. Only these paths get
 the structured ``{code, message}`` body; every other 422 (agent stream, plan
-approval, week approval) keeps the generic detail verbatim.
+approval, week approval) keeps the generic detail verbatim. #362 adds the
+admin agent-settings CRUD (MADR-0026).
 """
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
@@ -305,6 +318,67 @@ def _athlete_id_for_session(settings: Settings, session_cookie: str | None) -> i
     except TokenError:
         return DEFAULT_ATHLETE_ID
     return athlete_id_from_email(claims.get("email"))
+
+
+def _normalize_orientation_for_save(text: str | None) -> str | None:
+    """Sanitize then validate the owner orientation for persistence (#362).
+
+    MADR-0026 C2 save call site: the seam sanitizer
+    (:func:`coach_web.agent.sanitize_orientation`) is IMPORTED and reused —
+    its result is what gets stored, never a forked transform. Validation then
+    runs on the SANITIZED result (validate-after-sanitize, #361 review
+    binding): the sanitizer caps BEFORE zero-width defusion, so a payload
+    that fits the cap raw can sanitize PAST it (a defused role token inserts
+    a character) — storing that would trip the ``agent_settings`` CHECK and
+    surface as a 500, so the cap check answers 422 instead (via
+    :class:`SettingsValidationError`, the typed reason the endpoint maps to
+    the owner-safe body). The submission itself is also capped (AC2): an
+    oversize payload is rejected field-only rather than silently clamped,
+    so the echoed text never surprises the owner.
+
+    An empty sanitized text (unset preference) normalizes to ``None``,
+    matching the seam model's unset shape and the GET defaults body.
+    """
+    sanitized = sanitize_orientation(text)
+    if len(sanitized) > AGENT_ORIENTATION_MAX_CHARS:
+        raise SettingsValidationError(
+            SettingsReason.INVALID_VALUES,
+            "Sanitized orientation exceeds the agent_settings cap "
+            f"({AGENT_ORIENTATION_MAX_CHARS} characters)",
+        )
+    if text is not None and len(text) > AGENT_ORIENTATION_MAX_CHARS:
+        raise SettingsValidationError(
+            SettingsReason.INVALID_VALUES,
+            "Orientation exceeds the agent_settings cap "
+            f"({AGENT_ORIENTATION_MAX_CHARS} characters)",
+        )
+    return sanitized or None
+
+
+def _journal_agent_settings_change(
+    *,
+    athlete_id: int,
+    action: Literal["save", "reset"],
+    orientation: str | None,
+    updated_at: str,
+) -> None:
+    """Emit the agent-settings audit-journal line — metadata only (MADR-0026 C3).
+
+    One line per successful mutation (``save``/``reset``): athlete, action,
+    orientation length, sha256 prefix (≤8 hex) and updated_at. The
+    orientation CONTENT never reaches journald (#354 log-hygiene posture,
+    nLPD): integrity is provable from the length + hash alone.
+    """
+    stored = orientation or ""
+    digest = hashlib.sha256(stored.encode("utf-8")).hexdigest()[:8]
+    logger.info(
+        "Agent settings %s: athlete=%d length=%d sha256=%s updated_at=%s",
+        action,
+        athlete_id,
+        len(stored),
+        digest,
+        updated_at,
+    )
 
 
 async def _default_debrief_mirror(
@@ -1272,6 +1346,124 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.warning("Pending debrief derivation failed: %s", exc)
             pending = []
         return PendingDebriefResponse(pending=pending)
+
+    @application.get(
+        "/api/admin/agent-settings",
+        response_model=AgentSettings,
+        tags=["agent-settings"],
+    )
+    async def get_agent_settings_endpoint(request: Request) -> AgentSettings:
+        """Return the athlete's agent settings, or the defaults shape (MADR-0026, #362).
+
+        Auth-gated by the whitelist middleware when AUTH_ENABLED; the response
+        is the seam-boundary view (:class:`coach_web.agent_settings.AgentSettings`)
+        of the persisted row, or the defaults shape when no row exists (AC1).
+        A failed or corrupted read degrades to the defaults shape (fail open,
+        the digest-degrade family — MADR-0026 failure posture, cyber C6): the
+        admin surface never 500s on store trouble, and the next save heals
+        the row.
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        session_factory = request.app.state.db_session_factory
+        try:
+            async with session_factory() as session:
+                agent_settings = await get_agent_settings(session, athlete_id=athlete_id)
+        except (OSError, SQLAlchemyError, ValidationError) as exc:
+            logger.warning("Agent settings read failed: %s", exc)
+            agent_settings = None
+        return agent_settings if agent_settings is not None else AgentSettings()
+
+    @application.put(
+        "/api/admin/agent-settings",
+        response_model=AgentSettings,
+        tags=["agent-settings"],
+    )
+    async def put_agent_settings_endpoint(
+        request: Request,
+        payload: AgentSettingsSaveRequest,
+    ) -> AgentSettings | JSONResponse:
+        """Validate, sanitize and persist the athlete's agent settings (#362, AC1/AC2).
+
+        The seam sanitizer runs FIRST (MADR-0026 C2 save call site) and the
+        SANITIZED result is validated against the DB CHECK cap before
+        persistence (validate-after-sanitize — the #361 review binding): a
+        payload that survives sanitization can never trip the CHECK, so
+        violations answer 422 with the owner-safe reason body (#352 posture:
+        field-only detail, no value echo, no orientation content) instead of
+        a 500. The enum fields are boundary-validated as CHECK-enum literals
+        and mapped to the same reason body by the settings-path validation
+        handler. The response echoes the normalized stored text; the journal
+        line carries metadata only (MADR-0026 C3).
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        try:
+            stored_orientation = _normalize_orientation_for_save(payload.orientation)
+        except SettingsValidationError as exc:
+            # The typed reason becomes the owner-safe body (#181) — no
+            # exception text, no payload echo in the response (nLPD).
+            logger.warning("Rejected agent settings save on %s: %s", request.url.path, exc)
+            return JSONResponse(status_code=422, content=settings_reason_payload(exc.reason))
+        session_factory = request.app.state.db_session_factory
+        try:
+            async with session_factory() as session:
+                row = await save_agent_settings(
+                    session,
+                    athlete_id=athlete_id,
+                    orientation=stored_orientation,
+                    verbosity=payload.verbosity,
+                    tone=payload.tone,
+                )
+        except (OSError, SQLAlchemyError) as exc:
+            # Defense-in-depth (MADR-0026): the CHECK constraints must never
+            # surface as a 500 — the validate-after-sanitize gate above makes
+            # this branch unreachable for API-driven writes.
+            logger.warning("Agent settings persistence failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        _journal_agent_settings_change(
+            athlete_id=athlete_id,
+            action="save",
+            orientation=stored_orientation,
+            updated_at=row.updated_at,
+        )
+        return AgentSettings(
+            orientation=stored_orientation,
+            verbosity=payload.verbosity,
+            tone=payload.tone,
+        )
+
+    @application.delete(
+        "/api/admin/agent-settings",
+        response_model=AgentSettings,
+        tags=["agent-settings"],
+    )
+    async def delete_agent_settings_endpoint(request: Request) -> AgentSettings:
+        """Reset the athlete's agent settings to the defaults (#362, AC1).
+
+        The reset path is a row delete (MADR-0026) and idempotent by store
+        contract: a missing row still answers the defaults shape with 200.
+        The journal line rides successful changes only, metadata-only
+        (MADR-0026 C3). The response is the post-reset settings state, so
+        the admin surface can re-render without a follow-up GET.
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        session_factory = request.app.state.db_session_factory
+        try:
+            async with session_factory() as session:
+                deleted = await delete_agent_settings(session, athlete_id=athlete_id)
+        except (OSError, SQLAlchemyError) as exc:
+            logger.warning("Agent settings reset failed: %s", exc)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        if deleted:
+            _journal_agent_settings_change(
+                athlete_id=athlete_id,
+                action="reset",
+                orientation=None,
+                updated_at=datetime.now(UTC).isoformat(),
+            )
+        return AgentSettings()
 
     return application
 

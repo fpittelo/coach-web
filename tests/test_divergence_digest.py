@@ -845,7 +845,13 @@ class TestDivergenceDigestScope:
         }
 
     def test_no_new_endpoint_is_added(self, settings: Settings) -> None:
-        """C-S2-5 (AC6): the digest introduces no new HTTP endpoint."""
+        """C-S2-5 (AC6): the digest introduces no new HTTP endpoint.
+
+        Superseded for #362 (MADR-0026): the admin agent-settings CRUD
+        (``/api/admin/agent-settings``) is sanctioned surface outside the
+        digest's scope; its contract is pinned by
+        :mod:`tests.test_agent_settings_api`.
+        """
         app = create_app(settings)
         api_paths = {
             getattr(route, "path", "")
@@ -861,6 +867,7 @@ class TestDivergenceDigestScope:
             "/api/periodization/approve",
             "/api/debrief",
             "/api/debrief/pending",
+            "/api/admin/agent-settings",
         }
 
     def test_no_new_orm_model_or_migration_is_added(self) -> None:
