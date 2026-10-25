@@ -1,7 +1,7 @@
 # 📘 Admin Guide — Coach Web
 
 **Audience:** @devops, @architect, @fpittelo  
-**Last updated:** 2026-10-10
+**Last updated:** 2026-10-25
 
 > **Deployment model: ADR-007 — Local-First** (`docs/architecture.md` §10). The local Docker host on the workstation is the deployment target for the dev, qa, and prod lanes. The GCP Cloud Run topology is retired (Sprint 08, #64–#68) and is decommissioned via #111.
 
@@ -125,6 +125,7 @@ What the unit actually recovers: the compose `up -d` runs once at boot (without 
 | Supervisor | `systemctl --user` — **one supervisor only**: `lane.sh prod up\|down` is refused with a pointer here |
 | Boot without login | `loginctl enable-linger "$USER"` (required; the installer asserts it and refuses to install without it) |
 | Docker race | bounded `ExecStartPre` retry (30 × 2 s) before `up`, with `TimeoutStartSec=1200` above it — docker is a *system* unit and a user unit cannot order against it |
+| Checkout guard | the **first** `ExecStartPre` runs `scripts/repo-clean-check.sh`: the lane boots **only** from a clean checkout of `main` whose `HEAD` equals the last-known `origin/main`. A dirty or developer-branch tree fails the boot loudly instead of running unreviewed host-side code (#344) |
 | Shared lock | start **and** stop take the auto-update lock (`/run/user/%U/coach-web-prod.lock`, C3) with `flock -w 900`: the lane waits for an in-flight update tick instead of racing it; `TimeoutStopSec=1200` so a stop can wait too |
 | Secrets | `.env.prod` is passed to compose via `--env-file` only — never `EnvironmentFile=`, never printed, never copied (C4) |
 
@@ -174,6 +175,7 @@ Disables and removes all three units — the auto-update timer first (so no upda
 | **Unit runs an old checkout** | The checkout moved/renamed after install (the unit hardcodes the absolute repo path) | Re-run `./scripts/prod-install.sh` — it re-renders `@REPO_ROOT@` |
 | **`systemctl --user` cannot connect** | No user manager in the session | Log in (or enable linger) so `systemd --user` is running |
 | **Unit failed repeatedly** | `StartLimitBurst=3` in 300 s reached — systemd stopped retrying | `systemctl --user reset-failed coach-web`, fix the cause, `systemctl --user restart coach-web` |
+| **`repo-clean-check` ERROR in `journalctl --user -u coach-web` or `-u coach-web-update`** | The shared checkout is on a feature branch, has tracked changes, or its `HEAD` differs from the last-known `origin/main` (#344) | `git -C <repo> checkout main && git -C <repo> pull --ff-only`, then `systemctl --user reset-failed coach-web && systemctl --user restart coach-web`; the update timer retries on its next tick |
 
 ---
 
@@ -187,12 +189,34 @@ Since v0.14.0 a tag is the whole rollout: `coach-web-update.timer` runs `scripts
 | Cadence | 5 min after boot and after each completed run (`RandomizedDelaySec=30`) |
 | Convergence | the digest of `ghcr.io/fpittelo/coach-web:prod`, and **only when** it equals the digest of the latest GitHub release tag (provenance gate, C1) |
 | No-op cost | one registry digest resolution — no pull, no container restart |
-| Order of operations | provenance → **pull the verified digest** → measure + snapshot the database → atomic `.env.prod` rewrite → recreate → gate. `.env.prod` is only touched once the image is local, so a registry failure leaves it byte-identical. |
+| Order of operations | **checkout guard** → provenance → **pull the verified digest** → measure + snapshot the database → atomic `.env.prod` rewrite → recreate → gate. `.env.prod` is only touched once the image is local, so a registry failure leaves it byte-identical. |
 | Gate | 3/3 services healthy ≤ 120 s **and** `/healthz` reporting the release version; otherwise automatic rollback to the previous digest |
 | Snapshot | encrypted pre-swap dump (`python -m coach_web.maintenance backup`) in `~/.local/state/coach-web/snapshots/` (mode 600, last 4 kept) |
 | Lock | `/run/user/<uid>/coach-web-prod.lock` (`$XDG_RUNTIME_DIR`, C3). Take it: the update tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop/restart (via `flock -w 900`) and `prod-update.sh --rollback`/`--force`. Contention: the tick **skips** and exits 0 (nothing touched); the preflight **refuses** to start (exit 1); the unit and the operator commands **wait** up to 900 s, then fail. |
 | State | `~/.local/state/coach-web/update-state.json` (mode 600): last run, outcome, consecutive-failure streak |
 | Secret hygiene | `.env.prod` is only ever passed to compose as `--env-file`; the updater logs the public image digest and never the file, and never runs `docker compose config` (C4) |
+
+### Checkout guard — why the tree must stay clean (#344)
+
+The supervisor and the updater run **docker-group-privileged code straight from the developer working tree** (`@REPO_ROOT@`). During the v0.14.0 rollout the tree was checked out on a review-pending branch, so unreviewed host-side code performed the production swap. The checkout guard closes that supply-chain hole without a new component: `scripts/repo-clean-check.sh` is the first thing both the updater and the boot unit (`coach-web.service`, `ExecStartPre`) run.
+
+It refuses unless **all three** conditions hold:
+
+1. the path is a git work tree;
+2. the working tree has **no tracked modifications** (`git status --porcelain --untracked-files=no` empty) — **untracked files are allowed**, they cannot change a tracked script;
+3. the checkout is on **`main`** and `HEAD` equals the **last-known** `refs/remotes/origin/main`.
+
+On any violation the guard prints one line naming the failed condition and the fix, the updater records `reason=checkout-guard` in `~/.local/state/coach-web/update-state.json`, and it exits non-zero **before any registry, pull or docker call** — the lane is untouched. Example:
+
+```
+[prod-update] [repo-clean-check] ERROR: checkout is on 'fix/342-snapshot-extraction', not 'main' — prod tooling requires a clean checkout of 'main' at origin/main in /home/frede/projects/HOME/coach-web; fix: git -C … checkout main && git -C … pull --ff-only
+```
+
+Fix: `git checkout main && git pull --ff-only` in the checkout. A checkout on a feature branch, a mid-rebase tree or a stale clone all fail the same way.
+
+- **`--force` never bypasses the guard.** `--force` skips the no-op check and the C8 pause; it does **not** skip the checkout guard — unreviewed code must never run regardless of operator intent. `--rollback` may run from any *clean* state, but still requires a clean tree.
+- **Residual window (stale ref).** The guard never fetches (a fetch is a network op). It compares `HEAD` to the **last-fetched** `origin/main`, so a checkout whose `origin/main` ref is stale could pass while a newer release exists; the normal workflow (`git pull --ff-only` on `main`) keeps the ref current, and a genuinely dirty/foreign tree is still refused. The ref refreshes on the next fetch/pull.
+- **Boot impact.** A dirty tree now **fails the boot unit** (`StartLimitBurst=3` then systemd gives up) instead of starting the lane from unreviewed files. Keep the shared checkout clean — that is a deliberate availability-for-safety trade-off.
 
 ### Watch the automatic path
 
@@ -504,4 +528,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-25 (issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-10-25 (issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_

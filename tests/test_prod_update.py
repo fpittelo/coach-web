@@ -35,6 +35,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 CORE_PATH = SCRIPTS_DIR / "prod_update.py"
 ENTRYPOINT = SCRIPTS_DIR / "prod-update.sh"
+CHECK_GUARD = SCRIPTS_DIR / "repo-clean-check.sh"
 PREFLIGHT = SCRIPTS_DIR / "e2e-preflight.sh"
 LANE_UNIT_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "coach-web.service.in"
 
@@ -474,6 +475,34 @@ class TestFailureStreak:
         with pytest.raises(UpdateError):
             CORE.next_state(None, outcome="maybe", now=LAST_RUN)
 
+    def test_a_failure_reason_round_trips_and_a_success_clears_it(self, tmp_path: Path) -> None:
+        """#344: the state file names the failed condition (e.g. checkout-guard)."""
+        state_file = tmp_path / "update-state.json"
+        failed = CORE.next_state(None, outcome="failure", now=LAST_RUN, reason="checkout-guard")
+        assert failed.reason == "checkout-guard"
+        CORE.write_state(state_file, failed)
+        assert CORE.read_state(state_file) == failed
+        assert "checkout-guard" in state_file.read_text(encoding="utf-8")
+        succeeded = CORE.next_state(
+            failed, outcome="success", now=LAST_RUN, reason="checkout-guard"
+        )
+        assert succeeded.reason is None
+
+    def test_a_non_string_reason_is_no_history(self, tmp_path: Path) -> None:
+        state_file = tmp_path / "update-state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "last_run": LAST_RUN,
+                    "outcome": "failure",
+                    "consecutive_failures": 1,
+                    "reason": 7,
+                }
+            ),
+            encoding="utf-8",
+        )
+        assert CORE.read_state(state_file) is None
+
     def test_state_round_trips_owner_only(self, tmp_path: Path) -> None:
         state_file = tmp_path / "state" / "update-state.json"
         state = CORE.next_state(None, outcome="failure", now=LAST_RUN)
@@ -594,6 +623,24 @@ class TestCliContract:
         )
         assert "consecutive_failures=0" in capsys.readouterr().out
 
+    def test_state_record_tags_a_failure_reason(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#344: `state-record --reason TAG` records the failed condition."""
+        state_file = tmp_path / "update-state.json"
+        argv = [
+            "state-record",
+            "--state-file",
+            str(state_file),
+            "--outcome",
+            "failure",
+            "--reason",
+            "checkout-guard",
+        ]
+        assert CORE.main(argv) == 0
+        assert "reason=checkout-guard" in capsys.readouterr().out
+        assert json.loads(state_file.read_text(encoding="utf-8"))["reason"] == "checkout-guard"
+
     def test_snapshot_check_covers_both_phases(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert CORE.main(["snapshot-check", "--bytes", "4096"]) == 0
         assert capsys.readouterr().out.startswith("snapshot fits")
@@ -645,6 +692,28 @@ class TestScriptGuards:
     def test_entrypoint_exists_and_is_executable(self) -> None:
         assert ENTRYPOINT.is_file()
         assert ENTRYPOINT.stat().st_mode & 0o111
+
+    def test_checkout_guard_exists_and_is_executable(self) -> None:
+        """#344: the shared guard is a committed, executable script."""
+        assert CHECK_GUARD.is_file()
+        assert CHECK_GUARD.stat().st_mode & 0o111
+
+    def test_checkout_guard_passes_bash_syntax_check(self) -> None:
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(CHECK_GUARD)], check=False, capture_output=True, text=True
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_entrypoint_invokes_the_checkout_guard(self) -> None:
+        """#344: the updater runs the guard and records the failed condition."""
+        directives = self._directives()
+        assert "repo-clean-check.sh" in directives
+        assert "record failure checkout-guard" in directives
+
+    def test_boot_unit_applies_the_same_checkout_guard(self) -> None:
+        """#344: a dirty tree cannot change boot behaviour either."""
+        unit = LANE_UNIT_TEMPLATE.read_text(encoding="utf-8")
+        assert "ExecStartPre=/bin/bash @REPO_ROOT@/scripts/repo-clean-check.sh" in unit
 
     def test_entrypoint_passes_a_bash_syntax_check(self) -> None:
         result = subprocess.run(
@@ -873,9 +942,10 @@ class ProdUpdateSandbox:
         self.bin_dir.mkdir()
         self.home.mkdir()
         self.run_dir.mkdir()
-        for name in ("prod-update.sh", "prod_update.py"):
+        for name in ("prod-update.sh", "prod_update.py", "repo-clean-check.sh"):
             shutil.copy2(SCRIPTS_DIR / name, self.repo / "scripts" / name)
-        (self.repo / "scripts" / "prod-update.sh").chmod(0o755)
+        for name in ("prod-update.sh", "repo-clean-check.sh"):
+            (self.repo / "scripts" / name).chmod(0o755)
         for name in ("compose.yaml", "compose.prod.yml"):
             (self.repo / name).touch()
         self.log.touch()
@@ -883,6 +953,47 @@ class ProdUpdateSandbox:
             shim = self.bin_dir / name
             shim.write_text(source, encoding="utf-8")
             shim.chmod(0o755)
+        self._init_git()
+
+    def _git(self, *args: str) -> None:
+        """Run git in the sandbox repo with a hermetic, host-config-free env."""
+        env = dict(os.environ)
+        env["GIT_CONFIG_GLOBAL"] = os.devnull
+        env["GIT_CONFIG_SYSTEM"] = os.devnull
+        env["GIT_AUTHOR_NAME"] = env["GIT_COMMITTER_NAME"] = "sandbox"
+        env["GIT_AUTHOR_EMAIL"] = env["GIT_COMMITTER_EMAIL"] = "sandbox@example.invalid"
+        git = shutil.which("git")
+        assert git is not None, "git must be available for the #344 checkout-guard tests"
+        subprocess.run(
+            [git, *args], cwd=self.repo, env=env, check=True, capture_output=True, text=True
+        )
+
+    def _init_git(self) -> None:
+        """Make the sandbox repo a clean checkout of `main` at origin/main (#344).
+
+        Every sandbox test now crosses the checkout guard, so the fixture models
+        the legitimate case: branch `main`, no tracked changes, HEAD == the
+        last-known `refs/remotes/origin/main`.
+        """
+        self._git("init", "-q")
+        self._git("symbolic-ref", "HEAD", "refs/heads/main")
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "sandbox", "--no-gpg-sign")
+        self._git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+    def dirty_tracked_file(self) -> None:
+        """Introduce an unstaged modification to a tracked file (#344 AC3)."""
+        (self.repo / "compose.yaml").write_text("dirty\n", encoding="utf-8")
+
+    def switch_branch(self, name: str) -> None:
+        """Check out a new branch off the sandbox trunk (#344 AC3)."""
+        self._git("checkout", "-q", "-b", name)
+
+    def advance_head(self) -> None:
+        """Commit on main so HEAD no longer equals origin/main (#344 AC3)."""
+        (self.repo / "compose.yaml").write_text("ahead\n", encoding="utf-8")
+        self._git("add", "compose.yaml")
+        self._git("commit", "-q", "-m", "ahead", "--no-gpg-sign")
 
     @property
     def script(self) -> Path:
@@ -939,6 +1050,18 @@ class ProdUpdateSandbox:
             timeout=120,
         )
 
+    def run_guard(self) -> subprocess.CompletedProcess[str]:
+        """Run the #344 checkout guard directly against the sandbox repo."""
+        return subprocess.run(
+            ["/bin/bash", str(self.repo / "scripts" / "repo-clean-check.sh"), str(self.repo)],
+            cwd=self.repo,
+            env=self.env(),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
     def start(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
         """Start the entrypoint without waiting (lock-contention tests)."""
         return subprocess.Popen(
@@ -974,6 +1097,10 @@ class ProdUpdateSandbox:
         state: dict[str, str] = json.loads(self.state_file.read_text(encoding="utf-8"))
         return state["outcome"]
 
+    def state_reason(self) -> str | None:
+        state: dict[str, str | None] = json.loads(self.state_file.read_text(encoding="utf-8"))
+        return state.get("reason")
+
     def snapshots(self) -> list[Path]:
         return sorted(self.snapshot_dir.glob("coach-*.backup"))
 
@@ -996,6 +1123,79 @@ def sandbox(tmp_path: Path) -> Iterator[ProdUpdateSandbox]:
     box = ProdUpdateSandbox(tmp_path)
     yield box
     box.close()
+
+
+class TestCheckoutGuard:
+    """#344: the updater must never execute unreviewed code from a dirty tree.
+
+    The v0.14.0 incident ran a review-pending branch checked out in the shared
+    working tree. Each violation must abort before any registry or docker call,
+    name the condition and the fix, record ``reason=checkout-guard`` and exit
+    non-zero — ``--force`` and ``--rollback`` included.
+    """
+
+    def test_a_clean_checkout_on_main_passes(self, sandbox: ProdUpdateSandbox) -> None:
+        result = sandbox.run_guard()
+        assert result.returncode == 0, result.stderr
+        assert "ok: clean checkout of main" in result.stdout
+
+    def test_untracked_files_are_allowed(self, sandbox: ProdUpdateSandbox) -> None:
+        """Untracked files cannot change a tracked script, so they do not abort."""
+        sandbox.write_env_file(DIGEST_A)  # an untracked .env.prod
+        assert sandbox.run_guard().returncode == 0
+
+    def test_the_message_names_the_three_conditions_and_the_fix(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        sandbox.switch_branch("fix/some-review-pending-branch")
+        result = sandbox.run_guard()
+        assert result.returncode != 0
+        assert "clean checkout of 'main' at origin/main" in result.stderr
+        assert "checkout main" in result.stderr and "pull --ff-only" in result.stderr
+
+    def test_a_dirty_tracked_file_aborts_before_any_mutation(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        sandbox.write_env_file(DIGEST_A)
+        sandbox.dirty_tracked_file()
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode != 0
+        assert "tracked changes" in result.stderr
+        assert sandbox.invocations() == [], "no registry or docker call may run"
+        assert sandbox.state_reason() == "checkout-guard"
+
+    def test_a_feature_branch_aborts_before_any_mutation(self, sandbox: ProdUpdateSandbox) -> None:
+        sandbox.write_env_file(DIGEST_A)
+        sandbox.switch_branch("fix/342-snapshot-extraction")
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode != 0
+        assert "not 'main'" in result.stderr
+        assert sandbox.invocations() == []
+        assert sandbox.state_reason() == "checkout-guard"
+
+    def test_a_stale_head_aborts_before_any_mutation(self, sandbox: ProdUpdateSandbox) -> None:
+        sandbox.write_env_file(DIGEST_A)
+        sandbox.advance_head()  # clean tree, on main, but ahead of origin/main
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode != 0
+        assert "origin/main" in result.stderr
+        assert sandbox.invocations() == []
+        assert sandbox.state_reason() == "checkout-guard"
+
+    def test_force_never_bypasses_the_guard(self, sandbox: ProdUpdateSandbox) -> None:
+        """--force skips the no-op/C8 pause, never the checkout guard."""
+        sandbox.switch_branch("fix/342-snapshot-extraction")
+        result = sandbox.run("--force", extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode != 0
+        assert "not 'main'" in result.stderr
+        assert sandbox.invocations() == []
+
+    def test_rollback_requires_a_clean_tree(self, sandbox: ProdUpdateSandbox) -> None:
+        sandbox.dirty_tracked_file()
+        result = sandbox.run("--rollback")
+        assert result.returncode != 0
+        assert "tracked changes" in result.stderr
+        assert sandbox.invocations() == []
 
 
 class TestEntrypointBehaviour:

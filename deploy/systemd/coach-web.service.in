@@ -20,6 +20,9 @@
 #        PATH, Restart + StartLimit*, TimeoutStartSec above the retry window.
 #   C7 — linger (set/enforced by the installer) widens boot scope to every
 #        enabled user unit; the installer prints that audit list.
+#   #344 — the first ExecStartPre refuses to boot from a dirty/foreign checkout
+#        (scripts/repo-clean-check.sh), so a developer branch checked out in the
+#        shared tree cannot change boot behaviour.
 
 [Unit]
 Description=Coach Web prod lane (docker compose project coach-web-prod)
@@ -40,6 +43,12 @@ Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 NoNewPrivileges=yes
 PrivateTmp=yes
 UMask=0077
+# #344: refuse to boot the lane from a dirty or foreign checkout. Runs BEFORE the
+# docker-readiness probe below, so a violated condition makes zero docker calls.
+# This unit is a second consumer of the prod repo files (compose*.yml); the same
+# guard protects the auto-update path. It aborts boot while the tree is dirty —
+# that is the point: an unreviewed checkout must not change boot behaviour.
+ExecStartPre=/bin/bash @REPO_ROOT@/scripts/repo-clean-check.sh
 # Bounded docker-readiness wait: 30 attempts x 2 s = 60 s of retrying, which
 # must fit inside TimeoutStartSec below (the default 90 s would SIGTERM the
 # loop and leave the lane down).

@@ -23,7 +23,7 @@ CLI — one verb per decision, called by ``scripts/prod-update.sh``:
     prod_update.py provenance   --prod-digest DIGEST --tag vX.Y.Z --tag-digest DIGEST
     prod_update.py rewrite      --env-file FILE (--digest DIGEST | --from-prev)
     prod_update.py state-check  --state-file FILE [--limit N]
-    prod_update.py state-record --state-file FILE --outcome success|failure
+    prod_update.py state-record --state-file FILE --outcome success|failure [--reason TAG]
     prod_update.py snapshot-check --bytes N [--artifact-bytes M]
     prod_update.py health-gate  --tag vX.Y.Z --ps-json FILE --healthz-json FILE
 
@@ -445,11 +445,17 @@ def health_gate(*, ps_json: str, healthz_json: str, tag: str) -> tuple[bool, str
 
 @dataclass(frozen=True)
 class UpdateState:
-    """The C8 bookkeeping: last run, its outcome, and the failure streak."""
+    """The C8 bookkeeping: last run, its outcome, the failure streak and reason.
+
+    ``reason`` is a short machine-readable tag for a *failed* run (e.g.
+    ``checkout-guard``, #344); it is ``None`` when a run did not carry one (a
+    success, or a failure the caller did not tag).
+    """
 
     last_run: str
     outcome: str
     consecutive_failures: int
+    reason: str | None = None
 
 
 def read_state(path: Path) -> UpdateState | None:
@@ -465,23 +471,39 @@ def read_state(path: Path) -> UpdateState | None:
         last_run: Any = data["last_run"]
         outcome: Any = data["outcome"]
         streak: Any = data["consecutive_failures"]
+        reason: Any = data.get("reason")
     except (OSError, ValueError, TypeError, KeyError):
         return None
     if not isinstance(last_run, str) or outcome not in OUTCOMES:
         return None
     if isinstance(streak, bool) or not isinstance(streak, int) or streak < 0:
         return None
-    return UpdateState(last_run=last_run, outcome=outcome, consecutive_failures=streak)
+    if reason is not None and not isinstance(reason, str):
+        return None
+    return UpdateState(
+        last_run=last_run, outcome=outcome, consecutive_failures=streak, reason=reason
+    )
 
 
-def next_state(previous: UpdateState | None, *, outcome: str, now: str) -> UpdateState:
-    """Return the state after a run with *outcome*: a success resets the streak."""
+def next_state(
+    previous: UpdateState | None, *, outcome: str, now: str, reason: str | None = None
+) -> UpdateState:
+    """Return the state after a run with *outcome*: a success resets the streak.
+
+    *reason* tags a failed run (e.g. ``checkout-guard``); a success never carries
+    one. The streak accumulates on failure and resets on success.
+    """
     if outcome not in OUTCOMES:
         raise UpdateError(f"unknown outcome {outcome!r} (expected one of {OUTCOMES})")
     streak = 0
     if outcome == "failure":
         streak = (previous.consecutive_failures if previous is not None else 0) + 1
-    return UpdateState(last_run=now, outcome=outcome, consecutive_failures=streak)
+    return UpdateState(
+        last_run=now,
+        outcome=outcome,
+        consecutive_failures=streak,
+        reason=reason if outcome == "failure" else None,
+    )
 
 
 def should_halt(state: UpdateState | None, *, limit: int = FAILURE_LIMIT) -> bool:
@@ -498,6 +520,7 @@ def write_state(path: Path, state: UpdateState) -> None:
                 "last_run": state.last_run,
                 "outcome": state.outcome,
                 "consecutive_failures": state.consecutive_failures,
+                "reason": state.reason,
             },
             indent=2,
             sort_keys=True,
@@ -571,11 +594,14 @@ def _state_check(args: argparse.Namespace) -> int:
 
 def _state_record(args: argparse.Namespace) -> int:
     """`state-record`: append this run's outcome to the C8 state file."""
-    state = next_state(read_state(Path(args.state_file)), outcome=args.outcome, now=now_utc())
+    state = next_state(
+        read_state(Path(args.state_file)), outcome=args.outcome, now=now_utc(), reason=args.reason
+    )
     write_state(Path(args.state_file), state)
     suffix = " — auto-update will pause until a --force run" if should_halt(state) else ""
+    reason = f" reason={state.reason}" if state.reason else ""
     print(
-        f"outcome={state.outcome} consecutive_failures={state.consecutive_failures} "
+        f"outcome={state.outcome}{reason} consecutive_failures={state.consecutive_failures} "
         f"last_run={state.last_run}{suffix}"
     )
     return 0
@@ -652,6 +678,11 @@ def _build_parser() -> argparse.ArgumentParser:
     state_record = sub.add_parser("state-record", help="C8: record this run's outcome.")
     state_record.add_argument("--state-file", required=True, help="C8 state file.")
     state_record.add_argument("--outcome", required=True, choices=OUTCOMES, help="Run outcome.")
+    state_record.add_argument(
+        "--reason",
+        default=None,
+        help="Short machine-readable tag for a failed run (e.g. checkout-guard, #344).",
+    )
 
     snapshot = sub.add_parser("snapshot-check", help="C6: snapshot ceiling / integrity.")
     snapshot.add_argument("--bytes", type=int, required=True, help="Raw database size in bytes.")
