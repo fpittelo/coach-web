@@ -283,6 +283,7 @@ class TestPeriodizationMigration:
             "plan_drafts",
             "debriefs",
             "week_adherence",
+            "agent_settings",
         }
 
     def test_phase_table_columns_match_the_madr008_schema(self, db_path: Path) -> None:
@@ -429,20 +430,21 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0006.
+        """Re-running upgrade head is a no-op and the version stays at 0007.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
         Superseded for #189: migration 0004 (debriefs) extends the chain.
         Superseded for #234: migration 0005 (week_adherence) extends the chain.
         Superseded for #243: migration 0006 (encrypted debrief RPE) extends
-        the chain.
+        the chain. Superseded for #361: migration 0007 (agent_settings)
+        extends the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0006"
+        assert version == "0007"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -1002,3 +1004,166 @@ class TestDebriefRpeEncryptionMigration:
             assert b'"rpe": 7' not in wal_raw
         finally:
             holder.close()
+
+
+# ---------------------------------------------------------------------------
+# Migration 0007 — agent_settings (MADR-0026, #361)
+# ---------------------------------------------------------------------------
+
+EXPECTED_AGENT_SETTINGS_COLUMNS = (
+    "id",
+    "athlete_id",
+    "orientation",
+    "verbosity",
+    "tone",
+    "updated_at",
+)
+
+AGENT_SETTINGS_ORIENTATION_LENGTH_CHECK = "length(orientation) <= 1500"
+AGENT_SETTINGS_VERBOSITY_CHECK = "verbosity IN ('concise', 'standard', 'detailed')"
+AGENT_SETTINGS_TONE_CHECK = "tone IN ('strict', 'balanced', 'supportive')"
+
+
+def _agent_settings_table_sql(db_path: Path) -> str:
+    """Return the CREATE TABLE statement text of agent_settings."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='agent_settings'"
+        ).fetchone()
+    assert row is not None, "agent_settings table is missing"
+    return str(row[0])
+
+
+def _agent_settings_column_flags(db_path: Path) -> dict[str, tuple[bool, bool]]:
+    """Return ``(notnull, is_pk)`` flags per column of agent_settings."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(agent_settings)").fetchall()
+    return {row[1]: (bool(row[3]), bool(row[5])) for row in rows}
+
+
+class TestAgentSettingsMigration:
+    """Migration 0007 adds the MADR-0026 agent_settings table (#361)."""
+
+    def test_upgrade_head_creates_agent_settings(self, db_path: Path) -> None:
+        """After upgrade head, agent_settings joins the domain tables (#361)."""
+        command.upgrade(alembic_config(), "head")
+
+        domain_tables = _table_names(db_path) - {"alembic_version", "sqlite_sequence"}
+        assert domain_tables == {
+            "athlete_objectives",
+            "periodization_phases",
+            "plan_drafts",
+            "debriefs",
+            "week_adherence",
+            "agent_settings",
+        }
+
+    def test_columns_match_the_madr0026_schema(self, db_path: Path) -> None:
+        """The column set matches the MADR-0026 schema sketch exactly, in order."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(agent_settings)").fetchall()
+            ]
+
+        assert tuple(columns) == EXPECTED_AGENT_SETTINGS_COLUMNS
+
+    def test_required_columns_are_not_null(self, db_path: Path) -> None:
+        """athlete_id and updated_at are NOT NULL (orientation/enums nullable)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _agent_settings_column_flags(db_path)
+        for column in ("athlete_id", "updated_at"):
+            assert flags[column][0] is True, column
+
+    def test_optional_columns_are_nullable(self, db_path: Path) -> None:
+        """orientation/verbosity/tone allow NULL (unset preferences)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _agent_settings_column_flags(db_path)
+        for column in ("orientation", "verbosity", "tone"):
+            assert flags[column][0] is False, column
+
+    def test_check_constraints_are_declared(self, db_path: Path) -> None:
+        """The MADR-0026 CHECK constraints and the athlete_id UNIQUE are declared."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _agent_settings_table_sql(db_path)
+        assert AGENT_SETTINGS_ORIENTATION_LENGTH_CHECK in sql
+        assert AGENT_SETTINGS_VERBOSITY_CHECK in sql
+        assert AGENT_SETTINGS_TONE_CHECK in sql
+        assert "uq_agent_settings_athlete_id" in sql
+
+    def test_verbosity_check_rejects_unknown_values(self, db_path: Path) -> None:
+        """Inserting a verbosity outside the enum fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="verbosity"):
+                conn.execute(
+                    "INSERT INTO agent_settings (athlete_id, verbosity, updated_at) "
+                    "VALUES (1, 'shouty', 'u')"
+                )
+
+    def test_tone_check_rejects_unknown_values(self, db_path: Path) -> None:
+        """Inserting a tone outside the enum fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="tone"):
+                conn.execute(
+                    "INSERT INTO agent_settings (athlete_id, tone, updated_at) "
+                    "VALUES (1, 'passive', 'u')"
+                )
+
+    def test_orientation_length_check_rejects_oversize(self, db_path: Path) -> None:
+        """Inserting orientation past 1500 characters fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="orientation"):
+                conn.execute(
+                    "INSERT INTO agent_settings (athlete_id, orientation, updated_at) "
+                    "VALUES (1, ?, 'u')",
+                    ("x" * 1501,),
+                )
+
+    def test_orientation_at_the_cap_is_accepted(self, db_path: Path) -> None:
+        """Exactly 1500 characters of orientation persist (the cap is inclusive)."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO agent_settings (athlete_id, orientation, updated_at) "
+                "VALUES (1, ?, 'u')",
+                ("x" * 1500,),
+            )
+            length = conn.execute(
+                "SELECT length(orientation) FROM agent_settings WHERE athlete_id = 1"
+            ).fetchone()[0]
+
+        assert length == 1500
+
+    def test_athlete_id_is_unique(self, db_path: Path) -> None:
+        """A second row for the same athlete fails the UNIQUE constraint."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute("INSERT INTO agent_settings (athlete_id, updated_at) VALUES (1, 'u')")
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute("INSERT INTO agent_settings (athlete_id, updated_at) VALUES (1, 'u2')")
+
+    def test_downgrade_to_0006_drops_the_table(self, db_path: Path) -> None:
+        """Downgrade 0007 → 0006 removes agent_settings (reversible, AC1)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "0006")
+
+        assert "agent_settings" not in _table_names(db_path)
+
+    def test_downgrade_to_base_drops_the_table(self, db_path: Path) -> None:
+        """Downgrade to base removes agent_settings (data-destructive by design)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "base")
+
+        assert "agent_settings" not in _table_names(db_path)
