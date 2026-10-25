@@ -104,13 +104,19 @@ AgentEventType = Literal[
     "rpe_request",
     "debrief_summary",
     "morning_briefing",
+    "warning",
     "done",
     "error",
 ]
 """Typed SSE event categories emitted by the agent loop.
 
 ``morning_briefing`` (#262) is emitted by the stream endpoint itself —
-the server-rendered greeting card, never model-streamed prose."""
+the server-rendered greeting card, never model-streamed prose.
+``warning`` (#349, MADR-0025 C7) is endpoint-emitted too: the redacted
+persistence-degrade frame (``{code, message}``, static text — no content,
+no key material) that opens the stream when a pre-stream persistence step
+fails, or closes it when the completion write degrades. The reply is the
+product — the warning never aborts the stream."""
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are Coach Web, an expert endurance cycling coach embedded in Frederic's "

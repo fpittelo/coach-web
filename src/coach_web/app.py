@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import uvicorn
-from cryptography.fernet import InvalidToken
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -58,6 +58,30 @@ from coach_web.briefing import (
     derive_morning_briefing,
 )
 from coach_web.config import Settings, get_settings
+from coach_web.conversation import (
+    ConversationThreadRow,
+    archive_thread,
+    create_thread,
+    get_active_thread,
+    list_last_messages,
+)
+from coach_web.conversation_api import (
+    DEGRADE_WARNING_CODE,
+    DEGRADE_WARNING_MESSAGE,
+    REHYDRATE_MESSAGE_LIMIT,
+    ConversationMessageOut,
+    ConversationPurgeRequest,
+    ConversationPurgeResponse,
+    ConversationResetResponse,
+    ConversationResponse,
+    SessionFactory,
+    TurnPersistence,
+    log_persistence_degrade,
+    open_turn_thread,
+    purge_athlete_conversations,
+    record_assistant_turn,
+    record_user_turn,
+)
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import (
     DEFAULT_ATHLETE_ID,
@@ -676,12 +700,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ) -> EventSourceResponse:
         """Stream the coach agent's reasoning, tool calls and plan over SSE.
 
-        The conversation is client-owned (nLPD ephemeral posture): the request
-        body carries the current ``message`` plus the replayed ``history``
-        (validated and capped by :class:`AgentStreamRequest`) and nothing is
-        persisted server-side. Message content travels in the POST body —
-        never in the URL or query string (#79). Native ``fetch``/ReadableStream
-        clients consume the typed events emitted by
+        The conversation is SERVER-OWNED (MADR-0025, #349): the request
+        body carries the current ``message`` plus the optional server-issued
+        ``thread_id`` — the legacy client-owned ``history`` replay is
+        retired (deleted and never read, cached clients tolerated via
+        ``extra="ignore"``). The server resolves or opens the athlete's
+        active thread (unknown/non-owned → 404 fail-closed, archived →
+        409), persists the user message BEFORE streaming, and persists the
+        assistant message exactly once on the clean ``done`` marker — the
+        finalization write after the event loop, never a partial, never on
+        a disconnect (the turn did not complete). Persistence failures
+        never abort the stream (C7): they degrade to stateless chat with a
+        redacted ``warning`` frame (static code + text, no content, no key
+        material). Message content travels in the POST body — never in the
+        URL or query string (#79). Native ``fetch``/ReadableStream clients
+        consume the typed events emitted by
         :meth:`coach_web.agent.CoachAgent.run`.
         """
         settings: Settings = request.app.state.settings
@@ -743,6 +776,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         iso_year, iso_week, _ = today.isocalendar()
         current_week_start, _ = week_bounds(f"{iso_year}-W{iso_week:02d}")
         athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        # Conversation persistence boundary (MADR-0025 C7, #349): thread
+        # resolution and the user-message write happen HERE, before the
+        # stream exists. Any infra failure degrades to stateless chat —
+        # the turn streams with a redacted warning frame instead of
+        # failing; the request-validation outcomes (unknown/non-owned →
+        # 404, archived → 409) are NOT infra failures and fail closed
+        # before any stream. The lane cipher joins this boundary: a
+        # missing/invalid key degrades exactly like an unreadable store.
+        session_factory: SessionFactory = request.app.state.db_session_factory
+        cipher: Fernet | None = None
+        try:
+            cipher = build_debrief_cipher(settings)
+        except EncryptionUnavailableError as exc:
+            log_persistence_degrade(exc)
+        turn_thread: ConversationThreadRow | None = None
+        if cipher is not None:
+            turn_outcome = await open_turn_thread(
+                session_factory,
+                athlete_id=athlete_id,
+                thread_id=payload.thread_id,
+            )
+            turn_thread = turn_outcome.thread
+            if turn_thread is not None:
+                user_write = await record_user_turn(
+                    session_factory,
+                    athlete_id=athlete_id,
+                    thread=turn_thread,
+                    cipher=cipher,
+                    content=payload.message,
+                )
+            else:
+                user_write = TurnPersistence(persisted=False, degraded=True)
+        else:
+            user_write = TurnPersistence(persisted=False, degraded=True)
+        conversation_degraded = user_write.degraded or (cipher is None)
         approved_week_row: PlanDraftRow | None = None
         debrief_rpes: dict[str, int] = {}
         store_ok = True
@@ -897,9 +965,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ("morning_briefing",) if briefing is not None else ()
         )
 
+        # Completion tracking for the finalization write (#349, AC2): the
+        # terminal ``done`` event is the completed-turn marker; a typed
+        # ``error`` event marks a failed turn whose (partial) done message
+        # must never be persisted. The assistant write itself runs in the
+        # generator's finalization path — after the event loop ended
+        # NORMALLY. A client disconnect closes the generator mid-turn: the
+        # turn did not complete, so nothing assistant-side is persisted and
+        # the already-persisted user row remains the in-flight record
+        # (documented decision, MADR-0025 slice #349).
+        assistant_reply: str | None = None
+        saw_error = False
+
+        def _degrade_warning_event() -> AgentEvent:
+            """Build the stable, redacted persistence-degrade frame (C7)."""
+            return AgentEvent(
+                type="warning",
+                data={"code": DEGRADE_WARNING_CODE, "message": DEGRADE_WARNING_MESSAGE},
+            )
+
         async def event_generator() -> AsyncIterator[ServerSentEvent]:
+            nonlocal assistant_reply, saw_error
             try:
                 async with agent:
+                    if conversation_degraded:
+                        warning = _degrade_warning_event()
+                        yield ServerSentEvent(event=warning.type, data=warning.model_dump_json())
                     if briefing is not None:
                         greeting = AgentEvent(
                             type="morning_briefing",
@@ -908,16 +999,169 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         yield ServerSentEvent(event=greeting.type, data=greeting.model_dump_json())
                     async for event in agent.run(
                         payload.message,
-                        history=payload.history,
                         pre_emitted_outcomes=pre_emitted_outcomes,
                     ):
+                        if event.type == "error":
+                            saw_error = True
+                        elif event.type == "done" and isinstance(event.data.get("message"), str):
+                            assistant_reply = event.data["message"]
                         yield ServerSentEvent(event=event.type, data=event.model_dump_json())
+                    # Finalization (normal loop exit only — a disconnect or a
+                    # mid-stream exception never reaches this point): persist
+                    # the assistant message exactly once. The write path is
+                    # degrade-wrapped and cannot raise into the generator
+                    # (C7); a degrade surfaces as a trailing warning frame.
+                    # An empty ``done`` message (the model streamed nothing)
+                    # persists nothing — an empty assistant row would be
+                    # transcript noise.
+                    if (
+                        turn_thread is not None
+                        and cipher is not None
+                        and not saw_error
+                        and assistant_reply
+                    ):
+                        completion = await record_assistant_turn(
+                            session_factory,
+                            athlete_id=athlete_id,
+                            thread=turn_thread,
+                            cipher=cipher,
+                            content=assistant_reply,
+                        )
+                        if completion.degraded:
+                            warning = _degrade_warning_event()
+                            yield ServerSentEvent(
+                                event=warning.type, data=warning.model_dump_json()
+                            )
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)
                 failure = AgentEvent(type="error", data={"message": str(exc)})
                 yield ServerSentEvent(event=failure.type, data=failure.model_dump_json())
 
         return EventSourceResponse(event_generator())
+
+    @application.get("/api/conversation", response_model=ConversationResponse, tags=["agent"])
+    async def get_conversation(request: Request) -> ConversationResponse:
+        """Rehydrate the active conversation thread (MADR-0025, #349 AC3).
+
+        Returns the session athlete's ACTIVE thread metadata plus its last
+        N messages, oldest→newest, decrypted server-side (the stored copies
+        stay encrypted at rest, C1). No open thread → the empty state (null
+        metadata, no messages). Scoping is the session ``athlete_id`` only
+        (C4); a wrong/rotated key or an unreadable/tampered store fails
+        CLOSED with the static 503 (no partial garbage is ever served).
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        try:
+            async with request.app.state.db_session_factory() as session:
+                cipher = build_debrief_cipher(settings)
+                thread = await get_active_thread(session, athlete_id=athlete_id)
+                if thread is None:
+                    return ConversationResponse()
+                messages = await list_last_messages(
+                    session,
+                    athlete_id=athlete_id,
+                    thread_id=thread.id,
+                    limit=REHYDRATE_MESSAGE_LIMIT,
+                    cipher=cipher,
+                )
+        except (
+            OSError,
+            SQLAlchemyError,
+            ValidationError,
+            EncryptionUnavailableError,
+            InvalidToken,
+        ) as exc:
+            # Fail-closed read boundary: the rehydrate is a convenience —
+            # a broken store answers 503, never partial or garbage content.
+            logger.warning("Conversation rehydrate unavailable (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        return ConversationResponse(
+            thread_id=thread.id,
+            started_at=thread.started_at,
+            last_active_at=thread.last_active_at,
+            messages=[
+                ConversationMessageOut(
+                    role=message.role,
+                    content=message.content,
+                    seq=message.seq,
+                    created_at=message.created_at,
+                )
+                for message in messages
+            ],
+        )
+
+    @application.post(
+        "/api/conversation/reset", response_model=ConversationResetResponse, tags=["agent"]
+    )
+    async def reset_conversation(request: Request) -> ConversationResetResponse:
+        """Archive the active thread and open a fresh one (MADR-0025, #349 AC4).
+
+        Backs "New chat": the old thread becomes read-only (its id keeps
+        answering 409 on write attempts), the response returns the new
+        active thread id. With no open thread this simply opens the first
+        one (``archived_thread_id: null``). The session athlete's rows
+        only (C4). Fails closed with the static 503 on an unreadable store.
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        try:
+            async with request.app.state.db_session_factory() as session:
+                thread = await get_active_thread(session, athlete_id=athlete_id)
+                archived_id: int | None = None
+                if thread is not None:
+                    archived = await archive_thread(
+                        session, athlete_id=athlete_id, thread_id=thread.id
+                    )
+                    archived_id = archived.id if archived is not None else None
+                fresh = await create_thread(session, athlete_id=athlete_id)
+        except (
+            OSError,
+            SQLAlchemyError,
+            ValidationError,
+            EncryptionUnavailableError,
+            InvalidToken,
+        ) as exc:
+            logger.warning("Conversation reset unavailable (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        return ConversationResetResponse(archived_thread_id=archived_id, thread_id=fresh.id)
+
+    @application.post(
+        "/api/conversation/purge", response_model=ConversationPurgeResponse, tags=["agent"]
+    )
+    async def purge_conversation(
+        request: Request,
+        payload: ConversationPurgeRequest,
+    ) -> ConversationPurgeResponse:
+        """Delete ALL threads and messages of the session athlete (AC4, C4/C6).
+
+        Destructive and irrevocable — the body MUST carry the explicit
+        ``confirm: true`` flag (validated on the model; anything else
+        answers the static 422). The delete is strictly scoped by the
+        session ``athlete_id`` and reports COUNTS only (C3 — no content
+        ever leaves the store). Fails closed with the static 503 on an
+        unreadable store.
+        """
+        settings: Settings = request.app.state.settings
+        athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
+        try:
+            async with request.app.state.db_session_factory() as session:
+                threads_deleted, messages_deleted = await purge_athlete_conversations(
+                    session, athlete_id=athlete_id
+                )
+        except (
+            OSError,
+            SQLAlchemyError,
+            ValidationError,
+            EncryptionUnavailableError,
+            InvalidToken,
+        ) as exc:
+            logger.warning("Conversation purge unavailable (%s)", type(exc).__name__)
+            raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        return ConversationPurgeResponse(
+            threads_deleted=threads_deleted,
+            messages_deleted=messages_deleted,
+        )
 
     @application.post("/api/plan/approve", response_model=PlanApprovalResponse, tags=["plan"])
     async def approve_plan_endpoint(

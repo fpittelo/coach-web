@@ -813,7 +813,13 @@ class TestDivergenceDigestEndpoint:
         body = await self._stream(client)
 
         assert "event: done" in body
-        assert counting.calls == 1
+        # C-S2-4 for the DIGEST boundary: exactly one session serves every
+        # digest read of the turn. Superseded for #349 (MADR-0025): the
+        # conversation persistence boundary opens its own sessions —
+        # thread resolve + user write (one), assistant completion write
+        # (one) — a separate C7 failure posture, deliberately not shared
+        # with the digest reads. One clean turn opens 1 + 3 sessions.
+        assert counting.calls == 4
         prompt = agent.captured_prompt
         assert prompt is not None
         # The shared session served the divergence read too.
@@ -851,6 +857,9 @@ class TestDivergenceDigestScope:
         (``/api/admin/agent-settings``) is sanctioned surface outside the
         digest's scope; its contract is pinned by
         :mod:`tests.test_agent_settings_api`.
+        Superseded for #349 (MADR-0025): the server-owned conversation
+        surface (``/api/conversation`` GET/reset/purge) is sanctioned
+        surface; its contract is pinned by :mod:`tests.test_conversation_api`.
         """
         app = create_app(settings)
         api_paths = {
@@ -868,6 +877,9 @@ class TestDivergenceDigestScope:
             "/api/debrief",
             "/api/debrief/pending",
             "/api/admin/agent-settings",
+            "/api/conversation",
+            "/api/conversation/reset",
+            "/api/conversation/purge",
         }
 
     def test_no_new_orm_model_or_migration_is_added(self) -> None:

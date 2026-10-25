@@ -108,37 +108,64 @@ AGENT_MESSAGE_MAX_LENGTH = 8000
 """Hard cap on a single user message (characters) at the SSE boundary."""
 
 AGENT_HISTORY_MAX_ENTRIES = 10
-"""Hard cap on replayed history entries enforced server-side (#79)."""
+"""Legacy client-side replay cap, retired with the ``history`` field (#349).
+
+Kept only as the documented cap vocabulary of :class:`ChatMessage` (the
+agent-loop seam message type); the wire no longer accepts replayed
+history (MADR-0025, #349).
+"""
 
 
 class ChatMessage(BaseModel):
-    """A single chat message exchanged with the coach."""
+    """A single chat message exchanged with the coach.
+
+    No longer a wire type (#349): the client-owned replay is retired and
+    this model remains the internal seam type of
+    :meth:`coach_web.agent.CoachAgent.run` — #350 feeds it from the
+    server-owned store instead of the request body.
+    """
 
     role: Literal["user", "assistant"] = Field(..., description="Message role: user or assistant")
     content: str = Field(
         ...,
         max_length=AGENT_MESSAGE_MAX_LENGTH,
-        description=(
-            "Message content, capped per entry: 10 unbounded history entries "
-            "would bypass the message cap entirely (STRIDE #87)"
-        ),
+        description=("Message content, capped per entry (bounded context, STRIDE #87)"),
     )
 
 
 class AgentStreamRequest(BaseModel):
-    """Payload for ``POST /api/agent/stream`` (multi-turn SSE transport, #79).
+    """Payload for ``POST /api/agent/stream`` (server-owned threads, #349).
 
-    The conversation is client-owned: ``history`` replays the prior turns and
-    nothing is persisted server-side (nLPD ephemeral posture). Roles are
-    restricted to ``user``/``assistant`` and the entry count is capped here —
-    client-forged history is a prompt-injection surface (STRIDE #87).
+    The conversation is SERVER-OWNED (MADR-0025): the request carries the
+    current ``message`` plus the optional, opaque, SERVER-ISSUED
+    ``thread_id`` — nothing client-authored reaches the prompt. The legacy
+    ``history`` replay field is DELETED and never read: forged assistant
+    turns retire as an injection surface (STRIDE #87).
+
+    Deliberately NOT ``model_config = extra="forbid"`` (MADR-0025): a
+    cached old client that still sends ``history`` must keep working
+    through the transition, while the injection path stays closed
+    regardless — unknown keys (``history`` included) are ignored, never
+    honored. The documented contract is ``message`` + optional
+    ``thread_id`` (+ the ``briefing`` flag, #262).
     """
+
+    model_config = {"extra": "ignore"}
 
     message: str = Field(
         ...,
         min_length=1,
         max_length=AGENT_MESSAGE_MAX_LENGTH,
         description="Current user message for the coach agent",
+    )
+    thread_id: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional server-issued thread id (opaque) to continue an owned, "
+            "active thread; omitted → the server resolves or opens the "
+            "athlete's active thread"
+        ),
     )
     briefing: bool = Field(
         default=False,
@@ -147,11 +174,6 @@ class AgentStreamRequest(BaseModel):
             "#262). The flag is client-derived (R3 — not a security "
             "boundary); the server derives the card statelessly per request."
         ),
-    )
-    history: list[ChatMessage] = Field(
-        default_factory=list,
-        max_length=AGENT_HISTORY_MAX_ENTRIES,
-        description="Prior conversation turns (oldest first), capped at 10",
     )
 
     @field_validator("message")
