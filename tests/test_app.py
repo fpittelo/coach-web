@@ -1,5 +1,6 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
+import re
 from collections.abc import AsyncIterator, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -233,13 +234,19 @@ class TestSignInAffordance:
         assert self.SIGNIN_SLOT_PREFIX not in response.text
 
     def test_signin_link_sits_in_the_identity_bar(self, auth_client: TestClient) -> None:
-        """The affordance renders inside the identity bar's actions group."""
+        """The affordance renders inside the actions group, last visible (#340)."""
         html = auth_client.get("/").text
 
         actions_at = html.index('<div class="identity-actions">')
         link_at = html.index(self.INJECTED_SIGNIN_LINK)
         actions_close = html.index("</div>", actions_at)
         assert actions_at < link_at < actions_close
+
+        # #340 AC1: the link is the LAST visible element of the actions group.
+        # Trailing HTML comments (the untouched #319 avatar-slot marker) are
+        # not visible elements, and the group's own closing tag is excluded.
+        tail = html[link_at + len(self.INJECTED_SIGNIN_LINK) : actions_close]
+        assert re.findall(r"<(?!!--)[a-zA-Z/]", tail) == []
 
     def test_authenticated_root_renders_the_fallback_avatar(self, auth_client: TestClient) -> None:
         """#319 supersedes byte-for-byte: a signed-in session renders the avatar.

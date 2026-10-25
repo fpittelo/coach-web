@@ -101,7 +101,14 @@
             <span class="product-name">Coach Web</span>
           </div>
           <div class="identity-actions">
-            <!-- #180 signin-slot: swapped for the sign-in link by the / route when it renders an unauthenticated session (auth enabled). -->
+            <button
+              class="button button--ghost new-chat"
+              type="button"
+              aria-label="New chat: clear the conversation and reset the session"
+              @click="resetChat()"
+            >
+              New chat
+            </button>
             <button
               class="button button--ghost settings-toggle"
               type="button"
@@ -113,14 +120,7 @@
             >
               Settings
             </button>
-            <button
-              class="button button--ghost new-chat"
-              type="button"
-              aria-label="New chat: clear the conversation and reset the session"
-              @click="resetChat()"
-            >
-              New chat
-            </button>
+            <!-- #180 signin-slot: swapped for the sign-in link by the / route when it renders an unauthenticated session (auth enabled). -->
             <!-- #319 avatar-slot: swapped for the profile avatar by the / route when it renders an authenticated session (auth enabled). -->
           </div>
         </div>

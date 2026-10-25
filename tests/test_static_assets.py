@@ -710,6 +710,26 @@ class TestIdentityBarContract:
         assert ">Coach Web</span>" in header
         assert len(re.findall(r">\s*New chat\s*</button>", html)) == 1
 
+    def test_identity_actions_order_new_chat_settings_identity_slot(self) -> None:
+        """#340 AC5: source order is New chat → Settings → the identity slot.
+
+        The actions group renders ``[New chat] [Settings] [identity]``: the
+        New chat button is declared before the Settings button, and the #180
+        sign-in slot closes the group so the injected link (unauthenticated)
+        or the #319 avatar (signed in) sits flush right.
+        """
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        actions_at = html.index('<div class="identity-actions">')
+        actions_close = html.index("</div>", actions_at)
+        actions = html[actions_at:actions_close]
+
+        assert actions.index("button--ghost new-chat") < actions.index(
+            "button--ghost settings-toggle"
+        )
+        assert actions.index("button--ghost settings-toggle") < actions.index(
+            "<!-- #180 signin-slot:"
+        )
+
     def test_identity_bar_sits_inside_centered_column(self) -> None:
         """The identity bar is the content of the centered sticky header."""
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
