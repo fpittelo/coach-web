@@ -24,6 +24,7 @@ CLI — one verb per decision, called by ``scripts/prod-update.sh``:
     prod_update.py rewrite      --env-file FILE (--digest DIGEST | --from-prev)
     prod_update.py state-check  --state-file FILE [--limit N]
     prod_update.py state-record --state-file FILE --outcome success|failure
+    prod_update.py snapshot-check --bytes N [--artifact-bytes M]
     prod_update.py health-gate  --tag vX.Y.Z --ps-json FILE --healthz-json FILE
 
 Exit codes: ``0`` the verb succeeded (and, for the gate verbs, the decision is
@@ -69,6 +70,13 @@ STATE_DIR_MODE = 0o700
 
 FAILURE_LIMIT = 12
 """Consecutive failures after which the updater pauses instead of hammering (C8)."""
+
+SNAPSHOT_TMPFS_BYTES = 64 * 1024 * 1024
+"""The coach-web container's ``/tmp`` tmpfs (compose.yaml: ``64m``) — the C6 staging area."""
+
+FERNET_EXPANSION_NUM = 4
+FERNET_EXPANSION_DEN = 3
+"""Fernet/base64 expansion: the sealed artifact is ~4/3 of the raw database (C6)."""
 
 EXPECTED_SERVICES = frozenset({"coach-web", "coach-mcp", "github-mcp"})
 """The exact prod-lane service set the health gate requires (AC3)."""
@@ -302,6 +310,64 @@ def restore_env_digest(env_path: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# C6: the pre-swap snapshot guards
+# --------------------------------------------------------------------------- #
+
+
+def snapshot_artifact_bytes(raw_bytes: int) -> int:
+    """Estimate the sealed artifact size for a *raw_bytes* database.
+
+    The artifact is a Fernet envelope: base64 expands the payload by 4/3, plus a
+    few bytes of version/timestamp/HMAC. Rounded up, so the estimate is an upper
+    bound for the tmpfs pre-flight (C6).
+    """
+    return -(-raw_bytes * FERNET_EXPANSION_NUM // FERNET_EXPANSION_DEN)
+
+
+def snapshot_fits(
+    raw_bytes: int, *, capacity_bytes: int = SNAPSHOT_TMPFS_BYTES
+) -> tuple[bool, str]:
+    """C6 pre-flight: the sealed snapshot must fit the container's ``/tmp`` tmpfs.
+
+    The artifact is staged on the container's tmpfs before being copied out, so
+    the effective ceiling is the tmpfs size divided by the 4/3 encryption
+    expansion (~48 MB of database for the 64 MB tmpfs). A larger database aborts
+    with an actionable message instead of failing later inside the backup with a
+    generic encryption/WAL error.
+    """
+    if raw_bytes <= 0:
+        return False, "the database size is unknown (0 bytes) — refusing to snapshot blindly"
+    artifact = snapshot_artifact_bytes(raw_bytes)
+    if artifact > capacity_bytes:
+        return False, (
+            f"database too large for an in-container snapshot: {raw_bytes} B of database seal "
+            f"to ~{artifact} B, beyond the {capacity_bytes} B /tmp tmpfs — restore from the "
+            "off-host backup instead (docs/admin_guide.md, Database Maintenance)"
+        )
+    return True, (
+        f"snapshot fits: {raw_bytes} B raw -> ~{artifact} B sealed (tmpfs {capacity_bytes} B)"
+    )
+
+
+def snapshot_integrity_ok(*, raw_bytes: int, artifact_bytes: int) -> tuple[bool, str]:
+    """C6 post-copy: the extracted artifact must be present and larger than the source.
+
+    A successful ``docker compose cp`` is not evidence by itself: an empty or
+    truncated extraction must fail the update while ``.env.prod`` is still
+    untouched. Fernet always expands the payload, so an artifact no larger than
+    the raw database cannot be the sealed envelope.
+    """
+    if artifact_bytes <= 0:
+        return False, "the extracted snapshot is empty — refusing to continue (C6)"
+    if artifact_bytes <= raw_bytes:
+        return False, (
+            f"the extracted snapshot ({artifact_bytes} B) is not larger than the source database "
+            f"({raw_bytes} B): the sealed envelope is missing or the copy is truncated (C6)"
+        )
+    return True, f"snapshot integrity ok: {artifact_bytes} B artifact for a {raw_bytes} B database"
+
+
+# --------------------------------------------------------------------------- #
 # AC3: the post-swap health gate
 # --------------------------------------------------------------------------- #
 
@@ -515,6 +581,16 @@ def _state_record(args: argparse.Namespace) -> int:
     return 0
 
 
+def _snapshot_check(args: argparse.Namespace) -> int:
+    """`snapshot-check`: C6 pre-flight ceiling, or post-copy integrity."""
+    if args.artifact_bytes is None:
+        ok, detail = snapshot_fits(args.bytes)
+    else:
+        ok, detail = snapshot_integrity_ok(raw_bytes=args.bytes, artifact_bytes=args.artifact_bytes)
+    print(detail)
+    return 0 if ok else 1
+
+
 def _health_gate(args: argparse.Namespace) -> int:
     """`health-gate`: print PASS/FAIL for 3/3 healthy + release version (AC3)."""
     passed, detail = health_gate(
@@ -533,6 +609,7 @@ VERBS = {
     "rewrite": _rewrite,
     "state-check": _state_check,
     "state-record": _state_record,
+    "snapshot-check": _snapshot_check,
     "health-gate": _health_gate,
 }
 """The CLI verbs, one per decision (see the module docstring)."""
@@ -575,6 +652,15 @@ def _build_parser() -> argparse.ArgumentParser:
     state_record = sub.add_parser("state-record", help="C8: record this run's outcome.")
     state_record.add_argument("--state-file", required=True, help="C8 state file.")
     state_record.add_argument("--outcome", required=True, choices=OUTCOMES, help="Run outcome.")
+
+    snapshot = sub.add_parser("snapshot-check", help="C6: snapshot ceiling / integrity.")
+    snapshot.add_argument("--bytes", type=int, required=True, help="Raw database size in bytes.")
+    snapshot.add_argument(
+        "--artifact-bytes",
+        type=int,
+        default=None,
+        help="Extracted artifact size; switches the verb to the post-copy integrity check.",
+    )
 
     gate = sub.add_parser("health-gate", help="AC3: 3/3 healthy + release version.")
     gate.add_argument("--tag", required=True, help="Release tag the lane must report.")

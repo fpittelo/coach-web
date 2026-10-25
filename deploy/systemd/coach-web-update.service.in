@@ -7,9 +7,9 @@
 # the installed copy; re-run the installer to refresh it.
 #
 # Security conditions binding on this unit (fpittelo/coach-web#327):
-#   C3 — the updater takes the shared prod-lane flock itself (the preflight and
-#        the documented manual rollback take the same lock); systemd does not
-#        serialise those actors for us.
+#   C3 — the updater takes the shared prod-lane flock itself; the preflight,
+#        coach-web.service (start and stop) and the documented manual rollback
+#        take the same lock. systemd does not serialise those actors for us.
 #   C4 — no secret in the unit: .env.prod is handed to docker compose via
 #        --env-file only (never EnvironmentFile=), and neither the script nor
 #        this unit ever runs or logs `docker compose config`.
@@ -21,9 +21,11 @@
 [Unit]
 Description=Coach Web prod lane auto-update (provenance-gated digest pull)
 Documentation=file://@REPO_ROOT@/docs/admin_guide.md
-# StartLimit* live in [Unit] (their modern systemd location). The timer keeps
-# ticking, so repeated work is paced by the 5-minute schedule plus the shared
-# lock and the C8 streak — never by a tight restart loop.
+# StartLimit* live in [Unit] (their modern systemd location). Restart=on-failure
+# re-runs a FAILED trigger, bounded to StartLimitBurst=3 per StartLimitIntervalSec,
+# so the C8 streak of 12 consecutive failures is reached in as little as ~20
+# minutes; a run that completes (update or no-op) is paced by the 5-minute timer
+# (~1 h for the same streak). Repeated work therefore stays bounded.
 StartLimitIntervalSec=300
 StartLimitBurst=3
 

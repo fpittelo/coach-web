@@ -2,19 +2,26 @@
 # prod-update.sh — release-driven, provenance-gated auto-update of the prod lane
 # (MADR-0024 Option 4, issue #326). Run by coach-web-update.timer every 5 minutes.
 #
-# Flow (MADR-0024 §Option 4 steps 1-8; security conditions C1-C8):
-#   1. shared `flock` on the prod-lane lock — held => skip, exit 0 (C3);
+# Flow (MADR-0024 §Option 4 steps 1-8, with the image pulled BEFORE the env swap;
+# security conditions C1-C8):
+#   1. shared `flock` on the prod-lane lock (C3) — the unattended tick skips with
+#      exit 0 when it is held; --force/--rollback wait up to LOCK_WAIT_SECONDS;
 #   2. C8 pause check: 12 consecutive failures stop the hammering early;
 #   3. resolve ghcr.io/fpittelo/coach-web:prod and validate the digest (C2);
 #   4. no-op when it equals the digest already pinned in .env.prod (step 3);
 #   5. C1 provenance: digest(:prod) must equal the digest of the latest release
 #      tag, read from the PUBLIC Releases API — never the app's GITHUB_TOKEN;
-#   6. C6 encrypted pre-swap snapshot of the database, off-volume, mode 600,
-#      last 4 kept;
-#   7. C4 atomic .env.prod rewrite (mode 600 before and after, previous digest
-#      retained in .env.prod.prev);
-#   8. pull, recreate, then gate on 3/3 healthy <= 120 s AND /healthz reporting
-#      the release tag; on any failure after the swap the previous digest is
+#   6. pull that verified digest locally (C2): a pull failure leaves .env.prod
+#      byte-identical and the lane untouched, so no other actor (coach-web.service
+#      start/stop, a manual rollout) can recreate the lane on an unpulled image;
+#   7. C6 encrypted pre-swap snapshot: the database is measured first (the sealed
+#      artifact must fit the container's 64 MB /tmp tmpfs — ~48 MB effective),
+#      produced INSIDE the running coach-web container, copied out off-volume,
+#      verified non-empty and larger than the source, mode 600, last 4 kept;
+#   8. C4 atomic .env.prod rewrite (owner/mode 600 before and after, previous
+#      digest retained in .env.prod.prev) — only once the image is local;
+#   9. recreate, then gate on 3/3 healthy <= 120 s AND /healthz reporting the
+#      release tag; on any failure after the rewrite the previous digest is
 #      restored and the previous image is brought back, exit non-zero (step 8).
 #
 # Usage:
@@ -48,7 +55,17 @@ LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 LOCK_FILE="${LOCK_DIR}/coach-web-prod.lock"
 KEEP_SNAPSHOTS=4
 FAILURE_LIMIT=12
-GATE_TIMEOUT_SECONDS=120
+# Above the unit's own TimeoutStartSec (600 s) so a boot/restart waits for an
+# in-flight tick instead of failing; the unattended tick never waits (it skips).
+LOCK_WAIT_SECONDS=900
+# The gate window. Overridable so the wait loop can be exercised quickly by the
+# test suite (same precedent as LANE_WAIT_SECONDS in scripts/lane.sh); a shorter
+# window only makes the gate stricter.
+GATE_TIMEOUT_SECONDS="${COACH_WEB_GATE_TIMEOUT_SECONDS:-120}"
+# In-container probe: the raw size of the database the pre-swap snapshot would
+# seal. Used before the backup so an oversized database fails with an actionable
+# message instead of a generic encryption/WAL error.
+DB_SIZE_PROBE='import os, coach_web.config as c; print(os.path.getsize(c.get_settings().COACH_DB_PATH))'
 WORK_DIR=""
 
 log() {
@@ -126,29 +143,54 @@ check_pause() {
 }
 
 # C6: encrypted pre-swap snapshot. The maintenance CLI runs INSIDE the running
-# coach-web container, so DATA_ENCRYPTION_KEY stays in the container environment
-# and never reaches this script. The artifact is staged on the container's tmpfs
-# (encrypted, off the data volume) and copied out to an owner-only host
-# directory; the last KEEP_SNAPSHOTS artifacts are kept.
+# coach-web container, so the lane's data-encryption key stays in the container
+# environment and never reaches this script. The artifact is staged on the
+# container's tmpfs (encrypted, off the data volume) and copied out to an
+# owner-only host directory; the last KEEP_SNAPSHOTS artifacts are kept.
+#
+# Safety (F3/F4): the database is measured before the backup so an oversized
+# snapshot fails with an actionable message (the sealed envelope is ~4/3 of the
+# raw database and must fit the 64 MB tmpfs), and the extracted artifact must be
+# non-empty AND larger than the source — a successful `cp` alone is not evidence.
 write_snapshot() {
-    local tag="$1" stamp name staged
+    local tag="$1" stamp name staged dest db_bytes verdict artifact_bytes
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     name="coach-${stamp}-${tag}.backup"
+    staged="/tmp/${name}"
+    dest="${SNAPSHOT_DIR}/${name}"
+
+    if ! db_bytes="$(dc exec -T coach-web python -c "${DB_SIZE_PROBE}" 2>/dev/null)" \
+        || [[ ! "${db_bytes}" =~ ^[0-9]+$ ]]; then
+        error "cannot determine the database size inside the container — refusing to snapshot blindly (C6)"
+        return 1
+    fi
+    if ! verdict="$(python3 "${UPDATER}" snapshot-check --bytes "${db_bytes}" 2>&1)"; then
+        error "${verdict}"
+        return 1
+    fi
+    log "${verdict}"
+
     mkdir -p "${SNAPSHOT_DIR}"
     chmod 700 "${SNAPSHOT_DIR}"
-    staged="/tmp/${name}"
     if ! dc exec -T coach-web python -m coach_web.maintenance backup --output "${staged}" >/dev/null; then
         error "the in-container backup failed — check the lane's data-encryption key (docs/admin_guide.md) and the WAL checkpoint"
         return 1
     fi
-    if ! dc cp "coach-web:${staged}" "${SNAPSHOT_DIR}/${name}" >/dev/null; then
+    if ! dc cp "coach-web:${staged}" "${dest}" >/dev/null; then
         dc exec -T coach-web rm -f "${staged}" >/dev/null 2>&1 || true
         error "cannot copy the snapshot out of the container to ${SNAPSHOT_DIR}"
         return 1
     fi
     dc exec -T coach-web rm -f "${staged}" >/dev/null 2>&1 || true
-    chmod 600 "${SNAPSHOT_DIR}/${name}"
-    log "pre-swap snapshot: ${SNAPSHOT_DIR}/${name} (mode 600, keeping the last ${KEEP_SNAPSHOTS})"
+    chmod 600 "${dest}"
+    artifact_bytes="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
+    if ! verdict="$(python3 "${UPDATER}" snapshot-check --bytes "${db_bytes}" \
+            --artifact-bytes "${artifact_bytes}" 2>&1)"; then
+        rm -f -- "${dest}"
+        error "${verdict} — the unusable artifact was removed"
+        return 1
+    fi
+    log "pre-swap snapshot: ${dest} (mode 600, keeping the last ${KEEP_SNAPSHOTS}) — ${verdict}"
     prune_snapshots
 }
 
@@ -190,7 +232,8 @@ wait_for_gate() {
 }
 
 # Step 8: restore the previous digest, bring the previous image back, record the
-# failure. The lane keeps serving the previous release.
+# failure. The lane keeps serving the previous release; no pull is needed — the
+# previous image is the one that was running a moment ago.
 handle_post_swap_failure() {
     local reason="$1" out=""
     error "${reason} — rolling back to the previous release"
@@ -261,25 +304,34 @@ do_update() {
     fi
     log "provenance ${verdict}"
 
+    # C2/F1: pull the *verified* digest BEFORE touching .env.prod. The lane keeps
+    # serving the previous release and .env.prod stays byte-identical when this
+    # fails, so an unlocked writer elsewhere (coach-web.service start/stop, a
+    # manual rollout) can never recreate the lane on an image that has not been
+    # pulled through this gate.
+    if ! docker pull "${IMAGE_REPO}@${prod_digest}"; then
+        error "pulling ${IMAGE_REPO}@${prod_digest} failed — ${ENV_FILE} unchanged, lane untouched (C2)"
+        record failure
+        return 1
+    fi
+    log "pulled ${IMAGE_REPO}@${prod_digest}"
+
     if ! write_snapshot "${tag}"; then
         error "no pre-swap snapshot — refusing to swap the image (C6)"
         record failure
         return 1
     fi
 
-    # C4 swap: atomic rewrite, previous digest retained for the rollback.
+    # C4 swap: atomic rewrite, previous digest retained for the rollback. Only
+    # from here on can a failure require a rollback (the image is already local).
     if ! out="$(python3 "${UPDATER}" rewrite --env-file "${ENV_FILE}" \
             --digest "${prod_digest}" 2>&1)"; then
-        error "cannot rewrite ${ENV_FILE}: ${out} — lane untouched (C4)"
+        error "cannot rewrite ${ENV_FILE}: ${out} — recover with 'prod-update.sh --force' (re-apply) or '--rollback' (previous release); see known limits (C4)"
         record failure
         return 1
     fi
     log "${out}"
 
-    if ! dc pull coach-web; then
-        handle_post_swap_failure "pulling ${IMAGE_REPO}@${prod_digest} failed"
-        return 1
-    fi
     if ! dc up -d --remove-orphans; then
         handle_post_swap_failure "recreating the lane failed"
         return 1
@@ -340,10 +392,20 @@ main() {
         return 1
     fi
 
-    # C3: one lock for the timer, the preflight and the manual rollback. A held
-    # lock means another prod-lane operation is running — this tick is a no-op.
+    # C3: one lock for the timer, the preflight, coach-web.service start/stop and
+    # the manual rollback. The unattended tick never blocks (a held lock means
+    # another operation is running — it skips, exit 0); the operator-driven paths
+    # (--force, --rollback) wait like the unit does, so a manual action is never a
+    # silent no-op.
     exec 9>"${LOCK_FILE}"
-    if ! flock -n 9; then
+    if [[ "${rollback}" == "true" || "${force}" == "true" ]]; then
+        if flock -w "${LOCK_WAIT_SECONDS}" 9; then
+            log "acquired the shared prod-lane lock ${LOCK_FILE} (waited up to ${LOCK_WAIT_SECONDS}s, C3)"
+        else
+            error "the shared prod-lane lock ${LOCK_FILE} is still held after ${LOCK_WAIT_SECONDS}s — another prod-lane operation is running (C3)"
+            return 1
+        fi
+    elif ! flock -n 9; then
         log "another prod-lane operation holds ${LOCK_FILE} — skipping this tick (C3)"
         return 0
     fi

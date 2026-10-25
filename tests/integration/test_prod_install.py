@@ -145,6 +145,22 @@ class TestUnitTemplate:
         assert "@REPO_ROOT@" in text
         assert "/home/" not in text, "the committed template must not hardcode a home path"
 
+    def test_template_start_and_stop_take_the_shared_prod_lane_lock(self) -> None:
+        """C3 (#326 F1): the lane unit is a second writer of the update's project."""
+        directives = _non_comment_lines(self._text())
+        flock = "/usr/bin/flock -w 900 /run/user/%U/coach-web-prod.lock"
+        assert directives.count(flock) == 2, "ExecStart and ExecStop both take the lock"
+        assert "ExecStart=/usr/bin/flock" in directives
+        assert "ExecStop=/usr/bin/flock" in directives
+
+    def test_template_timeouts_cover_the_lock_wait(self) -> None:
+        """C5/#326: both timeouts sit above the 900 s lock wait, or the wait is killed."""
+        text = self._text()
+        for directive in ("TimeoutStartSec", "TimeoutStopSec"):
+            match = re.search(rf"^{directive}=(\d+)", text, re.MULTILINE)
+            assert match is not None, directive
+            assert int(match.group(1)) > 900, directive
+
 
 class TestUpdateUnitTemplates:
     """The #326 auto-update units carry the same C4/C5 contract."""

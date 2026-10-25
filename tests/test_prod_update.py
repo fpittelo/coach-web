@@ -19,9 +19,11 @@ import fcntl
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
@@ -34,6 +36,14 @@ SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 CORE_PATH = SCRIPTS_DIR / "prod_update.py"
 ENTRYPOINT = SCRIPTS_DIR / "prod-update.sh"
 PREFLIGHT = SCRIPTS_DIR / "e2e-preflight.sh"
+LANE_UNIT_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "coach-web.service.in"
+
+PROD_LANE_LOCK = "coach-web-prod.lock"
+RELEASES_API = "https://api.github.com/repos/fpittelo/coach-web/releases/latest"
+HEALTHZ_URL = "http://127.0.0.1:8000/healthz"
+
+ALLOWED_COMPOSE_VERBS = frozenset({"ps", "exec", "cp", "up", "down"})
+"""The `dc` helper's verbs: none of them ever prints the interpolated environment (C4)."""
 
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
@@ -317,6 +327,53 @@ class TestEnvRewrite:
 
 
 # --------------------------------------------------------------------------- #
+# C6 snapshot guards
+# --------------------------------------------------------------------------- #
+
+MEGABYTE = 1024 * 1024
+
+
+class TestSnapshotGuards:
+    """F3/F4: the sealed artifact must fit the tmpfs and must be usable."""
+
+    def test_the_tmpfs_ceiling_is_the_64mb_budget_over_the_4_3_expansion(self) -> None:
+        """~48 MB of database fits a 64 MB /tmp; a byte more does not."""
+        capacity = CORE.SNAPSHOT_TMPFS_BYTES
+        assert capacity == 64 * MEGABYTE
+        fits = capacity * CORE.FERNET_EXPANSION_DEN // CORE.FERNET_EXPANSION_NUM
+        ok, detail = CORE.snapshot_fits(fits)
+        assert ok is True
+        assert "snapshot fits" in detail
+        too_big, detail = CORE.snapshot_fits(fits + 1)
+        assert too_big is False
+        assert "database too large for an in-container snapshot" in detail
+        assert "off-host backup" in detail
+
+    def test_the_estimate_rounds_up_the_encryption_expansion(self) -> None:
+        assert CORE.snapshot_artifact_bytes(0) == 0
+        assert CORE.snapshot_artifact_bytes(3) == 4
+        assert CORE.snapshot_artifact_bytes(4096) == 5462
+
+    @pytest.mark.parametrize("raw_bytes", [0, -1])
+    def test_an_unknown_database_size_is_refused(self, raw_bytes: int) -> None:
+        ok, detail = CORE.snapshot_fits(raw_bytes)
+        assert ok is False
+        assert "refusing to snapshot blindly" in detail
+
+    def test_an_artifact_larger_than_the_database_passes_integrity(self) -> None:
+        ok, detail = CORE.snapshot_integrity_ok(raw_bytes=4096, artifact_bytes=5462)
+        assert ok is True
+        assert "snapshot integrity ok" in detail
+
+    @pytest.mark.parametrize("artifact_bytes", [0, 1, 4095, 4096])
+    def test_an_empty_or_truncated_artifact_fails_integrity(self, artifact_bytes: int) -> None:
+        """A `cp` that returned 0 is not evidence: the envelope must exceed the source."""
+        ok, detail = CORE.snapshot_integrity_ok(raw_bytes=4096, artifact_bytes=artifact_bytes)
+        assert ok is False
+        assert "snapshot" in detail
+
+
+# --------------------------------------------------------------------------- #
 # AC3 health gate
 # --------------------------------------------------------------------------- #
 
@@ -532,6 +589,18 @@ class TestCliContract:
         )
         assert "consecutive_failures=0" in capsys.readouterr().out
 
+    def test_snapshot_check_covers_both_phases(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert CORE.main(["snapshot-check", "--bytes", "4096"]) == 0
+        assert capsys.readouterr().out.startswith("snapshot fits")
+        assert CORE.main(["snapshot-check", "--bytes", str(50 * MEGABYTE)]) == 1
+        assert "too large" in capsys.readouterr().out
+        argv = ["snapshot-check", "--bytes", "4096", "--artifact-bytes", "10"]
+        assert CORE.main(argv) == 1
+        assert "not larger than the source database" in capsys.readouterr().out
+        argv = ["snapshot-check", "--bytes", "4096", "--artifact-bytes", "5462"]
+        assert CORE.main(argv) == 0
+        assert capsys.readouterr().out.startswith("snapshot integrity ok")
+
     def test_health_gate_prints_pass_and_fail(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -588,12 +657,24 @@ class TestScriptGuards:
         assert result.returncode == 0, result.stderr
 
     def test_entrypoint_never_traces_or_dumps_the_environment(self) -> None:
-        """AC8: no `set -x`, no `printenv`, no `docker compose config` output."""
+        """AC8: no `set -x`, no `printenv`, and the lane env file is only an --env-file."""
         directives = self._directives()
         assert "set -x" not in directives
         assert "printenv" not in directives
-        assert "docker compose config" not in directives
         assert "--env-file" in directives
+
+    def test_compose_helper_only_invokes_non_dumping_verbs(self) -> None:
+        """C4/AC8 (F7): assert what the `dc` helper actually runs, not a literal string.
+
+        A `docker compose config` that never prints its output would still hand
+        the resolved `.env.prod` to anything watching the process tree, so the
+        invariant is the helper's verb set: `ps`, `exec`, `cp`, `up`, `down` —
+        never `config` (or any future verb that dumps the interpolation).
+        """
+        verbs = set(re.findall(r"\bdc ([a-z][a-z-]*)", self._directives()))
+        assert verbs, "the compose helper is expected to be invoked directly"
+        assert verbs <= ALLOWED_COMPOSE_VERBS, sorted(verbs - ALLOWED_COMPOSE_VERBS)
+        assert "config" not in verbs
 
     def test_entrypoint_never_names_a_secret(self) -> None:
         """C4/AC8: the script carries no secret name except the defensive unset."""
@@ -610,13 +691,21 @@ class TestScriptGuards:
             if "GITHUB_TOKEN" in line:
                 assert "unset" in line, line
 
-    def test_entrypoint_and_preflight_share_the_prod_lane_lock(self) -> None:
-        """C3: one lock name, one expression, in both actors."""
+    def test_entrypoint_preflight_and_lane_unit_share_the_prod_lane_lock(self) -> None:
+        """C3 (F1): one lock file guards the tick, the preflight and the lane unit."""
         lock_expression = "XDG_RUNTIME_DIR:-/run/user/$(id -u)"
         for script in (ENTRYPOINT, PREFLIGHT):
             text = script.read_text(encoding="utf-8")
-            assert "coach-web-prod.lock" in text, script
+            assert PROD_LANE_LOCK in text, script
             assert lock_expression in text, script
+        # The lane unit is a second writer of the same project: its start and its
+        # stop must take the same lock, addressed as /run/user/%U (the unit's uid
+        # specifier), and wait rather than race the tick.
+        unit = LANE_UNIT_TEMPLATE.read_text(encoding="utf-8")
+        flock_command = f"/usr/bin/flock -w 900 /run/user/%U/{PROD_LANE_LOCK}"
+        assert unit.count(flock_command) == 2, "ExecStart and ExecStop both take the lock"
+        assert "ExecStart=/usr/bin/flock" in unit
+        assert "ExecStop=/usr/bin/flock" in unit
         assert "flock -n 9" in ENTRYPOINT.read_text(encoding="utf-8")
 
     def test_preflight_takes_the_lock_for_the_prod_lane_only(self) -> None:
@@ -627,30 +716,119 @@ class TestScriptGuards:
 
 
 # --------------------------------------------------------------------------- #
-# Shell entrypoint behaviour in a sandbox (C2, C3, step 3)
+# Shell entrypoint behaviour in a sandbox (C2, C3, C6, AC2/AC3/AC4)
 # --------------------------------------------------------------------------- #
 
 DOCKER_SHIM = '''#!/usr/bin/env python3
-"""Recording docker shim: logs argv; answers `buildx imagetools inspect` only."""
+"""Recording docker shim: logs argv and answers every call prod-update.sh makes.
+
+The shim is the whole (fake) docker surface: registry digest resolution, the
+digest pull, the compose verb set (ps/exec/cp/up), the in-container database
+size probe, the maintenance backup and its extracted artifact. Every call is
+appended to PROD_UPDATE_SHIM_LOG so the tests can assert the ORDER as well as
+the arguments; env vars steer each answer.
+"""
 import json
 import os
 import sys
 
 args = sys.argv[1:]
 with open(os.environ["PROD_UPDATE_SHIM_LOG"], "a", encoding="utf-8") as handle:
-    handle.write(json.dumps(args) + "\\n")
+    handle.write(json.dumps(["docker", *args]) + "\\n")
 
-digest = os.environ.get("PROD_UPDATE_DIGEST", "")
-if digest and args[:3] == ["buildx", "imagetools", "inspect"]:
+DIGEST = os.environ.get("PROD_UPDATE_DIGEST", "")
+TAG_DIGEST = os.environ.get("PROD_UPDATE_TAG_DIGEST", DIGEST)
+DB_BYTES = int(os.environ.get("PROD_UPDATE_DB_BYTES", "4096"))
+ARTIFACT_BYTES = int(os.environ.get("PROD_UPDATE_ARTIFACT_BYTES", str(DB_BYTES * 4 // 3 + 1)))
+
+
+def enabled(name: str) -> bool:
+    """True unless the test switched this behaviour off."""
+    return os.environ.get(name, "1") == "1"
+
+
+if args[:3] == ["buildx", "imagetools", "inspect"]:
+    digest = DIGEST if args[3].endswith(":prod") else TAG_DIGEST
+    if not digest:
+        sys.exit(1)
     print("Name:   " + args[3])
     print("Digest: " + digest)
+    sys.exit(0)
+
+if args[:1] == ["pull"]:
+    print("Digest: " + DIGEST)
+    sys.exit(0 if enabled("PROD_UPDATE_PULL_OK") else 1)
+
+if args[:1] == ["compose"]:
+    index = 1
+    while index < len(args) and args[index].startswith("-"):
+        index += 2  # -p / -f / --env-file all take exactly one value
+    verb = args[index] if index < len(args) else ""
+    rest = args[index + 1 :]
+    if verb == "ps":
+        health = os.environ.get("PROD_UPDATE_HEALTH", "healthy")
+        print(
+            json.dumps(
+                [
+                    {"Service": name, "Health": health, "State": "running"}
+                    for name in ("coach-web", "coach-mcp", "github-mcp")
+                ]
+            )
+        )
+        sys.exit(0)
+    if verb == "exec":
+        if "-c" in rest:
+            print(DB_BYTES)
+            sys.exit(0)
+        if any("coach_web.maintenance" in token for token in rest):
+            sys.exit(0 if enabled("PROD_UPDATE_BACKUP_OK") else 1)
+        sys.exit(0)  # the rm of the staged artifact
+    if verb == "cp":
+        with open(args[-1], "wb") as target:
+            target.write(b"x" * ARTIFACT_BYTES)
+        sys.exit(0)
+    if verb == "up":
+        sys.exit(0 if enabled("PROD_UPDATE_UP_OK") else 1)
+    if verb == "down":
+        sys.exit(0)
+    sys.exit(1)
+
+sys.exit(1)
+'''
+
+CURL_SHIM = '''#!/usr/bin/env python3
+"""Recording curl shim: answers the Releases API and /healthz the script fetches."""
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+with open(os.environ["PROD_UPDATE_SHIM_LOG"], "a", encoding="utf-8") as handle:
+    handle.write(json.dumps(["curl", *args]) + "\\n")
+
+url = args[-1]
+if "api.github.com" in url:
+    if os.environ.get("PROD_UPDATE_API_OK", "1") != "1":
+        sys.exit(22)  # what curl -f returns on an HTTP error
+    print(json.dumps({"tag_name": os.environ.get("PROD_UPDATE_RELEASE_TAG", "v0.14.0")}))
+    sys.exit(0)
+if url.endswith("/healthz"):
+    print(
+        json.dumps(
+            {
+                "status": "healthy",
+                "service": "coach-web",
+                "version": os.environ.get("PROD_UPDATE_HEALTHZ_VERSION", "0.14.0"),
+            }
+        )
+    )
     sys.exit(0)
 sys.exit(1)
 '''
 
 
 class ProdUpdateSandbox:
-    """Temp HOME + temp repo copy with a recording docker shim."""
+    """Temp HOME + temp repo copy with recording docker/curl shims."""
 
     def __init__(self, tmp_path: Path) -> None:
         self.tmp = tmp_path
@@ -658,7 +836,7 @@ class ProdUpdateSandbox:
         self.repo = tmp_path / "repo"
         self.home = tmp_path / "home"
         self.run_dir = tmp_path / "run"
-        self.log = tmp_path / "docker.log"
+        self.log = tmp_path / "shim.log"
         self._lock_handles: list[IO[str]] = []
         (self.repo / "scripts").mkdir(parents=True)
         self.bin_dir.mkdir()
@@ -670,9 +848,10 @@ class ProdUpdateSandbox:
         for name in ("compose.yaml", "compose.prod.yml"):
             (self.repo / name).touch()
         self.log.touch()
-        shim = self.bin_dir / "docker"
-        shim.write_text(DOCKER_SHIM, encoding="utf-8")
-        shim.chmod(0o755)
+        for name, source in (("docker", DOCKER_SHIM), ("curl", CURL_SHIM)):
+            shim = self.bin_dir / name
+            shim.write_text(source, encoding="utf-8")
+            shim.chmod(0o755)
 
     @property
     def script(self) -> Path:
@@ -682,13 +861,36 @@ class ProdUpdateSandbox:
     def lock_path(self) -> Path:
         return self.run_dir / "coach-web-prod.lock"
 
+    @property
+    def env_file(self) -> Path:
+        return self.repo / ".env.prod"
+
+    @property
+    def prev_file(self) -> Path:
+        return self.repo / ".env.prod.prev"
+
+    @property
+    def snapshot_dir(self) -> Path:
+        return self.home / ".local" / "state" / "coach-web" / "snapshots"
+
+    @property
+    def state_file(self) -> Path:
+        return self.home / ".local" / "state" / "coach-web" / "update-state.json"
+
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         env = dict(os.environ)
         env["PATH"] = f"{self.bin_dir}{os.pathsep}{env['PATH']}"
         env["HOME"] = str(self.home)
         env["XDG_RUNTIME_DIR"] = str(self.run_dir)
+        # Drop any ambient PROD_UPDATE_* steering from the developer's shell, then
+        # set the sandbox's own. Keep the gate loop short: the shim answers
+        # instantly, and a failing gate must not sit in the 120 s production
+        # window for the whole suite.
+        for key in list(env):
+            if key.startswith("PROD_UPDATE_"):
+                del env[key]
         env["PROD_UPDATE_SHIM_LOG"] = str(self.log)
-        env.pop("PROD_UPDATE_DIGEST", None)
+        env["COACH_WEB_GATE_TIMEOUT_SECONDS"] = "4"
         if extra:
             env.update(extra)
         return env
@@ -706,18 +908,43 @@ class ProdUpdateSandbox:
             timeout=120,
         )
 
-    def write_env_file(self, digest: str) -> Path:
-        env_file = self.repo / ".env.prod"
-        env_file.write_text(f"{IMAGE_LINE}{digest}\n", encoding="utf-8")
-        env_file.chmod(0o600)
-        return env_file
+    def start(self, *args: str, extra_env: dict[str, str] | None = None) -> subprocess.Popen[str]:
+        """Start the entrypoint without waiting (lock-contention tests)."""
+        return subprocess.Popen(
+            [str(self.script), *args],
+            cwd=self.repo,
+            env=self.env(extra_env),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
 
-    def docker_invocations(self) -> list[list[str]]:
+    def write_env_file(self, digest: str) -> Path:
+        self.env_file.write_text(f"{IMAGE_LINE}{digest}\n", encoding="utf-8")
+        self.env_file.chmod(0o600)
+        return self.env_file
+
+    def invocations(self) -> list[list[str]]:
+        """Every recorded shim call, in order, each prefixed by its tool name."""
         return [
             json.loads(line)
             for line in self.log.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
+
+    def docker_invocations(self) -> list[list[str]]:
+        return [call for call in self.invocations() if call[0] == "docker"]
+
+    def index_of(self, call: list[str]) -> int:
+        """Position of the first recorded call whose argv equals *call*."""
+        return self.invocations().index(call)
+
+    def outcome(self) -> str:
+        state: dict[str, str] = json.loads(self.state_file.read_text(encoding="utf-8"))
+        return state["outcome"]
+
+    def snapshots(self) -> list[Path]:
+        return sorted(self.snapshot_dir.glob("coach-*.backup"))
 
     def hold_lock(self) -> None:
         """Take the shared prod-lane lock in-process (flock(2) — same as the script)."""
@@ -741,7 +968,33 @@ def sandbox(tmp_path: Path) -> Iterator[ProdUpdateSandbox]:
 
 
 class TestEntrypointBehaviour:
-    """C2/C3/step-3 behaviour of scripts/prod-update.sh (shimmed, daemon-free)."""
+    """C2/C3/C6 behaviour of scripts/prod-update.sh (shimmed, daemon-free).
+
+    The docker and curl shims record every call, so the tests pin the arguments
+    (which digest, which artifact) *and* the order of the operations (pull before
+    the env swap, snapshot before the swap, rollback after a failed gate).
+    """
+
+    PROD_REF = "ghcr.io/fpittelo/coach-web:prod"
+
+    @staticmethod
+    def _first(sandbox: ProdUpdateSandbox, tool: str, needle: str) -> int:
+        """Position of the first *tool* call carrying *needle* as an exact argv token."""
+        for position, call in enumerate(sandbox.invocations()):
+            if call[0] == tool and needle in call:
+                return position
+        raise AssertionError(f"no {tool} call with argument {needle!r}: {sandbox.invocations()}")
+
+    @staticmethod
+    def _last(sandbox: ProdUpdateSandbox, tool: str, needle: str) -> int:
+        """Position of the last *tool* call carrying *needle* as an exact argv token."""
+        positions = [
+            position
+            for position, call in enumerate(sandbox.invocations())
+            if call[0] == tool and needle in call
+        ]
+        assert positions, f"no {tool} call with argument {needle!r}: {sandbox.invocations()}"
+        return positions[-1]
 
     def test_a_held_lock_makes_the_tick_a_no_op(self, sandbox: ProdUpdateSandbox) -> None:
         """AC6/C3: a tick during another prod-lane operation exits 0, untouched."""
@@ -750,8 +1003,23 @@ class TestEntrypointBehaviour:
         result = sandbox.run()
         assert result.returncode == 0, result.stderr
         assert "skipping this tick" in result.stdout
-        assert sandbox.docker_invocations() == []
-        assert not (sandbox.home / ".local" / "state" / "coach-web" / "update-state.json").exists()
+        assert sandbox.invocations() == []
+        assert not sandbox.state_file.exists()
+
+    def test_a_held_lock_is_waited_for_by_the_operator_paths(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """C3: --rollback waits for the in-flight operation instead of skipping."""
+        sandbox.write_env_file(DIGEST_A)
+        sandbox.hold_lock()
+        process = sandbox.start("--rollback")
+        time.sleep(1.0)
+        sandbox.close()  # the in-flight operation finishes; the wait must end
+        stdout, stderr = process.communicate(timeout=60)
+        assert "acquired the shared prod-lane lock" in stdout, (stdout, stderr)
+        # It then ran the rollback and refused it: no previous digest is retained.
+        assert process.returncode != 0
+        assert "rollback failed" in stderr
 
     def test_an_unreachable_registry_aborts_without_pull_or_recreate(
         self, sandbox: ProdUpdateSandbox
@@ -761,7 +1029,9 @@ class TestEntrypointBehaviour:
         result = sandbox.run()
         assert result.returncode != 0
         assert "registry unreachable" in result.stderr
-        assert [call[:2] for call in sandbox.docker_invocations()] == [["buildx", "imagetools"]]
+        assert sandbox.docker_invocations() == [
+            ["docker", "buildx", "imagetools", "inspect", self.PROD_REF]
+        ]
 
     def test_a_missing_lane_env_file_aborts_before_any_pull(
         self, sandbox: ProdUpdateSandbox
@@ -770,7 +1040,9 @@ class TestEntrypointBehaviour:
         result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
         assert result.returncode != 0
         assert "no pull, no recreate" in result.stderr
-        assert [call[:2] for call in sandbox.docker_invocations()] == [["buildx", "imagetools"]]
+        assert sandbox.docker_invocations() == [
+            ["docker", "buildx", "imagetools", "inspect", self.PROD_REF]
+        ]
 
     def test_a_matching_digest_is_a_no_op_without_pull_or_recreate(
         self, sandbox: ProdUpdateSandbox
@@ -781,26 +1053,157 @@ class TestEntrypointBehaviour:
         result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
         assert result.returncode == 0, result.stderr
         assert "no change" in result.stdout
-        assert [call[:2] for call in sandbox.docker_invocations()] == [["buildx", "imagetools"]]
+        assert sandbox.docker_invocations() == [
+            ["docker", "buildx", "imagetools", "inspect", self.PROD_REF]
+        ]
         assert env_file.read_text(encoding="utf-8") == before
+        assert sandbox.outcome() == "success"
+
+    def test_the_happy_path_pulls_snapshots_swaps_and_gates(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """AC3 (shell half): pull the verified digest, snapshot, swap atomically, gate."""
+        env_file = sandbox.write_env_file(DIGEST_B)  # the running release
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode == 0, result.stderr
+
+        # C4: exactly one image line, pinned to the verified digest, mode 600,
+        # with the previous line retained for the rollback.
+        assert env_file.read_text(encoding="utf-8") == f"{IMAGE_LINE}{DIGEST_A}\n"
+        assert env_file.stat().st_mode & 0o777 == 0o600
+        assert sandbox.prev_file.read_text(encoding="utf-8") == f"{IMAGE_LINE}{DIGEST_B}\n"
+        assert sandbox.prev_file.stat().st_mode & 0o777 == 0o600
+
+        # C2/F1: the *verified* digest is what gets pulled (not a tag).
+        assert ["docker", "pull", CORE.image_ref(DIGEST_A)] in sandbox.invocations()
+
+        # C6: one owner-only artifact, larger than the database it seals.
+        snapshots = sandbox.snapshots()
+        assert len(snapshots) == 1
+        assert snapshots[0].stat().st_mode & 0o777 == 0o600
+        raw_bytes = 4096
+        assert snapshots[0].stat().st_size == raw_bytes * 4 // 3 + 1
+        assert snapshots[0].stat().st_size > raw_bytes
+
+        # Ordering: provenance -> pull -> measure/snapshot -> recreate -> gate.
         assert (
-            json.loads(
-                (sandbox.home / ".local" / "state" / "coach-web" / "update-state.json").read_text(
-                    encoding="utf-8"
-                )
-            )["outcome"]
-            == "success"
+            self._first(sandbox, "curl", RELEASES_API)
+            < self._first(sandbox, "docker", "pull")
+            < self._first(sandbox, "docker", "-c")  # the in-container size probe
+            < self._first(sandbox, "docker", "coach_web.maintenance")
+            < self._first(sandbox, "docker", "cp")
+            < self._first(sandbox, "docker", "up")
+            < self._first(sandbox, "docker", "ps")
+            < self._first(sandbox, "curl", HEALTHZ_URL)
         )
+        assert sandbox.outcome() == "success"
+        assert "update complete" in result.stdout
+
+    def test_a_failed_pull_leaves_the_env_file_byte_identical(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """F1.1/C2: the swap happens only after the image is local."""
+        env_file = sandbox.write_env_file(DIGEST_B)
+        before = env_file.read_bytes()
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A, "PROD_UPDATE_PULL_OK": "0"})
+        assert result.returncode != 0
+        assert env_file.read_bytes() == before
+        assert not sandbox.prev_file.exists()
+        assert sandbox.snapshots() == [], "the snapshot must follow a successful pull"
+        assert not any("up" in call for call in sandbox.invocations())
+        assert sandbox.outcome() == "failure"
+        assert "unchanged, lane untouched" in result.stderr
+
+    def test_a_provenance_mismatch_aborts_before_any_pull_or_rewrite(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """AC2 (shell half)/C1: :prod one digest ahead of the release tags aborts."""
+        env_file = sandbox.write_env_file(DIGEST_B)
+        before = env_file.read_bytes()
+        result = sandbox.run(
+            extra_env={"PROD_UPDATE_DIGEST": DIGEST_A, "PROD_UPDATE_TAG_DIGEST": DIGEST_B}
+        )
+        assert result.returncode != 0
+        assert "provenance gate refused" in result.stderr
+        assert not any("pull" in call for call in sandbox.invocations())
+        assert not any("up" in call for call in sandbox.invocations())
+        assert env_file.read_bytes() == before
+        assert not sandbox.prev_file.exists()
+        assert sandbox.snapshots() == []
+        assert sandbox.outcome() == "failure"
+
+    def test_a_gate_failure_rolls_back_to_the_previous_release(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """AC4 (shell half): after the swap, a failed gate restores the previous digest."""
+        env_file = sandbox.write_env_file(DIGEST_B)
+        result = sandbox.run(
+            extra_env={
+                "PROD_UPDATE_DIGEST": DIGEST_A,
+                "PROD_UPDATE_HEALTHZ_VERSION": "0.13.0",  # never the release version
+            }
+        )
+        assert result.returncode != 0
+        assert "rolling back to the previous release" in result.stderr
+        assert "post-swap health gate failed" in result.stderr
+
+        # The previous release is pinned again, and its image is brought back
+        # after the failed gate (a second `up` follows the gate's `ps` probes).
+        assert env_file.read_text(encoding="utf-8") == f"{IMAGE_LINE}{DIGEST_B}\n"
+        assert env_file.stat().st_mode & 0o777 == 0o600
+        assert sandbox.prev_file.read_text(encoding="utf-8") == f"{IMAGE_LINE}{DIGEST_B}\n"
+        assert len(sandbox.snapshots()) == 1, "the pre-swap snapshot stays on disk"
+        assert self._last(sandbox, "docker", "up") > self._last(sandbox, "docker", "ps")
+        assert sandbox.outcome() == "failure"
+
+    def test_an_oversized_database_aborts_before_the_backup(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """F3/C6: the sealed artifact must fit the container's 64 MB tmpfs (~48 MB)."""
+        env_file = sandbox.write_env_file(DIGEST_B)
+        before = env_file.read_bytes()
+        result = sandbox.run(
+            extra_env={"PROD_UPDATE_DIGEST": DIGEST_A, "PROD_UPDATE_DB_BYTES": "52428800"}
+        )
+        assert result.returncode != 0
+        assert "database too large for an in-container snapshot" in result.stderr
+        assert not any("coach_web.maintenance" in call for call in sandbox.invocations())
+        assert not any("cp" in call for call in sandbox.invocations())
+        assert env_file.read_bytes() == before
+        assert sandbox.snapshots() == []
+        assert sandbox.outcome() == "failure"
+
+    @pytest.mark.parametrize("artifact_bytes", ["0", "10"])
+    def test_a_truncated_or_empty_artifact_fails_the_integrity_check(
+        self, sandbox: ProdUpdateSandbox, artifact_bytes: str
+    ) -> None:
+        """F4/C6: a successful `cp` is not evidence — the artifact must be usable.
+
+        This also pins the snapshot-before-swap order: the update aborts with
+        `.env.prod` still byte-identical.
+        """
+        env_file = sandbox.write_env_file(DIGEST_B)
+        before = env_file.read_bytes()
+        result = sandbox.run(
+            extra_env={"PROD_UPDATE_DIGEST": DIGEST_A, "PROD_UPDATE_ARTIFACT_BYTES": artifact_bytes}
+        )
+        assert result.returncode != 0
+        assert "snapshot" in result.stderr
+        assert any("coach_web.maintenance" in call for call in sandbox.invocations())
+        assert env_file.read_bytes() == before
+        assert not sandbox.prev_file.exists()
+        assert sandbox.snapshots() == [], "the unusable artifact is removed"
+        assert sandbox.outcome() == "failure"
 
     def test_help_lists_the_three_modes(self, sandbox: ProdUpdateSandbox) -> None:
         result = sandbox.run("--help")
         assert result.returncode == 0
         assert "--force" in result.stdout
         assert "--rollback" in result.stdout
-        assert sandbox.docker_invocations() == []
+        assert sandbox.invocations() == []
 
     def test_an_unknown_argument_is_refused(self, sandbox: ProdUpdateSandbox) -> None:
         result = sandbox.run("--nope")
         assert result.returncode == 2
         assert "unknown argument" in result.stderr
-        assert sandbox.docker_invocations() == []
+        assert sandbox.invocations() == []
