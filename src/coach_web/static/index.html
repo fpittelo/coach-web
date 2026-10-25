@@ -1176,6 +1176,8 @@
             </div>
             <p
               class="settings-note"
+              role="status"
+              aria-live="polite"
               x-show="settingsMessage"
               x-text="settingsMessage"
             ></p>
@@ -1188,6 +1190,117 @@
                 Save objectives
               </button>
             </div>
+            <!-- Orientation & agent preferences (#363, MADR-0026): ONE new
+                 section in the existing modal — free-text orientation
+                 textarea (maxlength 1500 + live counter), two segmented
+                 nullable enum controls with an explicit "default (unset)"
+                 affordance, Save (PUT with the full representation) and a
+                 confirm-gated "Reset to Coach defaults" (DELETE). The C4
+                 disclosure sits adjacent to the textarea so it reads as part
+                 of the input contract. All injected strings bind via x-text
+                 (the orientation is DATA, never markup); native radio groups
+                 with fieldset legends; success/failure rides the shared
+                 settingsMessage note above (role="status" aria-live) — the
+                 section adds no auth surface of its own, inheriting the
+                 modal's 401/sign-in flow unchanged. -->
+            <fieldset class="goal-fieldset">
+              <legend class="goal-legend">Orientation &amp; agent preferences</legend>
+              <label class="field">
+                <span class="field-label">Orientation</span>
+                <textarea
+                  x-model="agentSettingsForm.orientation"
+                  rows="4"
+                  maxlength="1500"
+                  aria-describedby="agent-orientation-counter agent-orientation-disclosure"
+                ></textarea>
+              </label>
+              <p class="settings-note agent-settings-counter" id="agent-orientation-counter">
+                <span x-text="agentSettingsForm.orientation.length + '/1500'"></span>
+              </p>
+              <p class="settings-note agent-settings-disclosure" id="agent-orientation-disclosure">
+                Orientation text is sent to the model provider on every turn.
+              </p>
+              <div class="field-row">
+                <fieldset class="agent-settings-segment">
+                  <legend class="field-label">Verbosity</legend>
+                  <div class="agent-settings-options">
+                    <label class="segment-option">
+                      <input type="radio" name="agent-verbosity" value="" x-model="agentSettingsForm.verbosity" />
+                      <span>Default (unset)</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-verbosity" value="concise" x-model="agentSettingsForm.verbosity" />
+                      <span>Concise</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-verbosity" value="standard" x-model="agentSettingsForm.verbosity" />
+                      <span>Standard</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-verbosity" value="detailed" x-model="agentSettingsForm.verbosity" />
+                      <span>Detailed</span>
+                    </label>
+                  </div>
+                </fieldset>
+                <fieldset class="agent-settings-segment">
+                  <legend class="field-label">Tone</legend>
+                  <div class="agent-settings-options">
+                    <label class="segment-option">
+                      <input type="radio" name="agent-tone" value="" x-model="agentSettingsForm.tone" />
+                      <span>Default (unset)</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-tone" value="strict" x-model="agentSettingsForm.tone" />
+                      <span>Strict</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-tone" value="balanced" x-model="agentSettingsForm.tone" />
+                      <span>Balanced</span>
+                    </label>
+                    <label class="segment-option">
+                      <input type="radio" name="agent-tone" value="supportive" x-model="agentSettingsForm.tone" />
+                      <span>Supportive</span>
+                    </label>
+                  </div>
+                </fieldset>
+              </div>
+              <p class="settings-note" x-show="agentSettingsDirty">Unsaved changes.</p>
+              <div class="settings-actions">
+                <button
+                  class="button button--ghost"
+                  type="button"
+                  x-show="agentSettingsResetArmed"
+                  @click="cancelAgentSettingsReset()"
+                >
+                  Cancel
+                </button>
+                <button
+                  class="button button--ghost"
+                  type="button"
+                  x-show="!agentSettingsResetArmed"
+                  @click="armAgentSettingsReset()"
+                >
+                  Reset to Coach defaults
+                </button>
+                <button
+                  class="button button--ghost"
+                  type="button"
+                  x-show="agentSettingsResetArmed"
+                  :disabled="agentSettingsSaving"
+                  @click="resetAgentSettings()"
+                >
+                  Confirm reset
+                </button>
+                <button
+                  class="button"
+                  type="button"
+                  :disabled="agentSettingsSaving || agentSettingsOrientationOverflow"
+                  @click="saveAgentSettings()"
+                >
+                  Save preferences
+                </button>
+              </div>
+            </fieldset>
           </form>
         </div>
       </div>
