@@ -4,7 +4,7 @@
 - **Date:** 2026-10-25
 - **Deciders:** @architect, @fpittelo
 - **Reviewed by:** @cyber-security (MADR-0008 security-impact routing — unattended image replacement on the daily-use lane; APPROVE-WITH-CONDITIONS C1–C8, review recorded on fpittelo/coach-web#327)
-- **Tracked in:** fpittelo/coach-web#327, Sprint 29 marker #331; to be implemented by #328 (boot supervision) and #326 (auto-update), proven live by #329 (all three `status::ready` at time of writing)
+- **Tracked in:** fpittelo/coach-web#327, Sprint 29 marker #331; to be implemented by #328 (boot supervision) and #326 (auto-update), proven live by #329 (all three `status::ready` at time of writing); flow order amended by #336 after the #326 implementation review
 
 > **Acceptance basis:** PO directive 2026-10-25 — "automated continuous deployment in production for each release… the docker image must be up and running all the time when I start my PC, and updated for each release" — plus the PO's instruction to start the Sprint 29 autonomous loop. Presented for PO review at sprint closeout.
 >
@@ -57,14 +57,15 @@ Forces that constrain any automation:
 
 - **Supervision:** `coach-web.service` (user unit, `Type=oneshot`, `RemainAfterExit=yes`, `WantedBy=default.target`) runs the compose `up -d` with a bounded docker-readiness retry; `loginctl enable-linger` makes it boot-persistent without a login.
 - **Update:** `coach-web-update.timer` (5 min, `Persistent=true`) runs a script that:
-  1. takes a shared `flock` (the preflight and any manual rollout take the same lock);
+  1. takes a shared `flock` (the preflight, the lane unit, and any manual rollout take the same lock);
   2. resolves `ghcr.io/fpittelo/coach-web:prod` and validates the digest;
   3. no-ops when it equals the digest in `.env.prod`;
   4. **provenance gate:** requires `digest(:prod) == digest(:vX.Y.Z)` for the latest non-prerelease release tag, resolved through the public Releases API (never the application's `GITHUB_TOKEN`);
-  5. writes an encrypted pre-swap snapshot of the database (off-volume, mode 600, last 4 retained);
-  6. rewrites the single `COACH_WEB_IMAGE=` line atomically (owner/mode 600 verified before and after; previous digest retained);
-  7. pulls, recreates, then requires 3/3 healthy within 120 s **and** `/healthz` reporting the release version;
-  8. on any failure after the swap, restores the previous digest and brings the previous image back.
+  5. **pulls the verified digest** (by digest, not by tag) — a pull failure leaves `.env.prod` byte-identical and the lane untouched;
+  6. measures the database and writes an encrypted pre-swap snapshot (off-volume, mode 600, last 4 retained);
+  7. rewrites the single `COACH_WEB_IMAGE=` line atomically (owner/mode 600 verified before and after; previous digest retained);
+  8. recreates, then requires 3/3 healthy within 120 s **and** `/healthz` reporting the release version;
+  9. on any failure after the swap, restores the previous digest and brings the previous image back.
 - Pros: no new surface (no listener, no privileged container, no credential); provenance is checked rather than assumed; the digest pin survives; rollback is a two-line state restore; the mechanism is repo-tracked, reviewable bash plus a unit-tested Python helper.
 - Cons: updates are not instantaneous (≤5 min after the release is published); the script runs with docker-group privilege; the timer is one more thing to understand.
 
@@ -73,6 +74,12 @@ Forces that constrain any automation:
 Chosen option: **"Option 4: systemd user units + provenance-gated pull timer"**, because it is the only option that satisfies zero-manual-step rollout and boot persistence while keeping the provenance guarantee (driver 2), adding no network surface or privileged component (driver 3), and remaining small enough for one person to own (driver 6).
 
 The manual Release Runbook survives, narrowed to two roles: first-time/bootstrap verification and the documented fallback when the automation is disabled or a release is explicitly excluded (a destructive migration).
+
+### Amendment (2026-10-25 — #326, PR #335)
+
+Implementation review found that steps 5–7 as first written (snapshot → rewrite → pull) left a window in which `.env.prod` could pin an image that was neither pulled nor health-gated, while the boot unit or a manual `systemctl --user restart` could recreate the lane from it. The delivered order **pulls the provenance-verified digest before the snapshot and the rewrite**, so the env file only ever pins an image that is already local and verified; the lane unit (`flock -w 900`) and every operator path now take the same lock as the tick. This amendment refines the flow; it does not change the decision.
+
+Residual window after the amendment: an interruption between the atomic rewrite and the completion of `up -d` + gate leaves `.env.prod` pinning a provenance-verified, already-pulled digest while the previous release still serves; the next tick reports `no change` and does not recreate the lane. Recovery: `--force` or `--rollback`. No unverified deployment is possible through this window.
 
 ## Consequences
 
@@ -88,7 +95,7 @@ Verdict: **APPROVE-WITH-CONDITIONS**. Conditions C1–C6 are binding on the impl
 | :--- | :--- | :--- |
 | C1 | Never trust the moving `:prod` tag alone: `digest(:prod)` must equal the digest of the latest non-prerelease release tag | binding |
 | C2 | Fail-safe: registry unreachable / rate-limited / tag absent / malformed digest ⇒ exit non-zero without any pull or recreate | binding |
-| C3 | One lock shared by timer, unit start, preflight and documented rollback | binding |
+| C3 | One lock shared by the tick, the lane unit (start/stop), the prod preflight and the operator paths (`--force`/`--rollback`) — contention behaviour differs by actor: the unattended tick **skips** (exit 0), the prod preflight **refuses to start** (exit 1), the lane unit and operator commands **wait** (bounded, 900 s) | binding |
 | C4 | `.env.prod`: `umask 077`, no `set -x`, owner/mode 600 verified before and after, tempfile+rename, exactly one image line, `--env-file` only (never `EnvironmentFile=`), never log `docker compose config` | binding |
 | C5 | Unit hygiene: `NoNewPrivileges`, `PrivateTmp`, `UMask=0077`, explicit `PATH`, `Restart=on-failure` + `StartLimit*`, `TimeoutStartSec` above the boot retry window | binding |
 | C6 | Image rollback ≠ data rollback: pre-swap encrypted snapshot, expand-contract migrations, destructive-migration releases excluded from unattended update | binding |
@@ -112,6 +119,8 @@ Residual risk accepted (verbatim from the review comment archived on fpittelo/co
 | No-op cost | one digest resolution per tick, no image pull, no container restart |
 | Rollback (image) | automatic on failed gate; manual = restore previous digest + `systemctl --user restart coach-web` |
 | Rollback (data) | restore the pre-swap encrypted snapshot with the existing maintenance CLI (#274) |
+| Snapshot ceiling | ~48 MB raw DB (64 MB container tmpfs ÷ 4/3) — a larger DB aborts the update fail-safe |
+| Interrupted swap | env may pin an already-pulled, provenance-verified digest while the previous release serves; next tick is a no-op — recover with `--force` / `--rollback` |
 | Excluded from automation | releases carrying a destructive migration (documented manual path) |
 
 ## References
