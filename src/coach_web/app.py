@@ -5,7 +5,7 @@ import html
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import date
 from importlib.metadata import PackageNotFoundError, version
@@ -170,6 +170,21 @@ WEEK_ADJUSTMENT_PEAK_DATE_DETAIL = (
 )
 """Static 422 detail for an adjustment placing a session past the active
 objective's target date (#233 AC2). Value-free like the other bodies."""
+
+
+def _safe_validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Project validation errors to their value-free fields (#352 AC1).
+
+    Pydantic v2 error dicts embed the offending ``input`` (and sometimes
+    ``ctx`` carrying the validator's exception instance), and custom validator
+    messages can interpolate the input (``models.validate_iso_date`` does), so
+    ``msg`` is dropped too. Only ``loc`` and ``type`` are safe to log: the
+    request path and the error count ride the log message itself, keeping the
+    diagnostic value (which field, which rule) without the value (nLPD, epic
+    #346 C3 — journald is not an approved store for health-adjacent content).
+    """
+    return [{"loc": error.get("loc"), "type": error.get("type")} for error in errors]
+
 
 _SIGNIN_SLOT = (
     "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
@@ -510,15 +525,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         FastAPI's default validation handler echoes the rejected input back to
         the client; the nLPD posture keeps validation detail server-side only —
-        the full errors are logged, the response carries a static string. On
-        the owner-facing settings paths (#181) the body is instead the
-        structured reason ``{code, message}``: the reason is threaded through
-        the validators as a typed exception attribute (never string-matched)
+        the log carries a value-free projection of each error (``loc``/``type``
+        and the count, #352 — never ``input``/``ctx``/``msg``) and the
+        response carries a static string. On the owner-facing settings paths
+        (#181) the body is instead the structured reason ``{code, message}``:
+        the reason is threaded through the validators as a typed exception
+        attribute (never string-matched)
         and unattributed errors map to the ``invalid_values`` catch-all, so
         the body shape stays consistent for the UI contract.
         """
         errors = exc.errors()
-        logger.warning("Rejected malformed request on %s: %s", request.url.path, errors)
+        safe_errors = _safe_validation_errors(errors)
+        logger.warning(
+            "Rejected malformed request on %s: %d validation error(s): %s",
+            request.url.path,
+            len(safe_errors),
+            safe_errors,
+        )
         if request.url.path in SETTINGS_REASON_PATHS:
             reason = settings_reason_from_errors(errors)
             return JSONResponse(status_code=422, content=settings_reason_payload(reason))
