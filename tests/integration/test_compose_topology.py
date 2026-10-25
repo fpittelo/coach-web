@@ -594,9 +594,10 @@ class TestLaneScript:
         )
         assert result.returncode == 0, result.stderr
 
-    def test_script_rejects_prod_with_manual_procedure_pointer(self, script: str) -> None:
-        """The prod lane is refused and points at the manual procedure (AC1)."""
-        assert "manual" in script.lower()
+    def test_script_points_prod_lifecycle_at_systemd(self, script: str) -> None:
+        """The prod lifecycle is owned by systemd; lane.sh says so (#328 AC6)."""
+        assert "systemctl --user" in script
+        assert "coach-web.service" in script
         assert "compose.prod.yml" in script
 
     def test_script_scopes_teardown_to_its_own_project(self, script: str) -> None:

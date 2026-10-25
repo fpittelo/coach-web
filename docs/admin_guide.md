@@ -106,9 +106,70 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 ```
 
 - `up` prints the lane URL (`http://127.0.0.1:8100` dev / `:8200` qa) and the per-service states once every service reports healthy.
-- Scope is **dev/qa only**: `prod` is rejected with a pointer to the manual procedure (usage header in `compose.prod.yml`, Release Runbook below) — prod stays a human-owned, digest-pinned + OIDC operation.
+- Scope is **dev/qa for lifecycle**: `prod up|down` are rejected with a pointer to systemd — the prod lane is supervised by `coach-web.service` (one supervisor only, MADR-0024; see *Boot & Supervision* below). `prod status` and `prod logs [service]` are read-only and supported.
 - Every action is scoped to the lane's own compose project (`coach-web-<lane>`); concurrent lanes and unrelated compose projects are never touched.
 - `scripts/e2e-preflight.sh` remains the validation gate — `lane.sh up` gets the lane running for browser-based verification, it does not replace the pre-flight assertions.
+
+---
+
+## 🔁 Boot & Supervision (prod lane, #328)
+
+The prod lane (`coach-web-prod`) is supervised by a **systemd user unit** so it comes back by itself after a reboot or a crash — no manual `up -d` (MADR-0024). The unit is rendered from the repo-tracked template `deploy/systemd/coach-web.service.in`; the installed copy under `~/.config/systemd/user/` is **never hand-edited** — re-run the installer to refresh it.
+
+| Property | Value |
+|:---|:---|
+| Unit | `~/.config/systemd/user/coach-web.service` (`Type=oneshot`, `RemainAfterExit=yes`, `WantedBy=default.target`) |
+| Supervisor | `systemctl --user` — **one supervisor only**: `lane.sh prod up\|down` is refused with a pointer here |
+| Boot without login | `loginctl enable-linger "$USER"` (required; the installer asserts it and refuses to install without it) |
+| Docker race | bounded `ExecStartPre` retry (30 × 2 s) before `up`, with `TimeoutStartSec=300` above it — docker is a *system* unit and a user unit cannot order against it |
+| Secrets | `.env.prod` is passed to compose via `--env-file` only — never `EnvironmentFile=`, never printed, never copied (C4) |
+
+### Install / refresh
+
+```bash
+./scripts/prod-install.sh
+```
+
+Idempotent: a second run rewrites nothing and re-asserts `enable --now`. The installer
+
+1. asserts `loginctl show-user "$USER" -p Linger` is `yes` — otherwise it prints the exact remediation (`loginctl enable-linger "$USER"`) and exits non-zero;
+2. renders the template into `~/.config/systemd/user/coach-web.service`, runs `systemctl --user daemon-reload`, then `enable --now`;
+3. prints the **boot-persistent user-unit audit list** — linger widens the boot scope to *every* enabled user unit (security condition C7), so the list is recorded;
+4. prints a verification block: unit state, `docker compose ps -a` for `coach-web-prod`, and `/healthz`.
+
+### Verify / restart / stop
+
+```bash
+./scripts/lane.sh prod status                 # read-only: ps -a for coach-web-prod
+./scripts/lane.sh prod logs coach-web         # read-only: --tail=100 (optional service)
+systemctl --user status coach-web             # unit state
+systemctl --user restart coach-web            # re-apply the compose up (bounded docker retry)
+systemctl --user stop coach-web               # project-scoped down --remove-orphans
+
+# 3/3 healthy + serving version
+docker compose -p coach-web-prod -f compose.yaml -f compose.prod.yml --env-file .env.prod ps -a
+curl -fsS http://127.0.0.1:8000/healthz
+```
+
+`systemctl --user stop coach-web` runs the unit's `ExecStop` (`down --remove-orphans`), so it leaves no orphan containers; named volumes are kept. A later `systemctl --user restart coach-web` (or `start`) restores the lane.
+
+### Uninstall
+
+```bash
+./scripts/prod-install.sh --uninstall
+```
+
+Disables and removes the unit (its `ExecStop` downs the project). The data volume `coach-web-prod_coach-data` is **never** removed — `docker compose down` keeps named volumes and the script never passes `-v`.
+
+### Troubleshooting
+
+| Problem | Cause | Fix |
+|:---|:---|:---|
+| **`docker daemon not ready`** in `journalctl --user -u coach-web` | The unit started before the system `docker.service` was up and the 60 s readiness retry expired | `systemctl --user restart coach-web` (retries the wait); if it persists, check `systemctl status docker`, then re-run `./scripts/prod-install.sh` |
+| **Lane is up only while logged in** | `linger` is off | `loginctl enable-linger "$USER"` (the installer refuses to install without it) |
+| **Unit runs an old checkout** | The checkout moved/renamed after install (the unit hardcodes the absolute repo path) | Re-run `./scripts/prod-install.sh` — it re-renders `@REPO_ROOT@` |
+| **`systemctl --user` cannot connect** | No user manager in the session | Log in (or enable linger) so `systemd --user` is running |
+| **Unit failed repeatedly** | `StartLimitBurst=3` in 300 s reached — systemd stopped retrying | `systemctl --user reset-failed coach-web`, fix the cause, `systemctl --user restart coach-web` |
 
 ---
 
@@ -367,4 +428,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-25 (issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; prior: issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-10-25 (issue #328 — new "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; prior: issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
