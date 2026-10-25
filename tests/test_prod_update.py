@@ -42,8 +42,13 @@ PROD_LANE_LOCK = "coach-web-prod.lock"
 RELEASES_API = "https://api.github.com/repos/fpittelo/coach-web/releases/latest"
 HEALTHZ_URL = "http://127.0.0.1:8000/healthz"
 
-ALLOWED_COMPOSE_VERBS = frozenset({"ps", "exec", "cp", "up", "down"})
-"""The `dc` helper's verbs: none of them ever prints the interpolated environment (C4)."""
+ALLOWED_COMPOSE_VERBS = frozenset({"ps", "exec", "up", "down"})
+"""The `dc` helper's verbs: none of them ever prints the interpolated environment (C4).
+
+`cp` is banned outright (#342): compose cp resolves paths on the container rootfs
+and cannot traverse the /tmp tmpfs the C6 artifact is staged on — the artifact is
+streamed out with `exec -T cat` instead.
+"""
 
 DIGEST_A = "sha256:" + "a" * 64
 DIGEST_B = "sha256:" + "b" * 64
@@ -668,13 +673,26 @@ class TestScriptGuards:
 
         A `docker compose config` that never prints its output would still hand
         the resolved `.env.prod` to anything watching the process tree, so the
-        invariant is the helper's verb set: `ps`, `exec`, `cp`, `up`, `down` —
+        invariant is the helper's verb set: `ps`, `exec`, `up`, `down` —
         never `config` (or any future verb that dumps the interpolation).
         """
         verbs = set(re.findall(r"\bdc ([a-z][a-z-]*)", self._directives()))
         assert verbs, "the compose helper is expected to be invoked directly"
         assert verbs <= ALLOWED_COMPOSE_VERBS, sorted(verbs - ALLOWED_COMPOSE_VERBS)
         assert "config" not in verbs
+
+    def test_entrypoint_streams_the_artifact_and_never_uses_compose_cp(self) -> None:
+        """C6/#342: the artifact leaves the container via `exec -T cat`, never cp.
+
+        The container's /tmp is a tmpfs mount: docker cp / compose cp resolve
+        paths on the container rootfs and do not traverse it, so every tick
+        failed at extraction ("Could not find the file"). The mechanism is
+        pinned statically: no `dc cp` anywhere, and the extraction is the
+        exec-stream redirect into a host temp file on the snapshots filesystem.
+        """
+        directives = self._directives()
+        assert not re.search(r"\bdc cp\b", directives)
+        assert "dc exec -T coach-web cat" in directives
 
     def test_entrypoint_never_names_a_secret(self) -> None:
         """C4/AC8: the script carries no secret name except the defensive unset."""
@@ -723,8 +741,9 @@ DOCKER_SHIM = '''#!/usr/bin/env python3
 """Recording docker shim: logs argv and answers every call prod-update.sh makes.
 
 The shim is the whole (fake) docker surface: registry digest resolution, the
-digest pull, the compose verb set (ps/exec/cp/up), the in-container database
-size probe, the maintenance backup and its extracted artifact. Every call is
+digest pull, the compose verb set (ps/exec/up), the in-container database
+size probe, the maintenance backup, and the extraction stream (`exec -T cat`)
+that carries the staged artifact out of the container. Every call is
 appended to PROD_UPDATE_SHIM_LOG so the tests can assert the ORDER as well as
 the arguments; env vars steer each answer.
 """
@@ -782,11 +801,23 @@ if args[:1] == ["compose"]:
             sys.exit(0)
         if any("coach_web.maintenance" in token for token in rest):
             sys.exit(0 if enabled("PROD_UPDATE_BACKUP_OK") else 1)
+        if any(token == "cat" for token in rest):
+            # The extraction stream (#342): `exec -T cat` writes the staged
+            # artifact to stdout; the entrypoint redirects it into a host temp
+            # file. PROD_UPDATE_STREAM_OK=0 fails the stream (mid-stream death),
+            # ARTIFACT_BYTES=0 empties it.
+            if not enabled("PROD_UPDATE_STREAM_OK"):
+                sys.exit(1)
+            sys.stdout.buffer.write(b"x" * ARTIFACT_BYTES)
+            sys.stdout.buffer.flush()
+            sys.exit(0)
         sys.exit(0)  # the rm of the staged artifact
     if verb == "cp":
-        with open(args[-1], "wb") as target:
-            target.write(b"x" * ARTIFACT_BYTES)
-        sys.exit(0)
+        # #342: compose cp resolves paths on the container rootfs and cannot
+        # traverse the /tmp tmpfs the C6 artifact is staged on — reproduce the
+        # real daemon failure so a regression back to cp fails like production.
+        print("Error response from daemon: Could not find the file", file=sys.stderr)
+        sys.exit(1)
     if verb == "up":
         sys.exit(0 if enabled("PROD_UPDATE_UP_OK") else 1)
     if verb == "down":
@@ -1077,21 +1108,26 @@ class TestEntrypointBehaviour:
         # C2/F1: the *verified* digest is what gets pulled (not a tag).
         assert ["docker", "pull", CORE.image_ref(DIGEST_A)] in sandbox.invocations()
 
-        # C6: one owner-only artifact, larger than the database it seals.
+        # C6: one owner-only artifact, larger than the database it seals, streamed
+        # out of the container and renamed into place (no staging file remains).
         snapshots = sandbox.snapshots()
         assert len(snapshots) == 1
         assert snapshots[0].stat().st_mode & 0o777 == 0o600
         raw_bytes = 4096
         assert snapshots[0].stat().st_size == raw_bytes * 4 // 3 + 1
         assert snapshots[0].stat().st_size > raw_bytes
+        assert list(sandbox.snapshot_dir.glob(".staging-*")) == []
 
-        # Ordering: provenance -> pull -> measure/snapshot -> recreate -> gate.
+        # #342: the artifact travelled via the exec-stream, never via compose cp.
+        assert not any("cp" in call for call in sandbox.docker_invocations())
+
+        # Ordering: provenance -> pull -> measure/snapshot/stream -> recreate -> gate.
         assert (
             self._first(sandbox, "curl", RELEASES_API)
             < self._first(sandbox, "docker", "pull")
             < self._first(sandbox, "docker", "-c")  # the in-container size probe
             < self._first(sandbox, "docker", "coach_web.maintenance")
-            < self._first(sandbox, "docker", "cp")
+            < self._first(sandbox, "docker", "cat")  # the exec-stream extraction
             < self._first(sandbox, "docker", "up")
             < self._first(sandbox, "docker", "ps")
             < self._first(sandbox, "curl", HEALTHZ_URL)
@@ -1177,10 +1213,11 @@ class TestEntrypointBehaviour:
     def test_a_truncated_or_empty_artifact_fails_the_integrity_check(
         self, sandbox: ProdUpdateSandbox, artifact_bytes: str
     ) -> None:
-        """F4/C6: a successful `cp` is not evidence — the artifact must be usable.
+        """F4/C6: a successful stream is not evidence — the artifact must be usable.
 
-        This also pins the snapshot-before-swap order: the update aborts with
-        `.env.prod` still byte-identical.
+        An empty (0-byte) or truncated stream aborts before the swap, and the
+        unusable host temp is deleted: `.env.prod` stays byte-identical and no
+        artifact (nor staging leftover) reaches the snapshots directory.
         """
         env_file = sandbox.write_env_file(DIGEST_B)
         before = env_file.read_bytes()
@@ -1193,6 +1230,29 @@ class TestEntrypointBehaviour:
         assert env_file.read_bytes() == before
         assert not sandbox.prev_file.exists()
         assert sandbox.snapshots() == [], "the unusable artifact is removed"
+        assert list(sandbox.snapshot_dir.glob(".staging-*")) == []
+        assert not any("up" in call for call in sandbox.invocations())
+        assert sandbox.outcome() == "failure"
+
+    def test_a_failed_stream_aborts_before_the_swap(self, sandbox: ProdUpdateSandbox) -> None:
+        """C6/#342: a failed extraction stream (mid-stream death) aborts the update.
+
+        The `exec -T cat` stream returning non-zero must abort before `.env.prod`
+        is touched, with the host temp deleted and no snapshot swapped in.
+        """
+        env_file = sandbox.write_env_file(DIGEST_B)
+        before = env_file.read_bytes()
+        result = sandbox.run(
+            extra_env={"PROD_UPDATE_DIGEST": DIGEST_A, "PROD_UPDATE_STREAM_OK": "0"}
+        )
+        assert result.returncode != 0
+        assert "cannot stream the snapshot out of the container" in result.stderr
+        assert any("coach_web.maintenance" in call for call in sandbox.invocations())
+        assert env_file.read_bytes() == before
+        assert not sandbox.prev_file.exists()
+        assert sandbox.snapshots() == []
+        assert list(sandbox.snapshot_dir.glob(".staging-*")) == []
+        assert not any("up" in call for call in sandbox.invocations())
         assert sandbox.outcome() == "failure"
 
     def test_help_lists_the_three_modes(self, sandbox: ProdUpdateSandbox) -> None:
