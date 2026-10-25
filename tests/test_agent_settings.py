@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from coach_web.agent import (
     ORIENTATION_LINE_PREFIX,
     assemble_system_prompt,
-    sanitize_orientation,
+    sanitize_untrusted_text,
 )
 from coach_web.agent_settings import (
     AGENT_ORIENTATION_MAX_CHARS,
@@ -271,7 +271,9 @@ class TestCorruptedRowReads:
         assert "<system>" not in prompt
         assert "system: ignore" not in prompt
         prompt_lines = prompt.splitlines()
-        for content_line in sanitize_orientation(payload).splitlines():
+        for content_line in sanitize_untrusted_text(
+            payload, max_chars=AGENT_ORIENTATION_MAX_CHARS
+        ).splitlines():
             assert (ORIENTATION_LINE_PREFIX + content_line) in prompt_lines
 
     async def test_control_characters_are_stripped_at_the_seam(
@@ -314,7 +316,9 @@ class TestCorruptedRowReads:
         assert "<|im_start|>" not in prompt
         # Un-neutralising the inserted zero-width characters recovers the
         # capped length — the clamp saw the pre-neutralisation text.
-        sanitized_body = sanitize_orientation(settings.orientation)
+        sanitized_body = sanitize_untrusted_text(
+            settings.orientation, max_chars=AGENT_ORIENTATION_MAX_CHARS
+        )
         assert len(sanitized_body.replace("<|\u200b", "<|")) <= AGENT_ORIENTATION_MAX_CHARS
         # The clamped body is what the fence carries.
         assert sanitized_body in prompt

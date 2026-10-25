@@ -816,11 +816,13 @@ class TestDivergenceDigestEndpoint:
         # C-S2-4 for the DIGEST boundary: exactly one session serves every
         # digest read of the turn. Superseded for #349 (MADR-0025): the
         # conversation persistence boundary opens its OWN session per step
-        # — thread resolve (1), user-message write (2), assistant
-        # completion write (3) — a separate C7 failure posture, deliberately
-        # not shared with the digest reads. One clean turn opens 4 sessions
-        # in total: 1 digest + 3 persistence.
-        assert counting.calls == 4
+        # — thread resolve (1), memory-window read (#350, 2), user-message
+        # write (3), assistant completion write (4), summary-refresh read
+        # (#350, 5; below the ~20-turn threshold it writes nothing) — a
+        # separate C7 failure posture, deliberately not shared with the
+        # digest reads. One clean turn opens 6 sessions: 1 digest + 5
+        # persistence.
+        assert counting.calls == 6
         prompt = agent.captured_prompt
         assert prompt is not None
         # The shared session served the divergence read too.

@@ -143,6 +143,19 @@ class Settings(BaseSettings):
     lane; the ``maintenance purge-conversations`` sweep consumes it.
     """
 
+    MEMORY_CONTEXT_MAX_CHARS: int = 200_000
+    """Total character bound on the assembled conversation-memory context (#350 AC5).
+
+    MADR-0025: "total assembled context bounded by a config constant,
+    enforced server-side (worst-case-tested)". The documented worst case —
+    20 × 8 000-char window messages + 250-word summary + fences + directive
+    + orientation block + digests + re-assert clause — measures ≈ 172 000
+    chars, so the default leaves headroom. The context builder
+    (``conversation_context.build_memory_block``) enforces the bound:
+    beyond it the memory window truncates OLDEST-FIRST (a contiguous
+    newest run is kept) and the summary section yields last.
+    """
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""

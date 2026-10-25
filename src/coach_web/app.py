@@ -34,7 +34,7 @@ from coach_web.agent import (
     apply_temporal_anchor,
     assemble_system_prompt,
     create_agent,
-    sanitize_orientation,
+    sanitize_untrusted_text,
 )
 from coach_web.agent_settings import (
     AGENT_ORIENTATION_MAX_CHARS,
@@ -81,6 +81,11 @@ from coach_web.conversation_api import (
     purge_athlete_conversations,
     record_assistant_turn,
     record_user_turn,
+)
+from coach_web.conversation_context import (
+    build_turn_memory_block,
+    produce_thread_summary,
+    refresh_thread_summary_if_due,
 )
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import (
@@ -348,7 +353,8 @@ def _normalize_orientation_for_save(text: str | None) -> str | None:
     """Sanitize then validate the owner orientation for persistence (#362).
 
     MADR-0026 C2 save call site: the seam sanitizer
-    (:func:`coach_web.agent.sanitize_orientation`) is IMPORTED and reused —
+    (:func:`coach_web.agent.sanitize_untrusted_text` — one generalised
+    sanitizer, four call sites since MADR-0025 C2) is IMPORTED and reused —
     its result is what gets stored, never a forked transform. Validation then
     runs on the SANITIZED result (validate-after-sanitize, #361 review
     binding): the sanitizer caps BEFORE zero-width defusion, so a payload
@@ -363,7 +369,7 @@ def _normalize_orientation_for_save(text: str | None) -> str | None:
     An empty sanitized text (unset preference) normalizes to ``None``,
     matching the seam model's unset shape and the GET defaults body.
     """
-    sanitized = sanitize_orientation(text)
+    sanitized = sanitize_untrusted_text(text, max_chars=AGENT_ORIENTATION_MAX_CHARS)
     if len(sanitized) > AGENT_ORIENTATION_MAX_CHARS:
         raise SettingsValidationError(
             SettingsReason.INVALID_VALUES,
@@ -706,7 +712,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         retired (deleted and never read, cached clients tolerated via
         ``extra="ignore"``). The server resolves or opens the athlete's
         active thread (unknown/non-owned → 404 fail-closed, archived →
-        409), persists the user message BEFORE streaming, and persists the
+        409), assembles the turn's fenced conversation-memory block from
+        the thread's stored messages and rolling summary (#350 — through
+        :func:`coach_web.agent.assemble_system_prompt`, the MADR-0026-pinned
+        slot), persists the user message BEFORE streaming, and persists the
         assistant message exactly once on the clean ``done`` marker — the
         finalization write after the event loop, never a partial, never on
         a disconnect (the turn did not complete). Persistence failures
@@ -791,6 +800,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except EncryptionUnavailableError as exc:
             log_persistence_degrade(exc)
         turn_thread: ConversationThreadRow | None = None
+        memory_block: str | None = None
         if cipher is not None:
             turn_outcome = await open_turn_thread(
                 session_factory,
@@ -799,6 +809,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             turn_thread = turn_outcome.thread
             if turn_thread is not None:
+                # Server-owned memory assembly (MADR-0025, #350): the turn's
+                # memory block is built from the thread's stored messages +
+                # rolling summary BEFORE the user turn is recorded, so the
+                # window replays the PRIOR context and the current message
+                # enters only as the live user turn. The read is
+                # degrade-wrapped (C7): a failure yields no memory block and
+                # the turn streams with the no-memory prompt.
+                memory_block = await build_turn_memory_block(
+                    session_factory,
+                    athlete_id=athlete_id,
+                    thread=turn_thread,
+                    cipher=cipher,
+                    bound=settings.MEMORY_CONTEXT_MAX_CHARS,
+                )
                 user_write = await record_user_turn(
                     session_factory,
                     athlete_id=athlete_id,
@@ -870,14 +894,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             approved_week_row = None
             agent_settings = None
             store_ok = False
-        # Prompt assembly through the single seam (MADR-0026, #361): the
-        # digest bodies are collected in the legacy order and handed to
+        # Prompt assembly through the single seam (MADR-0026, #361; memory #350):
+        # the digest bodies are collected in the legacy order and handed to
         # assemble_system_prompt together with the (possibly None) settings
-        # row. With no settings content the output is byte-identical to the
-        # pre-#361 apply_* chain (AC4 regression); with settings content the
-        # fenced non-authoritative orientation block and the pref directives
-        # sit between the core and the digests, and the re-assert clause
-        # closes the prompt (structural last word).
+        # row and the turn's fenced conversation-memory block. With no
+        # settings content and no memory block the output is byte-identical
+        # to the pre-#361 apply_* chain (AC4 regression); with content the
+        # fenced blocks sit in the pinned MADR-0026 order and the re-assert
+        # clause closes the prompt (structural last word — block-agnostic
+        # predicate, MADR-0025 C5).
         digests: list[str] = []
         if profile is not None:
             # The digest's phase resolution takes the same explicit ``today``
@@ -916,7 +941,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
             if divergence is not None:
                 digests.append(divergence_digest_text(divergence))
-        agent.system_prompt = assemble_system_prompt(core_prompt, agent_settings, digests)
+        agent.system_prompt = assemble_system_prompt(
+            core_prompt, agent_settings, digests, memory_block
+        )
 
         # Morning briefing card (#262, epic #215-A): on the FIRST page load
         # of the day (the client-derived date flag — R3, not a security
@@ -1032,6 +1059,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             yield ServerSentEvent(
                                 event=warning.type, data=warning.model_dump_json()
                             )
+                        elif completion.persisted:
+                            # Layer-2 refresh trigger (MADR-0025, #350 AC3):
+                            # once the thread exceeds ~20 stored turns the
+                            # rolling summary is regenerated from the
+                            # (sanitized) transcript. Degrade-wrapped and
+                            # log-only — the reply and its persistence are
+                            # unaffected (C7: the summary is convenience).
+                            await refresh_thread_summary_if_due(
+                                session_factory,
+                                athlete_id=athlete_id,
+                                thread_id=turn_thread.id,
+                                cipher=cipher,
+                            )
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)
                 failure = AgentEvent(type="error", data={"message": str(exc)})
@@ -1124,6 +1164,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ) as exc:
             logger.warning("Conversation reset unavailable (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # Layer-2 production trigger (MADR-0025, #350 AC3): the ARCHIVED
+        # thread's rolling summary is generated by the fixed server-side
+        # summarizer and stored encrypted. The archive+create transaction
+        # above has already committed; a summary failure must NOT fail the
+        # reset — the degrade-wrapped service logs and returns False (C7
+        # family; the summary is convenience).
+        if archived_id is not None:
+            reset_cipher: Fernet | None = None
+            try:
+                reset_cipher = build_debrief_cipher(settings)
+            except EncryptionUnavailableError as exc:
+                log_persistence_degrade(exc)
+            if reset_cipher is not None:
+                await produce_thread_summary(
+                    request.app.state.db_session_factory,
+                    athlete_id=athlete_id,
+                    thread_id=archived_id,
+                    cipher=reset_cipher,
+                )
         return ConversationResetResponse(archived_thread_id=archived_id, thread_id=fresh.id)
 
     @application.post(
