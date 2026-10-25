@@ -126,6 +126,23 @@ class Settings(BaseSettings):
     ``{code, message}`` vocabulary (#189); there is NO plaintext fallback.
     """
 
+    CONVERSATION_MESSAGE_RETENTION_DAYS: int = 90
+    """Raw conversation messages older than this are purged (MADR-0025 C6, #348).
+
+    Bounded retention is a privacy feature: raw turns age out of every
+    thread (the stored summary layer is what survives). Configurable per
+    lane; the ``maintenance purge-conversations`` sweep consumes it.
+    """
+
+    CONVERSATION_THREAD_RETENTION_DAYS: int = 365
+    """Threads inactive longer than this are purged (MADR-0025 C6, #348).
+
+    "Inactive" covers both shapes: archived threads (``last_active_at``
+    freezes at archive time) and active-but-stale threads. The FK CASCADE
+    removes the thread's remaining messages with it. Configurable per
+    lane; the ``maintenance purge-conversations`` sweep consumes it.
+    """
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""
