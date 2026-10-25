@@ -31,8 +31,10 @@ from coach_web.agent import (
     AgentEvent,
     CoachAgent,
     apply_temporal_anchor,
+    assemble_system_prompt,
     create_agent,
 )
+from coach_web.agent_settings import get_agent_settings
 from coach_web.analysis import WeekAdherenceMetric
 from coach_web.auth.middleware import (
     SESSION_COOKIE,
@@ -54,15 +56,15 @@ from coach_web.debrief import (
     DebriefSaveRequest,
     DebriefSaveResponse,
     PendingDebriefResponse,
-    apply_divergence_digest,
-    apply_pending_debrief_digest,
     athlete_id_from_email,
     build_debrief_cipher,
     build_divergence_digest,
     decrypt_rpe,
+    divergence_digest_text,
     list_debrief_rpes,
     list_pending_debriefs,
     parse_plan_day_rows,
+    pending_debrief_digest,
     save_debrief,
     upsert_week_adherence,
 )
@@ -82,7 +84,7 @@ from coach_web.microcycle import (
     WeekApprovalRequest,
     WeekApprovalResponse,
     adjusted_future_days,
-    apply_approved_week_digest,
+    approved_week_digest,
     build_week_markdown,
     list_drafts_by_week,
     moved_session_origins,
@@ -101,9 +103,9 @@ from coach_web.models import (
 from coach_web.objectives import (
     ObjectiveProfile,
     ObjectiveProfileResponse,
-    apply_objectives_digest,
     get_active_objective_row,
     get_objective_profile,
+    objectives_digest,
     save_objective_profile,
 )
 from coach_web.periodization import (
@@ -663,7 +665,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Duck-typed agents (test stubs) may not carry the attribute; the
         # default prompt is the base every real agent is built with.
         base_prompt = getattr(agent, "system_prompt", DEFAULT_SYSTEM_PROMPT)
-        agent.system_prompt = apply_temporal_anchor(base_prompt, today)
+        core_prompt = apply_temporal_anchor(base_prompt, today)
         iso_year, iso_week, _ = today.isocalendar()
         current_week_start, _ = week_bounds(f"{iso_year}-W{iso_week:02d}")
         athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
@@ -702,6 +704,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if row.status == "approved"
                 ]
                 approved_week_row = approved_rows[-1] if approved_rows else None
+                # Owner orientation & response preferences (MADR-0026, #361):
+                # the per-athlete settings row joins the SAME read boundary —
+                # any failure (unreadable store, or an out-of-band-corrupted
+                # row failing the seam-boundary validation) degrades to no
+                # settings at all: the prompt falls back to the anchored
+                # immutable core, extending the digest-degrade family (fail
+                # open, cyber C6). No row → defaults, byte-equivalent to the
+                # pre-settings prompt (AC4 regression). The orientation text
+                # is untrusted input — sanitized inside the seam at assembly.
+                agent_settings = await get_agent_settings(session, athlete_id=athlete_id)
         except (
             OSError,
             SQLAlchemyError,
@@ -714,17 +726,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             phases = []
             pending_debriefs = []
             approved_week_row = None
+            agent_settings = None
             store_ok = False
+        # Prompt assembly through the single seam (MADR-0026, #361): the
+        # digest bodies are collected in the legacy order and handed to
+        # assemble_system_prompt together with the (possibly None) settings
+        # row. With no settings content the output is byte-identical to the
+        # pre-#361 apply_* chain (AC4 regression); with settings content the
+        # fenced non-authoritative orientation block and the pref directives
+        # sit between the core and the digests, and the re-assert clause
+        # closes the prompt (structural last word).
+        digests: list[str] = []
         if profile is not None:
             # The digest's phase resolution takes the same explicit ``today``
             # so the call site owns the clock boundary (N3, PR #173).
-            agent.system_prompt = apply_objectives_digest(
-                agent.system_prompt, profile, phases=phases, today=today
-            )
+            digests.append(objectives_digest(profile, phases=phases, today=today))
         if pending_debriefs:
-            agent.system_prompt = apply_pending_debrief_digest(
-                agent.system_prompt, pending_debriefs
-            )
+            pending_digest = pending_debrief_digest(pending_debriefs)
+            if pending_digest is not None:
+                digests.append(pending_digest)
         if approved_week_row is not None:
             # Adjustment guardrail facts (#233 AC4): the proposal context
             # carries the current phase window and the objective's peak date
@@ -732,11 +752,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # shaped within the season structure the approval gates enforce.
             adjustment_target = profile.primary_goal.target_date if profile is not None else None
             adjustment_phase = resolve_phase_status(phases, adjustment_target, today).phase
-            agent.system_prompt = apply_approved_week_digest(
-                agent.system_prompt,
-                approved_week_row,
-                phase=adjustment_phase,
-                target_date=adjustment_target,
+            digests.append(
+                approved_week_digest(
+                    approved_week_row,
+                    phase=adjustment_phase,
+                    target_date=adjustment_target,
+                )
             )
             # Divergence digest (#236 AC1): the approved week's day slots vs
             # this athlete's debrief RPEs — a pure function of the rows
@@ -751,7 +772,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 debrief_rpes=debrief_rpes,
                 today=today,
             )
-            agent.system_prompt = apply_divergence_digest(agent.system_prompt, divergence)
+            if divergence is not None:
+                digests.append(divergence_digest_text(divergence))
+        agent.system_prompt = assemble_system_prompt(core_prompt, agent_settings, digests)
 
         # Morning briefing card (#262, epic #215-A): on the FIRST page load
         # of the day (the client-derived date flag — R3, not a security

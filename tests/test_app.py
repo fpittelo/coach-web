@@ -1,7 +1,9 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
 import re
+import sqlite3
 from collections.abc import AsyncIterator, Sequence
+from datetime import date
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -9,12 +11,21 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 
-from coach_web.agent import AgentEvent
+from coach_web.agent import (
+    DEFAULT_SYSTEM_PROMPT,
+    REASSERT_CLAUSE,
+    AgentEvent,
+    apply_temporal_anchor,
+)
+from coach_web.agent_settings import save_agent_settings
 from coach_web.app import CSP_POLICY, STATIC_DIR, create_app, resolve_version
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import Settings
+from coach_web.debrief import DEFAULT_ATHLETE_ID
+from coach_web.objectives import ObjectiveProfile, save_objective_profile
 
 # The exact minimal policy decided in the STRIDE #87 sign-off (conditions
 # C2/C5) and shipped as middleware in #84, with the single #319 img-src
@@ -760,3 +771,193 @@ class TestCspMiddleware:
 
         assert response.status_code == 401
         assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+
+
+# ---------------------------------------------------------------------------
+# Agent-settings prompt assembly at the stream endpoint (MADR-0026, #361)
+# ---------------------------------------------------------------------------
+
+
+class _PromptProbeAgent:
+    """Minimal agent carrying the real default prompt, for assembly pins."""
+
+    system_prompt: str = DEFAULT_SYSTEM_PROMPT
+
+    async def __aenter__(self) -> "_PromptProbeAgent":
+        """Enter the agent context."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Exit the agent context."""
+
+    async def run(
+        self,
+        message: str,
+        *,
+        history: list[Any] | None = None,
+        pre_emitted_outcomes: Sequence[str] = (),
+    ) -> AsyncIterator[AgentEvent]:
+        """Yield a single done event for the supplied message."""
+        yield AgentEvent(type="done", data={"message": "ok"})
+
+
+class TestAgentSettingsPromptAssembly:
+    """POST /api/agent/stream routes through the assembly seam (#361).
+
+    Failure posture (MADR-0026, cyber C6): a settings read failure joins the
+    existing digest-degrade boundary — the prompt falls back to the anchored
+    immutable core and the turn never blocks on the settings store.
+    """
+
+    def _client_with(self, settings: Settings, agent: Any, session_factory: Any) -> TestClient:
+        """Build a TestClient with a stub agent and a real session factory."""
+        app = create_app(settings)
+        app.state.agent_factory = MagicMock(return_value=agent)
+        app.state.db_session_factory = session_factory
+        return TestClient(app)
+
+    async def _stream_once(self, client: TestClient) -> None:
+        """Drive one stream request to completion (prompt side effects only)."""
+        with client.stream(
+            "POST", "/api/agent/stream", json={"message": "hi", "history": []}
+        ) as response:
+            response.read()
+
+    async def test_no_settings_row_is_byte_equivalent_to_the_legacy_prompt(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, db_session_factory: Any
+    ) -> None:
+        """AC4 regression: no settings row → today's prompt, byte-for-byte."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 25)  # Sunday of 2026-W43
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        agent = _PromptProbeAgent()
+        client = self._client_with(settings, agent, db_session_factory)
+
+        await self._stream_once(client)
+
+        expected = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, _FrozenDate(2026, 10, 25))
+        assert agent.system_prompt == expected
+        assert REASSERT_CLAUSE not in agent.system_prompt
+
+    async def test_settings_row_reaches_the_prompt_in_precedence_order(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, db_session_factory: Any
+    ) -> None:
+        """A persisted row injects the fenced block below the anchor, above digests."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 25)
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        async with db_session_factory() as session:
+            await save_objective_profile(
+                session,
+                ObjectiveProfile.model_validate(
+                    {
+                        "primary_goal": {
+                            "objective_type": "outcome",
+                            "title": "Podium at the national crit",
+                            "target_date": "2027-07-10",
+                        }
+                    }
+                ),
+            )
+            await save_agent_settings(
+                session,
+                athlete_id=DEFAULT_ATHLETE_ID,
+                orientation="Be pragmatic; prioritise recovery on tired weeks.",
+                verbosity="concise",
+                tone="supportive",
+            )
+        agent = _PromptProbeAgent()
+        client = self._client_with(settings, agent, db_session_factory)
+
+        await self._stream_once(client)
+
+        prompt = agent.system_prompt
+        assert "Today is 2026-10-25 (Sunday)." in prompt
+        assert "non-authoritative" in prompt.lower()
+        assert "| Be pragmatic; prioritise recovery on tired weeks." in prompt
+        assert "Verbosity: concise" in prompt
+        assert "Tone: supportive" in prompt
+        # Precedence: anchor (core) → orientation block → prefs → digest → re-assert.
+        assert prompt.index("Today is ") < prompt.index("OWNER ORIENTATION")
+        assert prompt.index("(END)") < prompt.index("Primary outcome goal")
+        assert prompt.index("Primary outcome goal") < prompt.index(REASSERT_CLAUSE)
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    async def test_settings_read_failure_fails_open_to_the_anchored_core(
+        self, settings: Settings, monkeypatch: pytest.MonkeyPatch, db_session_factory: Any
+    ) -> None:
+        """A settings-store outage degrades like any unreadable store (cyber C6)."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 25)
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+
+        async def _failing_read(*args: Any, **kwargs: Any) -> None:
+            raise SQLAlchemyError("settings store unavailable")
+
+        monkeypatch.setattr("coach_web.app.get_agent_settings", _failing_read)
+        agent = _PromptProbeAgent()
+        client = self._client_with(settings, agent, db_session_factory)
+
+        await self._stream_once(client)
+
+        expected = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, _FrozenDate(2026, 10, 25))
+        assert agent.system_prompt == expected
+        assert "OWNER ORIENTATION" not in agent.system_prompt
+        assert REASSERT_CLAUSE not in agent.system_prompt
+
+    async def test_corrupted_settings_row_fails_open_to_the_anchored_core(
+        self,
+        settings: Settings,
+        monkeypatch: pytest.MonkeyPatch,
+        migrated_db: Any,
+        db_session_factory: Any,
+    ) -> None:
+        """A raw-SQL-corrupted enum row degrades to the anchored core."""
+
+        class _FrozenDate(date):
+            @classmethod
+            def today(cls) -> "_FrozenDate":
+                return _FrozenDate(2026, 10, 25)
+
+        monkeypatch.setattr("coach_web.app.date", _FrozenDate)
+        conn = sqlite3.connect(migrated_db)
+        try:
+            # CHECK-defeating schema tampering (the CHECKs block an honest
+            # raw-SQL enum violation) — the degraded read path must hold.
+            conn.execute("DROP TABLE agent_settings")
+            conn.execute(
+                "CREATE TABLE agent_settings ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                "athlete_id INTEGER NOT NULL, "
+                "orientation TEXT, "
+                "verbosity TEXT, "
+                "tone TEXT, "
+                "updated_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                "INSERT INTO agent_settings (athlete_id, verbosity, updated_at) "
+                "VALUES (1, 'shouty', 'u')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        agent = _PromptProbeAgent()
+        client = self._client_with(settings, agent, db_session_factory)
+
+        await self._stream_once(client)
+
+        expected = apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, _FrozenDate(2026, 10, 25))
+        assert agent.system_prompt == expected
+        assert "OWNER ORIENTATION" not in agent.system_prompt

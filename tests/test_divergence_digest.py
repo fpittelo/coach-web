@@ -868,10 +868,13 @@ class TestDivergenceDigestScope:
 
         Superseded for #243: migration 0006 (encrypted debrief RPE) extends
         the chain — the digest itself still adds no persistence of its own.
+        Superseded for #361: migration 0007 (agent_settings, MADR-0026)
+        extends the chain — the divergence digest still persists nothing.
         """
         import coach_web.app  # noqa: F401 - pulls every model module into Base
 
         assert sorted(Base.metadata.tables) == [
+            "agent_settings",
             "athlete_objectives",
             "debriefs",
             "periodization_phases",
@@ -891,6 +894,7 @@ class TestDivergenceDigestScope:
             "0004_debriefs.py",
             "0005_week_adherence.py",
             "0006_encrypt_debrief_rpe.py",
+            "0007_agent_settings.py",
         ]
 
     def test_the_digest_module_imports_no_mcp_or_icu_client(self) -> None:
