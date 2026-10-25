@@ -114,11 +114,14 @@ Agents (and humans) drive the dev/qa lanes through one entrypoint instead of han
 
 ## 🔁 Boot & Supervision (prod lane, #328)
 
-The prod lane (`coach-web-prod`) is supervised by a **systemd user unit** so it comes back by itself after a reboot or a crash — no manual `up -d` (MADR-0024). The unit is rendered from the repo-tracked template `deploy/systemd/coach-web.service.in`; the installed copy under `~/.config/systemd/user/` is **never hand-edited** — re-run the installer to refresh it.
+The prod lane (`coach-web-prod`) is supervised by a **systemd user unit** so it comes back by itself after a reboot — no manual `up -d` (MADR-0024). The unit is rendered from the repo-tracked template `deploy/systemd/coach-web.service.in`; the installed copy under `~/.config/systemd/user/` is **never hand-edited** — re-run the installer to refresh it.
+
+What the unit actually recovers: the compose `up -d` runs once at boot (without a login, thanks to `linger`) and is re-run when the *unit* itself fails (`Restart=on-failure`, bounded by `StartLimit*`). It does **not** resurrect a container that dies later — the services declare no compose `restart:` policy, so a crashed container stays down until `systemctl --user restart coach-web`.
 
 | Property | Value |
 |:---|:---|
 | Unit | `~/.config/systemd/user/coach-web.service` (`Type=oneshot`, `RemainAfterExit=yes`, `WantedBy=default.target`) |
+| Auto-update | `coach-web-update.timer` + `coach-web-update.service` — installed by the same command (see *Auto-Update*) |
 | Supervisor | `systemctl --user` — **one supervisor only**: `lane.sh prod up\|down` is refused with a pointer here |
 | Boot without login | `loginctl enable-linger "$USER"` (required; the installer asserts it and refuses to install without it) |
 | Docker race | bounded `ExecStartPre` retry (30 × 2 s) before `up`, with `TimeoutStartSec=300` above it — docker is a *system* unit and a user unit cannot order against it |
@@ -133,9 +136,9 @@ The prod lane (`coach-web-prod`) is supervised by a **systemd user unit** so it 
 Idempotent: a second run rewrites nothing and re-asserts `enable --now`. The installer
 
 1. asserts `loginctl show-user "$USER" -p Linger` is `yes` — otherwise it prints the exact remediation (`loginctl enable-linger "$USER"`) and exits non-zero;
-2. renders the template into `~/.config/systemd/user/coach-web.service`, runs `systemctl --user daemon-reload`, then `enable --now`;
+2. renders `coach-web.service` and the auto-update pair (`coach-web-update.service` + `coach-web-update.timer`, #326) into `~/.config/systemd/user/`, runs `systemctl --user daemon-reload`, then `enable --now` on both the lane unit and the timer;
 3. prints the **boot-persistent user-unit audit list** — linger widens the boot scope to *every* enabled user unit (security condition C7), so the list is recorded;
-4. prints a verification block: unit state, `docker compose ps -a` for `coach-web-prod`, and `/healthz`.
+4. prints a verification block: unit and timer state, the next tick, `docker compose ps -a` for `coach-web-prod`, and `/healthz`.
 
 ### Verify / restart / stop
 
@@ -159,7 +162,7 @@ curl -fsS http://127.0.0.1:8000/healthz
 ./scripts/prod-install.sh --uninstall
 ```
 
-Disables and removes the unit (its `ExecStop` downs the project). The data volume `coach-web-prod_coach-data` is **never** removed — `docker compose down` keeps named volumes and the script never passes `-v`.
+Disables and removes all three units — the auto-update timer first (so no update can race the teardown), then the service (its `ExecStop` downs the project). The data volume `coach-web-prod_coach-data` is **never** removed — `docker compose down` keeps named volumes and the script never passes `-v`.
 
 ### Troubleshooting
 
@@ -170,6 +173,73 @@ Disables and removes the unit (its `ExecStop` downs the project). The data volum
 | **Unit runs an old checkout** | The checkout moved/renamed after install (the unit hardcodes the absolute repo path) | Re-run `./scripts/prod-install.sh` — it re-renders `@REPO_ROOT@` |
 | **`systemctl --user` cannot connect** | No user manager in the session | Log in (or enable linger) so `systemd --user` is running |
 | **Unit failed repeatedly** | `StartLimitBurst=3` in 300 s reached — systemd stopped retrying | `systemctl --user reset-failed coach-web`, fix the cause, `systemctl --user restart coach-web` |
+
+---
+
+## 🔄 Auto-Update (release-driven, #326)
+
+Since v0.14.0 a tag is the whole rollout: `coach-web-update.timer` runs `scripts/prod-update.sh` every 5 minutes and the prod lane converges onto the released image with **no manual step**. The script is a thin shell around `scripts/prod_update.py`, which is unit-tested (`tests/test_prod_update.py`).
+
+| Property | Value |
+|:---|:---|
+| Units | `~/.config/systemd/user/coach-web-update.timer` → `coach-web-update.service` (`Type=oneshot`), rendered from `deploy/systemd/coach-web-update.{service,timer}.in` |
+| Cadence | 5 min after boot and after each completed run (`RandomizedDelaySec=30`) |
+| Convergence | the digest of `ghcr.io/fpittelo/coach-web:prod`, and **only when** it equals the digest of the latest GitHub release tag (provenance gate, C1) |
+| No-op cost | one registry digest resolution — no pull, no container restart |
+| Gate | 3/3 services healthy ≤ 120 s **and** `/healthz` reporting the release version; otherwise automatic rollback to the previous digest |
+| Snapshot | encrypted pre-swap dump (`python -m coach_web.maintenance backup`) in `~/.local/state/coach-web/snapshots/` (mode 600, last 4 kept) |
+| Lock | `$XDG_RUNTIME_DIR/coach-web-prod.lock`, shared with `e2e-preflight.sh prod` and the rollback (C3) — a tick during a preflight or a manual rollout exits 0 without touching the lane |
+| State | `~/.local/state/coach-web/update-state.json` (mode 600): last run, outcome, consecutive-failure streak |
+| Secret hygiene | `.env.prod` is only ever passed to compose as `--env-file`; the updater logs the public image digest and never the file, and never runs `docker compose config` (C4) |
+
+### Watch the automatic path
+
+```bash
+systemctl --user list-timers coach-web-update.timer
+journalctl --user -u coach-web-update.service -n 30 --no-pager   # one block per tick
+curl -fsS http://127.0.0.1:8000/healthz    # version == the release tag without its "v"
+```
+
+Every tick logs `[prod-update] …`: `no change: .env.prod already pins sha256:…` (nothing touched), `update complete: the prod lane is serving vX.Y.Z (sha256:…)`, or an abort with the reason. A failure **before** the swap leaves the lane untouched; a failure **after** it restores the previous digest and brings the previous image back.
+
+### Force an update (also clears a C8 pause)
+
+```bash
+scripts/prod-update.sh --force                     # re-resolve, re-pull, re-apply even when unchanged
+systemctl --user start coach-web-update.service    # same run the timer makes (honours the pause)
+```
+
+After **12 consecutive failures** the updater pauses instead of hammering the registry (~1 h of 5-minute ticks): the tick then logs `auto-update paused (C8)`, exits 0 and touches nothing. `--force` resumes it.
+
+### Inspect the state
+
+```bash
+cat ~/.local/state/coach-web/update-state.json    # last_run, outcome, consecutive_failures
+ls -l ~/.local/state/coach-web/snapshots/         # pre-swap encrypted snapshots (mode 600, last 4)
+```
+
+### Rollback (image)
+
+Automatic when the post-swap gate fails. Manual:
+
+```bash
+scripts/prod-update.sh --rollback    # restores the digest in .env.prod.prev and re-applies it
+curl -fsS http://127.0.0.1:8000/healthz
+```
+
+`--rollback` takes the same shared lock as the timer (C3) and needs no network — the previous image is already local. It rolls back the **image** only: data rollback restores the pre-swap snapshot (see *Database Maintenance → Encrypted backup / restore*); an image rollback never rolls back a schema.
+
+### Disable / re-enable automatic updates
+
+```bash
+systemctl --user stop coach-web-update.timer           # pause the ticks (the lane keeps serving)
+systemctl --user disable coach-web-update.timer        # keep it off across reboots
+systemctl --user enable --now coach-web-update.timer   # resume
+```
+
+This is the supported way to keep one release off the lane (e.g. one carrying a **destructive migration**): roll back to the intended digest, stop the timer, then roll that release out manually (Release Runbook step 2, *fallback*).
+
+> **Known limits (C2, C6).** Anything that is not the latest release's digest aborts with the lane untouched: an unreachable registry, an unreachable or rate-limited GitHub API, an absent tag, a malformed digest, or an `.env.prod` that is not owner-only mode 600. The pre-swap snapshot is staged on the container's 64 MB `/tmp` tmpfs before being copied out — a database beyond that size fails the snapshot and aborts the update (the lane keeps serving).
 
 ---
 
@@ -256,7 +326,7 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
 
 ## 🚀 Release Runbook (approve + tag)
 
-> **Automated rollout (MADR-0024, Sprint 29 #326/#328 — in force from v0.14.0):** tagging is the whole rollout. Within 5 minutes of the GitHub Release the prod lane resolves `:prod`, verifies its digest against the latest release tag, snapshots the database, rewrites `COACH_WEB_IMAGE` atomically, pulls and recreates, then requires 3/3 healthy and `/healthz` on the release version — otherwise it restores the previous digest automatically. Step 2's manual block is the **fallback**, step 3 is **rollback**.
+> **Automated rollout (MADR-0024, Sprint 29 #326/#328 — in force from v0.14.0):** tagging is the whole rollout. Within 5 minutes of the GitHub Release the prod lane resolves `:prod`, verifies its digest against the latest release tag, snapshots the database, rewrites `COACH_WEB_IMAGE` atomically, pulls and recreates, then requires 3/3 healthy and `/healthz` on the release version — otherwise it restores the previous digest automatically. Step 2's manual block is the **fallback**, step 3 is **rollback**; the operational runbook for all of it is *Auto-Update* above.
 
 1. **Staging validation** (release candidate on trunk `main`): dispatch the deploy workflow on `main` with `environment=qa` — CI builds and pushes `ghcr.io/fpittelo/coach-web:qa`. Then locally:
    ```bash
@@ -311,7 +381,7 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
    systemctl --user start coach-web-update.timer
    ```
    The pre-flight tears its lane down on exit, so the final `up -d` is what leaves the lane serving.
-3. **Rollback:** automatic when the post-swap gate fails (the updater restores the previous digest before exiting non-zero). Manual: restore the previous digest retained in `.env.prod.prev`, then `systemctl --user restart coach-web` and re-check `/healthz`. Data rollback restores the pre-swap encrypted snapshot (see *Database Maintenance → Encrypted backup / restore*) — image rollback never rolls back a schema. No cloud console involved.
+3. **Rollback:** automatic when the post-swap gate fails (the updater restores the previous digest before exiting non-zero). Manual: `./scripts/prod-update.sh --rollback` — it restores the digest retained in `.env.prod.prev`, takes the shared prod-lane lock and re-applies the previous image; then re-check `/healthz` (see *Auto-Update → Rollback*). Data rollback restores the pre-swap encrypted snapshot (see *Database Maintenance → Encrypted backup / restore*) — image rollback never rolls back a schema. No cloud console involved.
 
 ---
 
@@ -428,4 +498,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-25 (issue #328 — new "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; prior: issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-10-25 (issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits and the pre-swap snapshot; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_

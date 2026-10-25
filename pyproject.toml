@@ -99,6 +99,8 @@ ignore = []
 "tests/integration/test_preflight_loopback.py" = ["S104", "S603"]
 "tests/integration/test_preflight_env_permissions.py" = ["S603"]
 "tests/integration/test_prod_install.py" = ["S603"]
+# Drives scripts/prod-update.sh in a temp-HOME sandbox (subprocess by design).
+"tests/test_prod_update.py" = ["S603"]
 
 [tool.isort]
 profile = "black"
