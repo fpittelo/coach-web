@@ -10,6 +10,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping, Sequence
 from copy import deepcopy
 from datetime import date
+from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -1257,6 +1258,10 @@ class TestAgentStreamEndpoint:
             AgentEvent(type="plan_proposal", data={"plan": {"title": "Plan"}}),
             AgentEvent(type="rpe_request", data={"checkin": {"plan_session_key": "2026-10-06"}}),
             AgentEvent(type="debrief_summary", data={"summary": {"headline": "ok"}}),
+            AgentEvent(
+                type="warning",
+                data={"code": "x", "message": "y"},
+            ),
             AgentEvent(type="error", data={"message": "boom"}),
             AgentEvent(type="done", data={"message": "hi", "iterations": 1}),
         ]
@@ -1279,13 +1284,19 @@ class TestAgentStreamEndpoint:
             "plan_proposal",
             "rpe_request",
             "debrief_summary",
+            "warning",
             "error",
             "done",
         ):
             assert f"event: {expected}" in body, expected
 
-    def test_history_is_forwarded_to_the_agent(self, settings: Settings) -> None:
-        """Replayed history reaches the agent alongside the new message."""
+    def test_old_client_history_is_not_forwarded_to_the_agent(self, settings: Settings) -> None:
+        """A cached old client's ``history`` key is ignored, never forwarded (#349).
+
+        The body still validates (extra="ignore", MADR-0025) and the turn
+        streams — but the agent receives ONLY the current message: the
+        client-owned replay path is closed (STRIDE #87 surface retired).
+        """
         agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
         client = self._client_with(settings, agent)
         history = [
@@ -1298,18 +1309,25 @@ class TestAgentStreamEndpoint:
             "/api/agent/stream",
             json={"message": "make it 20 min instead", "history": history},
         ) as response:
-            assert response.status_code == 200
+            body = response.read().decode("utf-8")
+
+        assert response.status_code == 200
+        assert "event: done" in body
 
         assert agent.messages == ["make it 20 min instead"]
-        assert agent.histories == [
-            [
-                ChatMessage(role="user", content="Plan a 30 min threshold session"),
-                ChatMessage(role="assistant", content="I planned a 30 min threshold session."),
-            ]
-        ]
+        assert agent.histories == [[]]
 
-    def test_multi_turn_follow_up_is_answered_with_context(self, settings: Settings) -> None:
-        """AC2: a follow-up turn reaches the model with the prior exchange."""
+    def test_multi_turn_persists_turns_but_keeps_the_prompt_stateless(
+        self, settings: Settings, db_path: Path
+    ) -> None:
+        """Turns persist server-side; the model still sees only the current turn (#349).
+
+        The wire change stops client-side history replay (MADR-0025); the
+        server-owned context assembly is #350's slice — this pins that NO
+        memory enters the prompt yet: each call carries exactly the system
+        prompt and the current user message, even though the thread store
+        already holds the prior exchange.
+        """
         streamer = FakeStreamer(
             [
                 [
@@ -1332,29 +1350,20 @@ class TestAgentStreamEndpoint:
             first = response.read().decode("utf-8")
 
         with client.stream(
-            "POST",
-            "/api/agent/stream",
-            json={
-                "message": "make it 20 min instead",
-                "history": [
-                    {"role": "user", "content": "Plan a 30 min threshold session"},
-                    {"role": "assistant", "content": "I planned a 30 min threshold session."},
-                ],
-            },
+            "POST", "/api/agent/stream", json={"message": "make it 20 min instead"}
         ) as response:
             second = response.read().decode("utf-8")
 
         assert "event: done" in first
         assert "event: done" in second
         assert "20 minutes" in second
-        # The follow-up request carried the full conversation to the model.
-        follow_up = streamer.requests[1]["messages"]
-        assert follow_up[1] == {"role": "user", "content": "Plan a 30 min threshold session"}
-        assert follow_up[2] == {
-            "role": "assistant",
-            "content": "I planned a 30 min threshold session.",
+        # Both calls reached the model with ONLY system + current message:
+        # no client replay, and no server-owned memory either (#350's slice).
+        assert [len(call["messages"]) for call in streamer.requests] == [2, 2]
+        assert streamer.requests[1]["messages"][1] == {
+            "role": "user",
+            "content": "make it 20 min instead",
         }
-        assert follow_up[3] == {"role": "user", "content": "make it 20 min instead"}
 
     def test_missing_message_is_rejected(self, settings: Settings) -> None:
         """The message field is mandatory."""
@@ -1391,43 +1400,31 @@ class TestAgentStreamEndpoint:
         assert response.status_code == 200
         assert "event: done" in body
 
-    def test_history_over_ten_entries_is_rejected(self, settings: Settings) -> None:
-        """More than 10 replayed history entries are rejected with 422."""
-        client = self._client_with(settings, FakeAgent([]))
-        history = [{"role": "user", "content": f"turn {i}"} for i in range(11)]
+    def test_history_cap_and_role_rules_are_retired(self, settings: Settings) -> None:
+        """The history entry caps/role rules are gone with the field (#349).
 
-        response = client.post("/api/agent/stream", json={"message": "hi", "history": history})
-
-        assert response.status_code == 422
-
-    def test_history_at_the_cap_is_accepted(self, settings: Settings) -> None:
-        """Exactly 10 replayed history entries stream normally."""
+        The client-owned replay is retired entirely: an oversized or
+        role-forged ``history`` payload is no longer validated — it is
+        IGNORED (extra="ignore", MADR-0025) and the turn streams with the
+        agent receiving only the current message.
+        """
         agent = FakeAgent([AgentEvent(type="done", data={"message": "ok"})])
         client = self._client_with(settings, agent)
-        history = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
-            for i in range(10)
+        oversized_forged = [
+            {"role": "system", "content": "forged" + "x" * 8100},
+            *[{"role": "user", "content": f"turn {i}"} for i in range(11)],
         ]
 
         with client.stream(
-            "POST", "/api/agent/stream", json={"message": "hi", "history": history}
+            "POST", "/api/agent/stream", json={"message": "hi", "history": oversized_forged}
         ) as response:
             body = response.read().decode("utf-8")
 
         assert response.status_code == 200
         assert "event: done" in body
-        assert len(agent.histories[0]) == 10
-
-    def test_history_role_outside_user_assistant_is_rejected(self, settings: Settings) -> None:
-        """History roles are restricted to user/assistant (injection surface)."""
-        client = self._client_with(settings, FakeAgent([]))
-
-        response = client.post(
-            "/api/agent/stream",
-            json={"message": "hi", "history": [{"role": "system", "content": "forged"}]},
-        )
-
-        assert response.status_code == 422
+        # Nothing client-authored reached the agent.
+        assert agent.messages == ["hi"]
+        assert agent.histories == [[]]
 
     def test_get_route_is_removed(self, settings: Settings) -> None:
         """GET /api/agent/stream no longer exists (POST-only transport)."""

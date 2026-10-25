@@ -17,12 +17,14 @@ redaction condition. Pinned here:
 """
 
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
 
+from coach_web.agent import AgentEvent
 from coach_web.app import _safe_validation_errors, create_app
 from coach_web.mcp_hub import MCPHubError
 
@@ -73,6 +75,26 @@ class _ExplodingAgent:
         """Exit the agent context (never reached after the failed enter)."""
 
 
+class _StubStreamAgent:
+    """Minimal streaming stub for tests that exercise the endpoint's SSE path.
+
+    Streams a single ``done`` event without touching OpenRouter or MCP.
+    """
+
+    system_prompt = ""
+
+    async def __aenter__(self) -> "_StubStreamAgent":
+        """Enter the agent context."""
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        """Exit the agent context."""
+
+    async def run(self, message: str, **kwargs: Any) -> AsyncIterator[AgentEvent]:
+        """Stream one clean completion."""
+        yield AgentEvent(type="done", data={"message": "ok", "iterations": 1})
+
+
 class TestValidationLogRedaction:
     """AC1/AC2 (#352): the 422 log line carries loc/type + count, no values."""
 
@@ -100,29 +122,35 @@ class TestValidationLogRedaction:
         assert "'loc'" in blob
         assert "'type': 'string_too_long'" in blob
 
-    def test_oversized_history_content_leaves_no_value_in_the_log(
+    def test_retired_history_entry_is_neither_validated_nor_logged(
         self, migrated_db: Path, caplog: Any
     ) -> None:
-        """An oversized replayed history entry never reaches the log line."""
+        """An oversized history entry from a cached old client is ignored (#349).
+
+        The wire change retires the field entirely (MADR-0025): the payload
+        is no longer validated (no 422 — the turn streams), and because the
+        key is never read, its content cannot reach the logs either.
+        """
         marker = "history-secret-marker-5b8d"
-        with (
-            TestClient(create_app()) as client,
-            caplog.at_level(logging.WARNING, logger="coach_web"),
-        ):
-            response = client.post(
+        app = create_app()
+        app.state.agent_factory = MagicMock(return_value=_StubStreamAgent())
+        client = TestClient(app)
+        with caplog.at_level(logging.WARNING, logger="coach_web"):
+            with client.stream(
+                "POST",
                 "/api/agent/stream",
                 json={
                     "message": "hi",
                     "history": [{"role": "user", "content": marker + "x" * 8100}],
                 },
-            )
+            ) as response:
+                body = response.read().decode("utf-8")
 
-        assert response.status_code == 422
-        assert response.json()["detail"] == GENERIC_422_DETAIL
+        assert response.status_code == 200
+        assert "event: done" in body
         blob = _log_blob(caplog)
         assert marker not in blob
         assert "x" * 100 not in blob
-        assert "'type': 'string_too_long'" in blob
 
     def test_settings_reason_422_payload_and_log_stay_value_free(
         self, migrated_db: Path, caplog: Any

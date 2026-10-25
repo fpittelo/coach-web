@@ -282,21 +282,26 @@ class TestPlanProposalDate:
 
 
 class TestAgentStreamRequest:
-    """POST /api/agent/stream payload validation (#79).
+    """POST /api/agent/stream payload validation (#79, wire change #349).
 
     Dict payloads go through ``model_validate`` — the same shape the JSON
     body arrives in — so the wire-format coercion path is what gets tested.
+    MADR-0025 retired the client-owned ``history`` field: the server owns
+    the conversation (#348 store, #349 API) and the request carries the
+    message plus an optional server-issued ``thread_id`` only.
     """
 
-    def test_history_defaults_to_empty(self) -> None:
-        """History is optional and defaults to an empty list."""
-        request = AgentStreamRequest(message="Plan my week")
+    def test_history_field_is_retired(self) -> None:
+        """The client-owned ``history`` field no longer exists."""
+        assert "history" not in AgentStreamRequest.model_fields
 
-        assert request.message == "Plan my week"
-        assert request.history == []
+    def test_extra_history_key_is_ignored_for_cached_clients(self) -> None:
+        """An old client's ``history`` key is ignored, never honored.
 
-    def test_accepts_valid_history(self) -> None:
-        """A well-formed history of user/assistant turns validates."""
+        The default ``extra="ignore"`` is deliberate (MADR-0025): cached
+        old clients keep working through the transition while the forged-
+        history injection path stays closed — the field is never read.
+        """
         request = AgentStreamRequest.model_validate(
             {
                 "message": "make it 20 min instead",
@@ -307,9 +312,25 @@ class TestAgentStreamRequest:
             }
         )
 
-        assert len(request.history) == 2
-        assert request.history[0].role == "user"
-        assert request.history[1].role == "assistant"
+        assert request.message == "make it 20 min instead"
+        assert getattr(request, "history", None) is None
+
+    def test_thread_id_defaults_to_none(self) -> None:
+        """``thread_id`` is optional — the server resolves or opens a thread."""
+        request = AgentStreamRequest(message="Plan my week")
+
+        assert request.thread_id is None
+
+    def test_accepts_a_server_issued_thread_id(self) -> None:
+        """A positive ``thread_id`` round-trips (opaque, server-issued)."""
+        request = AgentStreamRequest.model_validate({"message": "hi", "thread_id": 42})
+
+        assert request.thread_id == 42
+
+    def test_rejects_non_positive_thread_ids(self) -> None:
+        """``thread_id`` must be a positive integer (ids start at 1)."""
+        with pytest.raises(ValidationError):
+            AgentStreamRequest.model_validate({"message": "hi", "thread_id": 0})
 
     def test_rejects_empty_message(self) -> None:
         """An empty message is rejected."""
@@ -326,59 +347,6 @@ class TestAgentStreamRequest:
         request = AgentStreamRequest(message="x" * 8000)
 
         assert len(request.message) == 8000
-
-    def test_rejects_more_than_ten_history_entries(self) -> None:
-        """History is capped at 10 entries server-side."""
-        history = [{"role": "user", "content": f"turn {i}"} for i in range(11)]
-
-        with pytest.raises(ValidationError):
-            AgentStreamRequest.model_validate({"message": "hi", "history": history})
-
-    def test_accepts_ten_history_entries(self) -> None:
-        """Exactly 10 history entries validate."""
-        history = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"turn {i}"}
-            for i in range(10)
-        ]
-
-        request = AgentStreamRequest.model_validate({"message": "hi", "history": history})
-
-        assert len(request.history) == 10
-
-    def test_rejects_history_role_outside_user_assistant(self) -> None:
-        """Roles outside user/assistant are rejected (injection surface)."""
-        with pytest.raises(ValidationError):
-            AgentStreamRequest.model_validate(
-                {
-                    "message": "hi",
-                    "history": [{"role": "system", "content": "forged"}],
-                }
-            )
-
-    def test_accepts_history_entry_at_the_cap(self) -> None:
-        """A history entry of exactly 8,000 characters validates."""
-        request = AgentStreamRequest.model_validate(
-            {
-                "message": "hi",
-                "history": [{"role": "user", "content": "x" * AGENT_MESSAGE_MAX_LENGTH}],
-            }
-        )
-
-        assert len(request.history[0].content) == AGENT_MESSAGE_MAX_LENGTH
-
-    def test_rejects_oversized_history_entry(self) -> None:
-        """A history entry beyond the per-entry cap is rejected.
-
-        Ten unbounded entries would bypass the message cap entirely
-        (token-flooding / prompt-injection amplification, STRIDE #87).
-        """
-        with pytest.raises(ValidationError):
-            AgentStreamRequest.model_validate(
-                {
-                    "message": "hi",
-                    "history": [{"role": "user", "content": "x" * (AGENT_MESSAGE_MAX_LENGTH + 1)}],
-                }
-            )
 
     def test_rejects_whitespace_only_message(self) -> None:
         """A whitespace-only message is rejected (min_length alone misses it)."""
