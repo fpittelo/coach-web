@@ -1,10 +1,10 @@
-# MADR-0025: Conversation Memory Model Retention and Injection Contract
+# MADR-0025: Conversation Memory Model, Retention and Injection Contract
 
 - **Status:** accepted
 - **Date:** 2026-10-25
 - **Deciders:** @architect, @fpittelo
-- **Reviewed by:** @cyber-security (MADR-0008 security-impact routing — persistent storage of health-adjacent chat transcripts plus a stored-content re-injection channel into the LLM context; APPROVE-WITH-CONDITIONS C1–C7, review recorded on fpittelo/coach-web#346, 2026-10-25)
-- **Tracked in:** fpittelo/coach-web#346 (epic), Sprint 31 marker; implemented by #348 (persistence, migration **0008**), #349 (server-owned thread API + SSE), #350 (context assembly + injection fencing), #351 (reset/clear-memory UX); the seam it plugs into is merged (#361, MADR-0026)
+- **Reviewed by:** @cyber-security (MADR-0008 security-impact routing — persistent storage of health-adjacent chat transcripts plus a stored-content re-injection channel into the LLM context; APPROVE-WITH-CONDITIONS C1–C7, review recorded on fpittelo/coach-web#346 comment 6399479296, 2026-10-25 — supersedes the grooming-time routing table in the epic body, mapping included there)
+- **Tracked in:** fpittelo/coach-web#346 (epic), Sprint 31 marker #373; implemented by #348 (persistence, migration **0008**), #349 (server-owned thread API + SSE), #350 (context assembly + injection fencing), #351 (reset/clear-memory UX); the seam it plugs into is merged (#361, MADR-0026; block-agnostic re-assert advisory recorded as fpittelo/coach-web#346 comment 6397753939, originating from PR #368's review)
 
 ## Context
 
@@ -74,7 +74,7 @@ Stored messages and model-generated summaries enter the prompt **only** through 
 
 **C5 (blocking on #350):** the seam's re-assert predicate becomes **block-agnostic** — any fenced block below the core flips the clause, so the re-assert is structurally LAST whenever owner or memory content exists. Regression tests pin: block order, fence markers, directive presence, re-assert LAST with memory content, and the **no-memory byte-equivalence** of the prompt (MADR-0026's AC4 posture).
 
-**C2 (blocking):** the MADR-0026 sanitizer is generalised to `sanitize_untrusted_text` (same contract: NFKC → strip C0/C1 except newline/tab → cap → neutralise role/tag tokens → envelope) and applied at **both** memory boundaries: **read-for-summary** (defuse role tokens before the summarizer consumes stored messages) and **injection** (defuse the window and summary copies bound for the prompt). Stored/displayed copies stay raw for `GET /api/conversation` fidelity. One sanitizer, now four call sites — no forks.
+**C2 (blocking):** the MADR-0026 sanitizer is generalised to `sanitize_untrusted_text` (same contract: NFKC → strip C0/C1 except newline/tab → neutralise role/tag tokens → envelope; the **cap is a parameter** — memory boundaries pass their own limits) and applied at **both** memory boundaries: **read-for-summary** (defuse role tokens before the summarizer consumes stored messages) and **injection** (defuse the window and summary copies bound for the prompt). This makes four call sites in total (orientation save, assembly, plus these two) — **#362's validate-after-sanitize binding applies at every one of them** (validate the sanitized result, never the raw input). Stored/displayed copies stay raw for `GET /api/conversation` fidelity. One sanitizer, no forks.
 
 ### The API surface (#349)
 
