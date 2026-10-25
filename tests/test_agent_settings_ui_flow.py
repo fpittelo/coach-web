@@ -73,11 +73,18 @@ class TestSaveThenNextReply:
         assert REASSERT_CLAUSE in reply
 
     def test_reset_after_save_returns_the_reply_to_the_core_prompt(self, migrated_db: Path) -> None:
-        """Reset (the confirm-gated DELETE) clears the orientation from the reply."""
+        """Reset (the confirm-gated DELETE) clears the orientation from the reply.
+
+        The probe exchange between the two streams persists into a thread
+        whose memory block (#350) would enter the second prompt — the
+        conversation reset clears it so the second stream exercises the
+        settings-free core assembly.
+        """
         with _probe_client() as client:
             client.put("/api/admin/agent-settings", json=_ui_payload())
             with_save = _streamed_text(client)
             delete_response = client.delete("/api/admin/agent-settings")
+            client.post("/api/conversation/reset")
             after_reset = _streamed_text(client)
 
         assert delete_response.status_code == 200

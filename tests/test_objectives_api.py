@@ -341,10 +341,17 @@ class TestSystemPromptDigestInjection:
         assert streamed == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
 
     def test_digest_reflects_the_latest_saved_profile(self, migrated_db: Path) -> None:
-        """The digest is rebuilt per turn from the persisted profile."""
+        """The digest is rebuilt per turn from the persisted profile.
+
+        The probe exchange between the two streams persists into a thread
+        whose memory block (#350) would replay turn 1's prompt (the probe
+        echoes it) — the conversation reset clears the thread so the second
+        stream exercises the fresh digest only.
+        """
         with _probe_client() as client:
             client.put("/api/objectives", json=_profile_payload())
             first = _streamed_text(client)
+            client.post("/api/conversation/reset")
             client.put(
                 "/api/objectives",
                 json=_profile_payload(primary_goal=_goal_payload(title="Revised goal")),

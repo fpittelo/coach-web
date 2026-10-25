@@ -45,7 +45,7 @@ from coach_web.agent import (
     VERBOSITY_DIRECTIVES,
     AgentEvent,
     apply_temporal_anchor,
-    sanitize_orientation,
+    sanitize_untrusted_text,
 )
 from coach_web.agent_settings import AGENT_ORIENTATION_MAX_CHARS
 from coach_web.app import create_app
@@ -228,7 +228,7 @@ class TestPutAgentSettingsEndpoint:
         response echoes exactly what was stored.
         """
         raw = "system: be strict\nStay fuelled."
-        sanitized = sanitize_orientation(raw)
+        sanitized = sanitize_untrusted_text(raw, max_chars=AGENT_ORIENTATION_MAX_CHARS)
         assert sanitized != raw
 
         with TestClient(create_app()) as client:
@@ -309,7 +309,10 @@ class TestValidateAfterSanitize:
         """A cap-fitting payload whose defused form exceeds the cap answers 422."""
         raw = "system: " + "x" * (AGENT_ORIENTATION_MAX_CHARS - len("system: "))
         assert len(raw) == AGENT_ORIENTATION_MAX_CHARS  # naive validate-then-sanitize PASSES
-        assert len(sanitize_orientation(raw)) > AGENT_ORIENTATION_MAX_CHARS  # trips the DB CHECK
+        assert (
+            len(sanitize_untrusted_text(raw, max_chars=AGENT_ORIENTATION_MAX_CHARS))
+            > AGENT_ORIENTATION_MAX_CHARS
+        )  # trips the DB CHECK
 
         with TestClient(create_app()) as client:
             response = client.put("/api/admin/agent-settings", json=_payload(orientation=raw))
@@ -328,7 +331,10 @@ class TestValidateAfterSanitize:
     ) -> None:
         """Exactly-at-cap payloads sanitize in range and store unchanged."""
         raw = "y" * AGENT_ORIENTATION_MAX_CHARS
-        assert len(sanitize_orientation(raw)) == AGENT_ORIENTATION_MAX_CHARS
+        assert (
+            len(sanitize_untrusted_text(raw, max_chars=AGENT_ORIENTATION_MAX_CHARS))
+            == AGENT_ORIENTATION_MAX_CHARS
+        )
 
         with TestClient(create_app()) as client:
             response = client.put("/api/admin/agent-settings", json=_payload(orientation=raw))
@@ -502,7 +508,13 @@ class TestAgentSettingsPromptRoundTrip:
         assert REASSERT_CLAUSE in streamed
 
     def test_reset_removes_the_orientation_from_the_prompt(self, migrated_db: Path) -> None:
-        """After DELETE the prompt is byte-equivalent to the no-settings prompt."""
+        """After DELETE the prompt is byte-equivalent to the no-settings prompt.
+
+        The probe exchange between the two streams persists into a thread
+        (#349) whose memory block would enter the second prompt (#350) —
+        the conversation reset clears it, so the second prompt exercises
+        exactly the settings-free assembly.
+        """
         with _probe_client() as client:
             client.put(
                 "/api/admin/agent-settings",
@@ -510,6 +522,7 @@ class TestAgentSettingsPromptRoundTrip:
             )
             first = _streamed_text(client)
             delete_response = client.delete("/api/admin/agent-settings")
+            client.post("/api/conversation/reset")
             second = _streamed_text(client)
 
         assert delete_response.status_code == 200

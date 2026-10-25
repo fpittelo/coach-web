@@ -30,9 +30,9 @@ from coach_web.db import Base
 AGENT_ORIENTATION_MAX_CHARS = 1500
 """MADR-0026 cap on the persisted orientation (characters, post-normalisation).
 
-Hardcoded as a CHECK in migration 0007 — keep the two in sync. The sanitizer
-(:func:`coach_web.agent.sanitize_orientation`) enforces the same cap at both
-call sites (save + assembly).
+Hardcoded as a CHECK in migration 0007 — keep the two in sync. The generalised
+sanitizer (:func:`coach_web.agent.sanitize_untrusted_text`) enforces the same
+cap at the orientation call sites (save + assembly).
 """
 
 Verbosity = Literal["concise", "standard", "detailed"]
