@@ -1,0 +1,28 @@
+# Coach Web — 5-minute tick that drives coach-web-update.service (systemd USER
+# unit TEMPLATE; MADR-0024, issue #326).
+#
+# This file is the repo-tracked source of truth. scripts/prod-install.sh
+# replaces @REPO_ROOT@ with the absolute path of the checkout and writes the
+# result to ~/.config/systemd/user/coach-web-update.timer — never hand-edit the
+# installed copy; re-run the installer to refresh it.
+#
+# The timer targets coach-web-update.service (same unit name), whose job is a
+# no-op whenever .env.prod already pins the released digest (MADR-0024: the
+# no-op cost is one registry digest resolution per tick).
+
+[Unit]
+Description=Coach Web prod lane auto-update timer (5 min)
+Documentation=file://@REPO_ROOT@/docs/admin_guide.md
+
+[Timer]
+# OnBootSec converges the lane shortly after a boot; OnUnitActiveSec then paces
+# it 5 minutes after each completed run. Persistent= is trivial for monotonic
+# timers (it affects OnCalendar=) and is kept for the documented catch-up intent.
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+# Spread the tick so several user timers do not fire on the same second.
+RandomizedDelaySec=30
+
+[Install]
+WantedBy=timers.target

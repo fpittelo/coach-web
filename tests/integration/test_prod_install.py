@@ -2,16 +2,18 @@
 
 Two daemon-free layers, following the ``test_lane_script.py`` convention:
 
-- ``TestUnitTemplate`` pins the committed unit template
-  (``deploy/systemd/coach-web.service.in``) against security conditions C4/C5:
-  the hygiene directives, a bounded docker-readiness retry whose window is
+- ``TestUnitTemplate`` / ``TestUpdateUnitTemplates`` pin the committed unit
+  templates (``deploy/systemd/coach-web.service.in`` for #328 and
+  ``coach-web-update.{service,timer}.in`` for #326) against security conditions
+  C4/C5: the hygiene directives, a bounded docker-readiness retry whose window is
   strictly inside ``TimeoutStartSec``, ``--env-file`` and never
-  ``EnvironmentFile=``, plus the absence of any secret marker or hardcoded
-  checkout path.
+  ``EnvironmentFile=``, the 5-minute timer directives, plus the absence of any
+  secret marker or hardcoded checkout path.
 - ``TestProdInstall`` drives ``scripts/prod-install.sh`` in a temp ``HOME``
   with PATH shims for ``systemctl``/``loginctl``/``docker``/``curl``: template
-  rendering + enable, idempotency, the linger assertion, the C7 boot-unit audit
-  list and ``--uninstall`` leaving the data volume alone.
+  rendering + enable of all three units (#328 + #326), idempotency, the linger
+  assertion, the C7 boot-unit audit list and ``--uninstall`` leaving the data
+  volume alone.
 """
 
 import json
@@ -25,7 +27,24 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "coach-web.service.in"
+UPDATE_SERVICE_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "coach-web-update.service.in"
+UPDATE_TIMER_TEMPLATE = PROJECT_ROOT / "deploy" / "systemd" / "coach-web-update.timer.in"
 INSTALLER = PROJECT_ROOT / "scripts" / "prod-install.sh"
+
+SECRET_MARKERS = (
+    "AUTH_SESSION_SECRET",
+    "OPENROUTER_API_KEY",
+    "GITHUB_TOKEN",
+    "DATA_ENCRYPTION_KEY",
+    "GOOGLE_OIDC_CLIENT_SECRET",
+    "INTERVALS_API_KEY",
+)
+
+
+def _non_comment_lines(text: str) -> str:
+    """The template text with its comment lines removed (C4 marker checks)."""
+    return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+
 
 # A value no output may ever contain (C4: the lane env content never leaks).
 ENV_SENTINEL = "walled-garden-sentinel-42"
@@ -114,18 +133,10 @@ class TestUnitTemplate:
     def test_template_never_carries_a_secret(self) -> None:
         """C4: --env-file only, no EnvironmentFile= directive, no secret marker."""
         text = self._text()
-        directives = "\n".join(
-            line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
-        )
+        directives = _non_comment_lines(text)
         assert "EnvironmentFile=" not in directives
         assert "docker compose config" not in directives
-        for marker in (
-            "AUTH_SESSION_SECRET",
-            "OPENROUTER_API_KEY",
-            "GITHUB_TOKEN",
-            "DATA_ENCRYPTION_KEY",
-            "GOOGLE_OIDC_CLIENT_SECRET",
-        ):
+        for marker in SECRET_MARKERS:
             assert marker not in text, marker
 
     def test_template_is_placeholder_based(self) -> None:
@@ -133,6 +144,85 @@ class TestUnitTemplate:
         text = self._text()
         assert "@REPO_ROOT@" in text
         assert "/home/" not in text, "the committed template must not hardcode a home path"
+
+    def test_template_start_and_stop_take_the_shared_prod_lane_lock(self) -> None:
+        """C3 (#326 F1): the lane unit is a second writer of the update's project."""
+        directives = _non_comment_lines(self._text())
+        flock = "/usr/bin/flock -w 900 /run/user/%U/coach-web-prod.lock"
+        assert directives.count(flock) == 2, "ExecStart and ExecStop both take the lock"
+        assert "ExecStart=/usr/bin/flock" in directives
+        assert "ExecStop=/usr/bin/flock" in directives
+
+    def test_template_timeouts_cover_the_lock_wait(self) -> None:
+        """C5/#326: both timeouts sit above the 900 s lock wait, or the wait is killed."""
+        text = self._text()
+        for directive in ("TimeoutStartSec", "TimeoutStopSec"):
+            match = re.search(rf"^{directive}=(\d+)", text, re.MULTILINE)
+            assert match is not None, directive
+            assert int(match.group(1)) > 900, directive
+
+
+class TestUpdateUnitTemplates:
+    """The #326 auto-update units carry the same C4/C5 contract."""
+
+    def test_templates_exist(self) -> None:
+        """Both update unit templates are repo-tracked (#326)."""
+        assert UPDATE_SERVICE_TEMPLATE.is_file()
+        assert UPDATE_TIMER_TEMPLATE.is_file()
+
+    def test_service_template_runs_the_entrypoint_as_a_oneshot(self) -> None:
+        """The timer-activated oneshot runs scripts/prod-update.sh (thin wrapper)."""
+        text = UPDATE_SERVICE_TEMPLATE.read_text(encoding="utf-8")
+        assert "Type=oneshot" in text
+        assert "ExecStart=/bin/bash @REPO_ROOT@/scripts/prod-update.sh" in text
+        assert "WorkingDirectory=@REPO_ROOT@" in text
+        assert "WantedBy=default.target" in text
+
+    def test_service_template_has_the_c5_hygiene_set(self) -> None:
+        """The C5 hygiene directives, identical to the boot unit, are all present."""
+        text = UPDATE_SERVICE_TEMPLATE.read_text(encoding="utf-8")
+        for directive in (
+            "NoNewPrivileges=yes",
+            "PrivateTmp=yes",
+            "UMask=0077",
+            "Environment=PATH=",
+            "Restart=on-failure",
+            "StartLimitBurst=",
+            "StartLimitIntervalSec=",
+            "TimeoutStartSec=",
+        ):
+            assert directive in text, directive
+
+    def test_service_template_timeout_covers_the_update_window(self) -> None:
+        """TimeoutStartSec must exceed the 120 s health gate, not the 90 s default."""
+        text = UPDATE_SERVICE_TEMPLATE.read_text(encoding="utf-8")
+        match = re.search(r"TimeoutStartSec=(\d+)", text)
+        assert match is not None, "no TimeoutStartSec"
+        assert int(match.group(1)) > 120
+
+    def test_service_template_never_carries_a_secret(self) -> None:
+        """C4: --env-file only, no EnvironmentFile= directive, no secret marker."""
+        text = UPDATE_SERVICE_TEMPLATE.read_text(encoding="utf-8")
+        assert "EnvironmentFile=" not in _non_comment_lines(text)
+        assert "docker compose config" not in _non_comment_lines(text)
+        for marker in SECRET_MARKERS:
+            assert marker not in text, marker
+
+    def test_timer_template_ticks_every_five_minutes(self) -> None:
+        """5-minute schedule, boot catch-up, jitter, timer install target (#326)."""
+        text = UPDATE_TIMER_TEMPLATE.read_text(encoding="utf-8")
+        assert "OnBootSec=5min" in text
+        assert "OnUnitActiveSec=5min" in text
+        assert "Persistent=true" in text
+        assert "RandomizedDelaySec=30" in text
+        assert "WantedBy=timers.target" in text
+
+    def test_templates_are_placeholder_based(self) -> None:
+        """@REPO_ROOT@ is the render point — no hardcoded checkout path."""
+        for template in (UPDATE_SERVICE_TEMPLATE, UPDATE_TIMER_TEMPLATE):
+            text = template.read_text(encoding="utf-8")
+            assert "@REPO_ROOT@" in text, template
+            assert "/home/" not in text, template
 
 
 class ProdInstallSandbox:
@@ -150,7 +240,8 @@ class ProdInstallSandbox:
         self.home.mkdir()
         shutil.copy2(INSTALLER, self.repo / "scripts" / "prod-install.sh")
         (self.repo / "scripts" / "prod-install.sh").chmod(0o755)
-        shutil.copy2(TEMPLATE, self.repo / "deploy" / "systemd" / "coach-web.service.in")
+        for template in (TEMPLATE, UPDATE_SERVICE_TEMPLATE, UPDATE_TIMER_TEMPLATE):
+            shutil.copy2(template, self.repo / "deploy" / "systemd" / template.name)
         for name in ("compose.yaml", "compose.prod.yml"):
             (self.repo / name).touch()
         env_file = self.repo / ".env.prod"
@@ -166,6 +257,16 @@ class ProdInstallSandbox:
     def unit_path(self) -> Path:
         """The installed unit path under the sandbox HOME."""
         return self.home / ".config" / "systemd" / "user" / "coach-web.service"
+
+    @property
+    def update_service_path(self) -> Path:
+        """The installed #326 update service path under the sandbox HOME."""
+        return self.home / ".config" / "systemd" / "user" / "coach-web-update.service"
+
+    @property
+    def timer_path(self) -> Path:
+        """The installed #326 update timer path under the sandbox HOME."""
+        return self.home / ".config" / "systemd" / "user" / "coach-web-update.timer"
 
     def env(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         """Process environment with the shims first on PATH and a temp HOME."""
@@ -271,6 +372,47 @@ class TestProdInstall:
         assert result.returncode == 0, result.stderr
         assert ENV_SENTINEL not in result.stdout
         assert ENV_SENTINEL not in result.stderr
+
+    def test_install_renders_and_enables_the_auto_update_units(
+        self, sandbox: ProdInstallSandbox
+    ) -> None:
+        """#326 AC2 carry-over: the update service + its timer are installed and enabled."""
+        result = sandbox.run()
+        assert result.returncode == 0, result.stderr
+        assert sandbox.update_service_path.is_file()
+        assert sandbox.timer_path.is_file()
+        rendered = sandbox.timer_path.read_text(encoding="utf-8")
+        assert "@REPO_ROOT@" not in rendered
+        assert str(sandbox.repo) in rendered
+        assert "OnUnitActiveSec=5min" in rendered
+        assert ["systemctl", "--user", "enable", "--now", "coach-web-update.timer"] in (
+            sandbox.invocations()
+        )
+
+    def test_install_of_the_three_units_is_idempotent(self, sandbox: ProdInstallSandbox) -> None:
+        """A second install rewrites nothing and reports one no-op per unit."""
+        assert sandbox.run().returncode == 0
+        paths = (sandbox.unit_path, sandbox.update_service_path, sandbox.timer_path)
+        before = [path.read_text(encoding="utf-8") for path in paths]
+        second = sandbox.run()
+        assert second.returncode == 0, second.stderr
+        assert second.stdout.count("already up to date") == 3
+        assert [path.read_text(encoding="utf-8") for path in paths] == before
+
+    def test_uninstall_stops_the_timer_before_the_lane(self, sandbox: ProdInstallSandbox) -> None:
+        """--uninstall leaves no update unit behind and tears the lane down last."""
+        assert sandbox.run().returncode == 0
+        sandbox.log.write_text("", encoding="utf-8")
+        result = sandbox.run("--uninstall")
+        assert result.returncode == 0, result.stderr
+        assert not sandbox.timer_path.exists()
+        assert not sandbox.update_service_path.exists()
+        assert not sandbox.unit_path.exists()
+        commands = sandbox.invocations()
+        assert ["systemctl", "--user", "disable", "--now", "coach-web-update.timer"] in commands
+        assert commands.index(
+            ["systemctl", "--user", "disable", "--now", "coach-web-update.timer"]
+        ) < commands.index(["systemctl", "--user", "disable", "--now", "coach-web.service"])
 
 
 class TestInstallerScript:

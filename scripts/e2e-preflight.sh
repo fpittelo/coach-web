@@ -26,6 +26,12 @@
 # runbook that must leave the lane serving runs `up -d` AFTER this script.
 # Teardown is scoped to the lane's own compose project (-p coach-web-<lane>);
 # other lanes running concurrently are never touched.
+#
+# prod only: coach-web-update.timer (MADR-0024/#326) mutates the same compose
+# project and would resurrect the lane this script just tore down. Both take the
+# same shared flock on the prod-lane lock (security condition C3): while this
+# preflight holds it the timer skips, and a preflight that cannot take it
+# refuses to start instead of validating concurrently. dev/qa are unchanged.
 
 set -euo pipefail
 
@@ -59,6 +65,24 @@ case "${LANE}" in
         exit 1
         ;;
 esac
+
+# prod only (C3): the same shared lock coach-web-update.sh takes, so the update
+# timer cannot resurrect the lane this pre-flight tears down on exit.
+if [[ "${LANE}" == "prod" ]]; then
+    PROD_LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    PROD_LOCK_FILE="${PROD_LOCK_DIR}/coach-web-prod.lock"
+    if [[ ! -d "${PROD_LOCK_DIR}" ]]; then
+        error "runtime directory ${PROD_LOCK_DIR} not found — cannot take the shared prod-lane lock (C3)"
+        exit 1
+    fi
+    exec 9>"${PROD_LOCK_FILE}"
+    if ! flock -n 9; then
+        error "the shared prod-lane lock ${PROD_LOCK_FILE} is held — an auto-update or rollback is in flight"
+        error "wait for coach-web-update.service to finish, then re-run this pre-flight (C3)."
+        exit 1
+    fi
+    log "holding the shared prod-lane lock ${PROD_LOCK_FILE} for this run (the auto-update timer skips, C3)."
+fi
 
 COMPOSE_BASE="${PROJECT_DIR}/compose.yaml"
 COMPOSE_LANE="${PROJECT_DIR}/${LANE_COMPOSE}"

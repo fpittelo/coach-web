@@ -1,0 +1,48 @@
+# Coach Web — release-driven auto-update of the prod lane (systemd USER unit
+# TEMPLATE; MADR-0024, issue #326).
+#
+# This file is the repo-tracked source of truth. scripts/prod-install.sh
+# replaces @REPO_ROOT@ with the absolute path of the checkout and writes the
+# result to ~/.config/systemd/user/coach-web-update.service — never hand-edit
+# the installed copy; re-run the installer to refresh it.
+#
+# Security conditions binding on this unit (fpittelo/coach-web#327):
+#   C3 — the updater takes the shared prod-lane flock itself; the preflight,
+#        coach-web.service (start and stop) and the documented manual rollback
+#        take the same lock. systemd does not serialise those actors for us.
+#   C4 — no secret in the unit: .env.prod is handed to docker compose via
+#        --env-file only (never EnvironmentFile=), and neither the script nor
+#        this unit ever runs or logs `docker compose config`.
+#   C5 — the hygiene set below, identical to coach-web.service.
+#   C8 — the script keeps the failure streak in
+#        ~/.local/state/coach-web/update-state.json and pauses after 12
+#        consecutive failures instead of hammering the registry.
+
+[Unit]
+Description=Coach Web prod lane auto-update (provenance-gated digest pull)
+Documentation=file://@REPO_ROOT@/docs/admin_guide.md
+# StartLimit* live in [Unit] (their modern systemd location). Restart=on-failure
+# re-runs a FAILED trigger, bounded to StartLimitBurst=3 per StartLimitIntervalSec,
+# so the C8 streak of 12 consecutive failures is reached in as little as ~20
+# minutes; a run that completes (update or no-op) is paced by the 5-minute timer
+# (~1 h for the same streak). Repeated work therefore stays bounded.
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+WorkingDirectory=@REPO_ROOT@
+# Explicit PATH (C5): the user manager inherits a minimal environment, so the
+# docker CLI, python3 and /bin/bash must be found without a login PATH.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+ExecStart=/bin/bash @REPO_ROOT@/scripts/prod-update.sh
+# Above the update window (registry resolution + pull + recreate + the 120 s
+# health gate): the default 90 s would SIGTERM the run mid-gate (C5).
+TimeoutStartSec=600
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
