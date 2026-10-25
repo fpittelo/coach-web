@@ -16,8 +16,9 @@
 #      start/stop, a manual rollout) can recreate the lane on an unpulled image;
 #   7. C6 encrypted pre-swap snapshot: the database is measured first (the sealed
 #      artifact must fit the container's 64 MB /tmp tmpfs — ~48 MB effective),
-#      produced INSIDE the running coach-web container, copied out off-volume,
-#      verified non-empty and larger than the source, mode 600, last 4 kept;
+#      produced INSIDE the running coach-web container, streamed out off-volume
+#      (`exec -T cat` — docker cp cannot traverse the tmpfs, #342), verified
+#      non-empty and larger than the source, mode 600, last 4 kept;
 #   8. C4 atomic .env.prod rewrite (owner/mode 600 before and after, previous
 #      digest retained in .env.prod.prev) — only once the image is local;
 #   9. recreate, then gate on 3/3 healthy <= 120 s AND /healthz reporting the
@@ -145,15 +146,19 @@ check_pause() {
 # C6: encrypted pre-swap snapshot. The maintenance CLI runs INSIDE the running
 # coach-web container, so the lane's data-encryption key stays in the container
 # environment and never reaches this script. The artifact is staged on the
-# container's tmpfs (encrypted, off the data volume) and copied out to an
-# owner-only host directory; the last KEEP_SNAPSHOTS artifacts are kept.
+# container's tmpfs (encrypted, off the data volume) and streamed out with
+# `exec -T cat` — docker cp / compose cp resolve paths on the container rootfs
+# and cannot traverse the /tmp tmpfs mount (issue #342) — into an owner-only
+# host temp file on the snapshots filesystem; only a verified artifact is
+# renamed into place. The last KEEP_SNAPSHOTS artifacts are kept.
 #
 # Safety (F3/F4): the database is measured before the backup so an oversized
 # snapshot fails with an actionable message (the sealed envelope is ~4/3 of the
-# raw database and must fit the 64 MB tmpfs), and the extracted artifact must be
-# non-empty AND larger than the source — a successful `cp` alone is not evidence.
+# raw database and must fit the 64 MB tmpfs), and the streamed artifact must be
+# non-empty AND larger than the source — a successful stream alone is not
+# evidence.
 write_snapshot() {
-    local tag="$1" stamp name staged dest db_bytes verdict artifact_bytes
+    local tag="$1" stamp name staged dest host_tmp db_bytes verdict artifact_bytes
     stamp="$(date -u +%Y%m%dT%H%M%SZ)"
     name="coach-${stamp}-${tag}.backup"
     staged="/tmp/${name}"
@@ -176,20 +181,29 @@ write_snapshot() {
         error "the in-container backup failed — check the lane's data-encryption key (docs/admin_guide.md) and the WAL checkpoint"
         return 1
     fi
-    if ! dc cp "coach-web:${staged}" "${dest}" >/dev/null; then
+    # Extraction (#342): stream the artifact out of the container. The redirect
+    # target is a hidden temp file inside SNAPSHOT_DIR — the same filesystem, so
+    # the final `mv` is an atomic rename. pipefail (set at the top) makes any
+    # mid-stream failure non-zero; the integrity check below rejects an empty or
+    # truncated stream; any failure deletes the host temp and aborts the update
+    # before the swap. Nothing but the encrypted artifact crosses the boundary.
+    host_tmp="${SNAPSHOT_DIR}/.staging-${name}"
+    if ! dc exec -T coach-web cat "${staged}" >"${host_tmp}"; then
+        rm -f -- "${host_tmp}"
         dc exec -T coach-web rm -f "${staged}" >/dev/null 2>&1 || true
-        error "cannot copy the snapshot out of the container to ${SNAPSHOT_DIR}"
+        error "cannot stream the snapshot out of the container to ${SNAPSHOT_DIR}"
         return 1
     fi
     dc exec -T coach-web rm -f "${staged}" >/dev/null 2>&1 || true
-    chmod 600 "${dest}"
-    artifact_bytes="$(stat -c %s "${dest}" 2>/dev/null || echo 0)"
+    chmod 600 "${host_tmp}"
+    artifact_bytes="$(stat -c %s "${host_tmp}" 2>/dev/null || echo 0)"
     if ! verdict="$(python3 "${UPDATER}" snapshot-check --bytes "${db_bytes}" \
             --artifact-bytes "${artifact_bytes}" 2>&1)"; then
-        rm -f -- "${dest}"
+        rm -f -- "${host_tmp}"
         error "${verdict} — the unusable artifact was removed"
         return 1
     fi
+    mv -- "${host_tmp}" "${dest}"
     log "pre-swap snapshot: ${dest} (mode 600, keeping the last ${KEEP_SNAPSHOTS}) — ${verdict}"
     prune_snapshots
 }

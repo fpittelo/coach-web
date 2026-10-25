@@ -329,7 +329,7 @@ def snapshot_fits(
 ) -> tuple[bool, str]:
     """C6 pre-flight: the sealed snapshot must fit the container's ``/tmp`` tmpfs.
 
-    The artifact is staged on the container's tmpfs before being copied out, so
+    The artifact is staged on the container's tmpfs before being streamed out, so
     the effective ceiling is the tmpfs size divided by the 4/3 encryption
     expansion (~48 MB of database for the 64 MB tmpfs). A larger database aborts
     with an actionable message instead of failing later inside the backup with a
@@ -352,7 +352,7 @@ def snapshot_fits(
 def snapshot_integrity_ok(*, raw_bytes: int, artifact_bytes: int) -> tuple[bool, str]:
     """C6 post-copy: the extracted artifact must be present and larger than the source.
 
-    A successful ``docker compose cp`` is not evidence by itself: an empty or
+    A successful extraction stream is not evidence by itself: an empty or
     truncated extraction must fail the update while ``.env.prod`` is still
     untouched. Fernet always expands the payload, so an artifact no larger than
     the raw database cannot be the sealed envelope.
