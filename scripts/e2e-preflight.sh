@@ -66,7 +66,7 @@ case "${LANE}" in
         ;;
 esac
 
-# prod only (C3): the same shared lock coach-web-update.sh takes, so the update
+# prod only (C3): the same shared lock prod-update.sh takes, so the update
 # timer cannot resurrect the lane this pre-flight tears down on exit.
 if [[ "${LANE}" == "prod" ]]; then
     PROD_LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"

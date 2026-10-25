@@ -2,7 +2,7 @@
 # prod-update.sh — release-driven, provenance-gated auto-update of the prod lane
 # (MADR-0024 Option 4, issue #326). Run by coach-web-update.timer every 5 minutes.
 #
-# Flow (MADR-0024 §Option 4 steps 1-8, with the image pulled BEFORE the env swap;
+# Flow (MADR-0024 §Option 4 steps 1-9, with the image pulled BEFORE the env swap;
 # security conditions C1-C8):
 #   0. #344 checkout guard: refuse to run from anything but a clean checkout of
 #      `main` at origin/main (scripts/repo-clean-check.sh, shared with the boot
@@ -63,7 +63,7 @@ LOCK_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 LOCK_FILE="${LOCK_DIR}/coach-web-prod.lock"
 KEEP_SNAPSHOTS=4
 FAILURE_LIMIT=12
-# Above the unit's own TimeoutStartSec (600 s) so a boot/restart waits for an
+# Below the boot unit's TimeoutStartSec (1200 s) so a boot/restart waits for an
 # in-flight tick instead of failing; the unattended tick never waits (it skips).
 LOCK_WAIT_SECONDS=900
 # The gate window. Overridable so the wait loop can be exercised quickly by the
