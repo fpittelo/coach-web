@@ -341,6 +341,32 @@ async def list_last_messages(
     return messages
 
 
+async def count_thread_messages(
+    session: AsyncSession,
+    *,
+    athlete_id: int,
+    thread_id: int,
+) -> int:
+    """COUNT the thread's stored messages — no row read, no decryption.
+
+    The cheap due-check primitive behind the rolling-summary refresh
+    (#350, review 5644757392 nit 2): the refresh trigger only needs the
+    message count, so the decision runs as one scalar COUNT over
+    plaintext metadata — nothing is read, let alone decrypted, until the
+    refresh actually fires. Scoped by ``thread_id`` AND ``athlete_id``
+    (C4): an unknown or foreign thread counts zero, fail-closed.
+    """
+    result = await session.execute(
+        select(func.count())
+        .select_from(ConversationMessageRow)
+        .where(
+            ConversationMessageRow.thread_id == thread_id,
+            ConversationMessageRow.athlete_id == athlete_id,
+        )
+    )
+    return int(result.scalar_one())
+
+
 async def archive_thread(
     session: AsyncSession,
     *,

@@ -50,10 +50,13 @@ parameter) runs at BOTH memory boundaries:
 - **injection:** the window and summary copies bound for the prompt are
   sanitized and re-capped inside :func:`build_memory_block`.
 
-``#362``'s validate-after-sanitize binding applies at both: the caps are
-enforced on the SANITIZED result, never the raw input. The stored bytes
-and the rehydrate output stay RAW (GET /api/conversation fidelity is
-pinned in ``tests/test_conversation_api.py``).
+``#362``'s validate-after-sanitize binding applies at both: the SUMMARY
+word cap is enforced on the SANITIZED result, never the raw input; the
+per-message character clamp runs PRE-defusal (MADR-0026 order — cap, then
+neutralise), so the total ``MEMORY_CONTEXT_MAX_CHARS`` bound is the
+enforced cap for message copies. The stored bytes and the rehydrate output
+stay RAW (GET /api/conversation fidelity is pinned in
+``tests/test_conversation_api.py``).
 
 Failure posture (C7): every store read here is degrade-wrapped — a
 persistence failure never raises into the caller's stream or endpoint; it
@@ -72,6 +75,7 @@ from coach_web.agent import sanitize_untrusted_text
 from coach_web.conversation import (
     ConversationThreadRow,
     StoredMessage,
+    count_thread_messages,
     list_last_messages,
     set_thread_summary,
 )
@@ -87,7 +91,14 @@ MEMORY_WINDOW_MESSAGES = 20
 """MADR-0025 layer-1 window: the last 20 messages replayed oldest→newest."""
 
 MEMORY_MESSAGE_MAX_CHARS = 8000
-"""Per-message cap (unchanged from the #349 wire cap); sanitizer clamp."""
+"""Per-message cap (unchanged from the #349 wire cap); sanitizer clamp.
+
+Applied PRE-defusal inside the sanitizer (MADR-0026 order: cap, then
+neutralise), so a defusal-heavy payload's SANITIZED copy can exceed it —
+this clamp bounds the sanitization work on a tampered row, while the
+ENFORCED bound for the rendered block is the total
+``MEMORY_CONTEXT_MAX_CHARS`` (oldest-first truncation, :func:`_fit_newest_run`).
+"""
 
 MEMORY_SUMMARY_MAX_WORDS = 250
 """MADR-0025 layer-2 word cap on the rolling summary (hard bound)."""
@@ -220,7 +231,16 @@ def summarize_messages(messages: Sequence[StoredMessage]) -> str:
 
 
 def _render_stored_message(message: StoredMessage) -> str:
-    """Render one sanitized message as a fence-prefixed block line set."""
+    """Render one sanitized message as a fence-prefixed block line set.
+
+    Order is clamp-then-defuse: the sanitizer applies the
+    :data:`MEMORY_MESSAGE_MAX_CHARS` cap to the RAW input BEFORE the
+    zero-width neutralisation inserts characters (MADR-0026 order), so a
+    defusal-heavy payload can exceed 8 000 chars in the rendered lines —
+    the per-message clamp bounds the sanitization work; the total block
+    bound (:data:`MEMORY_CONTEXT_MAX_CHARS` via :func:`_fit_newest_run`)
+    is the enforcement.
+    """
     content = sanitize_untrusted_text(message.content, max_chars=MEMORY_MESSAGE_MAX_CHARS)
     lines = content.splitlines() or [""]
     first = f"{MEMORY_LINE_PREFIX}({message.seq}) {_role_label(message.role)}: {lines[0]}"
@@ -268,8 +288,9 @@ def build_memory_block(
 
     1. order the transcript by ``seq`` and take the last
        :data:`MEMORY_WINDOW_MESSAGES` messages (layer-1 window);
-    2. sanitize + clamp each message (per-message cap
-       :data:`MEMORY_MESSAGE_MAX_CHARS` — unchanged 8 000);
+    2. sanitize each message (the per-message
+       :data:`MEMORY_MESSAGE_MAX_CHARS` clamp — unchanged 8 000 — applies
+       PRE-defusal; the total *bound* is the enforcement);
     3. sanitize + word-cap the summary (:data:`MEMORY_SUMMARY_MAX_WORDS`);
     4. fit the rendered messages into *bound* minus the fences, directive
        and summary — oldest-first truncation (contiguous newest run kept);
@@ -406,12 +427,17 @@ async def refresh_thread_summary_if_due(
     """Refresh the rolling summary once the thread exceeds ~20 turns (AC3).
 
     The stream finalization trigger: after a completed turn is persisted,
-    the endpoint calls this; the summary is regenerated only when the
-    stored transcript slice holds more than
-    :data:`SUMMARY_REFRESH_THRESHOLD_MESSAGES` messages. Same degrade
-    posture as :func:`produce_thread_summary` — never raises into the
-    stream, logs the exception class only.
+    the endpoint calls this; the due-check is ONE scalar COUNT query over
+    plaintext metadata (review 5644757392 nit 2) — nothing is read or
+    decrypted unless the threshold is exceeded, at which point the bounded
+    transcript slice is read through :func:`_read_source` (decrypt only
+    when the refresh actually fires). Same degrade posture as
+    :func:`produce_thread_summary` — never raises into the stream, logs
+    the exception class only.
     """
+    count = await _count_messages(session_factory, athlete_id=athlete_id, thread_id=thread_id)
+    if count is None or count <= SUMMARY_REFRESH_THRESHOLD_MESSAGES:
+        return False
     source = await _read_source(
         session_factory, athlete_id=athlete_id, thread_id=thread_id, cipher=cipher
     )
@@ -425,6 +451,21 @@ async def refresh_thread_summary_if_due(
     except PERSISTENCE_DEGRADE_EXCEPTIONS as exc:
         log_persistence_degrade(exc)
         return False
+
+
+async def _count_messages(
+    session_factory: SessionFactory,
+    *,
+    athlete_id: int,
+    thread_id: int,
+) -> int | None:
+    """COUNT the thread's messages without touching any row; ``None`` on a degraded store (C7)."""
+    try:
+        async with session_factory() as session:
+            return await count_thread_messages(session, athlete_id=athlete_id, thread_id=thread_id)
+    except PERSISTENCE_DEGRADE_EXCEPTIONS as exc:
+        log_persistence_degrade(exc)
+        return None
 
 
 async def build_turn_memory_block(

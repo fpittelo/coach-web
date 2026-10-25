@@ -295,15 +295,16 @@ unchanged default path.
 def sanitize_untrusted_text(text: str | None, *, max_chars: int) -> str:
     """Sanitize untrusted free text per the MADR-0026 contract (pure).
 
-    ONE pure function, FOUR call sites (MADR-0025 C2 — "one sanitizer, no
-    forks"): orientation save (:func:`coach_web.app._normalize_orientation_for_save`),
+    ONE pure function, four sanitizer boundaries — five call sites, since
+    injection invokes it twice (MADR-0025 C2 — "one sanitizer, no forks"):
+    orientation save (:func:`coach_web.app._normalize_orientation_for_save`),
     orientation read-time assembly (:func:`assemble_system_prompt` — the DB
     row is untrusted input), and BOTH memory boundaries (#350,
     :mod:`coach_web.conversation_context`) — **read-for-summary** (defusing
     role tokens in stored messages before the summarizer consumes them) and
-    **injection** (defusing the window and summary copies bound for the
-    prompt). The **cap is a parameter** (MADR-0025 contract): each boundary
-    passes its own limit — the orientation sites pass
+    **injection** (defusing the window AND the summary copies bound for the
+    prompt — two calls). The **cap is a parameter** (MADR-0025 contract):
+    each boundary passes its own limit — the orientation sites pass
     :data:`ORIENTATION_MAX_CHARS`, the memory boundaries pass their own
     caps.
 

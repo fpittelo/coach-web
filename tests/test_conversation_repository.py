@@ -38,6 +38,7 @@ from coach_web.conversation import (
     ConversationThreadRow,
     append_message,
     archive_thread,
+    count_thread_messages,
     create_thread,
     get_active_thread,
     get_thread,
@@ -454,6 +455,39 @@ class TestAppendAndList:
         seqs = await asyncio.gather(*[append_one(i) for i in range(8)])
 
         assert sorted(seqs) == list(range(1, 9))
+
+
+class TestMessageCount:
+    """The COUNT primitive behind the summary-refresh due-check (#350)."""
+
+    async def test_counts_all_rows_scoped_to_the_owner(self, db_session_factory, cipher) -> None:
+        """Every stored row counts (no window); a foreign athlete counts zero (C4)."""
+        async with db_session_factory() as session:
+            thread = await create_thread(session, athlete_id=ATHLETE_A)
+            thread_id = thread.id
+            for i in range(25):
+                await append_message(
+                    session,
+                    athlete_id=ATHLETE_A,
+                    thread_id=thread_id,
+                    role="user" if i % 2 else "assistant",
+                    content=f"turn-{i}",
+                    cipher=cipher,
+                )
+
+        async with db_session_factory() as session:
+            assert (
+                await count_thread_messages(session, athlete_id=ATHLETE_A, thread_id=thread_id)
+                == 25
+            )
+            # C4: another athlete's COUNT over the same thread id is zero.
+            assert (
+                await count_thread_messages(session, athlete_id=ATHLETE_B, thread_id=thread_id) == 0
+            )
+
+    async def test_unknown_thread_counts_zero(self, db_session_factory) -> None:
+        async with db_session_factory() as session:
+            assert await count_thread_messages(session, athlete_id=ATHLETE_A, thread_id=99999) == 0
 
 
 class TestArchive:
