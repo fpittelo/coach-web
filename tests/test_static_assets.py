@@ -2245,7 +2245,8 @@ class TestFloatingComposerContract:
         """AC 1.7: the stop path adds no fetch target beyond the known API."""
         script = self._script()
 
-        # The only fetch targets are the pre-existing API surface.
+        # The only fetch targets are the pre-existing API surface. #363 adds the
+        # merged #362 admin settings endpoints the settings modal consumes.
         endpoints = set(re.findall(r'fetch\("([^"]+)"', script))
         assert endpoints <= {
             "/api/agent/stream",
@@ -2255,6 +2256,7 @@ class TestFloatingComposerContract:
             "/api/debrief",
             "/api/debrief/pending",
             "/api/objectives",
+            "/api/admin/agent-settings",
         }, sorted(endpoints)
 
 
@@ -4808,3 +4810,314 @@ class TestQuickReplyPillsContract:
             assert block, selector
             assert "animation" not in block, selector
             assert "transition" not in block, selector
+
+
+class TestAgentSettingsSectionContract:
+    """Orientation & agent preferences section in the settings modal (#363).
+
+    The final admin-orientation slice (MADR-0026): ONE new section inside the
+    EXISTING settings panel — a free-text orientation textarea (maxlength
+    1500 + live counter), two segmented nullable enum controls (verbosity,
+    tone) with an explicit "default (unset)" affordance, Save (PUT with the
+    full representation) and a confirm-gated "Reset to Coach defaults"
+    (DELETE). The save-time disclosure (MADR-0026 C4) sits adjacent to the
+    textarea so it reads as part of the input contract. All injected strings
+    bind via x-text (the orientation is DATA, never markup — the page keeps
+    exactly one x-html binding, the assistant body), no inline handlers (CSP),
+    native radio groups with fieldset legends for accessibility, and
+    success/failure rides the EXISTING settings-message line — now a
+    role="status" aria-live region. The section adds no auth surface of its
+    own: it inherits the modal's 401/sign-in flow unchanged.
+
+    app.js behavior is contracted through source assertions (no Node
+    toolchain, ADR-006 §5).
+    """
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _script(self) -> str:
+        return (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8").lower()
+
+    def _settings_form(self) -> str:
+        """Return the settings modal <form …>…</form> block."""
+        html = self._html()
+        start = html.index('class="settings-form"')
+        return html[start : html.index("</form>", start)]
+
+    def _section(self) -> str:
+        """Return the agent-settings section block (legend → end of form).
+
+        The section is the modal form's last element (after the objectives
+        action row — the #181 signin-link contract pins the first
+        ``.settings-actions`` occurrence to the objectives row).
+        """
+        html = self._html()
+        start = html.index("Orientation &amp; agent preferences")
+        return html[start : html.index("</form>", start)]
+
+    # --- section structure (AC1) -------------------------------------------------
+
+    def test_section_renders_inside_the_settings_panel(self) -> None:
+        """AC1: the section lives inside the existing settings modal form."""
+        form = self._settings_form()
+        section = self._section()
+
+        assert "Orientation &amp; agent preferences" in form
+        assert section in form
+        # One surface, zero new routing: no new dialog/overlay is introduced.
+        assert self._html().count('class="settings-overlay"') == 1
+        assert self._html().count('role="dialog"') == 1
+
+    def test_orientation_textarea_binds_with_x_model_and_caps_at_1500(self) -> None:
+        """AC4: the textarea binds x-model and carries maxlength=1500."""
+        section = self._section()
+
+        assert 'x-model="agentSettingsForm.orientation"' in section
+        assert 'maxlength="1500"' in section
+
+    def test_live_counter_renders_the_count_over_1500(self) -> None:
+        """AC4: a live character counter renders "<length>/1500" via x-text."""
+        section = self._section()
+
+        assert """x-text="agentSettingsForm.orientation.length + '/1500'\"""" in section
+        assert 'id="agent-orientation-counter"' in section
+
+    def test_counter_and_disclosure_are_described_by_the_textarea(self) -> None:
+        """AC5: the textarea references the counter and disclosure ids."""
+        section = self._section()
+
+        assert (
+            'aria-describedby="agent-orientation-counter agent-orientation-disclosure"' in section
+        )
+        assert 'id="agent-orientation-disclosure"' in section
+
+    def test_counter_overflow_disables_save(self) -> None:
+        """AC4: an overflowing orientation disables Save client-side.
+
+        maxlength normally prevents overflow; the disabled state backstops
+        programmatic/loaded oversize values while the server cap stays the
+        boundary (#362 validate-after-sanitize → 422).
+        """
+        section = self._section()
+        script = self._script()
+        save = _rule_block(script, "saveAgentSettings()")
+
+        assert "agentSettingsOrientationOverflow" in section
+        assert "get agentSettingsOrientationOverflow()" in script
+        assert "const AGENT_ORIENTATION_MAX_CHARS = 1500" in script
+        assert "this.agentSettingsForm.orientation.length > AGENT_ORIENTATION_MAX_CHARS" in script
+        assert ":disabled" in section
+        assert "if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow)" in save
+
+    def test_every_section_button_is_a_plain_button(self) -> None:
+        """The section's actions never submit the objectives form."""
+        section = self._section()
+
+        assert '@click="saveAgentSettings()"' in section
+        buttons = re.findall(r"<button[^>]*>", section)
+        assert len(buttons) >= 4  # Cancel, Reset, Confirm reset, Save
+        for button in buttons:
+            assert 'type="button"' in button, button
+
+    # --- segmented controls (AC1) ------------------------------------------------
+
+    def test_segmented_controls_offer_the_madr0026_enums(self) -> None:
+        """AC1: two segmented radio groups carrying the enum values."""
+        section = self._section()
+
+        assert 'name="agent-verbosity"' in section
+        assert 'name="agent-tone"' in section
+        assert section.count('x-model="agentSettingsForm.verbosity"') == 4
+        assert section.count('x-model="agentSettingsForm.tone"') == 4
+        for value in ("concise", "standard", "detailed", "strict", "balanced", "supportive"):
+            assert f'value="{value}"' in section, value
+
+    def test_unset_affordance_is_explicit(self) -> None:
+        """The nullable enums carry an explicit "default (unset)" option."""
+        section = self._section()
+
+        assert section.count("Default (unset)") == 2  # one per segmented control
+        assert 'value=""' in section
+
+    def test_segment_groups_are_labelled(self) -> None:
+        """AC5: fieldset legends name the groups; every radio has a label."""
+        section = self._section()
+
+        assert "<legend" in section
+        assert ">Verbosity</legend>" in section
+        assert ">Tone</legend>" in section
+        # Radios are wrapped in labelled containers (implicit labelling).
+        assert re.search(r'<label[^>]*>\s*<input type="radio"', section)
+
+    # --- disclosure (MADR-0026 C4) -----------------------------------------------
+
+    def test_disclosure_line_sits_adjacent_to_the_textarea(self) -> None:
+        """C4: the exact disclosure sentence, between textarea and controls."""
+        section = self._section()
+        marker = "Orientation text is sent to the model provider on every turn."
+
+        assert marker in section
+        textarea_at = section.index('x-model="agentSettingsForm.orientation"')
+        disclosure_at = section.index(marker)
+        segments_at = section.index('name="agent-verbosity"')
+        assert textarea_at < disclosure_at < segments_at
+
+    # --- unsaved-changes state (AC1) ---------------------------------------------
+
+    def test_unsaved_changes_state_is_visible(self) -> None:
+        """AC1: a visible unsaved-changes note driven by the dirty flag."""
+        section = self._section()
+        script = self._script()
+
+        assert 'x-show="agentSettingsDirty"' in section
+        assert "Unsaved changes." in section
+        assert "get agentSettingsDirty()" in script
+        assert "agentSettingsForm" in script
+        assert "agentSettingsSaved" in script
+        # The snapshot is internal state — never bound in the markup.
+        assert "agentSettingsSaved" not in self._html()
+
+    # --- load / save / reset wiring (AC1/AC2/AC3) ---------------------------------
+
+    def test_panel_open_loads_the_settings(self) -> None:
+        """AC1: opening the panel GETs the current settings."""
+        open_block = _rule_block(self._script(), "openSettings()")
+        load = _rule_block(self._script(), "loadAgentSettings()")
+
+        assert "this.loadAgentSettings()" in open_block
+        assert 'fetch("/api/admin/agent-settings")' in load
+        assert 'method: "PUT"' not in load
+        assert 'method: "DELETE"' not in load
+
+    def test_load_fills_the_form_and_the_dirty_snapshot(self) -> None:
+        """A successful GET fills the form AND the snapshot (dirty=false)."""
+        load = _rule_block(self._script(), "loadAgentSettings()")
+
+        assert "this.agentSettingsForm = this.formFromAgentSettings(body)" in load
+        assert "this.agentSettingsSaved = this.formFromAgentSettings(body)" in load
+
+    def test_save_puts_the_full_representation(self) -> None:
+        """AC2: save PUTs the full representation to the admin endpoint."""
+        save = _rule_block(self._script(), "saveAgentSettings()")
+
+        assert 'fetch("/api/admin/agent-settings"' in save
+        assert 'method: "PUT"' in save
+        assert "JSON.stringify(this.payloadFromAgentSettings())" in save
+
+    def test_payload_is_a_full_representation_with_null_for_unset(self) -> None:
+        """The payload carries all three fields; "" radios normalize to null."""
+        payload = _rule_block(self._script(), "payloadFromAgentSettings()")
+
+        assert "orientation" in payload
+        assert "verbosity" in payload
+        assert "tone" in payload
+        assert '=== "" ? null' in payload
+
+    def test_save_surfaces_confirmation_and_updates_the_snapshot(self) -> None:
+        """AC2: success surfaces a confirmation and clears the dirty flag."""
+        save = _rule_block(self._script(), "saveAgentSettings()")
+
+        assert "this.settingsMessage = " in save  # the existing message line
+        assert "Preferences saved." in save
+        assert "this.agentSettingsSaved = this.formFromAgentSettings(body)" in save
+
+    def test_save_renders_known_reason_codes(self) -> None:
+        """422 renders the owner-safe reason via the existing helper (#181)."""
+        save = _rule_block(self._script(), "saveAgentSettings()")
+
+        assert "settingsReasonMessage(" in save
+
+    def test_reset_requires_confirm_before_the_delete(self) -> None:
+        """AC3: DELETE fires only from the confirm path behind the armed state."""
+        script = self._script()
+        section = self._section()
+        arm = _rule_block(script, "armAgentSettingsReset()")
+        reset = _rule_block(script, "resetAgentSettings()")
+
+        assert 'x-show="!agentSettingsResetArmed"' in section
+        assert '@click="armAgentSettingsReset()"' in section
+        assert 'x-show="agentSettingsResetArmed"' in section
+        assert '@click="resetAgentSettings()"' in section
+        assert "@click" not in arm
+        assert "fetch(" not in arm  # arming performs no fetch
+        assert 'fetch("/api/admin/agent-settings"' in reset
+        assert 'method: "DELETE"' in reset
+
+    def test_reset_clears_the_form_to_the_defaults(self) -> None:
+        """AC3: a successful reset restores the defaults shape and disarms."""
+        reset = _rule_block(self._script(), "resetAgentSettings()")
+
+        assert "this.agentSettingsForm = this.formFromAgentSettings(body)" in reset
+        assert "this.agentSettingsSaved = this.formFromAgentSettings(body)" in reset
+        assert "this.agentSettingsResetArmed = false" in reset
+
+    def test_reset_disarms_on_panel_close(self) -> None:
+        """The confirm state never survives the modal (open + close disarm)."""
+        open_block = _rule_block(self._script(), "openSettings()")
+        close_block = _rule_block(self._script(), "closeSettings()")
+
+        assert "this.agentSettingsResetArmed = false" in open_block
+        assert "this.agentSettingsResetArmed = false" in close_block
+
+    def test_messages_ride_the_existing_settings_line(self) -> None:
+        """Success/failure reuse the shared settingsMessage state."""
+        for rule in ("loadAgentSettings()", "saveAgentSettings()", "resetAgentSettings()"):
+            block = _rule_block(self._script(), rule)
+            assert "this.settingsMessage = " in block, rule
+
+    # --- rendering hygiene (AC5) ---------------------------------------------------
+
+    def test_section_introduces_no_html_injection(self) -> None:
+        """All injected strings bind via x-text; exactly one x-html page-wide."""
+        html = self._html()
+        section = self._section()
+
+        assert "x-html" not in section
+        assert html.count("x-html") == 1  # the assistant body, unchanged
+        assert 'x-text="agentSettingsForm.orientation.length' in section
+
+    def test_section_introduces_no_inline_handlers(self) -> None:
+        """CSP-clean: no inline event handlers in the section."""
+        section = self._section()
+
+        for handler in ("onclick=", "onchange=", "oninput=", "onsubmit=", "javascript:"):
+            assert handler not in section.lower(), handler
+
+    def test_settings_message_line_is_a_live_region(self) -> None:
+        """AC5: the shared settings note announces via role=status aria-live."""
+        html = self._html()
+
+        note_at = html.index('x-show="settingsMessage"')
+        tag_start = html.rindex("<p", 0, note_at)
+        tag = html[tag_start : html.index(">", note_at) + 1]
+        assert 'role="status"' in tag
+        assert 'aria-live="polite"' in tag
+
+    # --- styling (AC5) ---------------------------------------------------------------
+
+    def test_section_styles_use_tokens(self) -> None:
+        """The new CSS exists and uses design tokens (no raw magic values)."""
+        css = self._css()
+
+        segment = _rule_block(css, ".agent-settings-segment")
+        disclosure = _rule_block(css, ".agent-settings-disclosure")
+        counter = _rule_block(css, ".agent-settings-counter")
+
+        assert segment, "the segment group must be styled"
+        legend = _rule_block(css, ".agent-settings-segment legend")
+        assert legend, "the segment legend must be styled"
+        assert "var(--muted)" in legend
+        options = _rule_block(css, ".agent-settings-options")
+        assert options, "the options row must be styled"
+        assert "var(--" in options
+        radio_input = _rule_block(css, ".segment-option input")
+        assert radio_input, "the radio input must opt out of the full-width rule"
+        assert "width: auto" in radio_input
+        assert disclosure, "the disclosure must be styled"
+        assert "var(--muted)" in disclosure
+        assert counter, "the counter must be styled"
+        assert "var(--muted)" in counter

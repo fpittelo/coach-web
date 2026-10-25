@@ -1681,6 +1681,54 @@ body {
   justify-content: flex-end;
 }
 
+/* Orientation & agent preferences (#363, MADR-0026): information lines are
+   muted — the accent-colored .settings-note stays the status surface; the
+   segmented controls are native radio groups whose inputs opt out of the
+   full-width settings-form input rule; accent-color tokenizes the check. */
+.agent-settings-counter {
+  color: var(--muted);
+}
+
+.agent-settings-disclosure {
+  color: var(--muted);
+}
+
+.agent-settings-segment {
+  border: none;
+  margin: 0;
+  padding: 0;
+  flex: 1 1 12rem;
+}
+
+.agent-settings-segment legend {
+  padding: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.agent-settings-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+}
+
+.segment-option {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: 0.9rem;
+}
+
+.segment-option input {
+  width: auto;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  accent-color: var(--accent);
+}
+
 /* --- Reduced motion (AC3, #85) ------------------------------------------ */
 
 /* Users who prefer reduced motion get no looping animations (status pulse

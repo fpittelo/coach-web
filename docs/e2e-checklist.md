@@ -47,6 +47,7 @@ Execute with `BROWSER_*` tools: `browser_navigate` → `browser_snapshot` (acces
 | J7 | New chat reset | Click New chat mid- or post-stream; snapshot | Log cleared, empty state returns; no stale stream events resurrect content |
 | J8 | XSS sanitization | Send `<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`, `[x](javascript:alert(1))`, and `<scr` + `ipt>` as two consecutive messages (accumulated-string re-sanitization across stream chunks, STRIDE C3) | All inert in assistant bubble (sanitized markdown); user bubble plain text; no execution; no console errors |
 | J9 | Console hygiene | After J1–J8, read console messages | No uncaught errors/warnings attributable to the app (browser-extension noise excluded) |
+| J10 | Admin orientation save → next reply → reset (#363) | Open Settings; type an orientation, pick verbosity/tone, watch the counter; Save; send a coaching message; then Reset → Confirm reset | "Preferences saved." note; counter ≤ 1500; the NEXT reply reflects the saved orientation (MADR-0026); the reset required the confirm click, then the textarea returned to the default state |
 
 **Pass criterion:** every journey's snapshot assertions hold and J9 is clean. A failed journey blocks sign-off and is filed as `type::bug` with the snapshot excerpt.
 

@@ -271,6 +271,12 @@ function settingsReasonMessage(body, fallback) {
   return fallback;
 }
 
+// Orientation cap (#363, MADR-0026): the client mirror of the server's
+// agent_settings CHECK (coach_web.agent_settings.AGENT_ORIENTATION_MAX_CHARS).
+// The HTML maxlength/counter carry the same number; the server cap remains
+// the boundary — an oversize payload still answers the field-only 422 (#362).
+const AGENT_ORIENTATION_MAX_CHARS = 1500;
+
 // Debrief error vocabulary (#189): the client mirror of the server's fixed
 // encryption-failure enum (coach_web.errors.EncryptionReason). The debrief
 // 503 body is {code, message}; the server-provided message renders ONLY when
@@ -504,6 +510,19 @@ function coachApp() {
       weeklyAvailabilityHours: 0,
       priorityDisciplines: "",
     },
+    // Orientation & agent preferences (#363, MADR-0026): the admin section in
+    // the settings modal. agentSettingsForm mirrors the AgentSettings API
+    // shape — nulls ride as "" in the segmented radios and normalize back to
+    // null on save (the full representation). agentSettingsSaved is the
+    // last-loaded/saved snapshot the unsaved-changes flag compares against
+    // (internal state, never bound in the markup). All bindings are
+    // x-text/x-model (structured Pydantic→HTML, no x-html).
+    agentSettingsForm: { orientation: "", verbosity: "", tone: "" },
+    agentSettingsSaved: { orientation: "", verbosity: "", tone: "" },
+    agentSettingsSaving: false,
+    // Confirm gate (AC3): the reset button arms, only the confirm button
+    // DELETEs; disarmed on open/close and after a successful reset.
+    agentSettingsResetArmed: false,
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -792,6 +811,10 @@ function coachApp() {
       this.settingsMessage = "";
       this.settingsSignin = false;
       this.loadObjectives();
+      // Orientation & agent preferences (#363): the section loads on panel
+      // open too, and the reset confirm gate never survives the modal.
+      this.loadAgentSettings();
+      this.agentSettingsResetArmed = false;
       // Move focus into the dialog (keyboard accessibility): the panel is
       // tabindex="-1" so it is programmatically focusable without entering
       // the tab order.
@@ -810,6 +833,7 @@ function coachApp() {
         return;
       }
       this.settingsOpen = false;
+      this.agentSettingsResetArmed = false;
       const toggle = this.$refs.settingsToggle;
       if (toggle) {
         toggle.focus();
@@ -979,6 +1003,174 @@ function coachApp() {
       if (index > 0) {
         this.objectivesForm.goals.splice(index, 1);
       }
+    },
+
+    // ------------------------------------------------------------------
+    // Orientation & agent preferences (#363, MADR-0026): the admin section
+    // in the settings modal. GET on open, PUT with the FULL representation
+    // (all three fields, JSON null for the "default (unset)" segmented
+    // options — an omitted field is a malformed payload, never an implicit
+    // clear), confirm-gated DELETE reset. Success/failure rides the shared
+    // settingsMessage note (role="status" aria-live); the 401 flow inherits
+    // the modal's sign-in affordance (#181 AC2) unchanged. Bindings are
+    // structured x-text/x-model — the orientation text is DATA, never
+    // markup.
+    // ------------------------------------------------------------------
+
+    get agentSettingsDirty() {
+      // Unsaved-changes state (AC1): any form field differing from the
+      // last-loaded/saved snapshot. The snapshot shares the form's shape, so
+      // the comparison is a plain field-by-field inequality.
+      return (
+        this.agentSettingsForm.orientation !== this.agentSettingsSaved.orientation ||
+        this.agentSettingsForm.verbosity !== this.agentSettingsSaved.verbosity ||
+        this.agentSettingsForm.tone !== this.agentSettingsSaved.tone
+      );
+    },
+
+    get agentSettingsOrientationOverflow() {
+      // Client-side cap guard (AC4): maxlength normally prevents overflow;
+      // this disables Save for programmatic/loaded oversize values. The
+      // server cap remains the boundary (#362 answers the field-only 422).
+      return this.agentSettingsForm.orientation.length > AGENT_ORIENTATION_MAX_CHARS;
+    },
+
+    formFromAgentSettings(settings) {
+      // API → form: nulls ride as "" so the segmented radios bind (x-model
+      // compares against the value attribute); the same shape backs the
+      // unsaved-changes snapshot.
+      return {
+        orientation: (settings && settings.orientation) || "",
+        verbosity: (settings && settings.verbosity) || "",
+        tone: (settings && settings.tone) || "",
+      };
+    },
+
+    payloadFromAgentSettings() {
+      // Form → API: the FULL representation (#362). Empty/whitespace-only
+      // orientation and "" radios serialize as null (the API validates strict
+      // enums — an empty string would be a 422).
+      return {
+        orientation:
+          this.agentSettingsForm.orientation.trim() === ""
+            ? null
+            : this.agentSettingsForm.orientation,
+        verbosity: this.agentSettingsForm.verbosity === "" ? null : this.agentSettingsForm.verbosity,
+        tone: this.agentSettingsForm.tone === "" ? null : this.agentSettingsForm.tone,
+      };
+    },
+
+    loadAgentSettings() {
+      fetch("/api/admin/agent-settings")
+        .then(async (response) => {
+          if (!response.ok) {
+            // 401 (#181 AC2): the section inherits the modal's sign-in flow —
+            // surface the prompt and arm the /auth/login link.
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            this.settingsMessage = "Could not load agent preferences.";
+            return;
+          }
+          const body = await response.json();
+          this.agentSettingsForm = this.formFromAgentSettings(body);
+          this.agentSettingsSaved = this.formFromAgentSettings(body);
+        })
+        .catch(() => {
+          this.settingsMessage = "Could not load agent preferences.";
+        });
+    },
+
+    saveAgentSettings() {
+      if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow) {
+        return;
+      }
+      this.agentSettingsSaving = true;
+      this.settingsMessage = "";
+      this.settingsSignin = false;
+      fetch("/api/admin/agent-settings", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(this.payloadFromAgentSettings()),
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            // 422 (#362): the field-only reason body {code, message} renders
+            // for known codes via the shared helper (#181); unknown/missing
+            // codes fall back to the generic text (fail-safe, no echo).
+            const body = await response.json().catch(() => ({}));
+            this.settingsMessage = settingsReasonMessage(
+              body,
+              "Could not save agent preferences. Check the values and retry."
+            );
+            return;
+          }
+          const body = await response.json();
+          // The response echoes the normalized stored text (#362) — re-forming
+          // from it keeps the textarea, snapshot and dirty flag honest (e.g.
+          // the save-time sanitizer's zero-width defusion).
+          this.agentSettingsForm = this.formFromAgentSettings(body);
+          this.agentSettingsSaved = this.formFromAgentSettings(body);
+          this.settingsMessage = "Preferences saved.";
+        })
+        .catch(() => {
+          // Transport failure: the generic text — no server detail echoed.
+          this.settingsMessage = "Could not save agent preferences. Check the values and retry.";
+        })
+        .finally(() => {
+          this.agentSettingsSaving = false;
+        });
+    },
+
+    armAgentSettingsReset() {
+      // Confirm gate (AC3): arming only swaps the affordance — no fetch.
+      this.agentSettingsResetArmed = true;
+    },
+
+    cancelAgentSettingsReset() {
+      this.agentSettingsResetArmed = false;
+    },
+
+    resetAgentSettings() {
+      if (this.agentSettingsSaving) {
+        return;
+      }
+      this.agentSettingsSaving = true;
+      this.settingsMessage = "";
+      this.settingsSignin = false;
+      fetch("/api/admin/agent-settings", { method: "DELETE" })
+        .then(async (response) => {
+          if (!response.ok) {
+            if (response.status === 401) {
+              this.settingsSignin = true;
+              this.settingsMessage = "Please sign in.";
+              return;
+            }
+            this.settingsMessage = "Could not reset agent preferences.";
+            return;
+          }
+          const body = await response.json();
+          // The DELETE response is the post-reset defaults shape (#362) —
+          // the textarea clears to the default state and the dirty flag
+          // resets with it.
+          this.agentSettingsForm = this.formFromAgentSettings(body);
+          this.agentSettingsSaved = this.formFromAgentSettings(body);
+          this.agentSettingsResetArmed = false;
+          this.settingsMessage = "Preferences reset to defaults.";
+        })
+        .catch(() => {
+          this.settingsMessage = "Could not reset agent preferences.";
+        })
+        .finally(() => {
+          this.agentSettingsSaving = false;
+        });
     },
 
     send() {
