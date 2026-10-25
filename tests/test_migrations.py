@@ -284,6 +284,8 @@ class TestPeriodizationMigration:
             "debriefs",
             "week_adherence",
             "agent_settings",
+            "conversation_threads",
+            "conversation_messages",
         }
 
     def test_phase_table_columns_match_the_madr008_schema(self, db_path: Path) -> None:
@@ -430,21 +432,22 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0007.
+        """Re-running upgrade head is a no-op and the version stays at 0008.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
         Superseded for #189: migration 0004 (debriefs) extends the chain.
         Superseded for #234: migration 0005 (week_adherence) extends the chain.
         Superseded for #243: migration 0006 (encrypted debrief RPE) extends
         the chain. Superseded for #361: migration 0007 (agent_settings)
-        extends the chain.
+        extends the chain. Superseded for #348: migration 0008 (conversation
+        memory) extends the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0007"
+        assert version == "0008"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -1045,7 +1048,11 @@ class TestAgentSettingsMigration:
     """Migration 0007 adds the MADR-0026 agent_settings table (#361)."""
 
     def test_upgrade_head_creates_agent_settings(self, db_path: Path) -> None:
-        """After upgrade head, agent_settings joins the domain tables (#361)."""
+        """After upgrade head, agent_settings joins the domain tables (#361).
+
+        Superseded for #348: migration 0008 (conversation memory) extends
+        the domain table set.
+        """
         command.upgrade(alembic_config(), "head")
 
         domain_tables = _table_names(db_path) - {"alembic_version", "sqlite_sequence"}
@@ -1056,6 +1063,8 @@ class TestAgentSettingsMigration:
             "debriefs",
             "week_adherence",
             "agent_settings",
+            "conversation_threads",
+            "conversation_messages",
         }
 
     def test_columns_match_the_madr0026_schema(self, db_path: Path) -> None:
@@ -1167,3 +1176,352 @@ class TestAgentSettingsMigration:
         command.downgrade(alembic_config(), "base")
 
         assert "agent_settings" not in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration 0008 — conversation memory (MADR-0025, #348)
+# ---------------------------------------------------------------------------
+
+EXPECTED_CONVERSATION_THREADS_COLUMNS = (
+    "id",
+    "athlete_id",
+    "status",
+    "started_at",
+    "last_active_at",
+    "summary_encrypted",
+    "summary_updated_at",
+)
+
+EXPECTED_CONVERSATION_MESSAGES_COLUMNS = (
+    "id",
+    "thread_id",
+    "athlete_id",
+    "role",
+    "content_encrypted",
+    "seq",
+    "created_at",
+)
+
+THREAD_STATUS_CHECK = "status IN ('active', 'archived')"
+MESSAGE_ROLE_CHECK = "role IN ('user', 'assistant')"
+
+
+def _conversation_threads_table_sql(db_path: Path) -> str:
+    """Return the CREATE TABLE statement text of conversation_threads."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_threads'"
+        ).fetchone()
+    assert row is not None, "conversation_threads table is missing"
+    return str(row[0])
+
+
+def _conversation_threads_column_flags(db_path: Path) -> dict[str, tuple[bool, bool]]:
+    """Return ``(notnull, is_pk)`` flags per column of conversation_threads."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(conversation_threads)").fetchall()
+    return {row[1]: (bool(row[3]), bool(row[5])) for row in rows}
+
+
+def _conversation_threads_indexed_columns(db_path: Path) -> set[str]:
+    """Return every column covered by an index on conversation_threads."""
+    with _connect(db_path) as conn:
+        indexes = conn.execute("PRAGMA index_list(conversation_threads)").fetchall()
+        columns: set[str] = set()
+        for index in indexes:
+            columns.update(
+                row[2] for row in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
+            )
+    return columns
+
+
+def _conversation_messages_table_sql(db_path: Path) -> str:
+    """Return the CREATE TABLE statement text of conversation_messages."""
+    with _connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='conversation_messages'"
+        ).fetchone()
+    assert row is not None, "conversation_messages table is missing"
+    return str(row[0])
+
+
+def _conversation_messages_column_flags(db_path: Path) -> dict[str, tuple[bool, bool]]:
+    """Return ``(notnull, is_pk)`` flags per column of conversation_messages."""
+    with _connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(conversation_messages)").fetchall()
+    return {row[1]: (bool(row[3]), bool(row[5])) for row in rows}
+
+
+def _conversation_messages_indexed_columns(db_path: Path) -> set[str]:
+    """Return every column covered by an index on conversation_messages."""
+    with _connect(db_path) as conn:
+        indexes = conn.execute("PRAGMA index_list(conversation_messages)").fetchall()
+        columns: set[str] = set()
+        for index in indexes:
+            columns.update(
+                row[2] for row in conn.execute(f"PRAGMA index_info({index[1]})").fetchall()
+            )
+    return columns
+
+
+def _seed_thread(db_path: Path, *, athlete_id: int = 1, status: str = "active") -> int:
+    """Insert one conversation_threads row; return its id."""
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO conversation_threads (athlete_id, status, started_at, last_active_at) "
+            "VALUES (?, ?, '2026-10-25T10:00:00+00:00', '2026-10-25T10:00:00+00:00')",
+            (athlete_id, status),
+        )
+        conn.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+
+def _seed_message(
+    db_path: Path,
+    *,
+    thread_id: int,
+    seq: int,
+    content_encrypted: str = "gAAAA-test-token",
+    role: str = "user",
+    athlete_id: int = 1,
+) -> int:
+    """Insert one conversation_messages row; return its id."""
+    with _connect(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO conversation_messages "
+            "(thread_id, athlete_id, role, content_encrypted, seq, created_at) "
+            "VALUES (?, ?, ?, ?, ?, '2026-10-25T10:00:00+00:00')",
+            (thread_id, athlete_id, role, content_encrypted, seq),
+        )
+        conn.commit()
+        assert cursor.lastrowid is not None
+        return int(cursor.lastrowid)
+
+
+class TestConversationMemoryMigration:
+    """Migration 0008 adds the conversation memory tables (MADR-0025, #348).
+
+    Two tables, one incremental migration on head 0007:
+
+    - ``conversation_threads`` — one row per server-owned thread; ``status``
+      is CHECK-bounded to the fixed active|archived enum; the rolling
+      summary rides along as Fernet ciphertext (``summary_encrypted``, C1)
+      with its update timestamp, both nullable (unset until #350 generates
+      one). Indexed on ``(athlete_id, status, last_active_at)`` for the
+      active-thread lookup and the retention sweep.
+    - ``conversation_messages`` — the raw turns; ``thread_id`` FK-cascades
+      onto its parent (deleting a thread deletes its messages); ``role`` is
+      CHECK-bounded to the server-assigned user|assistant enum; content is
+      Fernet ciphertext (``content_encrypted``, C1 — there is NO plaintext
+      content column); ``seq`` is the per-thread monotonic order key,
+      UNIQUE per thread via the ``(thread_id, seq)`` index. Metadata
+      (ids, role, seq, timestamps) stays plaintext (residual R3).
+
+    The contract pins the exact column sets, the nullable flags, both
+    CHECKs, the FK CASCADE, both indexes and the downgrade path — the
+    schema the ORM models mirror (MADR-0026/0007 precedent).
+    """
+
+    def test_upgrade_head_creates_both_conversation_tables(self, db_path: Path) -> None:
+        """After upgrade head, the two conversation tables exist (#348)."""
+        command.upgrade(alembic_config(), "head")
+
+        tables = _table_names(db_path)
+        assert "conversation_threads" in tables
+        assert "conversation_messages" in tables
+
+    def test_conversation_threads_columns_match_the_madr0025_schema(self, db_path: Path) -> None:
+        """The column set matches the MADR-0025 schema sketch exactly, in order."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            columns = [
+                row[1] for row in conn.execute("PRAGMA table_info(conversation_threads)").fetchall()
+            ]
+
+        assert tuple(columns) == EXPECTED_CONVERSATION_THREADS_COLUMNS
+
+    def test_conversation_messages_columns_match_the_madr0025_schema(self, db_path: Path) -> None:
+        """The column set matches the MADR-0025 schema sketch exactly, in order."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            columns = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(conversation_messages)").fetchall()
+            ]
+
+        assert tuple(columns) == EXPECTED_CONVERSATION_MESSAGES_COLUMNS
+
+    def test_conversation_threads_required_columns_are_not_null(self, db_path: Path) -> None:
+        """athlete_id, status and both timestamps are NOT NULL."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _conversation_threads_column_flags(db_path)
+        for column in ("athlete_id", "status", "started_at", "last_active_at"):
+            assert flags[column][0] is True, column
+
+    def test_conversation_threads_optional_columns_are_nullable(self, db_path: Path) -> None:
+        """summary_encrypted and summary_updated_at allow NULL (unset summary)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _conversation_threads_column_flags(db_path)
+        for column in ("summary_encrypted", "summary_updated_at"):
+            assert flags[column][0] is False, column
+
+    def test_conversation_messages_required_columns_are_not_null(self, db_path: Path) -> None:
+        """thread_id, athlete_id, role, content, seq and created_at are NOT NULL.
+
+        ``content_encrypted`` NOT NULL is the C1 no-plaintext-fallback pin:
+        a message row cannot exist without its ciphertext.
+        """
+        command.upgrade(alembic_config(), "head")
+
+        flags = _conversation_messages_column_flags(db_path)
+        for column in (
+            "thread_id",
+            "athlete_id",
+            "role",
+            "content_encrypted",
+            "seq",
+            "created_at",
+        ):
+            assert flags[column][0] is True, column
+
+    def test_conversation_threads_id_is_the_primary_key(self, db_path: Path) -> None:
+        """id is the single INTEGER primary key (AUTOINCREMENT rowid alias)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _conversation_threads_column_flags(db_path)
+        assert flags["id"][1] is True
+        assert [name for name, (_, pk) in flags.items() if pk] == ["id"]
+
+    def test_conversation_messages_id_is_the_primary_key(self, db_path: Path) -> None:
+        """id is the single INTEGER primary key (AUTOINCREMENT rowid alias)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _conversation_messages_column_flags(db_path)
+        assert flags["id"][1] is True
+        assert [name for name, (_, pk) in flags.items() if pk] == ["id"]
+
+    def test_conversation_threads_check_constraints_are_declared(self, db_path: Path) -> None:
+        """The status enum CHECK is declared on conversation_threads."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _conversation_threads_table_sql(db_path)
+        assert THREAD_STATUS_CHECK in sql
+
+    def test_conversation_messages_check_constraints_are_declared(self, db_path: Path) -> None:
+        """The role enum CHECK and the FK CASCADE are declared on conversation_messages."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _conversation_messages_table_sql(db_path)
+        assert MESSAGE_ROLE_CHECK in sql
+        assert "REFERENCES conversation_threads" in sql
+        assert "ON DELETE CASCADE" in sql
+
+    def test_thread_status_check_rejects_unknown_values(self, db_path: Path) -> None:
+        """Inserting a status outside the enum fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="status"):
+                conn.execute(
+                    "INSERT INTO conversation_threads "
+                    "(athlete_id, status, started_at, last_active_at) "
+                    "VALUES (1, 'lost', 's', 'l')"
+                )
+
+    def test_message_role_check_rejects_unknown_values(self, db_path: Path) -> None:
+        """Inserting a role outside the server-assigned enum fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        thread_id = _seed_thread(db_path)
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="role"):
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(thread_id, athlete_id, role, content_encrypted, seq, created_at) "
+                    "VALUES (?, 1, 'system', 'c', 1, 't')",
+                    (thread_id,),
+                )
+
+    def test_thread_id_foreign_key_rejects_unknown_parent(self, db_path: Path) -> None:
+        """Inserting a message for a nonexistent thread fails the FK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            with pytest.raises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO conversation_messages "
+                    "(thread_id, athlete_id, role, content_encrypted, seq, created_at) "
+                    "VALUES (99999, 1, 'user', 'c', 1, 't')"
+                )
+
+    def test_thread_id_foreign_key_cascades_deletes(self, db_path: Path) -> None:
+        """Deleting the parent thread removes its messages (MADR-0025 CASCADE)."""
+        command.upgrade(alembic_config(), "head")
+
+        thread_id = _seed_thread(db_path)
+        _seed_message(db_path, thread_id=thread_id, seq=1)
+        _seed_message(db_path, thread_id=thread_id, seq=2)
+        with _connect(db_path) as conn:
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("DELETE FROM conversation_threads WHERE id = ?", (thread_id,))
+            remaining = conn.execute("SELECT COUNT(*) FROM conversation_messages").fetchone()[0]
+
+        assert remaining == 0
+
+    def test_thread_seq_pair_is_unique(self, db_path: Path) -> None:
+        """A second message with the same (thread_id, seq) fails the unique index."""
+        command.upgrade(alembic_config(), "head")
+
+        thread_id = _seed_thread(db_path)
+        _seed_message(db_path, thread_id=thread_id, seq=1)
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE constraint failed"):
+            _seed_message(db_path, thread_id=thread_id, seq=1)
+
+    def test_required_indexes_are_declared(self, db_path: Path) -> None:
+        """(athlete_id, status, last_active_at) and (thread_id, seq) are indexed.
+
+        The exact index coverages of the MADR-0025 schema: the threads index
+        serves the active-thread lookup and the retention sweep; the
+        messages index doubles as the per-thread seq UNIQUE (one object,
+        KIS — the unique index IS the mandated (thread_id, seq) index).
+        """
+        command.upgrade(alembic_config(), "head")
+
+        assert _conversation_threads_indexed_columns(db_path) == {
+            "athlete_id",
+            "status",
+            "last_active_at",
+        }
+        assert _conversation_messages_indexed_columns(db_path) == {"thread_id", "seq"}
+
+    def test_message_content_column_has_no_plaintext_sibling(self, db_path: Path) -> None:
+        """The C1 pin: no plaintext content column exists in either table."""
+        command.upgrade(alembic_config(), "head")
+
+        assert "content" not in EXPECTED_CONVERSATION_MESSAGES_COLUMNS
+        assert "summary" not in EXPECTED_CONVERSATION_THREADS_COLUMNS
+
+    def test_downgrade_to_0007_drops_both_tables(self, db_path: Path) -> None:
+        """Downgrade 0008 → 0007 removes both tables (reversible, AC1)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "0007")
+
+        tables = _table_names(db_path)
+        assert "conversation_threads" not in tables
+        assert "conversation_messages" not in tables
+        assert "agent_settings" in tables
+
+    def test_downgrade_to_base_drops_both_tables(self, db_path: Path) -> None:
+        """Downgrade to base removes the conversation tables (data-destructive)."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "base")
+
+        tables = _table_names(db_path)
+        assert "conversation_threads" not in tables
+        assert "conversation_messages" not in tables

@@ -877,12 +877,18 @@ class TestDivergenceDigestScope:
         the chain — the digest itself still adds no persistence of its own.
         Superseded for #361: migration 0007 (agent_settings, MADR-0026)
         extends the chain — the divergence digest still persists nothing.
+        Superseded for #348: migration 0008 (conversation memory,
+        MADR-0025) extends the chain — the digest still persists nothing
+        of its own.
         """
         import coach_web.app  # noqa: F401 - pulls every model module into Base
+        import coach_web.conversation  # noqa: F401 - #348's app-independent store
 
         assert sorted(Base.metadata.tables) == [
             "agent_settings",
             "athlete_objectives",
+            "conversation_messages",
+            "conversation_threads",
             "debriefs",
             "periodization_phases",
             "plan_drafts",
@@ -902,6 +908,7 @@ class TestDivergenceDigestScope:
             "0005_week_adherence.py",
             "0006_encrypt_debrief_rpe.py",
             "0007_agent_settings.py",
+            "0008_conversation_memory.py",
         ]
 
     def test_the_digest_module_imports_no_mcp_or_icu_client(self) -> None:

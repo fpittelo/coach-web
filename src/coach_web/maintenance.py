@@ -22,20 +22,24 @@ database engine. The backup artifact is C2-derived and stays encrypted at
 rest (MADR-0008); the plaintext database bytes exist only inside this
 process's memory while the envelope is built or opened.
 
-Run via ``python -m coach_web.maintenance <vacuum|backup|restore> …`` —
-see ``docs/admin_guide.md`` for the runbook.
+Run via ``python -m coach_web.maintenance <vacuum|backup|restore|
+purge-conversations> …`` — see ``docs/admin_guide.md`` for the runbook.
 """
 
 import argparse
+import asyncio
 import os
 import sqlite3
 import sys
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
 from coach_web.config import get_settings
+from coach_web.conversation import PurgeCounts, purge_expired
+from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import resolve_data_encryption_key
 from coach_web.errors import EncryptionUnavailableError
 
@@ -150,11 +154,54 @@ def restore_database(backup_path: str, output_path: str, key: bytes) -> None:
         raise
 
 
+def purge_conversations(db_path: str) -> PurgeCounts:
+    """Run the MADR-0025 C6 conversation retention sweep (#348).
+
+    Deletes raw messages past the message window and inactive threads past
+    the thread window (both windows from Settings, defaults 90 d / 365 d)
+    and returns the deleted counts — COUNTS ONLY, never content (C3: the
+    sweep is a pure DELETE, it never reads ``content_encrypted`` or
+    ``summary_encrypted``, so no key is needed and no plaintext path
+    exists). The sweep is idempotent.
+
+    **Live-DB only (C6):** previously-taken encrypted backups retain the
+    ciphertext of purged/expired content until they age out of backup
+    rotation (MADR-0008 B11 boundary) — stated in the subcommand ``--help``
+    and in the printed line.
+
+    Raises:
+        FileNotFoundError: when *db_path* does not exist — a missing
+            database is refused, never silently created empty (#301 F-01).
+    """
+    if not Path(db_path).is_file():
+        raise FileNotFoundError(f"database not found: {db_path} — nothing to purge")
+    settings = get_settings()
+
+    async def _sweep() -> PurgeCounts:
+        engine = build_db_engine(db_path)
+        try:
+            factory = build_session_factory(engine)
+            async with factory() as session:
+                return await purge_expired(
+                    session,
+                    now=datetime.now(UTC),
+                    message_retention_days=settings.CONVERSATION_MESSAGE_RETENTION_DAYS,
+                    thread_retention_days=settings.CONVERSATION_THREAD_RETENTION_DAYS,
+                )
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_sweep())
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint: ``python -m coach_web.maintenance <verb> …``."""
     parser = argparse.ArgumentParser(
         prog="python -m coach_web.maintenance",
-        description="Coach Web persistence hygiene (#274): vacuum, encrypted backup, restore.",
+        description=(
+            "Coach Web persistence hygiene (#274): vacuum, encrypted backup, "
+            "restore, conversation retention purge (#348)."
+        ),
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -175,6 +222,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Restored database path (default: <COACH_DB_PATH>.restored).",
     )
 
+    sub.add_parser(
+        "purge-conversations",
+        help=(
+            "Purge expired conversation memory (MADR-0025 C6, #348) — "
+            "live-DB only; prints counts, never content."
+        ),
+        description=(
+            "Purge expired conversation memory (MADR-0025 C6, #348): raw messages "
+            "past the message retention window and inactive threads (archived or "
+            "active-stale) past the thread retention window — windows come from "
+            "Settings, defaults 90 d / 365 d. Idempotent; prints counts, never "
+            "content (C3). LIVE-DB ONLY: previously-taken encrypted backups retain "
+            "the ciphertext of purged content until they age out of backup "
+            "rotation (MADR-0008 B11 boundary)."
+        ),
+    )
+
     args = parser.parse_args(argv)
     db_path = get_settings().COACH_DB_PATH
     try:
@@ -188,6 +252,13 @@ def main(argv: list[str] | None = None) -> int:
             output = args.output or f"{db_path}.restored"
             restore_database(args.backup, output, _backup_key())
             print(f"Database restored to {output}")
+        elif args.command == "purge-conversations":
+            counts = purge_conversations(db_path)
+            print(
+                f"Purged {counts.messages_deleted} message(s) and "
+                f"{counts.threads_deleted} thread(s) — live-DB only; encrypted "
+                "backups retain purged ciphertext until backup rotation (MADR-0025 C6)."
+            )
     except (ValueError, InvalidToken, OSError, sqlite3.Error, EncryptionUnavailableError) as exc:
         # Clean single-line failure — no traceback, no key material (nLPD;
         # redaction pinned by tests/test_maintenance.py, #301 SEC-296-06).
