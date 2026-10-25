@@ -1197,6 +1197,23 @@ class TestCheckoutGuard:
         assert "tracked changes" in result.stderr
         assert sandbox.invocations() == []
 
+    def test_a_dirty_tree_refuses_before_waiting_on_the_lock(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """#344/review: the guard precedes the C3 lock.
+
+        With the lock held, `--rollback` on a dirty tree must refuse immediately
+        (it would otherwise wait up to LOCK_WAIT_SECONDS=900 s first). The guard
+        error is emitted and no lock acquisition is logged.
+        """
+        sandbox.dirty_tracked_file()
+        sandbox.hold_lock()
+        result = sandbox.run("--rollback")
+        assert result.returncode != 0
+        assert "tracked changes" in result.stderr
+        assert "acquired the shared prod-lane lock" not in result.stdout
+        assert sandbox.invocations() == []
+
 
 class TestEntrypointBehaviour:
     """C2/C3/C6 behaviour of scripts/prod-update.sh (shimmed, daemon-free).

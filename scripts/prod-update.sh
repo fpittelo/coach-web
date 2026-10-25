@@ -429,6 +429,14 @@ main() {
         return 1
     fi
 
+    # #344 checkout guard: runs BEFORE the lock, so a dirty/foreign checkout is
+    # refused immediately even for --force/--rollback (which would otherwise wait
+    # up to LOCK_WAIT_SECONDS on the lock first). No update, boot or rollback may
+    # run unreviewed code.
+    if ! checkout_guard; then
+        return 1
+    fi
+
     # C3: one lock for the timer, the preflight, coach-web.service start/stop and
     # the manual rollback. The unattended tick never blocks (a held lock means
     # another operation is running — it skips, exit 0); the operator-driven paths
@@ -449,11 +457,6 @@ main() {
 
     WORK_DIR="$(mktemp -d)"
     trap cleanup EXIT
-
-    # #344: no update, boot or rollback may run from a dirty/foreign checkout.
-    if ! checkout_guard; then
-        return 1
-    fi
 
     if [[ "${rollback}" == "true" ]]; then
         do_rollback
