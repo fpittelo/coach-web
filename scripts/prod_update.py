@@ -10,7 +10,9 @@ GitHub API or systemd:
 * the C4 ``.env.prod`` rewrite (exactly one image line, mode 600 before and
   after, tempfile + rename in the same directory, previous digest retained),
 * the step-7 gate (3/3 healthy **and** ``/healthz`` on the release version),
-* the C8 state file (last run, outcome, consecutive-failure streak).
+* the C8 state file (last run, outcome, consecutive-failure streak),
+* the #345 per-tick lane health signal (``lane-health``) and its additive
+  ``lane`` field on the state file.
 
 The module resolves nothing itself: the shell performs the docker/HTTP I/O and
 hands the results over as files or strings. It holds and prints no secret — only
@@ -23,9 +25,10 @@ CLI — one verb per decision, called by ``scripts/prod-update.sh``:
     prod_update.py provenance   --prod-digest DIGEST --tag vX.Y.Z --tag-digest DIGEST
     prod_update.py rewrite      --env-file FILE (--digest DIGEST | --from-prev)
     prod_update.py state-check  --state-file FILE [--limit N]
-    prod_update.py state-record --state-file FILE --outcome success|failure [--reason TAG]
+    prod_update.py state-record --state-file FILE --outcome OUTCOME [--reason TAG] [--lane LANE]
     prod_update.py snapshot-check --bytes N [--artifact-bytes M]
     prod_update.py health-gate  --tag vX.Y.Z --ps-json FILE --healthz-json FILE
+    prod_update.py lane-health  --ps-json FILE
 
 Exit codes: ``0`` the verb succeeded (and, for the gate verbs, the decision is
 positive), ``1`` the decision is negative (provenance refused, update paused,
@@ -81,8 +84,16 @@ FERNET_EXPANSION_DEN = 3
 EXPECTED_SERVICES = frozenset({"coach-web", "coach-mcp", "github-mcp"})
 """The exact prod-lane service set the health gate requires (AC3)."""
 
-OUTCOMES = ("success", "failure")
-"""The C8 run outcomes."""
+OUTCOMES = ("success", "failure", "degraded")
+"""The C8 run outcomes.
+
+``degraded`` (#345) is a tick that completed but whose prod lane is **not** 3/3
+healthy after the bounded self-heal; it is recorded instead of ``success`` so a
+swapped-but-broken lane can never read as healthy.
+"""
+
+LANE_STATES = ("healthy", "recovered", "degraded")
+"""The #345 per-tick lane health signal, recorded next to the outcome."""
 
 
 class UpdateError(Exception):
@@ -450,12 +461,17 @@ class UpdateState:
     ``reason`` is a short machine-readable tag for a *failed* run (e.g.
     ``checkout-guard``, #344); it is ``None`` when a run did not carry one (a
     success, or a failure the caller did not tag).
+
+    ``lane`` is the #345 per-tick lane health signal (``healthy``, ``recovered``
+    or ``degraded``); it is ``None`` for a state file written before #345, so the
+    field is additive and older files keep reading.
     """
 
     last_run: str
     outcome: str
     consecutive_failures: int
     reason: str | None = None
+    lane: str | None = None
 
 
 def read_state(path: Path) -> UpdateState | None:
@@ -463,6 +479,7 @@ def read_state(path: Path) -> UpdateState | None:
 
     The state file is a status signal, not a gate: a corrupt one is reported by
     the caller and treated as a first run rather than blocking the lane forever.
+    A pre-#345 file has no ``lane`` key; that reads back as ``lane=None``.
     """
     if not path.is_file():
         return None
@@ -472,6 +489,7 @@ def read_state(path: Path) -> UpdateState | None:
         outcome: Any = data["outcome"]
         streak: Any = data["consecutive_failures"]
         reason: Any = data.get("reason")
+        lane: Any = data.get("lane")
     except (OSError, ValueError, TypeError, KeyError):
         return None
     if not isinstance(last_run, str) or outcome not in OUTCOMES:
@@ -480,29 +498,52 @@ def read_state(path: Path) -> UpdateState | None:
         return None
     if reason is not None and not isinstance(reason, str):
         return None
+    if lane is not None and lane not in LANE_STATES:
+        return None
     return UpdateState(
-        last_run=last_run, outcome=outcome, consecutive_failures=streak, reason=reason
+        last_run=last_run,
+        outcome=outcome,
+        consecutive_failures=streak,
+        reason=reason,
+        lane=lane,
     )
 
 
 def next_state(
-    previous: UpdateState | None, *, outcome: str, now: str, reason: str | None = None
+    previous: UpdateState | None,
+    *,
+    outcome: str,
+    now: str,
+    reason: str | None = None,
+    lane: str | None = None,
 ) -> UpdateState:
     """Return the state after a run with *outcome*: a success resets the streak.
 
     *reason* tags a failed run (e.g. ``checkout-guard``); a success never carries
-    one. The streak accumulates on failure and resets on success.
+    one. *lane* records the #345 lane health signal (``healthy`` / ``recovered``
+    / ``degraded``). Streak semantics:
+
+    * ``success``   -> resets the streak to 0;
+    * ``failure``   -> accumulates the streak (the C8 pause counter);
+    * ``degraded``  -> leaves the streak untouched: a degraded lane is *not* an
+      update failure, and must not accumulate toward the C8 pause (a paused
+      updater stops before the lane check, which would hide the degradation).
     """
     if outcome not in OUTCOMES:
         raise UpdateError(f"unknown outcome {outcome!r} (expected one of {OUTCOMES})")
-    streak = 0
-    if outcome == "failure":
-        streak = (previous.consecutive_failures if previous is not None else 0) + 1
+    if lane is not None and lane not in LANE_STATES:
+        raise UpdateError(f"unknown lane state {lane!r} (expected one of {LANE_STATES})")
+    streak = previous.consecutive_failures if previous is not None else 0
+    if outcome == "success":
+        streak = 0
+    elif outcome == "failure":
+        streak += 1
     return UpdateState(
         last_run=now,
         outcome=outcome,
         consecutive_failures=streak,
         reason=reason if outcome == "failure" else None,
+        lane=lane,
     )
 
 
@@ -521,6 +562,7 @@ def write_state(path: Path, state: UpdateState) -> None:
                 "outcome": state.outcome,
                 "consecutive_failures": state.consecutive_failures,
                 "reason": state.reason,
+                "lane": state.lane,
             },
             indent=2,
             sort_keys=True,
@@ -595,13 +637,18 @@ def _state_check(args: argparse.Namespace) -> int:
 def _state_record(args: argparse.Namespace) -> int:
     """`state-record`: append this run's outcome to the C8 state file."""
     state = next_state(
-        read_state(Path(args.state_file)), outcome=args.outcome, now=now_utc(), reason=args.reason
+        read_state(Path(args.state_file)),
+        outcome=args.outcome,
+        now=now_utc(),
+        reason=args.reason,
+        lane=args.lane,
     )
     write_state(Path(args.state_file), state)
     suffix = " — auto-update will pause until a --force run" if should_halt(state) else ""
     reason = f" reason={state.reason}" if state.reason else ""
+    lane = f" lane={state.lane}" if state.lane else ""
     print(
-        f"outcome={state.outcome}{reason} consecutive_failures={state.consecutive_failures} "
+        f"outcome={state.outcome}{reason}{lane} consecutive_failures={state.consecutive_failures} "
         f"last_run={state.last_run}{suffix}"
     )
     return 0
@@ -628,6 +675,13 @@ def _health_gate(args: argparse.Namespace) -> int:
     return 0 if passed else 1
 
 
+def _lane_health(args: argparse.Namespace) -> int:
+    """`lane-health`: print PASS/FAIL for the exact healthy 3/3 set (#345)."""
+    passed, detail = services_healthy(_read_text(Path(args.ps_json)))
+    print(f"{'PASS' if passed else 'FAIL'}: {detail}")
+    return 0 if passed else 1
+
+
 VERBS = {
     "release-tag": _release_tag,
     "compare": _compare,
@@ -637,6 +691,7 @@ VERBS = {
     "state-record": _state_record,
     "snapshot-check": _snapshot_check,
     "health-gate": _health_gate,
+    "lane-health": _lane_health,
 }
 """The CLI verbs, one per decision (see the module docstring)."""
 
@@ -683,6 +738,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Short machine-readable tag for a failed run (e.g. checkout-guard, #344).",
     )
+    state_record.add_argument(
+        "--lane",
+        default=None,
+        choices=LANE_STATES,
+        help="Per-tick lane health signal (#345): healthy | recovered | degraded.",
+    )
 
     snapshot = sub.add_parser("snapshot-check", help="C6: snapshot ceiling / integrity.")
     snapshot.add_argument("--bytes", type=int, required=True, help="Raw database size in bytes.")
@@ -697,6 +758,13 @@ def _build_parser() -> argparse.ArgumentParser:
     gate.add_argument("--tag", required=True, help="Release tag the lane must report.")
     gate.add_argument("--ps-json", required=True, help="`docker compose ps -a --format json`.")
     gate.add_argument("--healthz-json", required=True, help="/healthz payload.")
+
+    lane_health = sub.add_parser(
+        "lane-health", help="AC1/#345: the exact 3/3 healthy set, no release version."
+    )
+    lane_health.add_argument(
+        "--ps-json", required=True, help="`docker compose ps -a --format json`."
+    )
 
     return parser
 

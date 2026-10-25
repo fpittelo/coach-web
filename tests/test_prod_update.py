@@ -441,6 +441,46 @@ class TestHealthGate:
 
 
 # --------------------------------------------------------------------------- #
+# #345: per-tick lane health signal
+# --------------------------------------------------------------------------- #
+
+
+class TestLaneHealthSignal:
+    """#345: the no-change tick measures the exact 3/3 set instead of assuming it."""
+
+    def test_a_complete_healthy_set_passes_with_the_3_3_verdict(self) -> None:
+        ok, detail = CORE.services_healthy(_ps())
+        assert ok is True
+        assert "3/3" in detail
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            _ps(services=("coach-web", "coach-mcp")),  # a sidecar disappeared at runtime
+            _ps(services=("coach-web", "coach-mcp", "extra")),
+            _ps(health="starting"),
+            _ps(health="unhealthy"),
+            "",
+        ],
+    )
+    def test_an_incomplete_or_unhealthy_set_is_detected(self, payload: str) -> None:
+        ok, detail = CORE.services_healthy(payload)
+        assert ok is False
+        assert detail
+
+    def test_lane_health_verb_prints_pass_and_fail(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        ps_json = tmp_path / "ps.json"
+        ps_json.write_text(_ps(), encoding="utf-8")
+        assert CORE.main(["lane-health", "--ps-json", str(ps_json)]) == 0
+        assert capsys.readouterr().out.startswith("PASS: ")
+        ps_json.write_text(_ps(services=("coach-web",)), encoding="utf-8")
+        assert CORE.main(["lane-health", "--ps-json", str(ps_json)]) == 1
+        assert capsys.readouterr().out.startswith("FAIL: ")
+
+
+# --------------------------------------------------------------------------- #
 # C8 state and failure streak
 # --------------------------------------------------------------------------- #
 
@@ -530,6 +570,54 @@ class TestFailureStreak:
     def test_a_corrupt_state_file_is_no_history(self, tmp_path: Path, payload: str) -> None:
         state_file = tmp_path / "update-state.json"
         state_file.write_text(payload, encoding="utf-8")
+        assert CORE.read_state(state_file) is None
+
+
+class TestLaneState:
+    """#345: the lane signal is additive — old state files keep reading (C8)."""
+
+    def test_a_success_records_the_lane_and_round_trips(self, tmp_path: Path) -> None:
+        state_file = tmp_path / "update-state.json"
+        state = CORE.next_state(None, outcome="success", now=LAST_RUN, lane="healthy")
+        assert state.lane == "healthy"
+        CORE.write_state(state_file, state)
+        assert CORE.read_state(state_file) == state
+        assert json.loads(state_file.read_text(encoding="utf-8"))["lane"] == "healthy"
+
+    def test_a_degraded_outcome_neither_resets_nor_increments_the_streak(self) -> None:
+        state = CORE.next_state(None, outcome="failure", now=LAST_RUN)
+        state = CORE.next_state(state, outcome="failure", now=LAST_RUN)
+        assert state.consecutive_failures == 2
+        degraded = CORE.next_state(state, outcome="degraded", now=LAST_RUN, lane="degraded")
+        assert degraded.outcome == "degraded"
+        assert degraded.lane == "degraded"
+        assert degraded.consecutive_failures == 2, "a degraded lane is not an update failure"
+
+    def test_an_old_state_file_without_a_lane_field_still_reads(self, tmp_path: Path) -> None:
+        """Backward compatibility: the pre-#345 file has no `lane` key."""
+        state_file = tmp_path / "update-state.json"
+        state_file.write_text(
+            json.dumps({"last_run": LAST_RUN, "outcome": "success", "consecutive_failures": 0}),
+            encoding="utf-8",
+        )
+        state = CORE.read_state(state_file)
+        assert state is not None
+        assert state.outcome == "success"
+        assert state.lane is None
+
+    def test_a_non_string_lane_is_no_history(self, tmp_path: Path) -> None:
+        state_file = tmp_path / "update-state.json"
+        state_file.write_text(
+            json.dumps(
+                {
+                    "last_run": LAST_RUN,
+                    "outcome": "success",
+                    "consecutive_failures": 0,
+                    "lane": 7,
+                }
+            ),
+            encoding="utf-8",
+        )
         assert CORE.read_state(state_file) is None
 
 
@@ -640,6 +728,24 @@ class TestCliContract:
         assert CORE.main(argv) == 0
         assert "reason=checkout-guard" in capsys.readouterr().out
         assert json.loads(state_file.read_text(encoding="utf-8"))["reason"] == "checkout-guard"
+
+    def test_state_record_records_the_lane_signal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """#345: `state-record --lane` persists and prints the lane health."""
+        state_file = tmp_path / "update-state.json"
+        argv = [
+            "state-record",
+            "--state-file",
+            str(state_file),
+            "--outcome",
+            "success",
+            "--lane",
+            "recovered",
+        ]
+        assert CORE.main(argv) == 0
+        assert "lane=recovered" in capsys.readouterr().out
+        assert json.loads(state_file.read_text(encoding="utf-8"))["lane"] == "recovered"
 
     def test_snapshot_check_covers_both_phases(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert CORE.main(["snapshot-check", "--bytes", "4096"]) == 0
@@ -828,11 +934,22 @@ DIGEST = os.environ.get("PROD_UPDATE_DIGEST", "")
 TAG_DIGEST = os.environ.get("PROD_UPDATE_TAG_DIGEST", DIGEST)
 DB_BYTES = int(os.environ.get("PROD_UPDATE_DB_BYTES", "4096"))
 ARTIFACT_BYTES = int(os.environ.get("PROD_UPDATE_ARTIFACT_BYTES", str(DB_BYTES * 4 // 3 + 1)))
+HEAL_MARKER = os.environ.get("PROD_UPDATE_HEAL_MARKER", "")
 
 
 def enabled(name: str) -> bool:
     """True unless the test switched this behaviour off."""
     return os.environ.get(name, "1") == "1"
+
+
+def healed() -> bool:
+    """True once a self-heal `up` recreated the lane (the marker file exists).
+
+    Models the #345 incident: before the heal the lane is degraded (a service is
+    missing or unhealthy, steered by PROD_UPDATE_PS_SERVICES / PROD_UPDATE_HEALTH);
+    after the idempotent `up` recreated it, the same `ps` reports 3/3 healthy.
+    """
+    return bool(HEAL_MARKER) and os.path.exists(HEAL_MARKER)
 
 
 if args[:3] == ["buildx", "imagetools", "inspect"]:
@@ -854,13 +971,19 @@ if args[:1] == ["compose"]:
     verb = args[index] if index < len(args) else ""
     rest = args[index + 1 :]
     if verb == "ps":
-        health = os.environ.get("PROD_UPDATE_HEALTH", "healthy")
+        if healed():
+            names = ("coach-web", "coach-mcp", "github-mcp")
+            health = "healthy"
+        else:
+            names = tuple(
+                os.environ.get(
+                    "PROD_UPDATE_PS_SERVICES", "coach-web,coach-mcp,github-mcp"
+                ).split(",")
+            )
+            health = os.environ.get("PROD_UPDATE_HEALTH", "healthy")
         print(
             json.dumps(
-                [
-                    {"Service": name, "Health": health, "State": "running"}
-                    for name in ("coach-web", "coach-mcp", "github-mcp")
-                ]
+                [{"Service": name, "Health": health, "State": "running"} for name in names]
             )
         )
         sys.exit(0)
@@ -888,7 +1011,11 @@ if args[:1] == ["compose"]:
         print("Error response from daemon: Could not find the file", file=sys.stderr)
         sys.exit(1)
     if verb == "up":
-        sys.exit(0 if enabled("PROD_UPDATE_UP_OK") else 1)
+        if enabled("PROD_UPDATE_UP_OK"):
+            if HEAL_MARKER:
+                open(HEAL_MARKER, "a", encoding="utf-8").close()
+            sys.exit(0)
+        sys.exit(1)
     if verb == "down":
         sys.exit(0)
     sys.exit(1)
@@ -1014,6 +1141,16 @@ class ProdUpdateSandbox:
     @property
     def snapshot_dir(self) -> Path:
         return self.home / ".local" / "state" / "coach-web" / "snapshots"
+
+    @property
+    def heal_marker(self) -> Path:
+        """Marker the docker shim writes when a self-heal `up` recreates the lane."""
+        return self.tmp / "healed"
+
+    def lane(self) -> str | None:
+        """The `lane` field recorded in the C8 state file (#345)."""
+        state: dict[str, str | None] = json.loads(self.state_file.read_text(encoding="utf-8"))
+        return state.get("lane")
 
     @property
     def state_file(self) -> Path:
@@ -1295,17 +1432,27 @@ class TestEntrypointBehaviour:
     def test_a_matching_digest_is_a_no_op_without_pull_or_recreate(
         self, sandbox: ProdUpdateSandbox
     ) -> None:
-        """Steps 2-3: one digest resolution per tick, nothing else touched."""
+        """Steps 2-3 + #345: the pinned digest is unchanged; the tick reads the lane."""
         env_file = sandbox.write_env_file(DIGEST_A)
         before = env_file.read_text(encoding="utf-8")
         result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
         assert result.returncode == 0, result.stderr
         assert "no change" in result.stdout
-        assert sandbox.docker_invocations() == [
-            ["docker", "buildx", "imagetools", "inspect", self.PROD_REF]
+        assert sandbox.docker_invocations()[0] == [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            self.PROD_REF,
         ]
+        # #345: the no-change tick now measures the lane (one `ps`) but never
+        # pulls and never recreates a healthy lane.
+        assert sum(1 for call in sandbox.docker_invocations() if "ps" in call) == 1
+        assert not any("pull" in call for call in sandbox.docker_invocations())
+        assert not any("up" in call for call in sandbox.docker_invocations())
         assert env_file.read_text(encoding="utf-8") == before
         assert sandbox.outcome() == "success"
+        assert sandbox.lane() == "healthy"
 
     def test_the_happy_path_pulls_snapshots_swaps_and_gates(
         self, sandbox: ProdUpdateSandbox
@@ -1484,3 +1631,126 @@ class TestEntrypointBehaviour:
         assert result.returncode == 2
         assert "unknown argument" in result.stderr
         assert sandbox.invocations() == []
+
+
+# --------------------------------------------------------------------------- #
+# #345: the no-change tick's lane health signal + bounded self-heal
+# --------------------------------------------------------------------------- #
+
+
+class TestLaneTicks:
+    """#345: a swapped-but-degraded lane is detected and healed on the no-op tick.
+
+    Root cause of the v0.14.0 incident: the no-change branch returned before any
+    ``dc ps``, so a sidecar that disappeared after the swap ran the lane 2/3 for
+    ~20 minutes unnoticed. These tests pin the new behaviour: every no-change tick
+    measures the exact 3/3 set, a degraded set triggers exactly ONE bounded
+    self-heal with the idempotent project-scoped ``up -d`` (no image pull), and a
+    lane that does not recover is recorded as ``degraded`` — never ``success``.
+    """
+
+    def test_a_healthy_lane_no_change_tick_is_healthy_without_recreate(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        env_file = sandbox.write_env_file(DIGEST_A)
+        before = env_file.read_bytes()
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert result.returncode == 0, result.stderr
+        assert sandbox.outcome() == "success"
+        assert sandbox.lane() == "healthy"
+        assert not any("up" in call for call in sandbox.docker_invocations())
+        assert not any("pull" in call for call in sandbox.docker_invocations())
+        assert env_file.read_bytes() == before
+
+    def test_a_missing_service_is_healed_once_without_a_pull(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """The v0.14.0 shape: github-mcp gone, the lane reports 2/3."""
+        sandbox.write_env_file(DIGEST_A)
+        result = sandbox.run(
+            extra_env={
+                "PROD_UPDATE_DIGEST": DIGEST_A,
+                "PROD_UPDATE_PS_SERVICES": "coach-web,coach-mcp",
+                "PROD_UPDATE_HEAL_MARKER": str(sandbox.heal_marker),
+            }
+        )
+        assert result.returncode == 0, result.stderr
+        ups = [call for call in sandbox.docker_invocations() if "up" in call]
+        assert len(ups) == 1, "exactly one bounded self-heal attempt"
+        assert "--remove-orphans" in ups[0]
+        assert not any("pull" in call for call in sandbox.docker_invocations())
+        assert sandbox.outcome() == "success"
+        assert sandbox.lane() == "recovered"
+        assert "RECOVERED" in result.stdout
+
+    def test_an_unhealthy_service_is_healed_once(self, sandbox: ProdUpdateSandbox) -> None:
+        sandbox.write_env_file(DIGEST_A)
+        result = sandbox.run(
+            extra_env={
+                "PROD_UPDATE_DIGEST": DIGEST_A,
+                "PROD_UPDATE_HEALTH": "starting",
+                "PROD_UPDATE_HEAL_MARKER": str(sandbox.heal_marker),
+            }
+        )
+        assert result.returncode == 0, result.stderr
+        assert len([call for call in sandbox.docker_invocations() if "up" in call]) == 1
+        assert sandbox.outcome() == "success"
+        assert sandbox.lane() == "recovered"
+
+    def test_a_heal_that_does_not_recover_is_recorded_degraded(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """AC1: an unrecovered lane is `degraded`, never `success`, bounded by the gate window."""
+        sandbox.write_env_file(DIGEST_A)
+        started = time.monotonic()
+        result = sandbox.run(
+            extra_env={
+                "PROD_UPDATE_DIGEST": DIGEST_A,
+                "PROD_UPDATE_PS_SERVICES": "coach-web",  # never repaired (no heal marker)
+                "COACH_WEB_GATE_TIMEOUT_SECONDS": "2",
+            }
+        )
+        elapsed = time.monotonic() - started
+        assert result.returncode == 0, result.stderr
+        assert sandbox.outcome() == "degraded"
+        assert sandbox.lane() == "degraded"
+        assert "DEGRADED" in result.stderr
+        assert len([call for call in sandbox.docker_invocations() if "up" in call]) == 1
+        assert 2.0 <= elapsed < 30.0, "the re-verify wait is bounded by the gate window"
+
+    def test_a_failed_self_heal_is_recorded_degraded(self, sandbox: ProdUpdateSandbox) -> None:
+        sandbox.write_env_file(DIGEST_A)
+        result = sandbox.run(
+            extra_env={
+                "PROD_UPDATE_DIGEST": DIGEST_A,
+                "PROD_UPDATE_PS_SERVICES": "coach-web,coach-mcp",
+                "PROD_UPDATE_UP_OK": "0",
+            }
+        )
+        assert result.returncode == 0, result.stderr
+        assert sandbox.outcome() == "degraded"
+        assert sandbox.lane() == "degraded"
+        assert "DEGRADED" in result.stderr
+
+    def test_the_degraded_state_does_not_accumulate_the_failure_streak(
+        self, sandbox: ProdUpdateSandbox
+    ) -> None:
+        """A sustained degradation keeps the tick running (exit 0) so it keeps healing.
+
+        The degraded outcome must not accumulate the C8 failure streak, otherwise
+        the pause would stop the tick before its lane check — reintroducing the
+        blind spot. Several degraded ticks must leave the streak at zero.
+        """
+        sandbox.write_env_file(DIGEST_A)
+        extra = {
+            "PROD_UPDATE_DIGEST": DIGEST_A,
+            "PROD_UPDATE_PS_SERVICES": "coach-web",
+            "COACH_WEB_GATE_TIMEOUT_SECONDS": "1",
+        }
+        for _ in range(3):
+            assert sandbox.run(extra_env=extra).returncode == 0
+        state = json.loads(sandbox.state_file.read_text(encoding="utf-8"))
+        assert state["outcome"] == "degraded"
+        assert state["consecutive_failures"] == 0, "a degraded lane is not an update failure"
+        result = sandbox.run(extra_env={"PROD_UPDATE_DIGEST": DIGEST_A})
+        assert "paused" not in result.stdout, "a degraded lane must not pause the updater"
