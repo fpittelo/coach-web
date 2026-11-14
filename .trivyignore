@@ -19,6 +19,16 @@ CVE-2025-69720
 CVE-2026-16742
 # exp: 2027-01-03
 CVE-2026-9538
+# libsqlite3-0 (3.46.1-7+deb13u2, debian 13.7 trixie): FTS5 heap overflow /
+# corrupted-index code execution and crafted session changesets — no fixed
+# version upstream (apt-cache policy: candidate == installed, 2026-11-14).
+# Re-triage with the base-image block above on 2027-01-03.
+# exp: 2027-01-03
+CVE-2026-119373
+# exp: 2027-01-03
+CVE-2026-119374
+# exp: 2027-01-03
+CVE-2026-119379
 # pcre2 (CVE-2026-103111) acceptance REMOVED at its 2026-11-03 expiry: the
 # re-triage verified the fix is now in the mutable python:3.12-slim tag the
 # Dockerfile builds from (libpcre2-8-0 10.46-1~deb13u3, measured 2026-11-14),

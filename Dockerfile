@@ -44,6 +44,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     LOG_LEVEL=INFO \
     COACH_WEB_VERSION=${COACH_WEB_VERSION}
 
+# Security (#351): the image-scan gate stays strict on OS findings that already
+# have a published fix — only *unfixed* CVEs belong in the .trivyignore
+# accepted-risk register. The mutable python:3.12-slim tag still ships zlib1g
+# 1.3.dfsg+really1.3.1-1+b1, whose HIGH fixes (CVE-2026-76844, CVE-2026-85091)
+# are in trixie-security as 1.3.dfsg+really1.3.1-1+deb13u1, so upgrade that one
+# package in place instead of accepting a fixable finding. This is a no-op once
+# the base tag carries the fix; the apt lists are removed in the same layer.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends --only-upgrade zlib1g && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user and group (UID/GID 10001) and pre-create the
 # persistence mountpoint (MADR-008, #166): the lane volume mounts at /data,
 # and Docker copies image content into an empty named volume on first use —
