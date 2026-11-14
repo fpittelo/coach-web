@@ -46,7 +46,16 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.2.0",
+    # pytest < 9: anyio's pytest plugin (resolved transitively via starlette;
+    # this repo pins anyio < 4.15 for the starlette 1.6 alias, see the runtime
+    # dependencies) still imports `_pytest.python.CallSpec2`, which pytest 9
+    # deprecates — the import raises PytestRemovedIn10Warning and the
+    # `pytest -W error` gate dies while loading the plugin. CI installs the
+    # dev extras unpinned (`pip install -e .[dev]`), so without this ceiling a
+    # fresh resolution picks pytest 9 and the Test & Lint job fails before
+    # collecting a single test. The lock pins 8.3.3; lift the ceiling together
+    # with the anyio/starlette upgrade (tracked with #351's CI note).
+    "pytest>=8.2.0,<9",
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
     "respx>=0.21.1",
