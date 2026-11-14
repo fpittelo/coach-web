@@ -2,12 +2,25 @@
  *
  * Consumes the typed SSE stream exposed by POST /api/agent/stream through
  * fetch + ReadableStream (the native SSE browser API cannot POST) and posts
- * approved plans to POST /api/plan/approve. The conversation is client-owned:
- * every turn replays the last ≤ 10 transcript messages as history inside the
- * request body — message and history content never appear in a URL or query
- * string (#79, Swiss nLPD). "New chat" (resetChat) is a full client-side
- * reset: it aborts any in-flight stream and clears every state slice without
- * transmitting anything.
+ * approved plans to POST /api/plan/approve. The transcript is SERVER-OWNED
+ * since #349 (MADR-0025): the server persists every turn, rehydrates the
+ * active thread on load (GET /api/conversation) and owns the memory window.
+ * The legacy client-side ≤ 10-message history replay no longer feeds the
+ * prompt (the field is deleted from the request model and never read; the
+ * tolerated client copy is inert), and the server assembles the memory
+ * window instead. Message content still only ever travels in a POST body —
+ * never in a URL or query string (#79, Swiss nLPD). The rehydrate is a PAGE
+ * OPT-IN: only the authenticated `/` variant carries
+ * data-conversation-restore="true", so auth-disabled lanes and the public
+ * landing page issue no restore call at all (AC4).
+ *
+ * Reset & clear-memory UX (#351): "New chat" (resetChat) archives the active
+ * thread through POST /api/conversation/reset when there is something to
+ * archive, then clears every client state slice — no thread browser, the
+ * archived thread simply leaves the active view. "Clear memory" (settings
+ * modal) is an explicit, confirm-gated destructive action: the dialog states
+ * the consequence, Cancel owns the default focus, and only its confirm button
+ * POSTs /api/conversation/purge with the explicit {confirm: true} flag.
  *
  * Rendering posture (ADR-006 §9, gated by STRIDE #87): user data is only
  * ever bound with x-text. Assistant messages are the sole HTML-rendered
@@ -183,6 +196,13 @@
 // for 90 s.
 const WATCHDOG_TIMEOUT_MS = 90000;
 
+// Conversation-memory failures (#351): static, value-free strings. The
+// archive runs after the view already cleared, so its failure must stay
+// visible; neither string ever carries content or server detail (nLPD/#142).
+const ARCHIVE_FAILED_BANNER =
+  "Could not start a new chat. The previous conversation was not archived.";
+const PURGE_FAILED_MESSAGE = "Could not clear memory. Try again.";
+
 // Auto-follow proximity band (#85): the log follows the stream only while
 // the viewport is within 60 px of the bottom; farther away, following
 // pauses so scrolling up to re-read is never hijacked (AC1). Scrolling
@@ -355,6 +375,25 @@ function stripReceipt(message) {
   return { role: message.role, content: message.content };
 }
 
+// Rehydrate mapping (#351 AC1): the server's GET /api/conversation payload is
+// reduced to the {role, content} shape the existing message components render,
+// in SERVER ORDER (seq), never re-sorted. Restored messages carry no receipt
+// stamp: receipts stay client-side only (nLPD), so a reload shows no
+// fabricated timestamps and the date dividers stay silent for server rows.
+function restoredMessages(messages) {
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+  return messages
+    .filter(
+      (message) =>
+        message &&
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.content === "string"
+    )
+    .map((message) => ({ role: message.role, content: message.content }));
+}
+
 // Quick-reply pill shape guard (#281, MADR-0011): the server never emits an
 // invalid suggestions payload (Pydantic-capped server-side), but the client
 // renders only from a valid shape — an array of non-empty strings capped at
@@ -523,6 +562,16 @@ function coachApp() {
     // Confirm gate (AC3): the reset button arms, only the confirm button
     // DELETEs; disarmed on open/close and after a successful reset.
     agentSettingsResetArmed: false,
+    // Conversation memory (#351, MADR-0025): the server-owned transcript.
+    // conversationRestoreEnabled mirrors the root data attribute the / route
+    // sets for an authenticated session only — false on the static file, so
+    // auth-disabled and unauthenticated pages never call GET
+    // /api/conversation (AC4). clearMemory* drive the destructive confirm
+    // dialog (message + busy flag are dialog-local state).
+    conversationRestoreEnabled: false,
+    clearMemoryOpen: false,
+    clearMemoryBusy: false,
+    clearMemoryMessage: "",
 
     init() {
       this.$watch("messages", () => this.scrollToBottom());
@@ -541,6 +590,15 @@ function coachApp() {
       // the only non-SSE data path (#165). Passive: any failure degrades
       // to no banner, never to an error surface.
       this.loadPendingDebriefs();
+      // Conversation rehydrate (#351 AC1/AC4): the server opts the page into
+      // the restore ONLY for an authenticated session. The flag is read from
+      // the root element — the static default is "false", so an
+      // auth-disabled or unauthenticated page makes no restore call at all.
+      this.conversationRestoreEnabled =
+        this.$el.dataset.conversationRestore === "true";
+      if (this.conversationRestoreEnabled) {
+        this.restoreConversation();
+      }
       this.$nextTick(() => {
         const log = this.$refs.log;
         if (!log) {
@@ -834,6 +892,11 @@ function coachApp() {
       }
       this.settingsOpen = false;
       this.agentSettingsResetArmed = false;
+      // The destructive confirm never outlives the modal (#351 AC3).
+      if (this.clearMemoryOpen) {
+        this.clearMemoryOpen = false;
+        this.clearMemoryMessage = "";
+      }
       const toggle = this.$refs.settingsToggle;
       if (toggle) {
         toggle.focus();
@@ -1737,6 +1800,12 @@ function coachApp() {
     },
 
     resetChat() {
+      // "New chat" (#351 AC2): the transcript is server-owned, so starting a
+      // fresh chat ARCHIVES the active thread — but only when there is
+      // something to archive and the page owns a memory session. The view
+      // clears first (the reset never waits on the network); the archive
+      // request itself carries no message content.
+      const hadConversation = this.messages.length > 0;
       this.finishStream();
       this.messages = [];
       this.thoughts = [];
@@ -1782,6 +1851,169 @@ function coachApp() {
       // otherwise a follow paused on the old transcript would leak into
       // the new one (AC2).
       this.stickToBottom = true;
+      if (hadConversation && this.conversationRestoreEnabled) {
+        this.archiveConversation();
+      }
+    },
+
+    // ------------------------------------------------------------------
+    // Conversation memory — rehydrate, archive, purge (#351, MADR-0025).
+    // The transcript is server-owned: this client restores it on load,
+    // archives it on "New chat" and erases it only through the explicit
+    // confirm dialog. All three calls are session-scoped server-side; the
+    // page opt-in only decides whether the UI participates at all (AC4).
+    // ------------------------------------------------------------------
+
+    restoreConversation() {
+      // Rehydrate the active thread (AC1). Passive by contract: a failed or
+      // forbidden read degrades to the empty state — no banner, no status
+      // line, no console output (AC4, #142 posture).
+      if (!this.conversationRestoreEnabled) {
+        return;
+      }
+      // A live transcript (or an in-flight turn) is never clobbered by a
+      // restore: there is exactly one transcript, and the client already has
+      // one. The guard is repeated after the await below.
+      if (this.streaming || this.messages.length > 0) {
+        return;
+      }
+      fetch("/api/conversation", { cache: "no-store" })
+        .then(async (response) => {
+          if (!response.ok) {
+            return;
+          }
+          const body = await response.json();
+          // Re-check after the await: a turn typed while the restore was in
+          // flight must never be reordered or duplicated (AC1).
+          if (this.streaming || this.messages.length > 0) {
+            return;
+          }
+          // The restored transcript IS the active transcript: follow it to
+          // its end before the transcript watcher scrolls.
+          this.stickToBottom = true;
+          // Server order is seq order — never re-sorted client-side. The
+          // restored rows carry no receipt stamp (receipts are client-side
+          // only, nLPD), so no fabricated timestamps appear.
+          this.messages = restoredMessages(body.messages);
+        })
+        .catch(() => {
+          // Passive restore (AC4): leave the empty state untouched.
+        });
+    },
+
+    archiveConversation() {
+      // Archive the active thread behind "New chat" (AC2). Fire-and-forget:
+      // the view already cleared, so a slow archive never blocks the reset.
+      // A failure stays visible in the non-blocking banner (a reload
+      // rehydrates the surviving thread — the memory is not silently lost).
+      fetch("/api/conversation/reset", {
+        method: "POST",
+        cache: "no-store",
+      })
+        .then((response) => {
+          if (response.ok) {
+            return;
+          }
+          this.errorBanner = ARCHIVE_FAILED_BANNER;
+          this.errorBannerSignin = response.status === 401;
+        })
+        .catch(() => {
+          this.errorBanner = ARCHIVE_FAILED_BANNER;
+        });
+    },
+
+    openClearMemory() {
+      // Destructive confirm (AC3): opening moves focus to CANCEL — the safe
+      // action is the default one. No request is made here.
+      this.clearMemoryOpen = true;
+      this.clearMemoryMessage = "";
+      this.$nextTick(() => {
+        const cancel = this.$refs.clearMemoryCancel;
+        if (cancel) {
+          cancel.focus();
+        }
+      });
+    },
+
+    cancelClearMemory() {
+      // Cancel is a pure dismissal: nothing is transmitted, and focus
+      // returns to the trigger that opened the dialog.
+      if (!this.clearMemoryOpen) {
+        return;
+      }
+      this.clearMemoryOpen = false;
+      this.clearMemoryMessage = "";
+      const trigger = this.$refs.clearMemoryTrigger;
+      if (trigger) {
+        trigger.focus();
+      }
+    },
+
+    confirmClearMemory() {
+      // The ONLY path to the destructive purge (AC3): the explicit confirm
+      // flag is the server-required contract (MADR-0025 C4/C6) — a missing
+      // or false flag answers a static 422.
+      if (this.clearMemoryBusy) {
+        return;
+      }
+      this.clearMemoryBusy = true;
+      this.clearMemoryMessage = "";
+      fetch("/api/conversation/purge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirm: true }),
+      })
+        .then((response) => {
+          if (!response.ok) {
+            this.clearMemoryMessage =
+              response.status === 401 ? "Please sign in." : PURGE_FAILED_MESSAGE;
+            return;
+          }
+          this.clearMemoryOpen = false;
+          // The purge deleted every thread and message server-side. Empty
+          // the transcript first so the view reset archives nothing (no
+          // second POST — there is nothing left to archive).
+          this.messages = [];
+          this.resetChat();
+          this.settingsMessage = "Conversation memory cleared.";
+          // The closed dialog cannot keep focus on a hidden button: return
+          // it to the trigger, where the destructive flow started.
+          const trigger = this.$refs.clearMemoryTrigger;
+          if (trigger) {
+            trigger.focus();
+          }
+        })
+        .catch(() => {
+          this.clearMemoryMessage = PURGE_FAILED_MESSAGE;
+        })
+        .finally(() => {
+          this.clearMemoryBusy = false;
+        });
+    },
+
+    trapConfirmFocus(event) {
+      // Keyboard containment (#351 AC3): Tab cycles inside the alertdialog
+      // only, mirroring the settings modal's trap. Hidden and disabled
+      // controls are never Tab stops.
+      const dialog = this.$refs.clearMemoryDialog;
+      if (!dialog) {
+        return;
+      }
+      const focusables = Array.from(
+        dialog.querySelectorAll("button, input, select, textarea, a[href]")
+      ).filter((el) => el.offsetParent !== null && !el.disabled);
+      if (focusables.length === 0) {
+        return;
+      }
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     },
 
     approvePlan() {

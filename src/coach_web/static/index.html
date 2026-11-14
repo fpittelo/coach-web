@@ -77,7 +77,18 @@
         <path d="m6 6 12 12"></path>
       </symbol>
     </svg>
-    <div x-data="coachApp()" x-init="init()" x-cloak>
+    <!-- Conversation-memory opt-in (#351, MADR-0025): "false" is the shipped
+         default — auth-disabled lanes and the public landing page issue no
+         GET /api/conversation. The / route swaps it to "true" for an
+         authenticated session only, so the rehydrate is scoped to a page that
+         actually owns a transcript. Not a security boundary: every /api/*
+         route stays session-scoped server-side. -->
+    <div
+      x-data="coachApp()"
+      x-init="init()"
+      data-conversation-restore="false"
+      x-cloak
+    >
       <header class="conversation-header" aria-label="Coach Web">
         <div class="identity-bar">
           <div class="identity-brand">
@@ -1301,7 +1312,85 @@
                 </button>
               </div>
             </fieldset>
+            <!-- Conversation memory (#351, MADR-0025): the athlete can erase
+                 the server-owned transcript. The trigger only opens the
+                 confirm dialog — the destructive POST is gated behind it, the
+                 dialog states the consequence in words, and Cancel owns the
+                 default focus (AC3). -->
+            <fieldset class="goal-fieldset">
+              <legend class="goal-legend">Conversation memory</legend>
+              <p class="settings-note" id="clear-memory-description">
+                The coach keeps your recent conversations so you can continue
+                where you left off. Clearing memory permanently deletes every
+                thread and message.
+              </p>
+              <div class="settings-actions">
+                <button
+                  class="button button--ghost button--danger-ghost"
+                  type="button"
+                  x-ref="clearMemoryTrigger"
+                  aria-describedby="clear-memory-description"
+                  @click="openClearMemory()"
+                >
+                  Clear memory
+                </button>
+              </div>
+            </fieldset>
           </form>
+        </div>
+        <!-- Destructive confirm (#351 AC3): a true alertdialog — named and
+             described, Escape dismisses it (stopped before the modal's
+             window-level handler), Cancel is focused on open, and the
+             destructive action is the only path to POST
+             /api/conversation/purge (confirm: true). -->
+        <div
+          class="confirm-overlay"
+          x-show="clearMemoryOpen"
+          x-cloak
+          @keydown.escape.stop="cancelClearMemory()"
+        >
+          <div
+            class="confirm-dialog"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="clear-memory-title"
+            aria-describedby="clear-memory-detail"
+            x-ref="clearMemoryDialog"
+            @keydown.tab="trapConfirmFocus($event)"
+          >
+            <h2 class="confirm-title" id="clear-memory-title">
+              Delete all conversation memory?
+            </h2>
+            <p class="confirm-detail" id="clear-memory-detail">
+              This permanently deletes every stored thread and message for
+              your account. It cannot be undone.
+            </p>
+            <p
+              class="settings-note"
+              role="status"
+              aria-live="polite"
+              x-show="clearMemoryMessage"
+              x-text="clearMemoryMessage"
+            ></p>
+            <div class="confirm-actions">
+              <button
+                class="button button--ghost"
+                type="button"
+                x-ref="clearMemoryCancel"
+                @click="cancelClearMemory()"
+              >
+                Cancel
+              </button>
+              <button
+                class="button button--danger"
+                type="button"
+                :disabled="clearMemoryBusy"
+                @click="confirmClearMemory()"
+              >
+                Delete memory permanently
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

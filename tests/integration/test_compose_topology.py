@@ -897,6 +897,18 @@ class TestDockerfileHardening:
         assert "--forwarded-allow-ips='127.0.0.1,::1'" in dockerfile
         assert "--forwarded-allow-ips='*'" not in dockerfile
 
+    def test_runtime_patches_os_findings_that_have_a_fix(self, dockerfile: str) -> None:
+        """Fixable base-image CVEs are patched in the image, not accepted (#351).
+
+        The accepted-risk register is reserved for *unfixed* CVEs (no version
+        available upstream); the trivy gate stays strict on everything else.
+        zlib1g (CVE-2026-76844 / CVE-2026-85091) is fixed in trixie-security,
+        so the runtime stage upgrades it in place instead of ignoring it.
+        """
+        assert "apt-get install" in dockerfile
+        assert "--only-upgrade" in dockerfile
+        assert "zlib1g" in dockerfile
+
 
 class TestPersistenceTopology:
     """Lane volume + DB path wiring for the persistence layer (#166, MADR-008).

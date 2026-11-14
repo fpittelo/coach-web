@@ -1126,6 +1126,25 @@ body {
   border-color: var(--accent);
 }
 
+/* Destructive actions (#351): the danger pair reuses the button geometry and
+   the shared .button:focus-visible ring — only the tokens change, so the
+   destructive affordance never forks the focus contract (AC5). */
+.button--danger {
+  background: var(--error);
+  color: var(--accent-ink);
+}
+
+.button--danger-ghost {
+  color: var(--error);
+  border-color: var(--error);
+}
+
+.button--danger-ghost:hover:not(:disabled) {
+  background: var(--error);
+  color: var(--paper);
+  border-color: var(--error);
+}
+
 /* --- Inline plan-approval card (#82) ------------------------------------ */
 
 /* The proposed plan renders as a conversation card beneath the assistant
@@ -1584,6 +1603,53 @@ body {
 .settings-panel:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+/* Destructive confirm dialog (#351 AC3): a second, higher scrim over the
+   settings modal. Fixed positioning keeps it viewport-centred even though it
+   lives inside the scrollable panel subtree; the tokens match the settings
+   modal so the two surfaces read as one system. */
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  z-index: 60;
+}
+
+.confirm-dialog {
+  background: var(--paper);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+  width: 100%;
+  max-width: 26rem;
+  padding: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.confirm-title {
+  margin: 0;
+  font-size: 1.05rem;
+  color: var(--ink);
+}
+
+.confirm-detail {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
 }
 
 .settings-head {

@@ -253,6 +253,19 @@ The raw static file keeps the comment, so /static/index.html and
 auth-disabled lanes stay byte-identical to the pre-#319 page.
 """
 
+_CONVERSATION_RESTORE_OFF = 'data-conversation-restore="false"'
+"""Root-element attribute default: the page issues NO rehydrate call (#351).
+
+The static file is the no-memory default, so auth-disabled lanes and the
+public landing page never call ``GET /api/conversation`` (AC4): there is no
+session to scope a transcript to, and an unauthenticated call would only
+earn a 401. The attribute is a UI opt-in, never a security boundary — every
+``/api/*`` route stays session-scoped server-side.
+"""
+
+_CONVERSATION_RESTORE_ON = 'data-conversation-restore="true"'
+"""Authenticated-session substitution for the root attribute (#351 AC1)."""
+
 
 def _avatar_html(claims: dict[str, Any]) -> str:
     """Build the identity-bar avatar markup from session claims (#319, #323).
@@ -662,11 +675,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         "Sign in" link to /auth/login (#180); with a valid session, the bar
         gains the owner's Google profile avatar built from the session's
         name/picture claims (#319 — deterministic fallbacks, never a broken
-        image); AUTH_ENABLED=false lanes (dev/qa) get the static file
-        byte-for-byte as today. Fail-safe: any cookie or validation error
-        resolves to the unauthenticated variant — the landing page can never
-        500. No auto-redirect: the public-landing posture is preserved
-        (rejected-by-default option 3, #180).
+        image) AND the page opts into the server-owned conversation rehydrate
+        (#351: ``data-conversation-restore="true"`` — only a session-scoped
+        page may restore a transcript); AUTH_ENABLED=false lanes (dev/qa) get
+        the static file byte-for-byte, i.e. the no-restore default. Fail-safe:
+        any cookie or validation error resolves to the unauthenticated
+        variant — the landing page can never 500. No auto-redirect: the
+        public-landing posture is preserved (rejected-by-default option 3,
+        #180).
         """
         settings: Settings = request.app.state.settings
         if not settings.AUTH_ENABLED:
@@ -681,8 +697,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             return FileResponse(STATIC_DIR / "index.html")
         if _AVATAR_SLOT in html:
+            # The authenticated variant owns both substitutions: the #319
+            # avatar and the #351 rehydrate opt-in. A static bundle without
+            # the avatar anchor keeps the static file — and therefore the
+            # no-restore default (fail-safe).
             return Response(
-                content=html.replace(_AVATAR_SLOT, _avatar_html(claims)),
+                content=html.replace(_AVATAR_SLOT, _avatar_html(claims)).replace(
+                    _CONVERSATION_RESTORE_OFF, _CONVERSATION_RESTORE_ON
+                ),
                 media_type="text/html",
             )
         return FileResponse(STATIC_DIR / "index.html")
