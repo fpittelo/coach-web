@@ -1,9 +1,9 @@
 # 📘 Admin Guide — Coach Web
 
 **Audience:** @devops, @architect, @fpittelo  
-**Last updated:** 2026-10-25
+**Last updated:** 2026-11-14
 
-> **Deployment model: ADR-007 — Local-First** (`docs/architecture.md` §10). The local Docker host on the workstation is the deployment target for the dev, qa, and prod lanes. The GCP Cloud Run topology is retired (Sprint 08, #64–#68) and is decommissioned via #111.
+> **Deployment model: ADR-007 — Local-First** (`docs/architecture.md` §10). The local Docker host on the workstation is the deployment target for the dev, qa, and prod lanes. The Sprint 08 GCP topology was retired (#64–#68, decommissioned via #111) and is **reinstated as the Cloud Run production lane per MADR-0027** — see ☁️ GCP Cloud Run Production below.
 
 ---
 
@@ -533,6 +533,155 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
+## ☁️ GCP Cloud Run Production (MADR-0027)
+
+> **Model:** always-on production, scale-to-zero, IAP edge gate (MADR-0027, Option 3). Project `coach-web-509209`, all resources pinned `europe-west6` (Swiss nLPD). Deploys run from GitHub Actions over Workload Identity Federation (keyless — no SA JSON keys anywhere). This section is the **one-time bootstrap** (#315) plus the IAP wiring that the deploy lane (#316) consumes.
+
+### Constants
+
+| Item | Value |
+|:---|:---|
+| Project ID | `coach-web-509209` |
+| Project number | `853194930683` |
+| Region | `europe-west6` |
+| WIF pool | `github-pool` (global) |
+| WIF provider | `github-oidc-provider` (issuer `https://token.actions.githubusercontent.com`) |
+| Deploy/runtime SA | `coach-web-deployer@coach-web-509209.iam.gserviceaccount.com` |
+| IAP service agent | `service-853194930683@gcp-sa-iap.iam.gserviceaccount.com` |
+| Image | `ghcr.io/fpittelo/coach-web` (anonymously pullable — no image-pull secret needed) |
+
+### One-time bootstrap (#315 — executed 2026-11-14)
+
+Re-executable on a fresh project, in this order; every create is check-first (describe → create only if absent).
+
+```bash
+PROJECT_ID=coach-web-509209
+SA_EMAIL=coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
+POOL=github-pool
+PROVIDER=github-oidc-provider
+PROJECT_NUMBER=853194930683
+
+# 1. Required APIs (sts for WIF token exchange was the only gap on 2026-11-14)
+gcloud services enable sts.googleapis.com iam.googleapis.com iamcredentials.googleapis.com \
+  secretmanager.googleapis.com run.googleapis.com iap.googleapis.com --project=$PROJECT_ID
+
+# 2. WIF pool + GitHub OIDC provider (keyless — AC3)
+gcloud iam workload-identity-pools create $POOL \
+  --location=global --project=$PROJECT_ID \
+  --display-name="GitHub Actions OIDC pool"
+gcloud iam workload-identity-pools providers create-oidc $PROVIDER \
+  --location=global --workload-identity-pool=$POOL --project=$PROJECT_ID \
+  --display-name="GitHub OIDC fpittelo/coach-web" \
+  --issuer-uri="https://token.actions.githubusercontent.com" \
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref,attribute.sha=assertion.sha" \
+  --attribute-condition="assertion.repository=='fpittelo/coach-web'"
+
+# 3. Deploy/runtime SA + least-privilege bindings
+gcloud iam service-accounts create coach-web-deployer \
+  --project=$PROJECT_ID \
+  --display-name="Coach Web deployer (GitHub Actions WIF)"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/run.admin" --condition=None
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/serviceusage.serviceUsageConsumer" --condition=None
+# self-actAs: the deploy sets the service's runtime identity (same SA)
+gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/iam.serviceAccountUser"
+# keyless path: only this repository's OIDC tokens may act as the SA
+gcloud iam service-accounts add-iam-policy-binding $SA_EMAIL \
+  --member="principalSet://iam.googleapis.com/projects/$PROJECT_NUMBER/locations/global/workloadIdentityPools/$POOL/attribute.repository/fpittelo/coach-web" \
+  --role="roles/iam.workloadIdentityUser"
+
+# 4. Secret Manager shells (payload pinned europe-west6; per-secret IAM only)
+for SECRET in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+  gcloud secrets create "$SECRET" --project=$PROJECT_ID \
+    --replication-policy=user-managed --locations=europe-west6
+  gcloud secrets add-iam-policy-binding "$SECRET" \
+    --project=$PROJECT_ID \
+    --member="serviceAccount:$SA_EMAIL" \
+    --role="roles/secretmanager.secretAccessor"
+done
+```
+
+Bootstrap notes:
+
+- **Replication:** the single-location `--location=europe-west6` regional-secret create is broken in gcloud 593.0.0 (`INVALID_ARGUMENT: The provided Project ID ... does not match the expected format [projects/*]`); the user-managed single-replica form above is the equivalent residency pin — secret payload stored/replicated **only** in `europe-west6`.
+- **Role ID:** the deploy SA role is `roles/serviceusage.serviceUsageConsumer` (`roles/iam.serviceUsageConsumer` does not exist).
+- **AC3 verification:** `gcloud iam service-accounts keys list --iam-account=$SA_EMAIL --managed-by=user` → empty. The SA's `SYSTEM_MANAGED`/`GOOGLE_PROVIDED` signing key is normal and is not a user-managed JSON key.
+
+### PO secret fill (one-time, after bootstrap)
+
+The 6 secrets are empty shells (0 versions). Fill each exactly once — values are never echoed and never committed:
+
+```bash
+# interactive stdin — value never lands in shell history or logs
+gcloud secrets versions add OPENROUTER_API_KEY --data-file=-
+# (paste the value, then Ctrl-D)
+```
+
+Repeat for `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `GITHUB_TOKEN`, `DATA_ENCRYPTION_KEY`, `INTERVALS_API_KEY` (console alternative: Secret Manager → secret → **Add new version**). Verify presence only:
+
+```bash
+for SECRET in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+  gcloud secrets versions list "$SECRET"   # version 1 enabled — value is never displayed
+done
+```
+
+### IAP prerequisites — brand + consent screen (console-only; MADR-0027 D2)
+
+The legacy `gcloud iap oauth-brands` path is dead for this project: it requires an organization, and the IAP OAuth Admin APIs were shut down (2026-03-19). The one-time IAP prerequisite is therefore console-based (no-org projects cannot create OAuth clients programmatically):
+
+1. **Branding / consent screen:** console → Google Auth Platform → **Branding** (`console.cloud.google.com/auth/branding`) → *Get started* → app name `Coach Web`, support email `frederic.pitteloud@gmail.com`, audience **External** → *Create*.
+2. **OAuth client:** console → Google Auth Platform → **Clients** → *Create client* → type **Web application**, with authorized redirect URIs:
+   - `https://iap.googleapis.com/v1/oauth/clientIds/CLIENT_ID:handleRedirect` (IAP edge)
+   - `https://<service-url>/auth/callback` (app-level OIDC — the `.run.app` URL is fixed in #316)
+
+   Record the client ID; the client **secret** is filled into the `GOOGLE_OIDC_CLIENT_SECRET` shell (step above).
+3. **Apply the custom OAuth client to IAP** (required for gcloud-managed access grants in no-org projects):
+   ```bash
+   # iap_settings.yaml — NEVER commit this file (carries the client secret)
+   access_settings:
+     oauth_settings:
+       client_id: CLIENT_ID
+       client_secret: CLIENT_SECRET
+   gcloud iap settings set iap_settings.yaml --project=$PROJECT_ID
+   ```
+
+### IAP + invoker bindings (#316 — requires the deployed service)
+
+```bash
+SERVICE=coach-web   # as deployed by #316
+# IAP service agent must be able to invoke the service (else every request 403s at invocation)
+gcloud run services add-iam-policy-binding $SERVICE \
+  --region=europe-west6 \
+  --member=serviceAccount:service-$PROJECT_NUMBER@gcp-sa-iap.iam.gserviceaccount.com \
+  --role=roles/run.invoker
+# platform-edge access: the PO account
+gcloud iap web add-iam-policy-binding \
+  --member=user:frederic.pitteloud@gmail.com \
+  --role=roles/iap.httpsResourceAccessor \
+  --region=europe-west6 --resource-type=cloud-run --service=$SERVICE
+# platform-edge access: the WIF deploy SA (post-deploy smoke checks; cyber-reviewed in #316)
+gcloud iap web add-iam-policy-binding \
+  --member=serviceAccount:$SA_EMAIL \
+  --role=roles/iap.httpsResourceAccessor \
+  --region=europe-west6 --resource-type=cloud-run --service=$SERVICE
+```
+
+### Federated deploy-time auth (#316 workflow snippet)
+
+```yaml
+- uses: google-github-actions/auth@v2
+  with:
+    project: coach-web-509209
+    workload_identity_provider: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
+    service_account: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
+```
+
+The binding chain (provider condition `assertion.repository=='fpittelo/coach-web'` → repo-scoped principalSet → `roles/iam.workloadIdentityUser`) was verified at bootstrap (#315 evidence); the first Actions deploy in #316 exercises the live token exchange end-to-end.
+
+---
+
 ## 📊 Monitoring & Health
 
 | Check | URL |
@@ -558,4 +707,4 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 
 ---
 
-_Last updated: 2026-10-25 (issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-11-14 (issue #315 — new "GCP Cloud Run Production (MADR-0027)" section: the one-time bootstrap runbook reflecting the executed state — WIF pool `github-pool` + GitHub-OIDC provider `github-oidc-provider` (repo-condition-scoped), the `coach-web-deployer` SA with least-privilege bindings, the 6 empty Secret Manager shells pinned `europe-west6` with per-secret accessor IAM, the PO secret-fill step, the console-only IAP brand/consent/OAuth-client prerequisites (legacy `iap oauth-brands` API is dead for no-org projects) and the #316 IAP/invoker binding commands; the ADR-007 callout notes the Cloud Run production reinstatement per MADR-0027. prior: issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
