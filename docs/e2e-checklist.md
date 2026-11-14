@@ -38,16 +38,17 @@ Execute with `BROWSER_*` tools: `browser_navigate` → `browser_snapshot` (acces
 
 | # | Journey | Steps | Expected UI state |
 |---|---|---|---|
-| J1 | Onboarding empty state | Navigate to `/`; snapshot | Hero monogram + welcome line ("Hello! I'm your coach — what should we work on today?") + exactly 3 starter chips |
+| J1 | Onboarding empty state | Navigate to `/` with no stored conversation (fresh browser/athlete); snapshot | Hero monogram + welcome line ("Hello! I'm your coach — what should we work on today?") + exactly 3 starter chips |
 | J2 | Chip prefill (no auto-send) | Click chip 1; snapshot | Composer contains the chip text and holds focus; **nothing sent**; no new message in the log |
 | J3 | Send + stream | Type a short coaching question; press Enter; poll snapshots while streaming | User bubble appears; assistant response streams; phase indicator transitions (waiting → streaming); final message rendered once |
 | J4 | Multi-turn follow-up | Send a follow-up referencing the previous answer | Coherent reply referencing conversation context (history contract #79) |
 | J5 | Plan proposal + approval card | Ask for a weekly plan; snapshot after proposal | Inline plan card beneath the proposing message with Approve/Reject; exactly one active card |
 | J6 | Plan reject | Click Reject; snapshot | Card dismissed; no plan state residue |
-| J7 | New chat reset | Click New chat mid- or post-stream; snapshot | Log cleared, empty state returns; no stale stream events resurrect content |
+| J7 | New chat reset | Click New chat mid- or post-stream; snapshot; then reload | Log cleared, empty state returns; the active thread is archived server-side (it does NOT come back on reload); no stale stream events resurrect content |
 | J8 | XSS sanitization | Send `<script>alert(1)</script>`, `<img src=x onerror=alert(1)>`, `[x](javascript:alert(1))`, and `<scr` + `ipt>` as two consecutive messages (accumulated-string re-sanitization across stream chunks, STRIDE C3) | All inert in assistant bubble (sanitized markdown); user bubble plain text; no execution; no console errors |
 | J9 | Console hygiene | After J1–J8, read console messages | No uncaught errors/warnings attributable to the app (browser-extension noise excluded) |
 | J10 | Admin orientation save → next reply → reset (#363) | Open Settings; type an orientation, pick verbosity/tone, watch the counter; Save; send a coaching message; then Reset → Confirm reset | "Preferences saved." note; counter ≤ 1500; the NEXT reply reflects the saved orientation (MADR-0026); the reset required the confirm click, then the textarea returned to the default state |
+| J11 | Conversation memory: rehydrate, archive, purge (#351) | After J3, reload `/`; snapshot. Then Settings → Clear memory (do not confirm yet); snapshot. Press Escape; re-open; click Cancel; re-open; click Delete memory permanently | Reload restores the same transcript in order with no duplication or fabricated receipt times; "Clear memory" states that it permanently deletes every thread and message; the dialog's Cancel holds the default focus, Escape and Cancel leave the transcript intact, and only the confirm deletes it (empty state afterwards) |
 
 **Pass criterion:** every journey's snapshot assertions hold and J9 is clean. A failed journey blocks sign-off and is filed as `type::bug` with the snapshot excerpt.
 

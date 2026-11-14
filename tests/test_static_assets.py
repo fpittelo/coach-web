@@ -213,6 +213,16 @@ and never transmitted. Markdown rendering (renderMarkdown + DOMPurify) is
 untouched; user messages stay x-text-only (ADR-006 §9, STRIDE #87); all
 six structured cards keep rendering beneath/inside the assistant bubble
 per the #82 single-active-card rule.
+
+Issue #351 brings the client to the server-owned memory model (#349,
+MADR-0025): the page rehydrates the active thread on load behind a
+server-injected opt-in, "New chat" archives the active thread through
+/api/conversation/reset, and "Clear memory" is an explicit, confirm-gated
+purge (/api/conversation/purge, confirm: true) with Cancel as the default
+focus. The view reset therefore no longer claims to be the whole story —
+its no-transmission contract is retained (test_new_chat_reset_is_client_side_only)
+because the archive is a separate, body-less call. The #351 contract and
+its source-level pins live in tests/test_conversation_ui.py.
 """
 
 import re
@@ -690,8 +700,10 @@ class TestIdentityBarContract:
 
     The identity bar is the compact app chrome at the top of the centered
     column: inline SVG monogram, product name, and exactly one "New chat"
-    action. The reset is a pure client-side operation — nothing is
-    transmitted and no transcript is persisted (Swiss nLPD posture).
+    action. The view reset itself transmits nothing and persists no
+    transcript client-side (Swiss nLPD posture); since #351 the transcript is
+    server-owned, so the same action also archives the active thread through
+    the merged /api/conversation/reset route (tests/test_conversation_ui.py).
 
     app.js behavior is contracted through source assertions: the repo ships
     no Node toolchain (ADR-006 §5, KIS), so JS is verified the same way as
@@ -901,7 +913,15 @@ class TestIdentityBarContract:
     # --- nLPD: client-side only, nothing persisted ----------------------------
 
     def test_new_chat_reset_is_client_side_only(self) -> None:
-        """The reset transmits nothing — no fetch, no beacon, no new stream."""
+        """The view reset transmits nothing — no fetch, no beacon, no stream.
+
+        Superseded in part by #351 (explicit, not silent): the transcript is
+        SERVER-OWNED since #349, so "New chat" now delegates the archive to
+        ``archiveConversation()`` — a separate, body-less POST to the merged
+        ``/api/conversation/reset`` route, invoked only when there is
+        something to archive. The view reset itself stays pure client state:
+        no request, and no message content ever leaves this method.
+        """
         script = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
         reset = _rule_block(script, "resetChat()")
         assert reset, "resetChat() must exist"
@@ -910,6 +930,10 @@ class TestIdentityBarContract:
         assert "EventSource" not in reset
         assert "XMLHttpRequest" not in reset
         assert "sendBeacon" not in reset
+        # The delegated archive is content-free: no request body at all.
+        archive = _rule_block(script, "archiveConversation()")
+        assert "body:" not in archive
+        assert "this.messages" not in archive
 
     def test_no_persistent_client_storage(self) -> None:
         """The transcript lives only in memory — no browser persistence.
@@ -2246,7 +2270,9 @@ class TestFloatingComposerContract:
         script = self._script()
 
         # The only fetch targets are the pre-existing API surface. #363 adds the
-        # merged #362 admin settings endpoints the settings modal consumes.
+        # merged #362 admin settings endpoints the settings modal consumes;
+        # #351 adds the merged #349 conversation-memory triple (rehydrate,
+        # archive, purge — no new server surface).
         endpoints = set(re.findall(r'fetch\("([^"]+)"', script))
         assert endpoints <= {
             "/api/agent/stream",
@@ -2257,6 +2283,9 @@ class TestFloatingComposerContract:
             "/api/debrief/pending",
             "/api/objectives",
             "/api/admin/agent-settings",
+            "/api/conversation",
+            "/api/conversation/reset",
+            "/api/conversation/purge",
         }, sorted(endpoints)
 
 
