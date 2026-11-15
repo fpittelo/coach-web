@@ -436,9 +436,19 @@ jobs:
       #   2. authorized smoke as the deploy SA (iap.httpsResourceAccessor)
       #      with NO app session cookie: /health + /healthz → 200;
       #      /api/* → 401 (app-layer boundary; full matrix in #317).
-      # The ID-token audience is the IAP OAuth client ID, extracted from the
-      # IAP sign-in redirect itself (fallback: project IAP settings).
+      # The ID-token audience is the IAP OAuth client ID, scraped from the
+      # IAP sign-in redirect (fallback: project IAP settings) and asserted
+      # equal to the GOOGLE_OIDC_CLIENT_ID Actions variable — a mismatch is
+      # IAP settings drift (the same OAuth client must be both the IAP custom
+      # client and the app OIDC client). The token is minted via SA
+      # impersonation: a keyless WIF session holds external-account
+      # credentials, which `print-identity-token --audiences` rejects
+      # ("Invalid account type for --audiences" — deploy attempt #5);
+      # the impersonation path (IAM Credentials API) needs the deployer's
+      # self roles/iam.serviceAccountTokenCreator (Amendment 0001 delta 6).
       - name: IAP-aware smoke checks
+        env:
+          GOOGLE_OIDC_CLIENT_ID: ${{ vars.GOOGLE_OIDC_CLIENT_ID }}
         run: |
           set -euo pipefail
           url="$(gcloud run services describe "${SERVICE}" \
@@ -462,11 +472,22 @@ jobs:
             echo "::error::Could not determine the IAP OAuth client ID (smoke ID-token audience). Check the project-level IAP settings (docs/admin_guide.md → IAP prerequisites)."
             exit 1
           fi
-          echo "IAP OAuth client ID resolved from the sign-in redirect."
 
-          token="$(gcloud auth print-identity-token --include-email --audiences="${client_id}")"
+          # Drift guard — BEFORE minting: the scraped client_id must equal the
+          # Actions variable (same OAuth client is both the IAP custom client
+          # and the app OIDC client; the deployed revision env proves it).
+          if [ "${client_id}" != "${GOOGLE_OIDC_CLIENT_ID}" ]; then
+            echo "::error::IAP settings drift: the client_id in the IAP sign-in redirect (${client_id}) does not equal the GOOGLE_OIDC_CLIENT_ID Actions variable (${GOOGLE_OIDC_CLIENT_ID}). Re-apply the IAP custom client (docs/admin_guide.md → IAP prerequisites)."
+            exit 1
+          fi
+          echo "IAP OAuth client ID resolved from the sign-in redirect and verified against GOOGLE_OIDC_CLIENT_ID."
+
+          # Impersonation mint — the WIF session's external-account credentials
+          # cannot use `--audiences` (requires classic SA-key credentials);
+          # this path needs the deployer's self tokenCreator grant (delta 6).
+          token="$(gcloud auth print-identity-token --impersonate-service-account="${DEPLOY_SA}" --include-email --audiences="${GOOGLE_OIDC_CLIENT_ID}")"
           if [ -z "${token}" ]; then
-            echo "::error::Failed to mint the deploy-SA ID token for the authorized smoke."
+            echo "::error::Failed to mint the deploy-SA ID token via impersonation — check the deployer's self roles/iam.serviceAccountTokenCreator grant (docs/admin_guide.md → Amendment 0001 delta 6)."
             exit 1
           fi
 
