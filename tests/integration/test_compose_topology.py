@@ -39,6 +39,10 @@ GITHUB_MCP_DIGEST_DEFAULT = f"${{GITHUB_MCP_IMAGE:-{GITHUB_MCP_DIGEST_PIN}}}"
 COACH_MCP_PIN = "ghcr.io/fpittelo/coach"
 COACH_MCP_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SERVICES = ("coach-web", "coach-mcp", "github-mcp")
+CLOUD_RUN_WORKFLOW = ".github/workflows/cloud-run-deploy.yaml"
+# The proven compose invocation (compose.yaml github-mcp command), which under
+# K8s/Knative semantics must reach the container as `args`, never as `command`.
+GITHUB_MCP_CLOUD_RUN_ARGS = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
 
 
 def load_yaml(name: str) -> dict[str, Any]:
@@ -66,6 +70,19 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def cloud_run_service_yaml() -> dict[str, Any]:
+    """Parse the Knative service YAML heredoc from the Cloud Run workflow."""
+    workflow = load_yaml(CLOUD_RUN_WORKFLOW)
+    steps = workflow["jobs"]["deploy"]["steps"]
+    render = next(step for step in steps if step.get("name") == "Render the service YAML")
+    script = render["run"]
+    match = re.search(r"<<YAML\n(.*?)\nYAML\n", script, re.DOTALL)
+    assert match is not None, "the render step must contain the service YAML heredoc"
+    rendered = yaml.safe_load(match.group(1))
+    assert isinstance(rendered, dict), "the heredoc must render a YAML mapping"
+    return rendered
 
 
 @pytest.fixture(scope="module")
@@ -213,6 +230,62 @@ class TestBaseComposeTopology:
         env = base_compose["services"]["github-mcp"].get("environment", {})
         assert env.get("GITHUB_PERSONAL_ACCESS_TOKEN") == "${GITHUB_TOKEN:-}"
         assert set(env) == {"GITHUB_PERSONAL_ACCESS_TOKEN", "GITHUB_TOOLSETS"}
+
+
+class TestCloudRunDeployWorkflow:
+    """The Cloud Run lane maps the compose sidecar contract to K8s semantics (#316).
+
+    In Compose, ``command:`` overrides CMD and is APPENDED to the image
+    ENTRYPOINT. In Kubernetes/Knative (Cloud Run), ``command:`` REPLACES the
+    ENTRYPOINT and ``args:`` is the CMD-equivalent. The first-deploy failure
+    (issue #316, revision coach-web-00001-qnn: "failed to resolve binary
+    path: ... \"http\"") came from translating the compose ``command:`` list
+    1:1 into a K8s ``command:`` — Cloud Run exec'd a binary named ``http``.
+    These tests pin the corrected semantics on the workflow source.
+    """
+
+    @pytest.fixture(scope="class")
+    def containers(self) -> dict[str, Any]:
+        """The rendered service YAML containers keyed by container name."""
+        service = cloud_run_service_yaml()
+        spec = service["spec"]["template"]["spec"]
+        return {container["name"]: container for container in spec["containers"]}
+
+    def test_three_container_pod(self, containers: dict[str, Any]) -> None:
+        """The pod carries exactly the compose topology's three containers."""
+        assert set(containers) == set(SERVICES)
+
+    def test_github_mcp_passes_the_transport_via_args_not_command(
+        self, containers: dict[str, Any]
+    ) -> None:
+        """github-mcp passes the transport subcommand via ``args:`` (#316).
+
+        The image ENTRYPOINT (/server/github-mcp-server, CMD=stdio) must stay
+        intact; a K8s ``command:`` whose first element is not the entrypoint
+        binary is exactly the failure class that broke the first deploy.
+        """
+        container = containers["github-mcp"]
+        assert "command" not in container
+        assert container["args"] == GITHUB_MCP_CLOUD_RUN_ARGS
+
+    def test_github_mcp_args_match_the_compose_contract(
+        self, containers: dict[str, Any], base_compose: dict[str, Any]
+    ) -> None:
+        """The Cloud Run args mirror the proven compose invocation byte-exact."""
+        compose_command = base_compose["services"]["github-mcp"]["command"]
+        assert containers["github-mcp"]["args"] == compose_command
+
+    def test_coach_mcp_keeps_the_image_entrypoint(
+        self, containers: dict[str, Any], base_compose: dict[str, Any]
+    ) -> None:
+        """coach-mcp overrides neither command nor args — env-driven contract."""
+        container = containers["coach-mcp"]
+        assert "command" not in container
+        assert "args" not in container
+        env = {entry["name"]: entry.get("value") for entry in container["env"]}
+        compose_env = base_compose["services"]["coach-mcp"]["environment"]
+        for key in ("MCP_TRANSPORT", "MCP_HOST", "MCP_PORT"):
+            assert env[key] == compose_env[key]
 
 
 class TestLaneOverrides:
