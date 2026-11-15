@@ -729,6 +729,26 @@ class TestTrustedHostMiddleware:
         assert response.status_code == 400
         assert response.text == "Invalid host header"
 
+    @pytest.mark.parametrize(
+        "traversal_path",
+        [
+            "/health/",
+            "//healthz",
+            "/HEALTHZ",
+            "/healthz/../api/conversation",
+            "/healthz/..%2fapi/x",
+        ],
+    )
+    def test_traversal_variants_fail_closed_on_probe_host(self, traversal_path: str) -> None:
+        """Fail-closed: traversal variants of the exempt paths stay 400 (#316)."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get(traversal_path)
+
+        assert response.status_code == 400
+        assert response.text == "Invalid host header"
+
     def test_run_app_host_behavior_unchanged(self) -> None:
         """A genuine *.run.app Host passes on / and /healthz alike (#316)."""
         app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
