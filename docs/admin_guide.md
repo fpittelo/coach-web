@@ -673,12 +673,54 @@ gcloud iap web add-iam-policy-binding \
 ```yaml
 - uses: google-github-actions/auth@v2
   with:
-    project: coach-web-509209
+    project_id: coach-web-509209
     workload_identity_provider: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
     service_account: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
 ```
 
 The binding chain (provider condition `assertion.repository=='fpittelo/coach-web'` → repo-scoped principalSet → `roles/iam.workloadIdentityUser`) was verified at bootstrap (#315 evidence); the first Actions deploy in #316 exercises the live token exchange end-to-end.
+
+### Production deploy lane (#316 — manual workflow)
+
+`.github/workflows/cloud-run-deploy.yaml` — `workflow_dispatch` with `image_tag_or_digest` (default `prod` = latest prod digest from GHCR; the input is resolved to an exact `@sha256:…` via `docker buildx imagetools inspect` before deploy — the pinned digest, not a mutable tag, is what ships). Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy. The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants).
+
+One-time prerequisites beyond the #315 bootstrap — run before the first dispatch:
+
+- **GitHub Environment gate:** the `gcp-cloud-run` environment must exist with `@fpittelo` as a **required reviewer** (repo → Settings → Environments → New environment → add required reviewer) — it is the one-approval-per-deploy gate; create it BEFORE the first dispatch so the very first run is gated.
+
+```bash
+# IAP enablement + per-service IAP grants are executed BY the workflow
+# (MADR-0027 D2) — the deploy SA needs the IAP admin surface:
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/iap.admin"
+# the workflow's pre-flight `gcloud secrets versions list` needs read-only
+# secret METADATA (values are never accessed by the workflow):
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/secretmanager.viewer"
+# app-level OAuth client ID (a public value — an Actions variable, NOT a secret):
+gh variable set GOOGLE_OIDC_CLIENT_ID --repo fpittelo/coach-web <CLIENT_ID>
+```
+
+Deployed-pod contract (Cloud Run v2, 3 containers sharing one localhost namespace):
+
+- **coach-web** (ingress container): the CI-built GHCR digest, non-root UID 10001 (baked in the image), binds `$PORT` (8080) via `APP_PORT`; `FORWARDED_ALLOW_IPS=*` (the GFE/IAP front end is the only ingress path — the baked Dockerfile default stays `127.0.0.1,::1` for the local lanes, #112/#316 AC2); `TRUSTED_HOSTS='["*.run.app"]'`; `CORS_ORIGINS` + `AUTH_REDIRECT_URI` pinned to the service origin (auto-synced after a first deploy — the URL is knowable only once the service exists); `AUTH_ENABLED=true`, `AUTH_WHITELIST_EMAILS='["frederic.pitteloud@gmail.com"]'`; startup probe `GET /healthz` (cold-start-tolerant `initialDelaySeconds`).
+- **Request timeout 3600 s** (service `timeoutSeconds`; the Cloud Run default 300 s would cut long agent SSE streams). **Bound:** a single chat turn — one request including its full SSE agent stream — must complete within 3600 s; turns beyond that bound are cut by the platform.
+- **coach-mcp**: `ghcr.io/fpittelo/coach:prod` resolved to its current digest; `localhost:8000/sse`; **startup TCP socket probe only** (never HTTP against the SSE stream).
+- **github-mcp**: pinned `v1.12.2@sha256:508a0857…` (same constant as `deploy.yaml`); `localhost:8001`; startup TCP socket probe.
+- **Secret wiring (per-secret scoping):** coach-web → `OPENROUTER_API_KEY`, `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `GITHUB_TOKEN`, `DATA_ENCRYPTION_KEY`; coach-mcp → `INTERVALS_API_KEY` only; github-mcp → the `GITHUB_TOKEN` secret exposed as `GITHUB_PERSONAL_ACCESS_TOKEN` only. All references resolve at instance start (`latest`); the runtime identity is `coach-web-deployer` (the #315 self-actAs contract).
+- **Persistence:** in-memory volume at `/data` (`emptyDir: medium: Memory`, MADR-0021 — per-instance scratch; all lane data is ephemeral by design). `minInstances=0`, `maxInstances=1`, region `europe-west6` everywhere.
+
+Smoke checks executed by the workflow (IAP-aware — no PO browser needed; full 401/403 matrix stays in #317):
+
+1. Unauthenticated `GET /` → **IAP 302/403 at the edge** (the app is never reached; an HTTP 200 fails the run).
+2. Authorized smoke with the **deploy-SA ID token** (`iap.httpsResourceAccessor`; audience = the IAP OAuth client ID, extracted from the IAP sign-in redirect) and **no app session cookie**: `/health` + `/healthz` → 200; `/api/*` → 401 (app-layer boundary intact under IAP).
+3. The live `.run.app` URL, the resolved digests and the serving revision are emitted in the job summary.
+
+**Rollback** (runbook line — deliberately NOT automated in the workflow, grooming amendment #7): the pre-deploy serving revision is captured in the job summary; to roll back:
+
+```bash
+gcloud run services update-traffic coach-web --region=europe-west6 --to-revisions=<PREVIOUS_REVISION>=100
+```
 
 ---
 
@@ -707,4 +749,4 @@ The binding chain (provider condition `assertion.repository=='fpittelo/coach-web
 
 ---
 
-_Last updated: 2026-11-14 (issue #315 — new "GCP Cloud Run Production (MADR-0027)" section: the one-time bootstrap runbook reflecting the executed state — WIF pool `github-pool` + GitHub-OIDC provider `github-oidc-provider` (repo-condition-scoped), the `coach-web-deployer` SA with least-privilege bindings, the 6 empty Secret Manager shells pinned `europe-west6` with per-secret accessor IAM, the PO secret-fill step, the console-only IAP brand/consent/OAuth-client prerequisites (legacy `iap oauth-brands` API is dead for no-org projects) and the #316 IAP/invoker binding commands; the ADR-007 callout notes the Cloud Run production reinstatement per MADR-0027. prior: issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-11-15 (issue #316 — new "Production deploy lane (#316 — manual workflow)" subsection: the `cloud-run-deploy.yaml` manual dispatch (digest-resolved `image_tag_or_digest`, `gcp-cloud-run` environment approval gate), the deploy-SA one-time prerequisites (`roles/iap.admin` for the in-workflow IAP enablement + grants, `roles/secretmanager.viewer` for the pre-flight versions list, the `GOOGLE_OIDC_CLIENT_ID` Actions variable), the deployed-pod contract (3-container pod, `FORWARDED_ALLOW_IPS=*` vs the loopback-only baked default, `TRUSTED_HOSTS=["*.run.app"]`, 3600 s request timeout as the max-chat-turn bound, in-memory `/data` per MADR-0021, min=0/max=1), the IAP-aware smoke semantics and the `update-traffic --to-revisions` rollback line. prior: issue #315 — new "GCP Cloud Run Production (MADR-0027)" section: the one-time bootstrap runbook reflecting the executed state — WIF pool `github-pool` + GitHub-OIDC provider `github-oidc-provider` (repo-condition-scoped), the `coach-web-deployer` SA with least-privilege bindings, the 6 empty Secret Manager shells pinned `europe-west6` with per-secret accessor IAM, the PO secret-fill step, the console-only IAP brand/consent/OAuth-client prerequisites (legacy `iap oauth-brands` API is dead for no-org projects) and the #316 IAP/invoker binding commands; the ADR-007 callout notes the Cloud Run production reinstatement per MADR-0027. prior: issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
