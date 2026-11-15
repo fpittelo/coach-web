@@ -638,11 +638,11 @@ class TestTrustedHostMiddleware:
         assert Settings().TRUSTED_HOSTS == ["localhost", "127.0.0.1"]
 
     def test_evil_host_is_rejected(self) -> None:
-        """A request with a non-allowlisted Host is rejected with 400."""
+        """A non-allowlisted Host is rejected with 400 (#316: / stays fail-closed)."""
         app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
 
         with TestClient(app, base_url="http://evil.com") as client:
-            response = client.get("/health")
+            response = client.get("/")
 
         assert response.status_code == 400
 
@@ -672,6 +672,73 @@ class TestTrustedHostMiddleware:
             response = client.get("/health")
 
         assert response.status_code == 200
+
+    # ------------------------------------------------------------------
+    # #316: the Cloud Run startup HTTP probe sends a non-*.run.app Host
+    # (platform-internal probe, e.g. 169.254.169.126). The exact health
+    # paths are exempt from host validation; every other route stays
+    # fail-closed (MADR-0008 scoped delta).
+    # ------------------------------------------------------------------
+
+    def test_cloud_run_probe_host_reaches_healthz(self) -> None:
+        """A probe Host outside the allowlist still gets the /healthz response."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get("/healthz")
+
+        assert response.status_code == 200
+        assert response.json()["service"] == "coach-web"
+
+    def test_cloud_run_probe_host_reaches_health(self) -> None:
+        """A probe Host outside the allowlist still gets the /health response."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json()["service"] == "coach-web"
+
+    def test_cloud_run_probe_missing_host_reaches_healthz(self) -> None:
+        """A request with an empty Host header still reaches /healthz."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get("/healthz", headers={"host": ""})
+
+        assert response.status_code == 200
+
+    def test_index_still_fails_closed_on_probe_host(self) -> None:
+        """Fail-closed: GET / with a probe Host is still rejected with 400."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get("/")
+
+        assert response.status_code == 400
+        assert response.text == "Invalid host header"
+
+    def test_api_still_fails_closed_on_probe_host(self) -> None:
+        """Fail-closed: /api/* with a probe Host is still rejected with 400."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://169.254.169.126") as client:
+            response = client.get("/api/conversation")
+
+        assert response.status_code == 400
+        assert response.text == "Invalid host header"
+
+    def test_run_app_host_behavior_unchanged(self) -> None:
+        """A genuine *.run.app Host passes on / and /healthz alike (#316)."""
+        app = create_app(Settings(TRUSTED_HOSTS=["*.run.app"]))
+
+        with TestClient(app, base_url="http://coach-web-00003-xqj.run.app") as client:
+            index_response = client.get("/")
+            healthz_response = client.get("/healthz")
+
+        assert index_response.status_code == 200
+        assert healthz_response.status_code == 200
 
 
 class TestCspMiddleware:
@@ -716,7 +783,7 @@ class TestCspMiddleware:
         app = create_app(Settings(TRUSTED_HOSTS=["localhost", "127.0.0.1"]))
 
         with TestClient(app, base_url="http://evil.com") as client:
-            response = client.get("/health")
+            response = client.get("/")
 
         assert response.status_code == 400
         assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
