@@ -1,0 +1,556 @@
+name: Cloud Run Production Deploy
+
+# ---------------------------------------------------------------------------
+# Manual production deploy lane — Cloud Run `coach-web-509209` (MADR-0027).
+#
+# Trigger: workflow_dispatch only (issue #316). main is the only trunk
+# (MADR-0017); the deployed artifact is always an exact GHCR sha256 digest:
+# the `image_tag_or_digest` input (default: `prod` = latest prod digest) is
+# resolved via `docker buildx imagetools inspect` and deployed as `@sha256:…`.
+#
+# Sequencing (Sprint 32 consensus, grooming amendment 2026-11-15): the FIRST
+# execution (AC1) must not run before @cyber-security records the AC5 review
+# (secret wiring/masking, FORWARDED_ALLOW_IPS=* rationale, IAP enablement +
+# both iap.httpsResourceAccessor grants) on the #316 PR.
+#
+# Auth: keyless Workload Identity Federation only (no SA JSON keys anywhere).
+# The `gcp-cloud-run` GitHub Environment is the explicit @fpittelo approval
+# gate for every deploy run.
+#
+# One-time prerequisites (docs/admin_guide.md → Amendment 0001 deltas +
+# deploy lane):
+#   - 6 Secret Manager secrets filled (#315 PO secret fill)
+#   - runtime SA coach-web-runtime: ONLY the 6 per-secret
+#     roles/secretmanager.secretAccessor bindings (service identity — no
+#     invoker, no IAP, no IAM-mutation roles; MADR-0027 Amendment 0001)
+#   - deploy SA: roles/iap.admin (enable IAP + manage per-service grants)
+#   - deploy SA: roles/secretmanager.viewer on EACH of the 6 secrets
+#     (per-secret metadata viewer — payload values are never accessed)
+#   - deploy SA: roles/iam.serviceAccountUser on the runtime SA (actAs
+#     bridge — the deploy sets the service's runtime identity)
+#   - Actions variable GOOGLE_OIDC_CLIENT_ID (app-level OAuth client ID)
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag_or_digest:
+        description: "coach-web image tag on ghcr.io/fpittelo/coach-web (default: prod = latest prod digest), or an explicit sha256:… digest"
+        required: false
+        default: "prod"
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: cloud-run-deploy
+  cancel-in-progress: false
+
+env:
+  GCP_PROJECT: coach-web-509209
+  GCP_REGION: europe-west6
+  SERVICE: coach-web
+  DEPLOY_SA: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
+  # Runtime identity of the service (MADR-0027 Amendment 0001): holds ONLY
+  # the six per-secret secretAccessor bindings — no invoker, no IAP, no
+  # IAM-mutation roles (service identity, not an invoker).
+  RUNTIME_SA: coach-web-runtime@coach-web-509209.iam.gserviceaccount.com
+  WIF_PROVIDER: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
+  IAP_SERVICE_AGENT: serviceAccount:service-853194930683@gcp-sa-iap.iam.gserviceaccount.com
+  IAP_PO_USER: user:frederic.pitteloud@gmail.com
+
+jobs:
+  # Single approval-gated job (MADR-0027 Amendment 0001 — AC5 fix round):
+  # EVERY step that authenticates to GCP — including the secrets pre-flight —
+  # runs inside the `gcp-cloud-run` environment job; there is no ungated GCP
+  # auth anywhere. GitHub environment approvals are per-JOB, so keeping the
+  # whole GCP pipeline in this one job is also what preserves the
+  # one-approval-per-deploy-run contract (two gated jobs would prompt twice).
+  deploy:
+    name: Pre-flight + deploy 3-container pod to Cloud Run
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Explicit @fpittelo approval gate — one approval per deploy run.
+    environment: gcp-cloud-run
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Grooming amendment #2: the input is resolved to an exact sha256:…
+      # digest here (fail fast) and the pinned ref is what ships — no
+      # mutable tag ever reaches `gcloud run services replace`.
+      - name: Resolve coach-web input to an exact sha256 digest
+        id: resolve
+        env:
+          IMAGE_INPUT: ${{ inputs.image_tag_or_digest }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/fpittelo/coach-web"
+          if [[ "${IMAGE_INPUT}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            ref="${repo}@${IMAGE_INPUT}"
+          elif [[ "${IMAGE_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
+            ref="${repo}@sha256:${IMAGE_INPUT}"
+          else
+            ref="${repo}:${IMAGE_INPUT}"
+          fi
+          digest="$(docker buildx imagetools inspect "${ref}" | sed -n 's/^Digest:[[:space:]]*//p' || true)"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve ${ref} to a sha256 digest (got: '${digest}'). Check that the tag exists in GHCR and is pullable."
+            exit 1
+          fi
+          echo "Resolved ${ref} -> ${repo}@${digest}"
+          echo "ref=${repo}@${digest}" >> "$GITHUB_OUTPUT"
+
+      # Sidecar pins (#316): coach-mcp is the separate pipeline's prod lane
+      # tag resolved to its current digest; github-mcp is the pinned upstream
+      # release — the same constants deploy.yaml verifies (do not re-derive).
+      - name: Resolve sidecar image refs
+        id: sidecars
+        env:
+          GITHUB_MCP_REF: ghcr.io/github/github-mcp-server:v1.12.2@sha256:508a0857ec762b1ab1cece29193345b501fab1dd9d1228a7b617062954cecac6
+        run: |
+          set -euo pipefail
+          resolve_digest() {
+            local ref="$1" digest
+            digest="$(docker buildx imagetools inspect "${ref}" | sed -n 's/^Digest:[[:space:]]*//p')"
+            if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::Failed to resolve a valid digest for ${ref} (got: '${digest}')."
+              exit 1
+            fi
+            echo "${digest}"
+          }
+          coach_mcp_digest="$(resolve_digest "ghcr.io/fpittelo/coach:prod")"
+          echo "coach-mcp resolves: ghcr.io/fpittelo/coach@${coach_mcp_digest}"
+          echo "github-mcp pinned:  ${GITHUB_MCP_REF}"
+          echo "coach_mcp_ref=ghcr.io/fpittelo/coach@${coach_mcp_digest}" >> "$GITHUB_OUTPUT"
+          echo "github_mcp_ref=${GITHUB_MCP_REF}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to GCP (WIF, keyless)
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+
+      # Grooming amendment #3: fail fast (5-second error, not a crash loop)
+      # when a secret shell is still empty. Requires per-secret
+      # roles/secretmanager.viewer bindings for the deploy SA on each of the
+      # six secrets (MADR-0027 Amendment 0001 — metadata only, payload values
+      # are never accessed; docs/admin_guide.md → Amendment 0001 deltas).
+      - name: Fail fast when a Secret Manager shell has no enabled version
+        run: |
+          set -euo pipefail
+          failed=0
+          for secret in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+            out="$(gcloud secrets versions list "${secret}" \
+              --project="${GCP_PROJECT}" \
+              --filter='state=ENABLED' --format='value(name)' --limit=1 2>&1 || true)"
+            if printf '%s' "${out}" | grep -qi 'PERMISSION_DENIED'; then
+              echo "::error::Cannot list versions of ${secret} (PERMISSION_DENIED). One-time grant required: per-secret roles/secretmanager.viewer for ${DEPLOY_SA} on ${secret} (MADR-0027 Amendment 0001 — docs/admin_guide.md → Amendment 0001 deltas)."
+              failed=1
+            elif [ -z "${out}" ]; then
+              echo "::error::Secret ${secret} has no enabled version — fill it once per docs/admin_guide.md → PO secret fill, then re-run."
+              failed=1
+            else
+              echo "secret ${secret}: enabled version present"
+            fi
+          done
+          if [ "${failed}" -ne 0 ]; then exit 1; fi
+
+      - name: Fail fast when the OIDC client id variable is unset
+        env:
+          OIDC_CLIENT_ID: ${{ vars.GOOGLE_OIDC_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OIDC_CLIENT_ID}" ]; then
+            echo "::error::Repository variable GOOGLE_OIDC_CLIENT_ID is unset — set it once with 'gh variable set GOOGLE_OIDC_CLIENT_ID --repo fpittelo/coach-web <client-id>' (the OAuth web client ID from the #315 IAP prerequisites; it is public, not a secret)."
+            exit 1
+          fi
+
+      # Grooming amendment #7: capture the revision that was serving before
+      # this deploy — the rollback target for the runbook line (NOT a
+      # workflow feature; YAGNI).
+      - name: Capture pre-deploy state (previous revision, URL)
+        id: pre
+        run: |
+          set -euo pipefail
+          prev_revision="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.latestReadyRevisionName)' 2>/dev/null || true)"
+          existing_url="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.address.url)' 2>/dev/null || true)"
+          echo "previous revision: ${prev_revision:-<first deploy>}"
+          echo "existing URL: ${existing_url:-<none>}"
+          echo "prev_revision=${prev_revision}" >> "$GITHUB_OUTPUT"
+          echo "url=${existing_url}" >> "$GITHUB_OUTPUT"
+
+      # Cloud Run v2 3-container pod, shared localhost namespace. The first
+      # container (coach-web) is the ingress container; sidecars are reachable
+      # on localhost only. /data is an in-memory (tmpfs) per-instance scratch
+      # volume (MADR-0021); scaling is min=0 / max=1; the request timeout is
+      # raised to the 3600 s maximum so long agent SSE streams are not cut by
+      # the 300 s Cloud Run default (bound documented in docs/admin_guide.md).
+      #
+      # Runtime identity (MADR-0027 Amendment 0001): the dedicated
+      # coach-web-runtime SA is set via `serviceAccountName` —
+      # `gcloud run services replace` is YAML-driven and has NO
+      # --service-account flag (that flag exists only on `run deploy` /
+      # `run services update`); the deployer's roles/iam.serviceAccountUser
+      # grant on the runtime SA (Amendment 0001 delta 2) authorizes the set.
+      - name: Render the service YAML
+        env:
+          COACH_WEB_REF: ${{ steps.resolve.outputs.ref }}
+          COACH_MCP_REF: ${{ steps.sidecars.outputs.coach_mcp_ref }}
+          GITHUB_MCP_REF: ${{ steps.sidecars.outputs.github_mcp_ref }}
+          EXISTING_URL: ${{ steps.pre.outputs.url }}
+          OIDC_CLIENT_ID: ${{ vars.GOOGLE_OIDC_CLIENT_ID }}
+        run: |
+          set -euo pipefail
+          if [ -n "${EXISTING_URL}" ]; then
+            cors_json="[\"${EXISTING_URL}\"]"
+            redirect_uri="${EXISTING_URL}/auth/callback"
+          else
+            cors_json='["https://pending-first-deploy.run.app"]'
+            redirect_uri="https://pending-first-deploy.run.app/auth/callback"
+          fi
+          cat > "${RUNNER_TEMP}/service.yaml" <<YAML
+          apiVersion: serving.knative.dev/v1
+          kind: Service
+          metadata:
+            name: ${SERVICE}
+            labels:
+              cloud.googleapis.com/location: ${GCP_REGION}
+            annotations:
+              run.googleapis.com/ingress: all
+              run.googleapis.com/description: Coach Web 3-container pod (MADR-0027, #316)
+          spec:
+            template:
+              metadata:
+                annotations:
+                  autoscaling.knative.dev/minScale: '0'
+                  autoscaling.knative.dev/maxScale: '1'
+              spec:
+                timeoutSeconds: 3600
+                serviceAccountName: ${RUNTIME_SA}
+                containers:
+                - name: coach-web
+                  image: ${COACH_WEB_REF}
+                  ports:
+                  - name: http1
+                    containerPort: 8080
+                  env:
+                  - name: APP_PORT
+                    value: '8080'
+                  - name: FORWARDED_ALLOW_IPS
+                    value: '*'
+                  - name: COACH_MCP_URL
+                    value: http://localhost:8000/sse
+                  - name: GITHUB_MCP_URL
+                    value: http://localhost:8001/
+                  - name: TRUSTED_HOSTS
+                    value: '["*.run.app"]'
+                  - name: CORS_ORIGINS
+                    value: '${cors_json}'
+                  - name: AUTH_ENABLED
+                    value: 'true'
+                  - name: AUTH_WHITELIST_EMAILS
+                    value: '["frederic.pitteloud@gmail.com"]'
+                  - name: AUTH_REDIRECT_URI
+                    value: ${redirect_uri}
+                  - name: GOOGLE_OIDC_CLIENT_ID
+                    value: ${OIDC_CLIENT_ID}
+                  - name: OPENROUTER_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: OPENROUTER_API_KEY
+                        key: latest
+                  - name: GOOGLE_OIDC_CLIENT_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: GOOGLE_OIDC_CLIENT_SECRET
+                        key: latest
+                  - name: AUTH_SESSION_SECRET
+                    valueFrom:
+                      secretKeyRef:
+                        name: AUTH_SESSION_SECRET
+                        key: latest
+                  - name: DATA_ENCRYPTION_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: DATA_ENCRYPTION_KEY
+                        key: latest
+                  resources:
+                    limits:
+                      cpu: 1000m
+                      memory: 512Mi
+                  startupProbe:
+                    httpGet:
+                      path: /healthz
+                      port: 8080
+                    initialDelaySeconds: 15
+                    periodSeconds: 5
+                    failureThreshold: 24
+                  volumeMounts:
+                  - name: data
+                    mountPath: /data
+                - name: coach-mcp
+                  image: ${COACH_MCP_REF}
+                  env:
+                  - name: MCP_TRANSPORT
+                    value: sse
+                  - name: MCP_HOST
+                    value: 0.0.0.0
+                  - name: MCP_PORT
+                    value: '8000'
+                  - name: INTERVALS_API_KEY
+                    valueFrom:
+                      secretKeyRef:
+                        name: INTERVALS_API_KEY
+                        key: latest
+                  resources:
+                    limits:
+                      cpu: 1000m
+                      memory: 512Mi
+                  startupProbe:
+                    tcpSocket:
+                      port: 8000
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    failureThreshold: 36
+                - name: github-mcp
+                  image: ${GITHUB_MCP_REF}
+                  command:
+                  - http
+                  - --port
+                  - '8001'
+                  - --listen-host
+                  - 0.0.0.0
+                  env:
+                  - name: GITHUB_PERSONAL_ACCESS_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: GITHUB_TOKEN
+                        key: latest
+                  - name: GITHUB_TOOLSETS
+                    value: default
+                  resources:
+                    limits:
+                      cpu: 1000m
+                      memory: 512Mi
+                  startupProbe:
+                    tcpSocket:
+                      port: 8001
+                    initialDelaySeconds: 5
+                    periodSeconds: 5
+                    failureThreshold: 36
+                volumes:
+                - name: data
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 256Mi
+          YAML
+          echo "Service YAML rendered at ${RUNNER_TEMP}/service.yaml"
+
+      - name: Deploy the service (create or replace)
+        run: |
+          gcloud run services replace "${RUNNER_TEMP}/service.yaml" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}"
+
+      # MADR-0027 D2: IAP enablement happens in the deploy step; the custom
+      # OAuth client was applied at project level (verified 2026-11-15).
+      - name: Enable IAP on the service
+        run: |
+          gcloud run services update "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --iap
+
+      - name: Ensure IAP invoker and edge-access bindings
+        run: |
+          set -euo pipefail
+          # The IAP service agent must hold invocation rights (else every
+          # request 403s at invocation).
+          gcloud run services add-iam-policy-binding "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --member="${IAP_SERVICE_AGENT}" \
+            --role=roles/run.invoker
+          # Platform-edge access: the PO account.
+          gcloud iap web add-iam-policy-binding \
+            --member="${IAP_PO_USER}" \
+            --role=roles/iap.httpsResourceAccessor \
+            --region="${GCP_REGION}" --resource-type=cloud-run --service="${SERVICE}"
+          # Platform-edge access: the WIF deploy SA (smoke identity).
+          gcloud iap web add-iam-policy-binding \
+            --member="serviceAccount:${DEPLOY_SA}" \
+            --role=roles/iap.httpsResourceAccessor \
+            --region="${GCP_REGION}" --resource-type=cloud-run --service="${SERVICE}"
+
+      - name: Verify IAP is enforced and the edge is fail-closed
+        run: |
+          set -euo pipefail
+          if ! gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            | grep -q 'Iap Enabled: true'; then
+            echo "::error::IAP is not enabled on ${SERVICE} — refusing to smoke-test an unprotected service."
+            exit 1
+          fi
+          if gcloud run services get-iam-policy "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(bindings)' | grep -q '"allUsers"'; then
+            echo "::error::An allUsers binding exists on ${SERVICE} — IAP edge must stay fail-closed."
+            exit 1
+          fi
+          echo "IAP enforced; no allUsers binding."
+
+      # First deploy only: the .run.app URL is knowable only once the service
+      # exists — sync the origin-derived env vars onto the service (a second
+      # revision). Steady-state deploys already carry the correct values in
+      # the rendered YAML, so this step is skipped.
+      - name: Sync origin-derived env vars (first deploy)
+        if: steps.pre.outputs.url == ''
+        run: |
+          set -euo pipefail
+          url="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.address.url)')"
+          gcloud run services update "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --update-env-vars="CORS_ORIGINS=[\"${url}\"],AUTH_REDIRECT_URI=${url}/auth/callback"
+
+      # AC3 (grooming amendment #1) — IAP-aware smoke, no PO browser needed:
+      #   1. unauthenticated GET / → IAP edge: 302 (Google sign-in redirect)
+      #      or 403; the app is never reached. 200 would mean IAP is not
+      #      enforced → hard fail.
+      #   2. authorized smoke as the deploy SA (iap.httpsResourceAccessor)
+      #      with NO app session cookie: /health + /healthz → 200;
+      #      /api/* → 401 (app-layer boundary; full matrix in #317).
+      # The ID-token audience is the IAP OAuth client ID, extracted from the
+      # IAP sign-in redirect itself (fallback: project IAP settings).
+      - name: IAP-aware smoke checks
+        run: |
+          set -euo pipefail
+          url="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.address.url)')"
+
+          unauth_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "${url}/")"
+          echo "unauthenticated GET / -> HTTP ${unauth_code}"
+          if [ "${unauth_code}" != "302" ] && [ "${unauth_code}" != "403" ]; then
+            echo "::error::Unauthenticated GET / returned HTTP ${unauth_code} — expected IAP 302/403 at the edge. HTTP 200 would mean IAP is not enforced."
+            exit 1
+          fi
+
+          redirect="$(curl -sS -o /dev/null -w '%{redirect_url}' --max-time 30 "${url}/" || true)"
+          client_id="$(printf '%s' "${redirect}" | sed -n 's/.*[?&]client_id=\([^&]*\).*/\1/p' || true)"
+          if [ -z "${client_id}" ]; then
+            client_id="$(gcloud iap settings get --project="${GCP_PROJECT}" 2>/dev/null \
+              | sed -n 's/^.*client_id: *//p' | head -n1 || true)"
+          fi
+          if [ -z "${client_id}" ]; then
+            echo "::error::Could not determine the IAP OAuth client ID (smoke ID-token audience). Check the project-level IAP settings (docs/admin_guide.md → IAP prerequisites)."
+            exit 1
+          fi
+          echo "IAP OAuth client ID resolved from the sign-in redirect."
+
+          token="$(gcloud auth print-identity-token --include-email --audiences="${client_id}")"
+          if [ -z "${token}" ]; then
+            echo "::error::Failed to mint the deploy-SA ID token for the authorized smoke."
+            exit 1
+          fi
+
+          # IAM/IAP grants propagate asynchronously — retry briefly.
+          health_code="000"; healthz_code="000"; api_code="000"
+          for attempt in 1 2 3 4 5 6; do
+            health_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+              -H "Authorization: Bearer ${token}" "${url}/health")"
+            healthz_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+              -H "Authorization: Bearer ${token}" "${url}/healthz")"
+            api_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+              -H "Authorization: Bearer ${token}" "${url}/api/agent/stream")"
+            echo "attempt ${attempt}: /health=${health_code} /healthz=${healthz_code} /api/agent/stream=${api_code}"
+            if [ "${health_code}" = "200" ] && [ "${healthz_code}" = "200" ] && [ "${api_code}" = "401" ]; then
+              break
+            fi
+            sleep 10
+          done
+
+          failed=0
+          if [ "${health_code}" != "200" ]; then
+            echo "::error::Authorized /health expected 200, got ${health_code} (deploy SA carries iap.httpsResourceAccessor; check IAP propagation and app boot logs)."
+            failed=1
+          fi
+          if [ "${healthz_code}" != "200" ]; then
+            echo "::error::Authorized /healthz expected 200, got ${healthz_code}."
+            failed=1
+          fi
+          if [ "${api_code}" != "401" ]; then
+            echo "::error::Authorized /api/agent/stream without an app session expected 401, got ${api_code}."
+            failed=1
+          fi
+          if [ "${failed}" -ne 0 ]; then exit 1; fi
+          {
+            echo "SMOKE_URL=${url}"
+            echo "SMOKE_UNAUTH=${unauth_code}"
+            echo "SMOKE_HEALTH=${health_code}"
+            echo "SMOKE_HEALTHZ=${healthz_code}"
+            echo "SMOKE_API=${api_code}"
+          } >> "$GITHUB_ENV"
+
+      - name: Write job summary
+        env:
+          PREV_REVISION: ${{ steps.pre.outputs.prev_revision }}
+        run: |
+          set -euo pipefail
+          revision="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.latestReadyRevisionName)')"
+          {
+            echo "## Cloud Run production deploy — ${SERVICE}"
+            echo ""
+            echo "| Item | Value |"
+            echo "|:---|:---|"
+            echo "| Service URL | ${SMOKE_URL} |"
+            echo "| coach-web image | ${{ steps.resolve.outputs.ref }} |"
+            echo "| coach-mcp image | ${{ steps.sidecars.outputs.coach_mcp_ref }} |"
+            echo "| github-mcp image | ${{ steps.sidecars.outputs.github_mcp_ref }} |"
+            echo "| Serving revision | ${revision} |"
+            echo "| Region / project | ${GCP_REGION} / ${GCP_PROJECT} |"
+            echo ""
+            echo "### IAP-aware smoke matrix (AC3)"
+            echo ""
+            echo "| Check | Expected | Observed |"
+            echo "|:---|:---|:---|"
+            echo "| Unauthenticated \`GET /\` | 302/403 (IAP edge) | ${SMOKE_UNAUTH} |"
+            echo "| Authorized \`GET /health\` (SA ID token, no app session) | 200 | ${SMOKE_HEALTH} |"
+            echo "| Authorized \`GET /healthz\` | 200 | ${SMOKE_HEALTHZ} |"
+            echo "| Authorized \`GET /api/agent/stream\` (no app session) | 401 | ${SMOKE_API} |"
+            if [ -n "${PREV_REVISION}" ]; then
+              echo ""
+              echo "### Rollback (runbook, docs/admin_guide.md)"
+              echo ""
+              echo '```bash'
+              echo "gcloud run services update-traffic ${SERVICE} --region=${GCP_REGION} --to-revisions=${PREV_REVISION}=100"
+              echo '```'
+            else
+              echo ""
+              echo "First deploy — no previous revision to roll back to."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Grooming amendment #3: a fail-closed boot (e.g. AUTH_SESSION_SECRET
+      # shorter than 32 bytes) must be visible in the startup-probe failure
+      # logs — surface recent revision logs on any failure.
+      - name: Dump recent revision logs on failure
+        if: failure()
+        run: |
+          gcloud logging read \
+            "resource.type=\"cloud_run_revision\" AND resource.labels.service_name=\"${SERVICE}\"" \
+            --project="${GCP_PROJECT}" --limit=40 \
+            --format='value(timestamp, textPayload)' || true

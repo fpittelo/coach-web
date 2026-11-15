@@ -42,6 +42,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     APP_HOST=0.0.0.0 \
     APP_PORT=8000 \
     LOG_LEVEL=INFO \
+    FORWARDED_ALLOW_IPS=127.0.0.1,::1 \
     COACH_WEB_VERSION=${COACH_WEB_VERSION}
 
 # Security (#351): the image-scan gate stays strict on OS findings that already
@@ -90,6 +91,12 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
 # Any future ingress change (proxy, non-loopback publish) must re-validate this
 # flag in the same change (see docs/security.md, Boundary 3).
 #
+# Cloud Run production (#316, MADR-0027 D4): the platform front end (GFE/IAP)
+# terminates TLS and sets X-Forwarded-*, so the trusted-peer list is
+# parameterized as the FORWARDED_ALLOW_IPS env var. The baked default stays
+# loopback-only — local lane behavior is unchanged (#316 AC2) — and the
+# Cloud Run service sets FORWARDED_ALLOW_IPS=* (GFE/IAP-only ingress).
+#
 # exec keeps uvicorn as PID 1 so SIGTERM is delivered directly to the ASGI server.
 #
 # Migrations run at container start (MADR-008, #166): `alembic upgrade head`
@@ -99,4 +106,4 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
 # startup on a failed migration rather than half-applying the schema. The
 # alembic.ini is packaged inside coach_web, so migrations always match the
 # installed code version.
-ENTRYPOINT ["sh", "-c", "alembic -c /app/src/coach_web/alembic.ini upgrade head && exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips='127.0.0.1,::1'"]
+ENTRYPOINT ["sh", "-c", "alembic -c /app/src/coach_web/alembic.ini upgrade head && exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}\""]

@@ -893,8 +893,16 @@ class TestDockerfileHardening:
         assert "http://localhost:8000/health" in dockerfile
 
     def test_forwarded_allow_ips_is_loopback_only(self, dockerfile: str) -> None:
-        """uvicorn trusts X-Forwarded-* from loopback peers only (AC7, #112)."""
-        assert "--forwarded-allow-ips='127.0.0.1,::1'" in dockerfile
+        """uvicorn trusts X-Forwarded-* from loopback peers only by default (AC7, #112).
+
+        #316 AC2 parameterizes the trusted-peer list as the FORWARDED_ALLOW_IPS
+        env var: the baked default stays loopback-only (local lane behavior
+        unchanged), the entrypoint passes it through with the same fallback,
+        and a literal wildcard is never baked into the image — the Cloud Run
+        prod lane sets FORWARDED_ALLOW_IPS=* via the service env (MADR-0027 D4).
+        """
+        assert "FORWARDED_ALLOW_IPS=127.0.0.1,::1" in dockerfile
+        assert "${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}" in dockerfile
         assert "--forwarded-allow-ips='*'" not in dockerfile
 
     def test_runtime_patches_os_findings_that_have_a_fix(self, dockerfile: str) -> None:

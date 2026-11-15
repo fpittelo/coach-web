@@ -1,9 +1,9 @@
 # 📕 Architecture — Coach Web
 
 **Audience:** @architect, @devops  
-**Last updated:** 2026-10-03
+**Last updated:** 2026-11-15
 
-> **Authority note:** Sections 1–3 and 7–8 still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh. **ADR-006 (§9)** is authoritative for the visual/rendering contract; **ADR-007 (§10)** is authoritative for the deployment topology (§4).
+> **Authority note:** Sections 1–3 and 7–8 still describe the retired Streamlit architecture (ADR-002) and are slated for a full refresh. **ADR-006 (§9)** is authoritative for the visual/rendering contract; **ADR-007 (§10)** and **MADR-0027** are authoritative for the deployment topology (§4 — local lanes and the Cloud Run production lane respectively).
 
 ---
 
@@ -140,7 +140,7 @@ graph TD
 
 ## 4. Deployment Topology (ADR-007 — Local-First)
 
-> **Authoritative deployment model: ADR-007 (§10).** The local Docker host on the workstation is the deployment target for all three lanes; the GCP Cloud Run topology (Sprint 08, #64–#68) is retired and decommissioned via #111.
+> **Authoritative deployment models: ADR-007 (§10) for the local lanes; MADR-0027 for the production lane.** The local Docker host on the workstation remains the deployment target for the dev/qa/prod lanes. The GCP Cloud Run topology (Sprint 08, #64–#68; retired and decommissioned via #111) is **reinstated as the production lane** per MADR-0027 (Amendment 0001): a 3-container pod on project `coach-web-509209`, region `europe-west6`, always-on scale-to-zero (`min=0`/`max=1`), IAP edge gate, deployed by the manual WIF-keyless workflow (#316 — deploy/runtime SA split; pod contract and one-time deltas in `docs/admin_guide.md` → GCP Cloud Run Production).
 
 ```mermaid
 graph TD
