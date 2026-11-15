@@ -327,7 +327,12 @@ jobs:
                     failureThreshold: 36
                 - name: github-mcp
                   image: ${GITHUB_MCP_REF}
-                  command:
+                  # K8s semantics: 'command' REPLACES the image ENTRYPOINT
+                  # (/server/github-mcp-server). The compose 'command:' list
+                  # is args-to-entrypoint, so it maps to 'args' here — a
+                  # 'command: [http, ...]' made Cloud Run exec a binary named
+                  # 'http' (issue #316, revision coach-web-00001-qnn).
+                  args:
                   - http
                   - --port
                   - '8001'
