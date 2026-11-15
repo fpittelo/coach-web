@@ -560,6 +560,33 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
 
 
+HEALTH_PROBE_PATHS = frozenset({"/health", "/healthz"})
+"""Exact paths exempt from trusted-host validation (#316, probe-only).
+
+The Cloud Run startup HTTP probe sends a Host header outside TRUSTED_HOSTS
+(e.g. the platform-internal 169.254.169.126) and was rejected with 400 on
+every startup attempt. Exact-match only — no prefixes, no normalization —
+so traversal variants (``/healthz/../api/x``) never bypass the allowlist;
+every other route stays fail-closed.
+"""
+
+
+class ProbeExemptTrustedHostMiddleware(TrustedHostMiddleware):
+    """TrustedHostMiddleware exempting the exact health-probe paths (#316).
+
+    Host validation stays fail-closed on every other route (DNS-rebinding
+    mitigation, #112); ``/health`` and ``/healthz`` answer regardless of the
+    Host header so the Cloud Run startup probe can observe readiness.
+    """
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Exempt exact health paths from the allowlist; delegate the rest."""
+        if scope["type"] == "http" and scope["path"] in HEALTH_PROBE_PATHS:
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Manage application startup and shutdown."""
@@ -622,9 +649,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Host allowlist (DNS-rebinding mitigation, #112): a malicious page that
     # resolves a hostname to 127.0.0.1 must not reach the loopback service
     # same-origin. Added last => outermost, so a bad Host is rejected before
-    # auth/CORS. Critical while dev/qa run AUTH_ENABLED=false.
+    # auth/CORS. Critical while dev/qa run AUTH_ENABLED=false. The exact
+    # health paths are exempt so the Cloud Run startup probe (non-public
+    # Host) observes readiness (#316); all other routes stay fail-closed.
     application.add_middleware(
-        TrustedHostMiddleware,
+        ProbeExemptTrustedHostMiddleware,
         allowed_hosts=resolved.TRUSTED_HOSTS,
         www_redirect=False,
     )
