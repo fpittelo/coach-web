@@ -546,7 +546,8 @@ The qa/prod lanes pull these CI-built images — a local build for qa/prod would
 | Region | `europe-west6` |
 | WIF pool | `github-pool` (global) |
 | WIF provider | `github-oidc-provider` (issuer `https://token.actions.githubusercontent.com`) |
-| Deploy/runtime SA | `coach-web-deployer@coach-web-509209.iam.gserviceaccount.com` |
+| Deploy SA (workflow identity) | `coach-web-deployer@coach-web-509209.iam.gserviceaccount.com` |
+| Runtime SA (service identity — Amendment 0001) | `coach-web-runtime@coach-web-509209.iam.gserviceaccount.com` |
 | IAP service agent | `service-853194930683@gcp-sa-iap.iam.gserviceaccount.com` |
 | Image | `ghcr.io/fpittelo/coach-web` (anonymously pullable — no image-pull secret needed) |
 
@@ -608,6 +609,76 @@ Bootstrap notes:
 - **Replication:** the single-location `--location=europe-west6` regional-secret create is broken in gcloud 593.0.0 (`INVALID_ARGUMENT: The provided Project ID ... does not match the expected format [projects/*]`); the user-managed single-replica form above is the equivalent residency pin — secret payload stored/replicated **only** in `europe-west6`.
 - **Role ID:** the deploy SA role is `roles/serviceusage.serviceUsageConsumer` (`roles/iam.serviceUsageConsumer` does not exist).
 - **AC3 verification:** `gcloud iam service-accounts keys list --iam-account=$SA_EMAIL --managed-by=user` → empty. The SA's `SYSTEM_MANAGED`/`GOOGLE_PROVIDED` signing key is normal and is not a user-managed JSON key.
+- **Amendment 0001:** the commands above are the historical #315 record (executed 2026-11-14, when deploy SA = runtime SA). The AC5 security review on #316 re-scoped the identity model — apply the one-time deltas in **"One-time bootstrap — Amendment 0001 deltas"** below before the first dispatch; on a fresh project, run this bootstrap first, then the deltas.
+
+### One-time bootstrap — Amendment 0001 deltas (AC5 fix round, #316 — PO-executed, not yet applied)
+
+MADR-0027 Amendment 0001 (2026-11-15; cyber BLOCK on #316 — HIGH 8.1, "deploy SA = runtime SA") splits the deploy and runtime identities and narrows WIF to trunk. The deltas below are **one-time, PO-executed Cloud Shell steps** (GCP-side execution is PO-routed by design; agents never touch the GCP console/CLI). They must be applied **before the first dispatch** — the cyber re-verification of the delta precedes any live deploy (AC5 gate on #316).
+
+```bash
+PROJECT_ID=coach-web-509209
+DEPLOY_SA=coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
+RUNTIME_SA=coach-web-runtime@coach-web-509209.iam.gserviceaccount.com
+POOL=github-pool
+PROVIDER=github-oidc-provider
+
+# 1. Runtime SA — the service identity. ONLY the six per-secret accessor
+#    bindings (no invoker, no IAP, no IAM-mutation roles: it is the service
+#    identity, NOT an invoker — unauthenticated access stays fail-closed at
+#    the IAP edge).
+gcloud iam service-accounts create coach-web-runtime \
+  --project=$PROJECT_ID \
+  --display-name="Coach Web runtime (service identity)"
+for SECRET in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+  gcloud secrets add-iam-policy-binding "$SECRET" \
+    --project=$PROJECT_ID \
+    --member="serviceAccount:$RUNTIME_SA" \
+    --role="roles/secretmanager.secretAccessor"
+done
+
+# 2. actAs bridge — the deploy sets the service's runtime identity, so the
+#    deployer needs roles/iam.serviceAccountUser ON the runtime SA.
+gcloud iam service-accounts add-iam-policy-binding $RUNTIME_SA \
+  --project=$PROJECT_ID \
+  --member="serviceAccount:$DEPLOY_SA" \
+  --role="roles/iam.serviceAccountUser"
+
+# 3. Pre-flight metadata viewer — PER-SECRET (metadata only, values never
+#    accessed). Supersedes the project-level roles/secretmanager.viewer
+#    routing that was provisionally documented for #316:
+for SECRET in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+  gcloud secrets add-iam-policy-binding "$SECRET" \
+    --project=$PROJECT_ID \
+    --member="serviceAccount:$DEPLOY_SA" \
+    --role="roles/secretmanager.viewer"
+done
+# 3b. Remove the project-level viewer routing IF it was already applied
+#     (if it was never granted, skip this — the removal errors otherwise):
+gcloud projects remove-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$DEPLOY_SA" --role="roles/secretmanager.viewer"
+
+# 4. Least-privilege hygiene — the deployer no longer reads secret PAYLOADS
+#    (the #315 accessor grants are superseded by the runtime SA's):
+for SECRET in OPENROUTER_API_KEY GOOGLE_OIDC_CLIENT_SECRET AUTH_SESSION_SECRET GITHUB_TOKEN DATA_ENCRYPTION_KEY INTERVALS_API_KEY; do
+  gcloud secrets remove-iam-policy-binding "$SECRET" \
+    --project=$PROJECT_ID \
+    --member="serviceAccount:$DEPLOY_SA" \
+    --role="roles/secretmanager.secretAccessor"
+done
+
+# 5. WIF narrowed to trunk — deploys authenticate only from main
+#    (post-squash-merge, MADR-0017), never from feature branches or forks:
+gcloud iam workload-identity-pools providers update $PROVIDER \
+  --location=global --workload-identity-pool=$POOL --project=$PROJECT_ID \
+  --attribute-condition="assertion.repository=='fpittelo/coach-web' && assertion.ref=='refs/heads/main'"
+```
+
+Delta notes:
+
+- **Order matters:** step 1 (runtime SA + its six accessor bindings) must precede the first deploy — the service cannot resolve its secrets otherwise; steps 2–5 complete the bridge and hygiene before the first dispatch.
+- **The runtime SA has NO invoker/IAP roles:** it is the service identity, not an invoker. Invocation rights stay with the IAP service agent (`roles/run.invoker`), and platform-edge access stays with the PO account + the deploy SA (smoke identity, `roles/iap.httpsResourceAccessor`).
+- **Deployer keeps:** `roles/run.admin`, `roles/serviceusage.serviceUsageConsumer`, self-`roles/iam.serviceAccountUser`, repo-scoped `roles/iam.workloadIdentityUser`, `roles/iap.admin`, service-scoped `roles/iap.httpsResourceAccessor` (deploy-SA smoke identity) — and, after the deltas, per-secret `roles/secretmanager.viewer` (metadata) instead of payload access.
+- **Verification:** the runtime SA holds no project-level roles; its only grants are the six per-secret `secretAccessor` bindings (`gcloud secrets get-iam-policy <SECRET>` shows exactly `secretAccessor` for the runtime SA + `viewer` for the deployer).
 
 ### PO secret fill (one-time, after bootstrap)
 
@@ -678,11 +749,11 @@ gcloud iap web add-iam-policy-binding \
     service_account: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
 ```
 
-The binding chain (provider condition `assertion.repository=='fpittelo/coach-web'` → repo-scoped principalSet → `roles/iam.workloadIdentityUser`) was verified at bootstrap (#315 evidence); the first Actions deploy in #316 exercises the live token exchange end-to-end.
+The binding chain (provider condition → repo-scoped principalSet → `roles/iam.workloadIdentityUser`) was verified at bootstrap (#315 evidence) under the original repo-only condition; the Amendment 0001 deltas narrow the provider condition to `assertion.repository=='fpittelo/coach-web' && assertion.ref=='refs/heads/main'` — deploys authenticate only from trunk, never from feature branches or forks. The first Actions deploy in #316 exercises the live token exchange end-to-end.
 
 ### Production deploy lane (#316 — manual workflow)
 
-`.github/workflows/cloud-run-deploy.yaml` — `workflow_dispatch` with `image_tag_or_digest` (default `prod` = latest prod digest from GHCR; the input is resolved to an exact `@sha256:…` via `docker buildx imagetools inspect` before deploy — the pinned digest, not a mutable tag, is what ships). Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy. The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants).
+`.github/workflows/cloud-run-deploy.yaml` — `workflow_dispatch` with `image_tag_or_digest` (default `prod` = latest prod digest from GHCR; the input is resolved to an exact `@sha256:…` via `docker buildx imagetools inspect` before deploy — the pinned digest, not a mutable tag, is what ships). Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy (Amendment 0001: the whole pipeline — pre-flight included — is that single gated job; no step authenticates to GCP outside it). The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants) **and for the Amendment 0001 deltas above to be applied**.
 
 One-time prerequisites beyond the #315 bootstrap — run before the first dispatch:
 
@@ -693,21 +764,21 @@ One-time prerequisites beyond the #315 bootstrap — run before the first dispat
 # (MADR-0027 D2) — the deploy SA needs the IAP admin surface:
 gcloud projects add-iam-policy-binding $PROJECT_ID \
   --member="serviceAccount:$SA_EMAIL" --role="roles/iap.admin"
-# the workflow's pre-flight `gcloud secrets versions list` needs read-only
-# secret METADATA (values are never accessed by the workflow):
-gcloud projects add-iam-policy-binding $PROJECT_ID \
-  --member="serviceAccount:$SA_EMAIL" --role="roles/secretmanager.viewer"
-# app-level OAuth client ID (a public value — an Actions variable, NOT a secret):
+# the pre-flight secret checks read per-secret METADATA only — the per-secret
+# roles/secretmanager.viewer bindings, the deploy/runtime identity split and
+# the WIF trunk condition are the Amendment 0001 deltas (see the dedicated
+# section above; the former project-level roles/secretmanager.viewer routing
+# is superseded and must not be applied):
 gh variable set GOOGLE_OIDC_CLIENT_ID --repo fpittelo/coach-web <CLIENT_ID>
 ```
 
 Deployed-pod contract (Cloud Run v2, 3 containers sharing one localhost namespace):
 
-- **coach-web** (ingress container): the CI-built GHCR digest, non-root UID 10001 (baked in the image), binds `$PORT` (8080) via `APP_PORT`; `FORWARDED_ALLOW_IPS=*` (the GFE/IAP front end is the only ingress path — the baked Dockerfile default stays `127.0.0.1,::1` for the local lanes, #112/#316 AC2); `TRUSTED_HOSTS='["*.run.app"]'`; `CORS_ORIGINS` + `AUTH_REDIRECT_URI` pinned to the service origin (auto-synced after a first deploy — the URL is knowable only once the service exists); `AUTH_ENABLED=true`, `AUTH_WHITELIST_EMAILS='["frederic.pitteloud@gmail.com"]'`; startup probe `GET /healthz` (cold-start-tolerant `initialDelaySeconds`).
+- **coach-web** (ingress container): the CI-built GHCR digest, non-root UID 10001 (baked in the image), binds `$PORT` (8080) via `APP_PORT`; `FORWARDED_ALLOW_IPS=*` (the GFE/IAP front end is the only ingress path — the baked Dockerfile default stays `127.0.0.1,::1` for the local lanes, #112/#316 AC2); the leftmost `X-Forwarded-For` value is never used for authorization or rate-limiting decisions (a client-supplied XFF entry is attacker-controlled — the IAP-authenticated edge is the only trust boundary); `TRUSTED_HOSTS='["*.run.app"]'`; `CORS_ORIGINS` + `AUTH_REDIRECT_URI` pinned to the service origin (auto-synced after a first deploy — the URL is knowable only once the service exists); `AUTH_ENABLED=true`, `AUTH_WHITELIST_EMAILS='["frederic.pitteloud@gmail.com"]'`; startup probe `GET /healthz` (cold-start-tolerant `initialDelaySeconds`).
 - **Request timeout 3600 s** (service `timeoutSeconds`; the Cloud Run default 300 s would cut long agent SSE streams). **Bound:** a single chat turn — one request including its full SSE agent stream — must complete within 3600 s; turns beyond that bound are cut by the platform.
 - **coach-mcp**: `ghcr.io/fpittelo/coach:prod` resolved to its current digest; `localhost:8000/sse`; **startup TCP socket probe only** (never HTTP against the SSE stream).
 - **github-mcp**: pinned `v1.12.2@sha256:508a0857…` (same constant as `deploy.yaml`); `localhost:8001`; startup TCP socket probe.
-- **Secret wiring (per-secret scoping):** coach-web → `OPENROUTER_API_KEY`, `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `GITHUB_TOKEN`, `DATA_ENCRYPTION_KEY`; coach-mcp → `INTERVALS_API_KEY` only; github-mcp → the `GITHUB_TOKEN` secret exposed as `GITHUB_PERSONAL_ACCESS_TOKEN` only. All references resolve at instance start (`latest`); the runtime identity is `coach-web-deployer` (the #315 self-actAs contract).
+- **Secret wiring (per-secret scoping, Amendment 0001):** coach-web → `OPENROUTER_API_KEY`, `GOOGLE_OIDC_CLIENT_SECRET`, `AUTH_SESSION_SECRET`, `DATA_ENCRYPTION_KEY` (the `GITHUB_TOKEN` mount was removed from the ingress container — the PAT is exposed **only** to github-mcp, as `GITHUB_PERSONAL_ACCESS_TOKEN`); coach-mcp → `INTERVALS_API_KEY` only; github-mcp → the `GITHUB_TOKEN` secret exposed as `GITHUB_PERSONAL_ACCESS_TOKEN` only. All references resolve at instance start (`latest`); the runtime identity is the dedicated `coach-web-runtime` SA (Amendment 0001 split — only the six per-secret `secretAccessor` bindings, no invoker/IAP roles; the deploy step sets it via `serviceAccountName` in the service YAML).
 - **Persistence:** in-memory volume at `/data` (`emptyDir: medium: Memory`, MADR-0021 — per-instance scratch; all lane data is ephemeral by design). `minInstances=0`, `maxInstances=1`, region `europe-west6` everywhere.
 
 Smoke checks executed by the workflow (IAP-aware — no PO browser needed; full 401/403 matrix stays in #317):
@@ -749,4 +820,4 @@ gcloud run services update-traffic coach-web --region=europe-west6 --to-revision
 
 ---
 
-_Last updated: 2026-11-15 (issue #316 — new "Production deploy lane (#316 — manual workflow)" subsection: the `cloud-run-deploy.yaml` manual dispatch (digest-resolved `image_tag_or_digest`, `gcp-cloud-run` environment approval gate), the deploy-SA one-time prerequisites (`roles/iap.admin` for the in-workflow IAP enablement + grants, `roles/secretmanager.viewer` for the pre-flight versions list, the `GOOGLE_OIDC_CLIENT_ID` Actions variable), the deployed-pod contract (3-container pod, `FORWARDED_ALLOW_IPS=*` vs the loopback-only baked default, `TRUSTED_HOSTS=["*.run.app"]`, 3600 s request timeout as the max-chat-turn bound, in-memory `/data` per MADR-0021, min=0/max=1), the IAP-aware smoke semantics and the `update-traffic --to-revisions` rollback line. prior: issue #315 — new "GCP Cloud Run Production (MADR-0027)" section: the one-time bootstrap runbook reflecting the executed state — WIF pool `github-pool` + GitHub-OIDC provider `github-oidc-provider` (repo-condition-scoped), the `coach-web-deployer` SA with least-privilege bindings, the 6 empty Secret Manager shells pinned `europe-west6` with per-secret accessor IAM, the PO secret-fill step, the console-only IAP brand/consent/OAuth-client prerequisites (legacy `iap oauth-brands` API is dead for no-org projects) and the #316 IAP/invoker binding commands; the ADR-007 callout notes the Cloud Run production reinstatement per MADR-0027. prior: issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_
+_Last updated: 2026-11-15 (issue #316 — AC5 fix round (MADR-0027 Amendment 0001): deploy/runtime identity split — the new `coach-web-runtime` runtime SA holds only the six per-secret `secretAccessor` bindings (no invoker/IAP roles), the deployer keeps the deploy/IAP surface plus per-secret `secretmanager.viewer` metadata grants and the `iam.serviceAccountUser` actAs bridge on the runtime SA, its six payload `secretAccessor` grants are removed, and the WIF provider condition is narrowed to repository + `refs/heads/main`; all GCP-authenticating workflow steps moved into the single `gcp-cloud-run` environment-gated job (one approval per deploy run); the `GITHUB_TOKEN` mount was removed from the coach-web ingress container (the PAT is only in github-mcp as `GITHUB_PERSONAL_ACCESS_TOKEN`) and `FORWARDED_ALLOW_IPS=*` is now set on the deployed coach-web env with the leftmost-XFF-never-for-authorization note; prior: issue #316 — new "Production deploy lane (#316 — manual workflow)" subsection: the `cloud-run-deploy.yaml` manual dispatch (digest-resolved `image_tag_or_digest`, `gcp-cloud-run` environment approval gate), the deploy-SA one-time prerequisites (`roles/iap.admin` for the in-workflow IAP enablement + grants, `roles/secretmanager.viewer` for the pre-flight versions list, the `GOOGLE_OIDC_CLIENT_ID` Actions variable), the deployed-pod contract (3-container pod, `FORWARDED_ALLOW_IPS=*` vs the loopback-only baked default, `TRUSTED_HOSTS=["*.run.app"]`, 3600 s request timeout as the max-chat-turn bound, in-memory `/data` per MADR-0021, min=0/max=1), the IAP-aware smoke semantics and the `update-traffic --to-revisions` rollback line. prior: issue #315 — new "GCP Cloud Run Production (MADR-0027)" section: the one-time bootstrap runbook reflecting the executed state — WIF pool `github-pool` + GitHub-OIDC provider `github-oidc-provider` (repo-condition-scoped), the `coach-web-deployer` SA with least-privilege bindings, the 6 empty Secret Manager shells pinned `europe-west6` with per-secret accessor IAM, the PO secret-fill step, the console-only IAP brand/consent/OAuth-client prerequisites (legacy `iap oauth-brands` API is dead for no-org projects) and the #316 IAP/invoker binding commands; the ADR-007 callout notes the Cloud Run production reinstatement per MADR-0027. prior: issue #329 — Auto-Update → Rollback: corrected the "no network / image already local" claim; the rollback pulls the previous digest from the registry when it was pruned locally (observed in the #329 drill), still lock-held and image-only. prior: issue #345 — per-tick lane health signal + bounded self-heal: every tick, a no-change tick included, verifies the exact 3/3 set (`lane-health`), makes ONE project-scoped `up -d` self-heal (lock held, no image pull) when a service is missing or unhealthy, and records `lane=healthy|recovered|degraded` additively in the state file (`outcome=degraded`, never `success`, when the lane does not recover); new "Lane health & self-heal" section. prior: issue #344 — checkout guard: the updater and the boot unit refuse to run from a dirty/foreign/stale checkout (`scripts/repo-clean-check.sh`, `ExecStartPre`), recording `reason=checkout-guard` before any docker call; issue #326 — new "Auto-Update" section: the release-driven, provenance-gated `coach-web-update.timer` runbook (auto path, force, state inspection, rollback, disable/re-enable) + the C1–C8 limits, the swap order (verified pull, then snapshot, then the atomic rewrite) and the pre-swap snapshot; the C3 lock story is now explicit — the tick, `e2e-preflight.sh prod`, `coach-web.service` start/stop and `--rollback`/`--force` all take it, with skip/refuse/wait semantics and the ~20 min vs ~1 h C8 bound; `prod-install.sh` now also installs/removes the update service+timer; corrected the #328 advisory A1 wording so "Boot & Supervision" states what the unit actually recovers — boot and unit-level failures, not a crashed container, since there is no compose `restart:` policy; prior: issue #328 — "Boot & Supervision" section for the systemd user-unit supervision of the prod lane per MADR-0024: install/verify/restart/stop/uninstall + "docker daemon not ready" troubleshooting; `lane.sh` now exposes read-only `prod status`/`prod logs`; issue #327 — Release Runbook rollout automated per MADR-0024: tag-driven auto-update is the normal path, manual block demoted to fallback, rollback rewritten around `.env.prod.prev` + pre-swap snapshot; issue #301 — maintenance CLI hardening)_

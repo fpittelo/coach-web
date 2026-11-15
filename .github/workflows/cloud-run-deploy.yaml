@@ -17,10 +17,17 @@ name: Cloud Run Production Deploy
 # The `gcp-cloud-run` GitHub Environment is the explicit @fpittelo approval
 # gate for every deploy run.
 #
-# One-time prerequisites (documented in docs/admin_guide.md → deploy lane):
+# One-time prerequisites (docs/admin_guide.md → Amendment 0001 deltas +
+# deploy lane):
 #   - 6 Secret Manager secrets filled (#315 PO secret fill)
+#   - runtime SA coach-web-runtime: ONLY the 6 per-secret
+#     roles/secretmanager.secretAccessor bindings (service identity — no
+#     invoker, no IAP, no IAM-mutation roles; MADR-0027 Amendment 0001)
 #   - deploy SA: roles/iap.admin (enable IAP + manage per-service grants)
-#   - deploy SA: roles/secretmanager.viewer (pre-flight versions list)
+#   - deploy SA: roles/secretmanager.viewer on EACH of the 6 secrets
+#     (per-secret metadata viewer — payload values are never accessed)
+#   - deploy SA: roles/iam.serviceAccountUser on the runtime SA (actAs
+#     bridge — the deploy sets the service's runtime identity)
 #   - Actions variable GOOGLE_OIDC_CLIENT_ID (app-level OAuth client ID)
 # ---------------------------------------------------------------------------
 
@@ -46,26 +53,34 @@ env:
   GCP_REGION: europe-west6
   SERVICE: coach-web
   DEPLOY_SA: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
+  # Runtime identity of the service (MADR-0027 Amendment 0001): holds ONLY
+  # the six per-secret secretAccessor bindings — no invoker, no IAP, no
+  # IAM-mutation roles (service identity, not an invoker).
+  RUNTIME_SA: coach-web-runtime@coach-web-509209.iam.gserviceaccount.com
   WIF_PROVIDER: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
   IAP_SERVICE_AGENT: serviceAccount:service-853194930683@gcp-sa-iap.iam.gserviceaccount.com
   IAP_PO_USER: user:frederic.pitteloud@gmail.com
 
 jobs:
-  preflight:
-    name: Pre-flight — resolve digest, verify secrets
+  # Single approval-gated job (MADR-0027 Amendment 0001 — AC5 fix round):
+  # EVERY step that authenticates to GCP — including the secrets pre-flight —
+  # runs inside the `gcp-cloud-run` environment job; there is no ungated GCP
+  # auth anywhere. GitHub environment approvals are per-JOB, so keeping the
+  # whole GCP pipeline in this one job is also what preserves the
+  # one-approval-per-deploy-run contract (two gated jobs would prompt twice).
+  deploy:
+    name: Pre-flight + deploy 3-container pod to Cloud Run
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      coach_web_ref: ${{ steps.resolve.outputs.ref }}
-      coach_mcp_ref: ${{ steps.sidecars.outputs.coach_mcp_ref }}
-      github_mcp_ref: ${{ steps.sidecars.outputs.github_mcp_ref }}
+    timeout-minutes: 30
+    # Explicit @fpittelo approval gate — one approval per deploy run.
+    environment: gcp-cloud-run
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
       # Grooming amendment #2: the input is resolved to an exact sha256:…
-      # digest here (fail fast) and the pinned ref is what the deploy job
-      # ships — no mutable tag ever reaches `gcloud run services replace`.
+      # digest here (fail fast) and the pinned ref is what ships — no
+      # mutable tag ever reaches `gcloud run services replace`.
       - name: Resolve coach-web input to an exact sha256 digest
         id: resolve
         env:
@@ -125,8 +140,10 @@ jobs:
           project_id: ${{ env.GCP_PROJECT }}
 
       # Grooming amendment #3: fail fast (5-second error, not a crash loop)
-      # when a secret shell is still empty. Requires roles/secretmanager.viewer
-      # on the deploy SA (one-time; docs/admin_guide.md → deploy lane).
+      # when a secret shell is still empty. Requires per-secret
+      # roles/secretmanager.viewer bindings for the deploy SA on each of the
+      # six secrets (MADR-0027 Amendment 0001 — metadata only, payload values
+      # are never accessed; docs/admin_guide.md → Amendment 0001 deltas).
       - name: Fail fast when a Secret Manager shell has no enabled version
         run: |
           set -euo pipefail
@@ -136,7 +153,7 @@ jobs:
               --project="${GCP_PROJECT}" \
               --filter='state=ENABLED' --format='value(name)' --limit=1 2>&1 || true)"
             if printf '%s' "${out}" | grep -qi 'PERMISSION_DENIED'; then
-              echo "::error::Cannot list versions of ${secret} (PERMISSION_DENIED). One-time grant required: roles/secretmanager.viewer for ${DEPLOY_SA} (docs/admin_guide.md → Cloud Run deploy lane prerequisites)."
+              echo "::error::Cannot list versions of ${secret} (PERMISSION_DENIED). One-time grant required: per-secret roles/secretmanager.viewer for ${DEPLOY_SA} on ${secret} (MADR-0027 Amendment 0001 — docs/admin_guide.md → Amendment 0001 deltas)."
               failed=1
             elif [ -z "${out}" ]; then
               echo "::error::Secret ${secret} has no enabled version — fill it once per docs/admin_guide.md → PO secret fill, then re-run."
@@ -156,26 +173,6 @@ jobs:
             echo "::error::Repository variable GOOGLE_OIDC_CLIENT_ID is unset — set it once with 'gh variable set GOOGLE_OIDC_CLIENT_ID --repo fpittelo/coach-web <client-id>' (the OAuth web client ID from the #315 IAP prerequisites; it is public, not a secret)."
             exit 1
           fi
-
-  deploy:
-    name: Deploy 3-container pod to Cloud Run
-    needs: preflight
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # Explicit @fpittelo approval gate — one approval per deploy run.
-    environment: gcp-cloud-run
-    steps:
-      - name: Authenticate to GCP (WIF, keyless)
-        uses: google-github-actions/auth@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT }}
-          workload_identity_provider: ${{ env.WIF_PROVIDER }}
-          service_account: ${{ env.DEPLOY_SA }}
-
-      - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: ${{ env.GCP_PROJECT }}
 
       # Grooming amendment #7: capture the revision that was serving before
       # this deploy — the rollback target for the runbook line (NOT a
@@ -201,11 +198,18 @@ jobs:
       # volume (MADR-0021); scaling is min=0 / max=1; the request timeout is
       # raised to the 3600 s maximum so long agent SSE streams are not cut by
       # the 300 s Cloud Run default (bound documented in docs/admin_guide.md).
+      #
+      # Runtime identity (MADR-0027 Amendment 0001): the dedicated
+      # coach-web-runtime SA is set via `serviceAccountName` —
+      # `gcloud run services replace` is YAML-driven and has NO
+      # --service-account flag (that flag exists only on `run deploy` /
+      # `run services update`); the deployer's roles/iam.serviceAccountUser
+      # grant on the runtime SA (Amendment 0001 delta 2) authorizes the set.
       - name: Render the service YAML
         env:
-          COACH_WEB_REF: ${{ needs.preflight.outputs.coach_web_ref }}
-          COACH_MCP_REF: ${{ needs.preflight.outputs.coach_mcp_ref }}
-          GITHUB_MCP_REF: ${{ needs.preflight.outputs.github_mcp_ref }}
+          COACH_WEB_REF: ${{ steps.resolve.outputs.ref }}
+          COACH_MCP_REF: ${{ steps.sidecars.outputs.coach_mcp_ref }}
+          GITHUB_MCP_REF: ${{ steps.sidecars.outputs.github_mcp_ref }}
           EXISTING_URL: ${{ steps.pre.outputs.url }}
           OIDC_CLIENT_ID: ${{ vars.GOOGLE_OIDC_CLIENT_ID }}
         run: |
@@ -235,7 +239,7 @@ jobs:
                   autoscaling.knative.dev/maxScale: '1'
               spec:
                 timeoutSeconds: 3600
-                serviceAccountName: ${DEPLOY_SA}
+                serviceAccountName: ${RUNTIME_SA}
                 containers:
                 - name: coach-web
                   image: ${COACH_WEB_REF}
@@ -245,6 +249,8 @@ jobs:
                   env:
                   - name: APP_PORT
                     value: '8080'
+                  - name: FORWARDED_ALLOW_IPS
+                    value: '*'
                   - name: COACH_MCP_URL
                     value: http://localhost:8000/sse
                   - name: GITHUB_MCP_URL
@@ -275,11 +281,6 @@ jobs:
                     valueFrom:
                       secretKeyRef:
                         name: AUTH_SESSION_SECRET
-                        key: latest
-                  - name: GITHUB_TOKEN
-                    valueFrom:
-                      secretKeyRef:
-                        name: GITHUB_TOKEN
                         key: latest
                   - name: DATA_ENCRYPTION_KEY
                     valueFrom:
@@ -516,9 +517,9 @@ jobs:
             echo "| Item | Value |"
             echo "|:---|:---|"
             echo "| Service URL | ${SMOKE_URL} |"
-            echo "| coach-web image | ${{ needs.preflight.outputs.coach_web_ref }} |"
-            echo "| coach-mcp image | ${{ needs.preflight.outputs.coach_mcp_ref }} |"
-            echo "| github-mcp image | ${{ needs.preflight.outputs.github_mcp_ref }} |"
+            echo "| coach-web image | ${{ steps.resolve.outputs.ref }} |"
+            echo "| coach-mcp image | ${{ steps.sidecars.outputs.coach_mcp_ref }} |"
+            echo "| github-mcp image | ${{ steps.sidecars.outputs.github_mcp_ref }} |"
             echo "| Serving revision | ${revision} |"
             echo "| Region / project | ${GCP_REGION} / ${GCP_PROJECT} |"
             echo ""
