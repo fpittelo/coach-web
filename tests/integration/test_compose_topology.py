@@ -287,6 +287,44 @@ class TestCloudRunDeployWorkflow:
         for key in ("MCP_TRANSPORT", "MCP_HOST", "MCP_PORT"):
             assert env[key] == compose_env[key]
 
+    @pytest.fixture(scope="class")
+    def smoke_script(self) -> str:
+        """The `run` script of the IAP-aware smoke step in the Cloud Run lane."""
+        workflow = load_yaml(CLOUD_RUN_WORKFLOW)
+        steps = workflow["jobs"]["deploy"]["steps"]
+        smoke = next(step for step in steps if step.get("name") == "IAP-aware smoke checks")
+        assert isinstance(smoke["run"], str), "the smoke step must have a run script"
+        return smoke["run"]
+
+    def test_smoke_id_token_is_minted_via_impersonation(self, smoke_script: str) -> None:
+        """The smoke mints its ID token via SA impersonation, not a gcloud flag (#316).
+
+        The WIF session authenticates with external-account credentials, and
+        ``gcloud auth print-identity-token --audiences`` fails for that account
+        type ("Invalid account type for --audiences. Requires valid service
+        account." — deploy attempt #5). The mint must go through SA
+        impersonation (IAM Credentials API) against the Actions-variable
+        audience — the bug class must not regress.
+        """
+        assert (
+            'gcloud auth print-identity-token --impersonate-service-account="${DEPLOY_SA}"'
+            in smoke_script
+        )
+        assert '--audiences="${GOOGLE_OIDC_CLIENT_ID}"' in smoke_script
+
+    def test_smoke_asserts_redirect_client_id_matches_the_oidc_variable(
+        self, smoke_script: str
+    ) -> None:
+        """The scraped IAP client_id must equal the GOOGLE_OIDC_CLIENT_ID variable (#316).
+
+        A mismatch is IAP settings drift (the same OAuth client must be both
+        the IAP custom client and the app OIDC client) — the check must fail
+        the run before any ID token is minted.
+        """
+        drift = 'if [ "${client_id}" != "${GOOGLE_OIDC_CLIENT_ID}" ]; then'
+        assert drift in smoke_script
+        assert smoke_script.index(drift) < smoke_script.index("print-identity-token")
+
 
 class TestLaneOverrides:
     """Per-lane override checks (AC1/AC2/AC3)."""
