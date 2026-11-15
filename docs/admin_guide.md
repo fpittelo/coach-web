@@ -726,6 +726,8 @@ The legacy `gcloud iap oauth-brands` path is dead for this project: it requires 
    gcloud iap settings set iap_settings.yaml --project=$PROJECT_ID
    ```
 
+> **Programmatic access (Google IAP requirement):** the custom OAuth client must have the **programmatic access allowlist** configured for ID-token-based programmatic access to the IAP-protected service — without it, authorized smoke requests 403 at the edge (fail-closed, but an avoidable deploy failure). Reference: Google IAP "Programmatic access" docs (<https://cloud.google.com/iap/docs/sharing-oauth-clients#programmatic_access>).
+
 ### IAP + invoker bindings (#316 — requires the deployed service)
 
 ```bash

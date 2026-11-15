@@ -486,6 +486,7 @@ jobs:
           # cannot use `--audiences` (requires classic SA-key credentials);
           # this path needs the deployer's self tokenCreator grant (delta 6).
           token="$(gcloud auth print-identity-token --impersonate-service-account="${DEPLOY_SA}" --include-email --audiences="${GOOGLE_OIDC_CLIENT_ID}")"
+          echo "::add-mask::${token}"
           if [ -z "${token}" ]; then
             echo "::error::Failed to mint the deploy-SA ID token via impersonation — check the deployer's self roles/iam.serviceAccountTokenCreator grant (docs/admin_guide.md → Amendment 0001 delta 6)."
             exit 1
