@@ -291,9 +291,17 @@ jobs:
                     limits:
                       cpu: 1000m
                       memory: 512Mi
+                  # /health, not /healthz: Cloud Run reserves URL paths ending
+                  # in `z` — the Google Frontend intercepts exact /healthz
+                  # with an edge 404 before the container is reached
+                  # (cloud.google.com/run/docs/known-issues); /health is the
+                  # canonical Cloud Run startup-probe endpoint
+                  # (docs: configuring/healthchecks). Deploy run 44815740742:
+                  # /health passed 200 through IAP, /healthz 404'd at the
+                  # edge (#316).
                   startupProbe:
                     httpGet:
-                      path: /healthz
+                      path: /health
                       port: 8080
                     initialDelaySeconds: 15
                     periodSeconds: 5
@@ -434,7 +442,10 @@ jobs:
       #      or 403; the app is never reached. 200 would mean IAP is not
       #      enforced → hard fail.
       #   2. authorized smoke as the deploy SA (iap.httpsResourceAccessor)
-      #      with NO app session cookie: /health + /healthz → 200;
+      #      with NO app session cookie: /health → 200 (the probe surface;
+      #      /healthz is NOT checked — Cloud Run reserves URL paths ending
+      #      in `z` and the GFE intercepts /healthz with an edge 404,
+      #      cloud.google.com/run/docs/known-issues);
       #      /api/* → 401 (app-layer boundary; full matrix in #317).
       # The ID-token audience is the IAP OAuth client ID, scraped from the
       # IAP sign-in redirect (fallback: project IAP settings) and asserted
@@ -505,16 +516,17 @@ jobs:
           fi
 
           # IAM/IAP grants propagate asynchronously — retry briefly.
-          health_code="000"; healthz_code="000"; api_code="000"
+          # No /healthz check: Cloud Run reserves URL paths ending in `z` —
+          # the GFE answers exact /healthz with an edge 404 before the
+          # container is reached (cloud.google.com/run/docs/known-issues).
+          health_code="000"; api_code="000"
           for attempt in 1 2 3 4 5 6; do
             health_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
               -H "Authorization: Bearer ${token}" "${url}/health")"
-            healthz_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
-              -H "Authorization: Bearer ${token}" "${url}/healthz")"
             api_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
               -H "Authorization: Bearer ${token}" "${url}/api/agent/stream")"
-            echo "attempt ${attempt}: /health=${health_code} /healthz=${healthz_code} /api/agent/stream=${api_code}"
-            if [ "${health_code}" = "200" ] && [ "${healthz_code}" = "200" ] && [ "${api_code}" = "401" ]; then
+            echo "attempt ${attempt}: /health=${health_code} /api/agent/stream=${api_code}"
+            if [ "${health_code}" = "200" ] && [ "${api_code}" = "401" ]; then
               break
             fi
             sleep 10
@@ -523,10 +535,6 @@ jobs:
           failed=0
           if [ "${health_code}" != "200" ]; then
             echo "::error::Authorized /health expected 200, got ${health_code} (deploy SA carries iap.httpsResourceAccessor; check IAP propagation and app boot logs)."
-            failed=1
-          fi
-          if [ "${healthz_code}" != "200" ]; then
-            echo "::error::Authorized /healthz expected 200, got ${healthz_code}."
             failed=1
           fi
           if [ "${api_code}" != "401" ]; then
@@ -538,7 +546,6 @@ jobs:
             echo "SMOKE_URL=${url}"
             echo "SMOKE_UNAUTH=${unauth_code}"
             echo "SMOKE_HEALTH=${health_code}"
-            echo "SMOKE_HEALTHZ=${healthz_code}"
             echo "SMOKE_API=${api_code}"
           } >> "$GITHUB_ENV"
 
@@ -568,7 +575,6 @@ jobs:
             echo "|:---|:---|:---|"
             echo "| Unauthenticated \`GET /\` | 302/403 (IAP edge) | ${SMOKE_UNAUTH} |"
             echo "| Authorized \`GET /health\` (SA ID token, no app session) | 200 | ${SMOKE_HEALTH} |"
-            echo "| Authorized \`GET /healthz\` | 200 | ${SMOKE_HEALTHZ} |"
             echo "| Authorized \`GET /api/agent/stream\` (no app session) | 401 | ${SMOKE_API} |"
             if [ -n "${PREV_REVISION}" ]; then
               echo ""
