@@ -440,12 +440,15 @@ jobs:
       # IAP sign-in redirect (fallback: project IAP settings) and asserted
       # equal to the GOOGLE_OIDC_CLIENT_ID Actions variable — a mismatch is
       # IAP settings drift (the same OAuth client must be both the IAP custom
-      # client and the app OIDC client). The token is minted via SA
-      # impersonation: a keyless WIF session holds external-account
-      # credentials, which `print-identity-token --audiences` rejects
-      # ("Invalid account type for --audiences" — deploy attempt #5);
-      # the impersonation path (IAM Credentials API) needs the deployer's
-      # self roles/iam.serviceAccountTokenCreator (Amendment 0001 delta 6).
+      # client and the app OIDC client). The token is minted by a DIRECT IAM
+      # Credentials API call (generateIdToken): a keyless WIF session holds
+      # external-account credentials, which `print-identity-token --audiences`
+      # rejects ("Invalid account type for --audiences" — deploy attempt #5),
+      # and gcloud's --impersonate-service-account shortcut first drives
+      # generateAccessToken — PERMISSION_DENIED under the deployer's narrowed
+      # self-grant (deploy attempt #7, cyber C1). generateIdToken needs
+      # exactly getOpenIdToken: the deployer's self
+      # roles/iam.serviceAccountOpenIdTokenCreator (Amendment 0001 delta 6).
       - name: IAP-aware smoke checks
         env:
           GOOGLE_OIDC_CLIENT_ID: ${{ vars.GOOGLE_OIDC_CLIENT_ID }}
@@ -482,13 +485,22 @@ jobs:
           fi
           echo "IAP OAuth client ID resolved from the sign-in redirect and verified against GOOGLE_OIDC_CLIENT_ID."
 
-          # Impersonation mint — the WIF session's external-account credentials
-          # cannot use `--audiences` (requires classic SA-key credentials);
-          # this path needs the deployer's self tokenCreator grant (delta 6).
-          token="$(gcloud auth print-identity-token --impersonate-service-account="${DEPLOY_SA}" --include-email --audiences="${GOOGLE_OIDC_CLIENT_ID}")"
+          # Direct IAM Credentials API mint — the WIF session's external-account
+          # credentials cannot use `--audiences` (requires classic SA-key
+          # credentials), and gcloud's SA-impersonation shortcut first drives
+          # generateAccessToken (the broader tokenCreator role, deliberately
+          # not granted — cyber C1). generateIdToken needs exactly the narrow
+          # getOpenIdToken permission: the deployer's self
+          # roles/iam.serviceAccountOpenIdTokenCreator grant (delta 6).
+          token="$(curl -sS -X POST \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+            -H "Content-Type: application/json" \
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${DEPLOY_SA}:generateIdToken" \
+            -d "{\"audience\": \"${GOOGLE_OIDC_CLIENT_ID}\", \"includeEmail\": true}" \
+            | python3 -c 'import sys, json; print(json.load(sys.stdin).get("token", ""))')"
           echo "::add-mask::${token}"
           if [ -z "${token}" ]; then
-            echo "::error::Failed to mint the deploy-SA ID token via impersonation — check the deployer's self roles/iam.serviceAccountTokenCreator grant (docs/admin_guide.md → Amendment 0001 delta 6)."
+            echo "::error::Failed to mint the deploy-SA ID token via the IAM Credentials API — check the deployer's self roles/iam.serviceAccountOpenIdTokenCreator grant (docs/admin_guide.md → Amendment 0001 delta 6)."
             exit 1
           fi
 

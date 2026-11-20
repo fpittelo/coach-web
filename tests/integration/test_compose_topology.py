@@ -296,21 +296,33 @@ class TestCloudRunDeployWorkflow:
         assert isinstance(smoke["run"], str), "the smoke step must have a run script"
         return smoke["run"]
 
-    def test_smoke_id_token_is_minted_via_impersonation(self, smoke_script: str) -> None:
-        """The smoke mints its ID token via SA impersonation, not a gcloud flag (#316).
+    def test_smoke_id_token_is_minted_via_the_iam_credentials_api(self, smoke_script: str) -> None:
+        """The smoke mints its ID token via a direct generateIdToken call (#316).
 
         The WIF session authenticates with external-account credentials, and
         ``gcloud auth print-identity-token --audiences`` fails for that account
         type ("Invalid account type for --audiences. Requires valid service
-        account." — deploy attempt #5). The mint must go through SA
-        impersonation (IAM Credentials API) against the Actions-variable
-        audience — the bug class must not regress.
+        account." — deploy attempt #5). gcloud's ``--impersonate-service-account``
+        shortcut is no alternative either: it first drives
+        ``generateAccessToken`` (PERMISSION_DENIED — deploy attempt #7), the
+        broader tokenCreator capability the deployer's self-grant deliberately
+        excludes (cyber C1). The mint must be a direct POST to the IAM
+        Credentials API ``generateIdToken`` method — needing exactly the narrow
+        getOpenIdToken permission — against the Actions-variable audience, with
+        the minted token masked — the bug class must not regress.
         """
         assert (
-            'gcloud auth print-identity-token --impersonate-service-account="${DEPLOY_SA}"'
+            "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/${DEPLOY_SA}:generateIdToken"
             in smoke_script
         )
-        assert '--audiences="${GOOGLE_OIDC_CLIENT_ID}"' in smoke_script
+        assert '-H "Authorization: Bearer $(gcloud auth print-access-token)"' in smoke_script
+        assert (
+            '-d "{\\"audience\\": \\"${GOOGLE_OIDC_CLIENT_ID}\\", \\"includeEmail\\": true}"'
+            in smoke_script
+        )
+        assert "--impersonate-service-account" not in smoke_script
+        mint = smoke_script.index("generateIdToken")
+        assert smoke_script.index('echo "::add-mask::${token}"') > mint
 
     def test_smoke_asserts_redirect_client_id_matches_the_oidc_variable(
         self, smoke_script: str
@@ -323,7 +335,7 @@ class TestCloudRunDeployWorkflow:
         """
         drift = 'if [ "${client_id}" != "${GOOGLE_OIDC_CLIENT_ID}" ]; then'
         assert drift in smoke_script
-        assert smoke_script.index(drift) < smoke_script.index("print-identity-token")
+        assert smoke_script.index(drift) < smoke_script.index("generateIdToken")
 
 
 class TestLaneOverrides:
