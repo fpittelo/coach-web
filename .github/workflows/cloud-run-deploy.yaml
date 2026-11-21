@@ -27,7 +27,12 @@ name: Cloud Run Production Deploy
 #   - deploy SA: roles/secretmanager.viewer on EACH of the 6 secrets
 #     (per-secret metadata viewer — payload values are never accessed)
 #   - deploy SA: roles/iam.serviceAccountUser on the runtime SA (actAs
-#     bridge — the deploy sets the service's runtime identity)
+#     bridge — the deploy sets the service's runtime identity; KEEP per
+#     MADR-0027 Amendment 0002 D1 — structurally required for
+#     `services replace` + serviceAccountName)
+#   - deploy SA: roles/run.admin RESOURCE-SCOPED on the coach-web service
+#     (MADR-0027 Amendment 0002 — the former project-level binding is
+#     removed; docs/admin_guide.md → Amendment 0002 deltas)
 #   - Actions variable GOOGLE_OIDC_CLIENT_ID (app-level OAuth client ID)
 # ---------------------------------------------------------------------------
 
@@ -524,6 +529,63 @@ jobs:
           print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact service hostname.")
           '
 
+      # D4 (MADR-0027 Amendment 0002, issue #390) — post-deploy drift guard:
+      # read the DEPLOYED service spec back and fail the run on drift:
+      #   - the serving serviceAccountName must be the dedicated runtime SA
+      #     (Amendment 0001 identity split) — any other identity re-opens the
+      #     Amendment 0001 finding (a deployer-controlled or foreign runtime
+      #     identity);
+      #   - the env secretKeyRef surface must be EXACTLY the rendered wiring
+      #     (6 secrets, per-container): coach-web → OPENROUTER_API_KEY,
+      #     GOOGLE_OIDC_CLIENT_SECRET, AUTH_SESSION_SECRET, DATA_ENCRYPTION_KEY;
+      #     coach-mcp → INTERVALS_API_KEY; github-mcp → GITHUB_TOKEN exposed
+      #     as GITHUB_PERSONAL_ACCESS_TOKEN — any rogue-revision edit of the
+      #     wiring (the R1 escalation path, issue #390) fails the run.
+      # The ruling's invoker-set assertion is subsumed by the #396 C1 gate
+      # above (invoker set == exactly the IAP service agent — a strictly
+      # stronger check) and is deliberately NOT duplicated here.
+      - name: Assert deployed identity and secret wiring (D4 drift guard, Amendment 0002)
+        run: |
+          set -euo pipefail
+          gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(spec.template.spec)' \
+          | EXPECTED_SA="${RUNTIME_SA}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          spec = (raw.get("spec", {}).get("template", {}).get("spec", {}) if isinstance(raw, dict) else {})
+          expected_sa = os.environ["EXPECTED_SA"]
+          expected_wiring = {
+              "coach-web": {
+                  "OPENROUTER_API_KEY": "OPENROUTER_API_KEY",
+                  "GOOGLE_OIDC_CLIENT_SECRET": "GOOGLE_OIDC_CLIENT_SECRET",
+                  "AUTH_SESSION_SECRET": "AUTH_SESSION_SECRET",
+                  "DATA_ENCRYPTION_KEY": "DATA_ENCRYPTION_KEY",
+              },
+              "coach-mcp": {"INTERVALS_API_KEY": "INTERVALS_API_KEY"},
+              "github-mcp": {"GITHUB_PERSONAL_ACCESS_TOKEN": "GITHUB_TOKEN"},
+          }
+          failed = False
+          sa = spec.get("serviceAccountName", "")
+          if sa != expected_sa:
+              print("::error::D4 violation: deployed serviceAccountName=" + json.dumps(sa) + " must be the dedicated runtime SA " + json.dumps(expected_sa) + " (Amendment 0001 identity split; a foreign runtime identity re-opens the deploy-SA escalation path — issue #390).")
+              failed = True
+          wiring = {}
+          for c in spec.get("containers", []):
+              refs = {}
+              for e in c.get("env", []):
+                  ref = (e.get("valueFrom") or {}).get("secretKeyRef")
+                  if ref:
+                      refs[e.get("name")] = ref.get("name")
+              wiring[c.get("name")] = refs
+          if wiring != expected_wiring:
+              print("::error::D4 violation: deployed secretKeyRef wiring drifted — found=" + json.dumps(wiring, sort_keys=True) + ", expected=" + json.dumps(expected_wiring, sort_keys=True) + " (rogue-revision env/secret edits are the R1 escalation path; MADR-0027 Amendment 0002 D4).")
+              failed = True
+          if failed:
+              sys.exit(1)
+          print("D4 verified: serving identity is the runtime SA and the 6-secret per-container secretKeyRef wiring is unchanged.")
+          '
+
       # C4 (#396 — cyber sign-off condition, #317 comment 7059788814):
       # the deployer holds roles/iam.serviceAccountUser (actAs) on the
       # runtime SA — required to set serviceAccountName, and harmless ONLY
@@ -568,6 +630,45 @@ jobs:
           if platform_only:
               print("C4 note: a token-minting role is held ONLY by the platform Cloud Run service agent (explicitly excluded — Cloud Run runtime-identity mechanism; flagged for @cyber-security verification, #396).")
           print("C4 verified: no non-platform principal holds token-minting rights on " + os.environ["RUNTIME_SA"] + ".")
+          '
+
+      # AC3 (MADR-0027 Amendment 0002 D2, issue #390) — IAM-surface drift
+      # gate (BLOCKING — the live migration to the resource-scoped grant was
+      # executed 2026-11-21): the deploy SA must hold NO project-level
+      # roles/run.admin binding — the grant is resource-scoped on the
+      # coach-web service only. roles/run.admin does NOT include
+      # resourcemanager.projects.getIamPolicy, so the deploy SA cannot read
+      # the project IAM policy to inspect its own bindings; the official
+      # TestIamPermissions API (cloudresourcemanager v3) requires NO
+      # permission to call and answers directly: a project-level run.admin
+      # (re-)grant would surface run.services.getIamPolicy / update / delete
+      # (all run.admin signature permissions) on the PROJECT resource, while
+      # the resource-scoped binding grants them only on the service itself.
+      # Steady state: an EMPTY permissions array. Fail-closed: an API error
+      # or an unexpected response also fails the run.
+      - name: Assert no project-level run.admin on the deploy SA (AC3, Amendment 0002)
+        run: |
+          set -euo pipefail
+          curl -sS -X POST \
+            -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+            -H "Content-Type: application/json" \
+            -d '{"permissions":["run.services.getIamPolicy","run.services.update","run.services.delete"]}' \
+            "https://cloudresourcemanager.googleapis.com/v3/projects/${GCP_PROJECT}:testIamPermissions" \
+          | python3 -c '
+          import json, sys
+          try:
+              raw = json.load(sys.stdin)
+          except Exception:
+              print("::error::AC3 gate: TestIamPermissions returned a non-JSON response — failing closed (check API availability / auth).")
+              sys.exit(1)
+          held = raw.get("permissions")
+          if not isinstance(held, list):
+              print("::error::AC3 gate: unexpected TestIamPermissions response (no permissions list): " + json.dumps(raw)[:300])
+              sys.exit(1)
+          if held:
+              print("::error::AC3 violation: the deploy SA holds project-level run.* permissions " + json.dumps(held) + " on the project — the run.admin grant must be resource-scoped on the coach-web service ONLY (MADR-0027 Amendment 0002 D2; remove the project-level binding per docs/admin_guide.md → Amendment 0002 deltas).")
+              sys.exit(1)
+          print("AC3 verified: no project-level run.admin-surface permission on the deploy SA (grant is resource-scoped on coach-web).")
           '
 
       # AC3 (grooming amendment #1) — IAP-aware smoke, no PO browser needed:
