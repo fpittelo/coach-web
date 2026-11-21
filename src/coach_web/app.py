@@ -230,19 +230,6 @@ def _safe_validation_errors(errors: Sequence[Mapping[str, Any]]) -> list[dict[st
     return [{"loc": error.get("loc"), "type": error.get("type")} for error in errors]
 
 
-_SIGNIN_SLOT = (
-    "<!-- #180 signin-slot: swapped for the sign-in link by the / route"
-    " when it renders an unauthenticated session (auth enabled). -->"
-)
-"""Inert marker comment in index.html's identity bar (the injection anchor).
-
-The raw static file keeps the comment, so /static/index.html and
-auth-disabled lanes stay byte-identical to the pre-#180 page (AC3).
-"""
-
-_SIGNIN_LINK_HTML = '<a class="signin-link" href="/auth/login">Sign in</a>'
-"""The unauthenticated identity-bar affordance (#180): a real link, no JS."""
-
 _AVATAR_SLOT = (
     "<!-- #319 avatar-slot: swapped for the profile avatar by the / route"
     " when it renders an authenticated session (auth enabled). -->"
@@ -697,34 +684,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @application.get("/", include_in_schema=False)
     async def index(request: Request) -> Response:
-        """Serve the single-page interface with identity-aware chrome (#180, #319).
+        """Serve the public landing page or the console with identity chrome.
 
-        The landing page is public (AC4 #65). Three render paths: with auth
-        enabled and no valid session cookie, the identity bar gains a visible
-        "Sign in" link to /auth/login (#180); with a valid session, the bar
-        gains the owner's Google profile avatar built from the session's
-        name/picture claims (#319 — deterministic fallbacks, never a broken
-        image) AND the page opts into the server-owned conversation rehydrate
-        (#351: ``data-conversation-restore="true"`` — only a session-scoped
-        page may restore a transcript); AUTH_ENABLED=false lanes (dev/qa) get
-        the static file byte-for-byte, i.e. the no-restore default. Fail-safe:
-        any cookie or validation error resolves to the unauthenticated
-        variant — the landing page can never 500. No auto-redirect: the
-        public-landing posture is preserved (rejected-by-default option 3,
-        #180).
+        ``/`` is public (AC4 #65) and renders three ways (#398): with auth
+        enabled and no valid session, the static landing page
+        (``static/landing.html``) pitches the product with a single Sign in
+        CTA to /auth/login — no console markup, no JavaScript, no external
+        requests; with a valid session, the console gains the owner's Google
+        profile avatar built from the session's name/picture claims (#319 —
+        deterministic fallbacks, never a broken image) AND opts into the
+        server-owned conversation rehydrate (#351:
+        ``data-conversation-restore="true"`` — only a session-scoped page may
+        restore a transcript); AUTH_ENABLED=false lanes (dev/qa) get the
+        static file byte-for-byte, i.e. the no-restore default. Fail-safe:
+        any cookie or validation error resolves to the landing variant — the
+        page can never 500. No auto-redirect: the public-landing posture is
+        preserved (rejected-by-default option 3, #180).
         """
         settings: Settings = request.app.state.settings
         if not settings.AUTH_ENABLED:
             return FileResponse(STATIC_DIR / "index.html")
         claims = _verified_session_claims(request, settings)
-        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         if claims is None:
-            if _SIGNIN_SLOT in html:
-                return Response(
-                    content=html.replace(_SIGNIN_SLOT, _SIGNIN_LINK_HTML),
-                    media_type="text/html",
-                )
-            return FileResponse(STATIC_DIR / "index.html")
+            return FileResponse(STATIC_DIR / "landing.html")
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         if _AVATAR_SLOT in html:
             # The authenticated variant owns both substitutions: the #319
             # avatar and the #351 rehydrate opt-in. A static bundle without

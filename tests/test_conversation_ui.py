@@ -100,12 +100,11 @@ class TestRestoreOptIn:
         assert RESTORE_ON not in response.text
 
     def test_unauthenticated_page_never_opts_in(self, auth_client: TestClient) -> None:
-        """The public landing page stays empty — it has no session to restore."""
+        """The landing page carries no console at all — nothing to restore (#398)."""
         response = auth_client.get("/")
 
         assert response.status_code == 200
-        assert RESTORE_OFF in response.text
-        assert RESTORE_ON not in response.text
+        assert "data-conversation-restore=" not in response.text
 
     def test_authenticated_session_opts_in(self, auth_client: TestClient) -> None:
         """A signed-in session rehydrates: the server swaps the attribute."""

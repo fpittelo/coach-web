@@ -1,0 +1,221 @@
+/* Coach Web — public landing page (#398).
+   Mobile-first, system fonts only, no external requests: the page must render
+   with zero network fetches beyond this same-origin stylesheet (Swiss nLPD
+   no-tracking posture, CSP 'self'). Palette mirrors the console (ADR-006). */
+
+:root {
+  --surface: #ffffff;
+  --surface-alt: #f8fafc;
+  --ink: #1e293b;
+  --muted: #475569;
+  --line: #e2e8f0;
+  --accent: #0f766e;
+  --accent-hover: #115e59;
+  --accent-ink: #ffffff;
+  --radius: 12px;
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-md: 0 12px 32px rgba(15, 23, 42, 0.08);
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --measure: 62ch;
+  --font-sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.site-header {
+  display: flex;
+  align-items: center;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--line);
+}
+
+.wordmark {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.wordmark__mark {
+  width: 1.75rem;
+  height: 1.75rem;
+  color: var(--accent);
+}
+
+main {
+  flex: 1;
+  width: 100%;
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: var(--space-6) var(--space-5);
+}
+
+.hero {
+  padding: var(--space-6) 0 var(--space-7);
+}
+
+.eyebrow {
+  margin: 0 0 var(--space-3);
+  color: var(--accent);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+h1 {
+  max-width: 22ch;
+  margin: 0 0 var(--space-4);
+  font-size: clamp(2rem, 7vw, 3.25rem);
+  line-height: 1.1;
+  letter-spacing: -0.02em;
+}
+
+.lede {
+  max-width: var(--measure);
+  margin: 0 0 var(--space-6);
+  color: var(--muted);
+  font-size: 1.0625rem;
+}
+
+.button {
+  display: inline-block;
+  padding: var(--space-3) var(--space-6);
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 600;
+  text-decoration: none;
+  box-shadow: var(--shadow-sm);
+  transition: background 150ms ease;
+}
+
+.button:hover {
+  background: var(--accent-hover);
+}
+
+.button:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 3px;
+}
+
+.hero__note {
+  margin: var(--space-4) 0 0;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.features {
+  padding: var(--space-6) 0;
+  background: var(--surface-alt);
+  border: 1px solid var(--line);
+  border-radius: calc(var(--radius) + 4px);
+  padding-inline: var(--space-5);
+}
+
+.features h2 {
+  margin: 0 0 var(--space-5);
+  font-size: 1.375rem;
+  letter-spacing: -0.01em;
+}
+
+.features__grid {
+  display: grid;
+  gap: var(--space-4);
+}
+
+.card {
+  padding: var(--space-5);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-md);
+}
+
+.card h3 {
+  margin: 0 0 var(--space-2);
+  font-size: 1.0625rem;
+}
+
+.card p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.site-footer {
+  padding: var(--space-6) var(--space-5);
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.site-footer p {
+  margin: 0 auto;
+  max-width: 68rem;
+}
+
+.site-footer__fine {
+  margin-top: var(--space-2);
+  font-size: 0.8125rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .button {
+    transition: none;
+  }
+}
+
+@media (min-width: 48rem) {
+  .site-header {
+    padding-inline: var(--space-6);
+  }
+
+  main {
+    padding: var(--space-7) var(--space-6);
+  }
+
+  .hero {
+    padding-top: var(--space-7);
+  }
+
+  .features {
+    padding-inline: var(--space-6);
+  }
+
+  .features__grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: var(--space-5);
+  }
+
+  .site-footer {
+    padding-inline: var(--space-6);
+  }
+}

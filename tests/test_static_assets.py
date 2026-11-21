@@ -229,9 +229,14 @@ import re
 
 from fastapi.testclient import TestClient
 
-from coach_web.app import _SIGNIN_SLOT, STATIC_DIR, create_app
+from coach_web.app import STATIC_DIR, create_app
 
 VENDOR_DIR = STATIC_DIR / "vendor"
+
+# The inert identity-bar anchor comment (#180): since #398 the unauthenticated
+# / route serves static/landing.html, so no Python constant reads this marker
+# any more — the literal is pinned here as shipped markup.
+SIGNIN_SLOT_PREFIX = "<!-- #180 signin-slot:"
 
 # The inline plan card template (#82): pinned to the proposing assistant
 # message via planMessageIndex (AC4 — single active card). One literal
@@ -2015,8 +2020,8 @@ class TestFloatingComposerContract:
     3. Height budget: the capsule lives INSIDE the height-bounded .chat
        panel (the pinned-footer mechanism is untouched); the height-budget
        comment carries the honest recomputation.
-    4. _SIGNIN_SLOT: the literal marker comment survives byte-exact
-       (cross-checked against app.py's constant).
+    4. The #180 sign-in marker comment survives byte-exact (an inert anchor
+       since #398 moved unauthenticated visitors to static/landing.html).
 
     app.js behavior is contracted through source assertions (ADR-006 §5 —
     no Node toolchain), same as every stream/composer wiring test above.
@@ -2255,15 +2260,15 @@ class TestFloatingComposerContract:
     # --- AC 1.7: markup invariants --------------------------------------------------
 
     def test_signin_slot_survives_byte_exact(self) -> None:
-        """AC 1.7: the _SIGNIN_SLOT marker survives the redesign byte-exact.
+        """AC 1.7: the #180 sign-in marker survives the redesign byte-exact.
 
-        Cross-checked against app.py's constant (the / route does a literal
-        string replace for the auth landing variant) — drift on either side
-        fails here.
+        The console bundle keeps its identity-bar anchor comment (inert since
+        #398 moved unauthenticated visitors to the landing page) so the
+        auth-disabled byte-parity lane is unchanged.
         """
         html = self._html()
 
-        assert _SIGNIN_SLOT in html
+        assert SIGNIN_SLOT_PREFIX in html
 
     def test_stop_stays_client_side_no_new_server_endpoint(self) -> None:
         """AC 1.7: the stop path adds no fetch target beyond the known API."""

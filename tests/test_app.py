@@ -1,6 +1,5 @@
 """Tests for the Coach Web FastAPI application factory, healthcheck and static serving."""
 
-import re
 import sqlite3
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
@@ -211,53 +210,77 @@ class TestStaticServing:
         assert "Coach Web" in response.text
 
 
-class TestSignInAffordance:
-    """Conditional sign-in affordance on the public landing route (#180).
+class TestLandingPage:
+    """Landing page for unauthenticated visitors on the public route (#398).
 
-    ``/`` is public by design (AC4 #65), but an unauthenticated visitor in an
-    auth-enabled lane previously hit a silent 401 dead-end: the shell offered
-    no path to ``/auth/login``. The route now reads the session cookie with
-    the existing HS256 verification and conditionally injects a "Sign in"
-    link into the identity bar. Fail-safe by contract: any cookie/validation
-    error resolves to the unauthenticated variant — the landing page can
-    never 500.
+    ``/`` is public by design (AC4 #65). The index handler now branches on the
+    verified session cookie: a valid ``cw_session`` keeps today's chat console
+    (avatar + rehydrate opt-in, #319/#351), while an absent, invalid or expired
+    session gets the static landing page (:file:`static/landing.html`) — hero
+    pitch, one Sign in CTA to ``/auth/login``, privacy footer, zero JavaScript
+    and zero external requests. AUTH_ENABLED=false lanes (dev/qa) keep the
+    byte-parity ``FileResponse`` of ``index.html``. Fail-safe by contract: any
+    cookie/validation error resolves to the landing variant — ``/`` can never
+    500.
     """
 
     OWNER_EMAIL = "frederic.pitteloud@gmail.com"
     SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
 
-    # The exact server-injected identity-bar link (no x-show — the banner's
-    # Alpine-gated sign-in action in the static file carries one, so this
-    # exact string is unambiguous between the two surfaces).
-    INJECTED_SIGNIN_LINK = '<a class="signin-link" href="/auth/login">Sign in</a>'
+    SIGNIN_CTA = 'href="/auth/login"'
     SIGNIN_SLOT_PREFIX = "<!-- #180 signin-slot:"
 
     def _session_cookie(self, ttl_seconds: int = 600) -> str:
         """Craft a session token as if issued by a successful login."""
         return create_session_token(self.OWNER_EMAIL, self.SESSION_SECRET, ttl_seconds=ttl_seconds)
 
-    def test_unauthenticated_root_surfaces_signin_link(self, auth_client: TestClient) -> None:
-        """AC1: an unauthenticated visitor gets a visible Sign in affordance."""
+    def test_unauthenticated_root_serves_the_landing_page(self, auth_client: TestClient) -> None:
+        """AC1: no session → the landing page, never the chat console."""
         response = auth_client.get("/")
+        html = response.text
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK in response.text
-        assert self.SIGNIN_SLOT_PREFIX not in response.text
+        assert "text/html" in response.headers["content-type"]
+        assert self.SIGNIN_CTA in html
+        # The console markup never leaks to a visitor without a session.
+        assert '<form class="composer"' not in html
+        assert 'class="identity-bar"' not in html
+        assert "data-conversation-restore=" not in html
+        assert "/static/app.js" not in html
+        assert self.SIGNIN_SLOT_PREFIX not in html
 
-    def test_signin_link_sits_in_the_identity_bar(self, auth_client: TestClient) -> None:
-        """The affordance renders inside the actions group, last visible (#340)."""
+    def test_landing_cta_is_the_only_auth_navigation(self, auth_client: TestClient) -> None:
+        """AC2: exactly one same-origin Sign in link; no logout surface."""
         html = auth_client.get("/").text
 
-        actions_at = html.index('<div class="identity-actions">')
-        link_at = html.index(self.INJECTED_SIGNIN_LINK)
-        actions_close = html.index("</div>", actions_at)
-        assert actions_at < link_at < actions_close
+        assert html.count(self.SIGNIN_CTA) == 1
+        assert "/auth/logout" not in html
+        assert "http://" not in html
+        assert "https://" not in html
 
-        # #340 AC1: the link is the LAST visible element of the actions group.
-        # Trailing HTML comments (the untouched #319 avatar-slot marker) are
-        # not visible elements, and the group's own closing tag is excluded.
-        tail = html[link_at + len(self.INJECTED_SIGNIN_LINK) : actions_close]
-        assert re.findall(r"<(?!!--)[a-zA-Z/]", tail) == []
+    def test_landing_page_loads_only_local_assets(self) -> None:
+        """AC1/security: landing assets reference nothing but same-origin files.
+
+        Grep-level contract (no CDN, no third-party fonts, no trackers — the
+        Swiss nLPD no-tracking posture) and no script at all: the page is
+        inert HTML + one local stylesheet.
+        """
+        html = (STATIC_DIR / "landing.html").read_text(encoding="utf-8")
+        css = (STATIC_DIR / "landing.css").read_text(encoding="utf-8")
+
+        for asset in (html, css):
+            assert "http://" not in asset
+            assert "https://" not in asset
+        assert "<script" not in html.lower()
+        assert "@import" not in css.lower()
+        assert 'href="/static/landing.css"' in html
+
+    def test_landing_stylesheet_is_served_publicly(self, auth_client: TestClient) -> None:
+        """The stylesheet rides the existing public /static mount."""
+        response = auth_client.get("/static/landing.css")
+
+        assert response.status_code == 200
+        assert "text/css" in response.headers["content-type"]
 
     def test_authenticated_root_renders_the_fallback_avatar(self, auth_client: TestClient) -> None:
         """#319 supersedes byte-for-byte: a signed-in session renders the avatar.
@@ -273,11 +296,24 @@ class TestSignInAffordance:
         response = auth_client.get("/")
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK not in response.text
+        assert 'href="/static/landing.css"' not in response.text
         assert self.SIGNIN_SLOT_PREFIX in response.text
         assert '<span class="avatar avatar--fallback"' in response.text
         assert 'title="frederic.pitteloud@gmail.com"' in response.text
         assert ">F</span>" in response.text
+
+    def test_authenticated_root_serves_the_console(self, auth_client: TestClient) -> None:
+        """AC3: a valid session gets today's console, not the landing page."""
+        auth_client.cookies.set(SESSION_COOKIE, self._session_cookie())
+
+        response = auth_client.get("/")
+        html = response.text
+
+        assert response.status_code == 200
+        assert 'class="identity-bar"' in html
+        assert '<form class="composer"' in html
+        assert 'data-conversation-restore="true"' in html
+        assert 'href="/static/landing.css"' not in html
 
     def test_auth_disabled_root_is_unchanged(self) -> None:
         """AC3: AUTH_ENABLED=false lanes (dev/qa) render exactly as today."""
@@ -285,39 +321,88 @@ class TestSignInAffordance:
             response = client.get("/")
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK not in response.text
+        assert 'href="/static/landing.css"' not in response.text
         assert self.SIGNIN_SLOT_PREFIX in response.text
         assert response.text == (STATIC_DIR / "index.html").read_text(encoding="utf-8")
 
     def test_invalid_session_cookie_fails_safe(self, auth_client: TestClient) -> None:
-        """A malformed cookie renders the unauthenticated variant — never a 500."""
+        """AC4: a malformed cookie renders the landing page — never a 500."""
         auth_client.cookies.set(SESSION_COOKIE, "not-a-jwt")
 
         response = auth_client.get("/")
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK in response.text
+        assert self.SIGNIN_CTA in response.text
 
     def test_expired_session_cookie_fails_safe(self, auth_client: TestClient) -> None:
-        """An expired session renders the unauthenticated variant."""
+        """AC4: an expired session renders the landing page."""
         auth_client.cookies.set(SESSION_COOKIE, self._session_cookie(ttl_seconds=-10))
 
         response = auth_client.get("/")
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK in response.text
+        assert self.SIGNIN_CTA in response.text
 
-    def test_signin_variant_keeps_the_page_contract(self, auth_client: TestClient) -> None:
-        """The injected variant is the same page: brand, identity bar, composer."""
+    def test_landing_page_carries_the_exact_policy(self, auth_client: TestClient) -> None:
+        """CSP untouched: the ASGI wrapper stamps the exact policy on it too."""
         response = auth_client.get("/")
-        html = response.text
 
-        assert "Coach Web" in html
-        assert 'class="identity-bar"' in html
-        assert '<form class="composer"' in html
-        # CSP untouched (#180 constraint): the ASGI wrapper stamps the exact
-        # policy on the injected variant too.
         assert response.headers["content-security-policy"] == CSP_POLICY
+
+
+class TestLandingAssets:
+    """Content and presentation contract of the landing assets (#398 AC5)."""
+
+    def _html(self) -> str:
+        return (STATIC_DIR / "landing.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "landing.css").read_text(encoding="utf-8")
+
+    def test_landing_page_is_semantic_html5(self) -> None:
+        """Semantic landmarks, one h1 and a mobile viewport declaration."""
+        html = self._html()
+
+        for landmark in ("<header", "<main", "<footer", "<h1"):
+            assert landmark in html
+        assert '<meta name="viewport" content="width=device-width, initial-scale=1"' in html
+        assert html.count("<h1") == 1
+        assert 'lang="en"' in html
+
+    def test_landing_page_presents_the_product(self) -> None:
+        """Hero pitch, three feature cards (plans, approval, debrief)."""
+        html = self._html()
+
+        assert "AI endurance coach" in html
+        assert html.lower().count("<article") == 3
+        assert "approval" in html.lower()
+        assert "debrief" in html.lower()
+
+    def test_landing_footer_states_the_privacy_posture(self) -> None:
+        """nLPD, encryption at rest and the Swiss residency footnote."""
+        footer = self._html()
+        footer = footer[footer.index("<footer") :]
+
+        assert "nLPD" in footer
+        assert "encrypted at rest" in footer
+        assert "europe-west6" in footer
+
+    def test_landing_styles_are_system_font_only_and_tokenized(self) -> None:
+        """System font stack, CSS custom properties, no webfont fetch."""
+        css = self._css().lower()
+
+        assert "system-ui" in css
+        assert ":root" in css
+        assert "--" in css
+        assert "@font-face" not in css
+        assert "url(" not in css
+
+    def test_landing_styles_are_mobile_first(self) -> None:
+        """Base rules target small screens; a min-width query scales up."""
+        css = self._css().lower()
+
+        assert "@media (min-width:" in css
+        assert "@media (max-width:" not in css
 
 
 class TestProfileAvatarContract:
@@ -337,7 +422,6 @@ class TestProfileAvatarContract:
     SESSION_SECRET = "unit-test-session-signing-key-0123456789abcdef"  # noqa: S105
     PROFILE_NAME = "Frederic Pitteloud"
     PICTURE_URL = "https://lh3.googleusercontent.com/a/photo-id"
-    INJECTED_SIGNIN_LINK = '<a class="signin-link" href="/auth/login">Sign in</a>'
 
     def _session_cookie(
         self, name: str | None = None, picture: str | None = None, ttl_seconds: int = 600
@@ -426,11 +510,11 @@ class TestProfileAvatarContract:
         assert 'title="Eve&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;"' in response.text
 
     def test_unauthenticated_root_renders_no_avatar(self, auth_client: TestClient) -> None:
-        """AC3: the unauthenticated variant is unchanged — no avatar markup."""
+        """AC3: the unauth landing page carries no avatar markup (#398)."""
         response = auth_client.get("/")
 
         assert response.status_code == 200
-        assert self.INJECTED_SIGNIN_LINK in response.text
+        assert 'href="/auth/login"' in response.text
         assert 'class="avatar' not in response.text
 
 
