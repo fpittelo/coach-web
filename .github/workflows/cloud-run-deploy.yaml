@@ -644,8 +644,11 @@ jobs:
       # (re-)grant would surface run.services.getIamPolicy / update / delete
       # (all run.admin signature permissions) on the PROJECT resource, while
       # the resource-scoped binding grants them only on the service itself.
-      # Steady state: an EMPTY permissions array. Fail-closed: an API error
-      # or an unexpected response also fails the run.
+      # Steady state: an EMPTY result — Resource Manager v3 serializes it as
+      # `{}` (the repeated `permissions` field is omitted when empty), so
+      # exactly `{}` is accepted as the healthy steady state (issue #390
+      # reopen, cyber verification comment 7060731941). Fail-closed: an API
+      # error or any unexpected response also fails the run.
       - name: Assert no project-level run.admin on the deploy SA (AC3, Amendment 0002)
         run: |
           set -euo pipefail
@@ -661,9 +664,18 @@ jobs:
           except Exception:
               print("::error::AC3 gate: TestIamPermissions returned a non-JSON response — failing closed (check API availability / auth).")
               sys.exit(1)
-          held = raw.get("permissions")
-          if not isinstance(held, list):
-              print("::error::AC3 gate: unexpected TestIamPermissions response (no permissions list): " + json.dumps(raw)[:300])
+          # Minimal safe shape per cyber verification (comment 7060731941):
+          # ONLY exactly `{}` is the healthy empty steady state (v3 omits the
+          # repeated `permissions` field when empty); ONLY a dict whose sole
+          # key is `permissions` with a list value is parsed. EVERY other
+          # shape — API-error objects (key `error`), unexpected keys, non-dict
+          # bodies, non-list `permissions` — fails closed.
+          if raw == {}:
+              held = []
+          elif isinstance(raw, dict) and set(raw) == {"permissions"} and isinstance(raw["permissions"], list):
+              held = raw["permissions"]
+          else:
+              print("::error::AC3 gate: unexpected TestIamPermissions response shape — failing closed: " + json.dumps(raw)[:300])
               sys.exit(1)
           if held:
               print("::error::AC3 violation: the deploy SA holds project-level run.* permissions " + json.dumps(held) + " on the project — the run.admin grant must be resource-scoped on the coach-web service ONLY (MADR-0027 Amendment 0002 D2; remove the project-level binding per docs/admin_guide.md → Amendment 0002 deltas).")
