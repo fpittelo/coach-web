@@ -120,15 +120,20 @@ class TestLoginRedirect:
         assert response.cookies["cw_oidc_state"] == state_param
 
     def test_login_uses_explicit_redirect_uri(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """AUTH_REDIRECT_URI overrides the request-derived redirect URI."""
+        """AUTH_REDIRECT_URI overrides the request-derived redirect URI.
+
+        The client enters on the canonical host (#406): the canonical-host
+        middleware would otherwise 302 the login to that origin first.
+        """
         monkeypatch.setenv("AUTH_ENABLED", "true")
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_ID", CLIENT_ID)
         monkeypatch.setenv("GOOGLE_OIDC_CLIENT_SECRET", "test-client-secret")
         monkeypatch.setenv("AUTH_SESSION_SECRET", SESSION_SECRET)
         monkeypatch.setenv("AUTH_REDIRECT_URI", "https://coach.example.ch/auth/callback")
+        monkeypatch.setenv("TRUSTED_HOSTS", '["coach.example.ch"]')
         get_settings.cache_clear()
 
-        with TestClient(create_app(get_settings()), base_url="https://testserver") as client:
+        with TestClient(create_app(get_settings()), base_url="https://coach.example.ch") as client:
             response = client.get("/auth/login", follow_redirects=False)
 
         assert "redirect_uri=https%3A%2F%2Fcoach.example.ch%2Fauth%2Fcallback" in (
