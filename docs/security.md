@@ -81,6 +81,41 @@ graph LR
 
 ---
 
+## Cloud Run Zero-Trust Access & Edge Posture (MADR-0027; verified #317)
+
+The production deployment on Cloud Run (project `coach-web-509209`, `europe-west6`, always-on scale-to-zero — MADR-0021 hybrid model + MADR-0027) enforces access through **two independent, fail-closed layers**; the app-level gate is never the sole control:
+
+- **Layer 1 — IAP platform edge (MADR-0027 D2):** `roles/iap.httpsResourceAccessor` is bound to `frederic.pitteloud@gmail.com` and the WIF deploy SA (smoke identity) **only**; Cloud Run invoker is granted to the IAP service agent alone, so the app cannot be reached by bypassing IAP. Unauthenticated requests are redirected to Google sign-in (302) or rejected (403) before the application; any identity outside the binding is rejected at the edge.
+- **Layer 2 — in-app OIDC whitelist (defense-in-depth):** `AUTH_ENABLED=true`, `AUTH_WHITELIST_EMAILS='["frederic.pitteloud@gmail.com"]'`; enforced at login and re-checked on every authenticated request; an empty/none whitelist rejects everyone (fail closed).
+
+### Verified access matrix (live, 2026-11-21 — full transcript on issue #317)
+
+| Probe | Expected | Observed |
+|:---|:---|:---|
+| Unauthenticated `GET /`, `/api/*`, `/health` | 302 → Google sign-in (IAP edge; app never reached) | 302 + `x-goog-iap-generated-response: true` |
+| Unauthenticated spoofed `Host` (`evil.example.com`, `localhost`) | never routed to the service | GFE edge 404 |
+| Authorized `GET /health` (deploy-SA ID token, no app session) | 200 | 200 (#316 deploy smoke) |
+| Authorized `GET /api/*` (IAP pass, no app session) | 401 (app boundary) | 401 (#316 smoke + request logs) |
+| PO browser OIDC login → session | session issued, API 200s | `/auth/login` 302 → `/auth/callback` 302 → 200s on `/`, `/api/*` (request logs) |
+| Any other Google identity | 403 at IAP edge | policy audit: 2 bound principals; app whitelist fail-closed proven by unit tests + live config audit |
+
+### Edge posture (MADR-0027 D4)
+
+- **`FORWARDED_ALLOW_IPS=*`:** safe under Cloud Run because the Google Frontend is the **only** ingress path to the container (IAP-gated); uvicorn therefore trusts the platform proxy's `X-Forwarded-Proto: https` for correct redirect URIs. The Dockerfile default stays `127.0.0.1,::1` — local lanes unchanged (#112).
+- **`TRUSTED_HOSTS='["*.run.app"]'`:** the app-level host allowlist (DNS-rebinding mitigation, #112) is retained behind IAP as defense-in-depth — a spoofed Host reaching the app is rejected with 400. Exact paths `/health`, `/healthz` are probe-only exemptions (exact-match, no traversal bypass, #316).
+- **Scratch persistence (D3):** tmpfs `/data`, per-instance; durable SSOTs remain Intervals.icu + GitHub (#190).
+
+### Secret scoping (MADR-0027 Amendment 0001; audited #317)
+
+| Principal | Grants | Explicitly absent |
+|:---|:---|:---|
+| `coach-web-runtime` (service identity) | per-secret `secretmanager.secretAccessor` on exactly the 6 secrets | any project-level role — no project-wide accessor, no invoker/IAP/IAM-mutation; SA-token minting denied to callers |
+| `coach-web-deployer` (deploy identity) | `run.admin`, `iap.admin`, `serviceusage.serviceUsageConsumer`; per-secret `secretmanager.viewer` (metadata only) | every payload-accessor grant (removed by Amendment 0001) |
+
+Each container receives only the secrets it needs (coach-web: 4 app secrets; coach-mcp: `INTERVALS_API_KEY`; github-mcp: `GITHUB_TOKEN`) — the app process cannot see the sidecar credentials (live revision env audit, #317). The retired v0.6.0 cloud appendix below is the historical record only; the current topology is this section plus MADR-0027.
+
+---
+
 ## Secret Boundaries
 
 | Secret | Location (ADR-007 local-first) | Never in |
@@ -348,7 +383,7 @@ Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-eval'; st
 
 ## Historical Appendix — v0.6.0 Cloud Run STRIDE Model (retired)
 
-> **⚠️ Historical record only.** The model below is the authoritative STRIDE analysis of the **retired v0.6.0 Cloud Run topology**. The GCP platform is decommissioned (#111); it is retained here so the release's analysis is not lost. Do not use it as the current threat model — see the Local Topology model above.
+> **⚠️ Historical record only.** The model below is the authoritative STRIDE analysis of the **retired v0.6.0 Cloud Run topology** (unauthenticated edge). It is retained here so the release's analysis is not lost. Do not use it as the current threat model — the current Cloud Run production topology (IAP edge + OIDC whitelist, MADR-0027) is documented in "Cloud Run Zero-Trust Access & Edge Posture" above; for the local baseline see the Local Topology model.
 
 <details>
 <summary>Click to expand the retired v0.6.0 Cloud Run STRIDE analysis (issue #68)</summary>
@@ -561,4 +596,4 @@ Current acceptances (2026-11-14): 8 unfixed debian 13.7 (trixie) OS packages in 
 
 ---
 
-_Last updated: 2026-11-14 (issue #351 — accepted-risk register re-triaged after the trivy DB refresh: 3 unfixed `libsqlite3-0` CVEs time-boxed to 2027-01-03, the fixable zlib1g pair patched in the image build instead of accepted, pcre2 retired; prior: issue #319 — img-src allowlists `https://*.googleusercontent.com` as the single remote-origin exception, **policy-wide**: sanitized markdown images load from it too, residual narrowed-not-closed and accepted at n=1 — see B9/CSP posture; avatar fetched with `referrerpolicy="no-referrer"`; prior: issue #297 — backup boundary B11 added + nLPD row #3 refreshed for the #296 encrypted backup; prior: issue #148 — CSP stamped outside the whole ASGI stack incl. unhandled-exception 500s, SSE/401 CSP regression pins, B10 C6/C7 recorded IMPLEMENTED; prior: issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
+_Last updated: 2026-11-21 (issue #317 — "Cloud Run Zero-Trust Access & Edge Posture" section added: two-layer IAP + OIDC-whitelist matrix verified live on `coach-web-509209`, secret-scoping audit per MADR-0027 Amendment 0001, retired v0.6.0 appendix pointer refreshed; prior: issue #351 — accepted-risk register re-triaged after the trivy DB refresh: 3 unfixed `libsqlite3-0` CVEs time-boxed to 2027-01-03, the fixable zlib1g pair patched in the image build instead of accepted, pcre2 retired; prior: issue #319 — img-src allowlists `https://*.googleusercontent.com` as the single remote-origin exception, **policy-wide**: sanitized markdown images load from it too, residual narrowed-not-closed and accepted at n=1 — see B9/CSP posture; avatar fetched with `referrerpolicy="no-referrer"`; prior: issue #297 — backup boundary B11 added + nLPD row #3 refreshed for the #296 encrypted backup; prior: issue #148 — CSP stamped outside the whole ASGI stack incl. unhandled-exception 500s, SSE/401 CSP regression pins, B10 C6/C7 recorded IMPLEMENTED; prior: issue #84 — CSP middleware shipped (C2/C5) & B9 refreshed to the implemented #81 state; prior: issue #87 — v0.7 STRIDE addendum: untrusted-content→DOM sanitization (B9), client-owned replayed history (B10), CSP posture; prior: issue #113 local-topology STRIDE rewrite)_
