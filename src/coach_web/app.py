@@ -46,8 +46,10 @@ from coach_web.agent_settings import (
 )
 from coach_web.analysis import WeekAdherenceMetric
 from coach_web.auth.middleware import (
+    PROBE_EXEMPT_PATHS,
     SESSION_COOKIE,
     AuthMiddleware,
+    CanonicalHostMiddleware,
     validate_auth_config,
 )
 from coach_web.auth.router import router as auth_router
@@ -547,7 +549,7 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
 
 
-HEALTH_PROBE_PATHS = frozenset({"/health", "/healthz"})
+HEALTH_PROBE_PATHS = PROBE_EXEMPT_PATHS
 """Exact paths exempt from trusted-host validation (#316, probe-only).
 
 The Cloud Run startup HTTP probe sends a Host header outside TRUSTED_HOSTS
@@ -632,6 +634,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # is enforced before any route, mount or CORS logic runs.
         application.include_router(auth_router)
         application.add_middleware(AuthMiddleware)
+
+    # Canonical entry (#406, architect ruling part 2): Cloud Run serves the
+    # app under two URL families while the OIDC state cookie is host-scoped
+    # (#339 class). Any non-canonical entry is 302-redirected to the same path
+    # on the AUTH_REDIRECT_URI origin BEFORE auth runs, so a login can only
+    # start on the host that receives the callback. Added after AuthMiddleware
+    # => inside it (no 401 before the redirect) and before the host allowlist
+    # => inside it (a bad Host still 400s; no open redirector). Fail-safe:
+    # unset/invalid AUTH_REDIRECT_URI or AUTH_ENABLED=false => no redirect.
+    application.add_middleware(CanonicalHostMiddleware)
 
     # Host allowlist (DNS-rebinding mitigation, #112): a malicious page that
     # resolves a hostname to 127.0.0.1 must not reach the loopback service
