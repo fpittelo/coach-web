@@ -1,0 +1,72 @@
+<!doctype html>
+<!-- Public landing page for unauthenticated visitors (#398).
+     Fully static: no JavaScript, no external requests, same-origin assets
+     only (Swiss nLPD no-tracking posture, CSP 'self'). -->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Coach Web — your AI endurance coach</title>
+    <meta
+      name="description"
+      content="An AI endurance coach for structured weekly plans, human approval gates and encrypted post-session debriefs."
+    />
+    <link rel="stylesheet" href="/static/landing.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <p class="wordmark">
+        <svg class="wordmark__mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="3" />
+          <path d="M16 7v9l6 4" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" />
+        </svg>
+        <span>Coach Web</span>
+      </p>
+    </header>
+
+    <main>
+      <section class="hero" aria-labelledby="hero-title">
+        <p class="eyebrow">Personal endurance coaching</p>
+        <h1 id="hero-title">An AI endurance coach that asks before it acts.</h1>
+        <p class="lede">
+          Weekly training plans drawn from your Intervals.icu data, a human approval gate on
+          every change, and encrypted post-session debriefs — together in one calm cockpit.
+        </p>
+        <a class="button" href="/auth/login">Sign in</a>
+        <p class="hero__note">Private by design: your data never leaves your own account.</p>
+      </section>
+
+      <section class="features" aria-labelledby="features-title">
+        <h2 id="features-title">Built around your judgement</h2>
+        <div class="features__grid">
+          <article class="card">
+            <h3>Weekly plan proposals</h3>
+            <p>
+              Your fitness, fatigue and form become a structured week of intervals, with explicit
+              warm-up, sets, recovery and wind-down durations and wattage.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Human approval gates</h3>
+            <p>
+              Nothing is written to your calendar until you approve it. Every proposal is a draft
+              you review, adjust or reject — the coach never overrides you.
+            </p>
+          </article>
+          <article class="card">
+            <h3>Encrypted debriefs</h3>
+            <p>
+              After each session the coach reads the numbers, then asks how it felt. Your RPE and
+              notes are stored encrypted at rest and stay scoped to you.
+            </p>
+          </article>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <p>Swiss nLPD · encrypted at rest · europe-west6 residency</p>
+      <p class="site-footer__fine">No trackers, no third-party requests, no cookies on this page.</p>
+    </footer>
+  </body>
+</html>

@@ -1,7 +1,7 @@
 # 📗 User Guide — Coach Web
 
 **Audience:** @fpittelo (Athlete & Product Owner)  
-**Last updated:** 2026-09-05
+**Last updated:** 2026-11-21
 
 ---
 
@@ -20,11 +20,22 @@
 # (in the coach repo):
 # docker run -d --rm -p 8000:8000 -e MCP_TRANSPORT=streamable_http -e INTERVALS_API_KEY=xxx ghcr.io/fpittelo/coach:latest
 
-# Start Coach Web
-streamlit run src/coach_web/app.py --server.port 8501
+# Start Coach Web (FastAPI + uvicorn, binds APP_PORT — default 8000)
+uv run coach-web
 ```
 
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+**What you see on arrival (landing page):** an unauthenticated visit to
+[http://localhost:8000](http://localhost:8000) now presents a **landing page** —
+the product pitch (weekly plan proposals, human approval gates, encrypted
+post-session debriefs) plus a single **Sign in** button. The chat console is no
+longer shown to visitors without a session.
+
+**Signing in:** click **Sign in** → you are redirected to Google (OIDC) → after
+consent you land back on the console. In dev/qa lanes (`AUTH_ENABLED=false`) the
+route skips the landing page and serves the console directly, exactly as before.
+
+When you use the avatar menu to **sign out**, you land back on the landing page —
+ready to sign in again.
 
 ---
 
