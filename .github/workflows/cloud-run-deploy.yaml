@@ -33,6 +33,11 @@ name: Cloud Run Production Deploy
 #   - deploy SA: roles/run.admin RESOURCE-SCOPED on the coach-web service
 #     (MADR-0027 Amendment 0002 — the former project-level binding is
 #     removed; docs/admin_guide.md → Amendment 0002 deltas)
+#   - deploy SA: roles/resourcemanager.viewer PROJECT-LEVEL (Amendment 0002
+#     delta addendum, #407 ruling — the `gcloud iap web …` step performs a
+#     project-level Resource Manager lookup previously supplied by the
+#     removed project-level run.admin; the role holds exactly
+#     resourcemanager.projects.get + projects.list and zero write surface)
 #   - Actions variable GOOGLE_OIDC_CLIENT_ID (app-level OAuth client ID)
 # ---------------------------------------------------------------------------
 
@@ -57,6 +62,11 @@ env:
   GCP_PROJECT: coach-web-509209
   GCP_REGION: europe-west6
   SERVICE: coach-web
+  # Project number of GCP_PROJECT (the same number embedded in WIF_PROVIDER):
+  # derives the deterministic second Cloud Run serving URL host
+  # ${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app (#406 ruling —
+  # Cloud Run serves BOTH URL families; see the render step).
+  GCP_PROJECT_NUMBER: 853194930683
   DEPLOY_SA: coach-web-deployer@coach-web-509209.iam.gserviceaccount.com
   # Runtime identity of the service (MADR-0027 Amendment 0001): holds ONLY
   # the six per-secret secretAccessor bindings — no invoker, no IAP, no
@@ -220,22 +230,30 @@ jobs:
         run: |
           set -euo pipefail
           if [ -n "${EXISTING_URL}" ]; then
-            cors_json="[\"${EXISTING_URL}\"]"
+            # C3 (#396, corrected per #406 ruling comment 7061551550): Cloud
+            # Run serves the service under TWO URL families — the primary
+            # per-service hash form (status.address.url, scraped from the
+            # pre-deploy describe in step `pre`) AND the deterministic
+            # project-number form
+            # ${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app. The
+            # exact-match posture is preserved: BOTH served hosts are
+            # enumerated explicitly — no wildcard in steady state. The
+            # scraped URL stays canonical: AUTH_REDIRECT_URI is pinned to it
+            # (single OIDC callback — Google requires exact redirect_uri
+            # match), and it is the first CORS origin.
+            primary_host="${EXISTING_URL#https://}"
+            number_host="${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
+            cors_json="[\"${EXISTING_URL}\",\"https://${number_host}\"]"
             redirect_uri="${EXISTING_URL}/auth/callback"
-            # C3 (#396): the Cloud Run URL carries a stable per-service hash
-            # that is NOT derivable statically — scrape the live URL (from
-            # the pre-deploy describe, step `pre`) and pin the exact hostname
-            # instead of the shared '*.run.app' wildcard (which matches every
-            # Cloud Run service of every GCP project).
-            trusted_hosts="[\"${EXISTING_URL#https://}\"]"
+            trusted_hosts="[\"${primary_host}\",\"${number_host}\"]"
           else
             cors_json='["https://pending-first-deploy.run.app"]'
             redirect_uri="https://pending-first-deploy.run.app/auth/callback"
             # Bootstrap fallback ONLY (service — and its hash-bearing URL —
             # does not exist yet): the wildcard is replaced with the exact
-            # host by the first-deploy sync step before the smoke checks
-            # (#396 C3). The steady-state deploy path always pins the exact
-            # host.
+            # host list by the first-deploy sync step before the smoke checks
+            # (#396 C3, #406). The steady-state deploy path always pins the
+            # exact hosts.
             trusted_hosts='["*.run.app"]'
           fi
           cat > "${RUNNER_TEMP}/service.yaml" <<YAML
@@ -463,10 +481,11 @@ jobs:
       # exists — sync the origin-derived env vars onto the service (a second
       # revision). Steady-state deploys already carry the correct values in
       # the rendered YAML, so this step is skipped. TRUSTED_HOSTS rides along
-      # (#396 C3): the bootstrap render carries the '*.run.app' wildcard
+      # (#396 C3, #406): the bootstrap render carries the '*.run.app' wildcard
       # fallback (the hash-bearing URL does not exist yet); the sync replaces
-      # it with the exact host before the smoke checks and the C2/C3
-      # read-back gate run.
+      # it with the exact two-host list (scraped primary + deterministic
+      # project-number form) before the smoke checks and the C2/C3 read-back
+      # gate run.
       - name: Sync origin-derived env vars (first deploy)
         if: steps.pre.outputs.url == ''
         run: |
@@ -474,9 +493,11 @@ jobs:
           url="$(gcloud run services describe "${SERVICE}" \
             --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
             --format='value(status.address.url)')"
+          primary_host="${url#https://}"
+          number_host="${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app"
           gcloud run services update "${SERVICE}" \
             --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
-            --update-env-vars="CORS_ORIGINS=[\"${url}\"],AUTH_REDIRECT_URI=${url}/auth/callback,TRUSTED_HOSTS=[\"${url#https://}\"]"
+            --update-env-vars="CORS_ORIGINS=[\"${url}\",\"https://${number_host}\"],AUTH_REDIRECT_URI=${url}/auth/callback,TRUSTED_HOSTS=[\"${primary_host}\",\"${number_host}\"]"
 
       # C2/C3 (#396 — cyber sign-off conditions, #317 comment 7059788814):
       # read the DEPLOYED coach-web container env back from the service
@@ -486,11 +507,14 @@ jobs:
       #     origin — auth/router.py falls back to request.base_url when the
       #     setting is empty, a path influenceable under FORWARDED_ALLOW_IPS=*
       #     (#317 C2; today the value is pinned — the gate keeps it pinned).
-      #   - TRUSTED_HOSTS must be exactly the service hostname — the shared
-      #     '*.run.app' wildcard is permitted only for the bootstrap render
-      #     before the service exists and never survives to this gate
-      #     (#317 C3; verified live in #317 that a spoofed Host is dropped by
-      #     the GFE, so this stays defence-in-depth).
+      #   - TRUSTED_HOSTS must be exactly the two served hostnames — the
+      #     scraped primary hash form AND the deterministic project-number
+      #     form (Cloud Run serves both URL families; #406 ruling comment
+      #     7061551550). The shared '*.run.app' wildcard is permitted only
+      #     for the bootstrap render before the service exists and never
+      #     survives to this gate (#317 C3; verified live in #317 that a
+      #     spoofed Host is dropped by the GFE, so this stays
+      #     defence-in-depth).
       - name: Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)
         run: |
           set -euo pipefail
@@ -500,7 +524,8 @@ jobs:
           gcloud run services describe "${SERVICE}" \
             --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
             --format='json(spec.template.spec.containers)' \
-          | SERVICE_URL="${url}" python3 -c '
+          | SERVICE_URL="${url}" \
+            NUMBER_HOST="${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app" python3 -c '
           import json, os, sys
           from urllib.parse import urlparse
           raw = json.load(sys.stdin)
@@ -514,6 +539,7 @@ jobs:
               sys.exit(1)
           origin = os.environ["SERVICE_URL"].rstrip("/")
           host = urlparse(origin).hostname
+          number_host = os.environ["NUMBER_HOST"]
           redirect = env.get("AUTH_REDIRECT_URI", "")
           trusted = env.get("TRUSTED_HOSTS", "")
           failed = False
@@ -521,12 +547,17 @@ jobs:
           if not redirect_ok:
               print("::error::C2 violation: deployed AUTH_REDIRECT_URI=" + json.dumps(redirect) + " must be a https URL on the service origin (" + origin + "/auth/callback) — an empty or drifted value lets auth/router.py fall back to request.base_url, influenceable under FORWARDED_ALLOW_IPS=* (#317 C2).")
               failed = True
-          if trusted != json.dumps([host]):
-              print("::error::C3 violation: deployed TRUSTED_HOSTS=" + json.dumps(trusted) + " must be exactly " + json.dumps([host]) + " — the shared *.run.app wildcard matches every Cloud Run service of every GCP project (#317 C3; permitted only for the bootstrap render before the service exists).")
+          expected_hosts = [host, number_host]
+          # Compact JSON separators — the rendered env value is bash-built
+          # ("[a,b]") while default json.dumps would emit "[a, b]" (space
+          # after the comma), a false drift the single-host form never
+          # exposed (no separator in a one-element list).
+          if trusted != json.dumps(expected_hosts, separators=(",", ":")):
+              print("::error::C3 violation: deployed TRUSTED_HOSTS=" + json.dumps(trusted) + " must be exactly " + json.dumps(expected_hosts) + " — the shared *.run.app wildcard matches every Cloud Run service of every GCP project (#317 C3; permitted only for the bootstrap render before the service exists; both served URL forms enumerated per the #406 ruling).")
               failed = True
           if failed:
               sys.exit(1)
-          print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact service hostname.")
+          print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact two-host served list (primary hash form + project-number form).")
           '
 
       # D4 (MADR-0027 Amendment 0002, issue #390) — post-deploy drift guard:
