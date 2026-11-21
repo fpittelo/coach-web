@@ -1,0 +1,233 @@
+name: Deep Validation
+
+# MADR-0028 deep-validation contract for coach-web: a durable `deep-validation`
+# commit status must exist on every trunk (main) head sha and every release-tag
+# sha, so the release gate can verify the DV signal without relying on deletable
+# workflow-run records. coach-web never implemented this contract (0 contexts on
+# all recent trunk heads); this workflow ports the minimal slice of the
+# fpittelo/opencode-home-config deep-validation.yml that coach-web's CI does NOT
+# already cover (@architect ruling: executes the already-accepted MADR-0028
+# decision, KIS scope, no new MADR).
+#
+# Triggers:
+#   - push to main (= every trunk merge): posts the DV status on the head sha.
+#   - push of a release tag v* (= every tag-from-trunk release, MADR-0017):
+#     posts the DV status on the tagged sha at release time.
+#   - workflow_dispatch: manual on-demand run on an arbitrary ref/sha (used to
+#     backfill the status on a pre-tag sha, e.g. right before cutting a tag).
+#
+# Explicitly NOT included here (already gated on every PR and trunk push by
+# ci.yaml, 5/5 green — do not duplicate): test/lint/mypy/pytest, docker build,
+# compose lanes, full-history gitleaks, pip-audit, trivy image scan.
+#
+# This workflow never gates PRs and must NOT be added to branch-protection
+# required checks: it is the durable DV SIGNAL of the release gate, not a merge
+# gate.
+#
+# record-run-status posts a legacy commit status on github.sha — statuses live
+# outside the deletable run records, so the verdict survives run deletion
+# (same mechanism as the config repo, #449). statuses: write is the marginal
+# permission needed; the principal able to edit this workflow file can already
+# forge a status, so the risk sits inside the existing trust boundary.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-render-validation:
+    name: Docs Render Validation (mermaid render, relative links)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Pull published docs-validator image (digest-pinned)
+        # Digest-pinned (tag alone is mutable — #142 A5). The digest is the OCI
+        # image index of ghcr.io/fpittelo/harness-docs-validator, identical to
+        # the pin used by the config-repo deep-validation workflow; refresh it
+        # there first, then here. No build fallback: coach-web does not carry
+        # the validator Dockerfile (KIS — the org image is the SSOT).
+        run: |
+          docker pull ghcr.io/fpittelo/harness-docs-validator@sha256:92770b9c4df72106912c195cb230ee66bb4267a5aa607b8d77cfdc981c3074ca
+
+      - name: Run docs validation in hardened container
+        # Identical hardening to the config-repo docs-render-validation job:
+        # read-only rootfs, non-root UID 1000, no capabilities,
+        # no-new-privileges, no network, resource caps, tmpfs /tmp. The
+        # validator is invoked inline (this repo has no
+        # harness/docs-validation checkout) and mirrors
+        # run_docs_validation.sh semantics for coach-web's mermaid-bearing
+        # doc set: render-level mermaid validation via the image's pinned
+        # mmdc, plus relative-link validation. python3 reads the validator
+        # from stdin (docker -i); /tmp is the only writable path — mmdc
+        # outputs and XDG state live there.
+        run: |
+          docker run -i --rm \
+            --read-only \
+            --user 1000:1000 \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            --network=none \
+            --memory=4g --memory-swap=4g \
+            --cpus=2.0 \
+            --tmpfs /tmp:noexec,nosuid,size=1g \
+            -v "$PWD:/workspace:ro" \
+            -w /workspace \
+            ghcr.io/fpittelo/harness-docs-validator@sha256:92770b9c4df72106912c195cb230ee66bb4267a5aa607b8d77cfdc981c3074ca \
+            python3 - <<'PY'
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          from pathlib import Path
+
+          # The mermaid-bearing doc set (contract-pinned): a renamed/removed
+          # file fails the job so the pin cannot silently go stale.
+          DOCS = (
+              "docs/specifications.md",
+              "docs/architecture.md",
+              "docs/security.md",
+          )
+          FENCE_RE = re.compile(r"^ {0,3}(`{3,})(.*)$")
+          LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
+          MMDC_TIMEOUT_S = 120
+
+          root = Path("/workspace")
+          failures = []
+
+          # --- [1/2] relative link validation --------------------------------
+          for name in DOCS:
+              path = root / name
+              if not path.is_file():
+                  failures.append(f"missing doc file: {name}")
+                  continue
+              for target in LINK_RE.findall(path.read_text(encoding="utf-8")):
+                  if target.startswith(("http://", "https://", "mailto:", "#")):
+                      continue
+                  rel = target.split("#", 1)[0].strip()
+                  if rel and not (path.parent / rel).resolve().exists():
+                      failures.append(f"{name}: broken relative link -> {target}")
+
+          # --- [2/2] mermaid render validation (mmdc, render-level) ----------
+          if shutil.which("mmdc") is None:
+              print(
+                  "error: mmdc not found in PATH - the docs-validator image "
+                  "guarantees it",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          def extract_mermaid(text: str) -> list[str]:
+              """Extract fenced mermaid blocks, tracking all fences so blocks
+              nested inside other fenced blocks are never extracted."""
+              blocks: list[str] = []
+              fence_len: int | None = None
+              capturing = False
+              body: list[str] = []
+              for line in text.splitlines():
+                  m = FENCE_RE.match(line)
+                  if fence_len is None:
+                      if m:
+                          fence_len = len(m.group(1))
+                          info = m.group(2).strip().split()
+                          capturing = bool(info) and info[0] == "mermaid"
+                          if capturing:
+                              body = []
+                  elif m and len(m.group(1)) >= fence_len and not m.group(2).strip():
+                      if capturing:
+                          blocks.append("\n".join(body))
+                      fence_len, capturing = None, False
+                  elif capturing:
+                      body.append(line)
+              return blocks
+
+          total = 0
+          with tempfile.TemporaryDirectory(prefix="dv-mmdc-") as td:
+              workdir = Path(td)
+              for name in DOCS:
+                  path = root / name
+                  if not path.is_file():
+                      continue
+                  for index, code in enumerate(extract_mermaid(path.read_text(encoding="utf-8")), 1):
+                      total += 1
+                      src = workdir / f"block-{index}.mmd"
+                      out = workdir / f"out-{index}.svg"
+                      src.write_text(code, encoding="utf-8")
+                      try:
+                          proc = subprocess.run(
+                              ["mmdc", "-i", str(src), "-o", str(out)],
+                              capture_output=True,
+                              text=True,
+                              timeout=MMDC_TIMEOUT_S,
+                              cwd=workdir,
+                              check=False,
+                          )
+                      except subprocess.TimeoutExpired:
+                          failures.append(
+                              f"{name}: block #{index}: mmdc timed out "
+                              f"after {MMDC_TIMEOUT_S}s"
+                          )
+                          continue
+                      if proc.returncode != 0:
+                          combined = (proc.stderr + "\n" + proc.stdout).splitlines()
+                          excerpt = "\n".join(
+                              line for line in combined if line.strip()
+                          )[-1000:]
+                          failures.append(
+                              f"{name}: block #{index}: mmdc exited "
+                              f"{proc.returncode}\n{excerpt}"
+                          )
+
+          print(f"validated {total} mermaid block(s) in {len(DOCS)} doc file(s)")
+          if failures:
+              for failure in failures:
+                  print(f"FAIL: {failure}")
+              sys.exit(1)
+          print("PASS docs-render-validation: links + mermaid render")
+          PY
+
+  record-run-status:
+    name: Record DV verdict as a durable commit status
+    # MADR-0028 contract implementation: a legacy commit status on github.sha
+    # lives OUTSIDE the deletable run records (statuses are keyed by sha +
+    # context). Aggregates ONLY this workflow's DV jobs — never CI jobs that
+    # CI itself owns and reports. Signal, not gate: never a branch-protection
+    # required check.
+    needs: [docs-render-validation]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Post the commit status (durable)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DV_RESULT: ${{ needs.docs-render-validation.result }}
+        run: |
+          # Overall DV verdict: failure if any DV job failed or was cancelled;
+          # skipped jobs do not fail the verdict (mirrors the config-repo
+          # record-run-status aggregation).
+          overall="success"
+          case "$DV_RESULT" in
+            failure | cancelled) overall="failure" ;;
+          esac
+          if gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state="$overall" \
+            -f context="deep-validation" \
+            -f description="deep-validation ${overall} (run ${GITHUB_RUN_ID})" \
+            -f target_url="$RUN_URL" >/dev/null 2>&1; then
+            echo "durable commit status posted: deep-validation=${overall} on ${SHA}"
+          else
+            echo "::warning::could not post the deep-validation commit status — the durable record is MISSING for ${SHA}; investigate the API failure"
+          fi
+          exit 0
