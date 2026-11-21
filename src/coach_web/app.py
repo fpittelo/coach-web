@@ -1366,7 +1366,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     objective_row = None
                     phases = []
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Week draft persistence failed: %s", exc)
+            logger.warning("Week draft persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         approved_rows = [row for row in stored_rows if row.status == "approved"]
         stored = approved_rows[-1] if approved_rows else None
@@ -1443,7 +1443,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 row = await upsert_week_draft(session, payload.week)
                 draft_id = row.id
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Week draft persistence failed: %s", exc)
+            logger.warning("Week draft persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
 
         # Terminal-state short-circuit (PR #174 F3): an already-APPROVED
@@ -1480,7 +1480,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if stored is not None and stored.status == "submitted":
                         await transition_draft_status(session, stored, "approved")
             except (OSError, SQLAlchemyError) as exc:
-                logger.warning("Week draft approval transition failed: %s", exc)
+                logger.warning("Week draft approval transition failed (%s)", type(exc).__name__)
 
         return WeekApprovalResponse(results=results)
 
@@ -1613,7 +1613,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     session, athlete_id=athlete_id, payload=payload, cipher=cipher
                 )
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Debrief persistence failed: %s", exc)
+            logger.warning("Debrief persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         # Weekly adherence metric (#234 AC2): event-driven recompute + upsert
         # on the debrief-save path — counts/percentages only (C3). Best-effort
@@ -1627,7 +1627,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     session, athlete_id=athlete_id, plan_session_key=payload.plan_session_key
                 )
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Week adherence upsert failed: %s", exc)
+            logger.warning("Week adherence upsert failed (%s)", type(exc).__name__)
         # ICU session-comment mirror (#190 AC3): strictly opt-in and
         # NON-BLOCKING on the save — the debrief row is already durable when
         # the mirror starts, and every mirror failure degrades to the fixed
@@ -1697,7 +1697,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     session, athlete_id=athlete_id, today=date.today()
                 )
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Pending debrief derivation failed: %s", exc)
+            logger.warning("Pending debrief derivation failed (%s)", type(exc).__name__)
             pending = []
         return PendingDebriefResponse(pending=pending)
 
@@ -1724,7 +1724,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with session_factory() as session:
                 agent_settings = await get_agent_settings(session, athlete_id=athlete_id)
         except (OSError, SQLAlchemyError, ValidationError) as exc:
-            logger.warning("Agent settings read failed: %s", exc)
+            logger.warning("Agent settings read failed (%s)", type(exc).__name__)
             agent_settings = None
         return agent_settings if agent_settings is not None else AgentSettings()
 
@@ -1773,7 +1773,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # Defense-in-depth (MADR-0026): the CHECK constraints must never
             # surface as a 500 — the validate-after-sanitize gate above makes
             # this branch unreachable for API-driven writes.
-            logger.warning("Agent settings persistence failed: %s", exc)
+            logger.warning("Agent settings persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         _journal_agent_settings_change(
             athlete_id=athlete_id,
@@ -1808,7 +1808,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             async with session_factory() as session:
                 deleted = await delete_agent_settings(session, athlete_id=athlete_id)
         except (OSError, SQLAlchemyError) as exc:
-            logger.warning("Agent settings reset failed: %s", exc)
+            logger.warning("Agent settings reset failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
         if deleted:
             _journal_agent_settings_change(
