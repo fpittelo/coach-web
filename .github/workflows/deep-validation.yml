@@ -13,8 +13,11 @@ name: Deep Validation
 #   - push to main (= every trunk merge): posts the DV status on the head sha.
 #   - push of a release tag v* (= every tag-from-trunk release, MADR-0017):
 #     posts the DV status on the tagged sha at release time.
-#   - workflow_dispatch: manual on-demand run on an arbitrary ref/sha (used to
-#     backfill the status on a pre-tag sha, e.g. right before cutting a tag).
+#   - workflow_dispatch: manual on-demand run with a BRANCH or TAG ref only —
+#     the dispatch API does not accept raw SHAs (422 "No ref found for: <sha>").
+#     To backfill the status on a pre-tag sha, create a temporary branch at the
+#     target sha and dispatch on that ref; the durable status is sha-keyed and
+#     survives the branch's deletion.
 #
 # Explicitly NOT included here (already gated on every PR and trunk push by
 # ci.yaml, 5/5 green — do not duplicate): test/lint/mypy/pytest, docker build,
