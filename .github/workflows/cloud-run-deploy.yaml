@@ -217,9 +217,21 @@ jobs:
           if [ -n "${EXISTING_URL}" ]; then
             cors_json="[\"${EXISTING_URL}\"]"
             redirect_uri="${EXISTING_URL}/auth/callback"
+            # C3 (#396): the Cloud Run URL carries a stable per-service hash
+            # that is NOT derivable statically — scrape the live URL (from
+            # the pre-deploy describe, step `pre`) and pin the exact hostname
+            # instead of the shared '*.run.app' wildcard (which matches every
+            # Cloud Run service of every GCP project).
+            trusted_hosts="[\"${EXISTING_URL#https://}\"]"
           else
             cors_json='["https://pending-first-deploy.run.app"]'
             redirect_uri="https://pending-first-deploy.run.app/auth/callback"
+            # Bootstrap fallback ONLY (service — and its hash-bearing URL —
+            # does not exist yet): the wildcard is replaced with the exact
+            # host by the first-deploy sync step before the smoke checks
+            # (#396 C3). The steady-state deploy path always pins the exact
+            # host.
+            trusted_hosts='["*.run.app"]'
           fi
           cat > "${RUNNER_TEMP}/service.yaml" <<YAML
           apiVersion: serving.knative.dev/v1
@@ -256,7 +268,7 @@ jobs:
                   - name: GITHUB_MCP_URL
                     value: http://localhost:8001/
                   - name: TRUSTED_HOSTS
-                    value: '["*.run.app"]'
+                    value: '${trusted_hosts}'
                   - name: CORS_ORIGINS
                     value: '${cors_json}'
                   - name: AUTH_ENABLED
@@ -420,12 +432,36 @@ jobs:
             echo "::error::An allUsers binding exists on ${SERVICE} — IAP edge must stay fail-closed."
             exit 1
           fi
-          echo "IAP enforced; no allUsers binding."
+          # C1 (#396 — cyber sign-off condition, #317 comment 7059788814):
+          # the allUsers check alone does not catch allAuthenticatedUsers.
+          # The invoker member set must be EXACTLY the IAP service agent —
+          # any other principal (a stray allAuthenticatedUsers above all)
+          # would make the IAP edge bypassable (the app layer still answers
+          # 401, but the zero-trust edge claim is void).
+          gcloud run services get-iam-policy "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | INVOKER_EXPECTED="${IAP_SERVICE_AGENT}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          invoker = sorted(set(m for b in bindings if b.get("role") == "roles/run.invoker" for m in b.get("members", [])))
+          expected = [os.environ["INVOKER_EXPECTED"]]
+          if invoker != expected:
+              print("::error::C1 violation: roles/run.invoker on " + os.environ["SERVICE"] + " must be held by exactly the IAP service agent — found members=" + json.dumps(invoker) + ", expected=" + json.dumps(expected) + " (allAuthenticatedUsers or any stray invoker would bypass the IAP edge; #317 C1).")
+              sys.exit(1)
+          print("C1 verified: roles/run.invoker held by exactly the IAP service agent.")
+          '
+          echo "IAP enforced; no allUsers/allAuthenticatedUsers binding; invoker = IAP service agent only."
 
       # First deploy only: the .run.app URL is knowable only once the service
       # exists — sync the origin-derived env vars onto the service (a second
       # revision). Steady-state deploys already carry the correct values in
-      # the rendered YAML, so this step is skipped.
+      # the rendered YAML, so this step is skipped. TRUSTED_HOSTS rides along
+      # (#396 C3): the bootstrap render carries the '*.run.app' wildcard
+      # fallback (the hash-bearing URL does not exist yet); the sync replaces
+      # it with the exact host before the smoke checks and the C2/C3
+      # read-back gate run.
       - name: Sync origin-derived env vars (first deploy)
         if: steps.pre.outputs.url == ''
         run: |
@@ -435,7 +471,104 @@ jobs:
             --format='value(status.address.url)')"
           gcloud run services update "${SERVICE}" \
             --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
-            --update-env-vars="CORS_ORIGINS=[\"${url}\"],AUTH_REDIRECT_URI=${url}/auth/callback"
+            --update-env-vars="CORS_ORIGINS=[\"${url}\"],AUTH_REDIRECT_URI=${url}/auth/callback,TRUSTED_HOSTS=[\"${url#https://}\"]"
+
+      # C2/C3 (#396 — cyber sign-off conditions, #317 comment 7059788814):
+      # read the DEPLOYED coach-web container env back from the service
+      # (post-sync, so first-deploy placeholder values are already replaced)
+      # and fail the run on config drift:
+      #   - AUTH_REDIRECT_URI must be present, https and on the service's own
+      #     origin — auth/router.py falls back to request.base_url when the
+      #     setting is empty, a path influenceable under FORWARDED_ALLOW_IPS=*
+      #     (#317 C2; today the value is pinned — the gate keeps it pinned).
+      #   - TRUSTED_HOSTS must be exactly the service hostname — the shared
+      #     '*.run.app' wildcard is permitted only for the bootstrap render
+      #     before the service exists and never survives to this gate
+      #     (#317 C3; verified live in #317 that a spoofed Host is dropped by
+      #     the GFE, so this stays defence-in-depth).
+      - name: Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)
+        run: |
+          set -euo pipefail
+          url="$(gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.address.url)')"
+          gcloud run services describe "${SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(spec.template.spec.containers)' \
+          | SERVICE_URL="${url}" python3 -c '
+          import json, os, sys
+          from urllib.parse import urlparse
+          raw = json.load(sys.stdin)
+          containers = (raw.get("spec", {}).get("template", {}).get("spec", {}).get("containers", []) if isinstance(raw, dict) else raw)
+          env = {}
+          for c in containers:
+              if c.get("name") == "coach-web":
+                  env = {e.get("name"): e.get("value", "") for e in c.get("env", [])}
+          if not env:
+              print("::error::C2/C3 gate could not read the coach-web container env from the deployed service spec.")
+              sys.exit(1)
+          origin = os.environ["SERVICE_URL"].rstrip("/")
+          host = urlparse(origin).hostname
+          redirect = env.get("AUTH_REDIRECT_URI", "")
+          trusted = env.get("TRUSTED_HOSTS", "")
+          failed = False
+          redirect_ok = (urlparse(redirect).scheme == "https" and redirect == origin + "/auth/callback")
+          if not redirect_ok:
+              print("::error::C2 violation: deployed AUTH_REDIRECT_URI=" + json.dumps(redirect) + " must be a https URL on the service origin (" + origin + "/auth/callback) — an empty or drifted value lets auth/router.py fall back to request.base_url, influenceable under FORWARDED_ALLOW_IPS=* (#317 C2).")
+              failed = True
+          if trusted != json.dumps([host]):
+              print("::error::C3 violation: deployed TRUSTED_HOSTS=" + json.dumps(trusted) + " must be exactly " + json.dumps([host]) + " — the shared *.run.app wildcard matches every Cloud Run service of every GCP project (#317 C3; permitted only for the bootstrap render before the service exists).")
+              failed = True
+          if failed:
+              sys.exit(1)
+          print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact service hostname.")
+          '
+
+      # C4 (#396 — cyber sign-off condition, #317 comment 7059788814):
+      # the deployer holds roles/iam.serviceAccountUser (actAs) on the
+      # runtime SA — required to set serviceAccountName, and harmless ONLY
+      # while no principal can mint tokens for that identity: the moment a
+      # token-minting grant appears on coach-web-runtime, actAs becomes a
+      # direct read path to all 6 app secrets (#317 C4; the denial path was
+      # demonstrated live in #317). Assert the runtime-SA policy grants NO
+      # token-minting role (roles/iam.serviceAccountTokenCreator /
+      # ...AccessTokenCreator / ...OpenIdTokenCreator) to ANY principal.
+      # Explicit, justified exclusion (flagged for @cyber-security in the
+      # #396 PR): the platform Cloud Run service agent
+      # service-853194930683@serverless-robot-prod.iam.gserviceaccount.com —
+      # Cloud Run's own runtime-identity mechanism. (Role-NAME matching per
+      # the AC; custom roles with equivalent permissions are out of scope.)
+      - name: Assert no token-minting grants on the runtime SA
+        run: |
+          set -euo pipefail
+          gcloud iam service-accounts get-iam-policy "${RUNTIME_SA}" \
+            --project="${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | PLATFORM_AGENT="serviceAccount:service-853194930683@serverless-robot-prod.iam.gserviceaccount.com" \
+            RUNTIME_SA="${RUNTIME_SA}" python3 -c '
+          import json, os, re, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          platform = os.environ["PLATFORM_AGENT"]
+          minting = re.compile(r"iam\.serviceAccount(Token|AccessToken|OpenIdToken)Creator$")
+          violations = []
+          platform_only = False
+          for b in bindings:
+              role = b.get("role", "")
+              if not minting.search(role):
+                  continue
+              members = b.get("members", [])
+              if sorted(members) == [platform]:
+                  platform_only = True
+                  continue
+              violations.extend(role + " -> " + m for m in members if m != platform)
+          if violations:
+              print("::error::C4 violation: token-minting grants exist on " + os.environ["RUNTIME_SA"] + " — the holder(s) can mint access/ID tokens for the runtime identity, turning the deployer actAs bridge into a direct read path to all 6 secrets: " + "; ".join(violations) + " (#317 C4; remove the grant(s), docs/admin_guide.md → Production deploy lane).")
+              sys.exit(1)
+          if platform_only:
+              print("C4 note: a token-minting role is held ONLY by the platform Cloud Run service agent (explicitly excluded — Cloud Run runtime-identity mechanism; flagged for @cyber-security verification, #396).")
+          print("C4 verified: no non-platform principal holds token-minting rights on " + os.environ["RUNTIME_SA"] + ".")
+          '
 
       # AC3 (grooming amendment #1) — IAP-aware smoke, no PO browser needed:
       #   1. unauthenticated GET / → IAP edge: 302 (Google sign-in redirect)
