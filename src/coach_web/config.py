@@ -13,6 +13,10 @@ class Settings(BaseSettings):
         env_file=".env",
         env_prefix="",
         extra="ignore",
+        # Secret Manager injects ``secretKeyRef`` payloads verbatim and they often
+        # carry a trailing newline; untrimmed, it reaches outbound headers and h11
+        # rejects the request. Credential normalization belongs here (SSOT), #393.
+        str_strip_whitespace=True,
     )
 
     COACH_MCP_URL: str = "http://coach-mcp:8000/sse"

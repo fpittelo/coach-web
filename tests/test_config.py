@@ -1,8 +1,11 @@
 """Tests for coach_web.config."""
 
+from typing import cast
+
 import pytest
 from pydantic import SecretStr
 
+from coach_web.agent import OpenRouterClient, create_agent
 from coach_web.config import Settings, get_settings
 
 
@@ -63,8 +66,53 @@ class TestSettings:
         assert isinstance(first, Settings)
 
 
+class TestEnvValueWhitespaceNormalization:
+    """Secret Manager env payloads are trimmed at the config boundary (#393).
+
+    Secret Manager values injected via ``secretKeyRef`` routinely carry a
+    trailing newline; leaves that reach an outbound header make h11 reject the
+    request (``Illegal header value b'Bearer sk-or-v1-…\\n'``).
+    """
+
+    @pytest.mark.parametrize("suffix", ["\n", "\r\n"])
+    def test_openrouter_api_key_env_value_is_trimmed(
+        self, monkeypatch: pytest.MonkeyPatch, suffix: str
+    ) -> None:
+        """A trailing line ending never survives into the settings value."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", f"sk-or-v1-test{suffix}")
+        get_settings.cache_clear()
+
+        assert get_settings().OPENROUTER_API_KEY == "sk-or-v1-test"
+
+    async def test_trimmed_key_reaches_authorization_header(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Wiring: the normalized settings value reaches the ``Authorization`` header."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-test\n")
+        get_settings.cache_clear()
+
+        agent = create_agent(get_settings())
+        client = cast(OpenRouterClient, agent.client)
+        try:
+            assert client._headers()["Authorization"] == "Bearer sk-or-v1-test"
+        finally:
+            await client.close()
+
+
 class TestDataEncryptionKey:
     """The C2 field-encryption key setting (MADR-0008 C5, #189)."""
+
+    def test_env_value_with_trailing_newline_is_trimmed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression pin: the Fernet key is trimmed too (SecretStr path, #393)."""
+        monkeypatch.setenv("DATA_ENCRYPTION_KEY", "unit-test-fernet-key-value\n")
+        get_settings.cache_clear()
+
+        settings = get_settings()
+
+        assert isinstance(settings.DATA_ENCRYPTION_KEY, SecretStr)
+        assert settings.DATA_ENCRYPTION_KEY.get_secret_value() == "unit-test-fernet-key-value"
 
     def test_defaults_to_empty_secret(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Absent env var → empty SecretStr (fail-safe: saves answer 503).
