@@ -1,8 +1,8 @@
 # MADR-0031: Serve the Public Landing Page from a Separate Static Surface — IAP Posture Unchanged
 
-- **Status:** proposed
+- **Status:** accepted
 - **Date:** 2026-11-22
-- **Deciders:** @architect, @fpittelo (PO direction), @cyber-security (verification pending — AC2 of #413)
+- **Deciders:** @architect, @fpittelo (PO direction confirmed 2026-11-22: strangers see the landing page without any Google interaction), @cyber-security (verdict APPROVE-WITH-CONDITIONS, comment 7076175268 on #413 — conditions C1–C7 embedded below before acceptance, per AC2 of #413)
 
 ## Context
 
@@ -79,7 +79,10 @@ paths) from IAP at the URL-map level.
 - Pros: single surface, path-granular exemptions, IAP retained for everything else.
 - Cons (disqualifying): a new infrastructure class for the portfolio (load balancer, NEG, LB-level
   IAP config, new certificate and domain management) — significant cost and operational complexity
-  to serve two static files; over-engineering (YAGNI). Revisit only if the portfolio later needs
+  to serve two static files; over-engineering (YAGNI). Cyber precision (verdict C-note): the cost is
+  in fact **understated** — an LB-fronted IAP does **not** protect the direct
+  `<service>-<hash>.run.app` URL unless that URL is separately ingress-restricted, so Option 3 adds
+  a second, weaker edge rather than replacing the problem. Revisit only if the portfolio later needs
   multi-service path-routing anyway.
 
 ## Decision Outcome
@@ -98,10 +101,31 @@ portfolio does not need with infrastructure it does not want.
   auditable (two static files, no config).
 - **Negative:** a second surface to deploy, monitor, and keep secret-free; two-URL handoff for the
   visitor; a standing `allUsers` invoker binding on the static service that must remain justification-bound.
-- **Mitigations:** the static container ships no secrets/env config and no service-account grants
-  (runtime SA = the default compute SA with **no** roles on app resources — asserted at deploy);
-  the admin guide documents both URLs and the handoff; a future security review trigger mirrors the
-  #406/#420 pattern: any growth of the static surface beyond static files (API, auth, persistence)
-  requires a new MADR. Implementation grooming follows this ADR's acceptance (`@cyber-security`
-  verification of this draft is AC2 of #413 and must complete before the implementation spec is
-  finalized).
+- **Mitigations (amended per the @cyber-security verdict, conditions C1–C7 — binding):**
+  - **C1/C2 (material — replaces the original "default compute SA" formulation):** the static
+    service runs under a **dedicated, purpose-created service account with zero roles** — never the
+    default compute SA. Deploy-time assertion must be **exact, project-wide and fail-closed** (the
+    #396 C4 pattern): no project- or SA-level role bindings on the landing SA, **no token-minting
+    grants** (`iam.serviceAccount*` family excluded, platform service agents excepted). The deploy
+    SA holds only `resourcemanager.viewer` (no `getIamPolicy`); where the assertion needs a policy
+    *read*, the minimal grant to add is `resourcemanager.projectIamViewer`.
+  - **C3 (per-service invoker gates):** console invoker stays exactly {IAP service agent}; landing
+    invoker == exactly {`allUsers`}; the landing service carries **no** `iap-enabled` annotation.
+  - **C4 (MADR-0027 Am.0002 D3 revisit trigger FIRES):** the second Cloud Run service now exists →
+    record the `roles/iap.admin` ruling for the landing deploy (grant **resource-scoped to the
+    landing service**, mirroring the console's Amendment-0002 scoping).
+  - **C5 (public-surface hardening):** non-root container user; no env config, no
+    `GOOGLE_APPLICATION_CREDENTIALS`; nothing in the console's path space served; explicit
+    `Cache-Control`; `maxInstances`, request timeout, and a budget cap set.
+  - **C6 (content provenance):** the static surface's image is **digest-pinned** (trunk-digest deploys
+    like the console — see #411's drift guard); content tracked to source.
+  - **C7 (CTA safety + documentation):** the CTA links/pins to the **canonical console origin** with a
+    constant redirect target (no open-redirect surface; host-only cookies confirmed by the #406/#410
+    middleware); official GCP doc citations embedded in the implementation docs;
+    `docs/security.md` + the admin guide gain the public-surface section; the MADR trigger extends:
+    **any growth of the static surface beyond static files (API, auth, persistence, dynamic
+    render) requires a new MADR.**
+  - **Sequencing note (verdict cross-link):** #412's `no-store` fix must land on the console **before**
+    the public CTA is published — the heuristic-cache incident (#406/#412 forensics) showed the
+    console `/` can serve a stale cached landing; publishing a cross-surface CTA before that fix
+    would expose that stale-cache window to strangers.
