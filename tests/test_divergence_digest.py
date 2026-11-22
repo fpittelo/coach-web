@@ -950,6 +950,7 @@ class TestDivergenceDigestScope:
             "0006_encrypt_debrief_rpe.py",
             "0007_agent_settings.py",
             "0008_conversation_memory.py",
+            "0009_standing_athlete_preferences.py",
         ]
 
     def test_the_digest_module_imports_no_mcp_or_icu_client(self) -> None:

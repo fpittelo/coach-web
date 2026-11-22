@@ -432,7 +432,7 @@ class TestPeriodizationMigration:
         assert "objective_id" in _phase_indexed_columns(db_path)
 
     def test_upgrade_head_is_idempotent(self, db_path: Path) -> None:
-        """Re-running upgrade head is a no-op and the version stays at 0008.
+        """Re-running upgrade head is a no-op and the version stays at 0009.
 
         Superseded for #168: migration 0003 (plan_drafts) extends the chain.
         Superseded for #189: migration 0004 (debriefs) extends the chain.
@@ -440,14 +440,15 @@ class TestPeriodizationMigration:
         Superseded for #243: migration 0006 (encrypted debrief RPE) extends
         the chain. Superseded for #361: migration 0007 (agent_settings)
         extends the chain. Superseded for #348: migration 0008 (conversation
-        memory) extends the chain.
+        memory) extends the chain. Superseded for #419: migration 0009
+        (standing preferences) extends the chain.
         """
         command.upgrade(alembic_config(), "head")
         command.upgrade(alembic_config(), "head")
 
         with _connect(db_path) as conn:
             version = conn.execute("SELECT version_num FROM alembic_version").fetchone()[0]
-        assert version == "0008"
+        assert version == "0009"
 
     def test_downgrade_to_0001_drops_the_phase_table(self, db_path: Path) -> None:
         """Downgrade to 0001 removes periodization_phases (authored, per ADR)."""
@@ -1020,11 +1021,20 @@ EXPECTED_AGENT_SETTINGS_COLUMNS = (
     "verbosity",
     "tone",
     "updated_at",
+    "environment_preference",
+    "standing_preferences",
 )
 
 AGENT_SETTINGS_ORIENTATION_LENGTH_CHECK = "length(orientation) <= 1500"
 AGENT_SETTINGS_VERBOSITY_CHECK = "verbosity IN ('concise', 'standard', 'detailed')"
 AGENT_SETTINGS_TONE_CHECK = "tone IN ('strict', 'balanced', 'supportive')"
+AGENT_SETTINGS_ENVIRONMENT_CHECK = (
+    "environment_preference IS NULL OR environment_preference IN "
+    "('indoor_first', 'outdoor_first', 'mixed')"
+)
+AGENT_SETTINGS_STANDING_LENGTH_CHECK = (
+    "standing_preferences IS NULL OR length(standing_preferences) <= 1000"
+)
 
 
 def _agent_settings_table_sql(db_path: Path) -> str:
@@ -1176,6 +1186,189 @@ class TestAgentSettingsMigration:
         command.downgrade(alembic_config(), "base")
 
         assert "agent_settings" not in _table_names(db_path)
+
+
+# ---------------------------------------------------------------------------
+# Migration 0009 — standing athlete preferences (MADR-0032 §3, #419)
+# ---------------------------------------------------------------------------
+
+
+class TestStandingPreferencesMigration:
+    """Migration 0009 extends ``agent_settings`` with the #419 preference set.
+
+    Two nullable columns added in batch mode (the SQLite recreate path):
+
+    - ``environment_preference`` — CHECK enum ``indoor_first|outdoor_first|mixed``
+      (server-side fixed directive mapping), nullable = unset.
+    - ``standing_preferences`` — C1 plaintext free text capped at 1000
+      characters by CHECK, nullable = unset.
+
+    The upgrade/downgrade round trip MUST preserve the pre-existing
+    orientation/verbosity/tone settings (and their CHECK constraints) — the
+    batch recreate is a table rebuild, not a data migration.
+    """
+
+    def test_upgrade_head_adds_the_two_columns(self, db_path: Path) -> None:
+        """After upgrade head both preference columns exist on agent_settings."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _agent_settings_column_flags(db_path)
+        assert "environment_preference" in flags
+        assert "standing_preferences" in flags
+
+    def test_new_columns_are_nullable(self, db_path: Path) -> None:
+        """Unset preferences allow NULL (the nullable enum/text contract)."""
+        command.upgrade(alembic_config(), "head")
+
+        flags = _agent_settings_column_flags(db_path)
+        assert flags["environment_preference"][0] is False
+        assert flags["standing_preferences"][0] is False
+
+    def test_new_check_constraints_are_declared(self, db_path: Path) -> None:
+        """The enum CHECK and the 1000-character cap are declared in SQL."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _agent_settings_table_sql(db_path)
+        assert AGENT_SETTINGS_ENVIRONMENT_CHECK in sql
+        assert AGENT_SETTINGS_STANDING_LENGTH_CHECK in sql
+        assert "ck_agent_settings_environment_preference" in sql
+        assert "ck_agent_settings_standing_preferences_len" in sql
+
+    def test_prior_check_constraints_survive_the_batch_recreate(self, db_path: Path) -> None:
+        """The 0007 CHECKs are preserved by the 0009 table rebuild."""
+        command.upgrade(alembic_config(), "head")
+
+        sql = _agent_settings_table_sql(db_path)
+        assert AGENT_SETTINGS_ORIENTATION_LENGTH_CHECK in sql
+        assert AGENT_SETTINGS_VERBOSITY_CHECK in sql
+        assert AGENT_SETTINGS_TONE_CHECK in sql
+        assert "uq_agent_settings_athlete_id" in sql
+
+    def test_environment_check_rejects_unknown_values(self, db_path: Path) -> None:
+        """Inserting an environment preference outside the enum fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="environment_preference"):
+                conn.execute(
+                    "INSERT INTO agent_settings (athlete_id, environment_preference, updated_at) "
+                    "VALUES (1, 'sometimes', 'u')"
+                )
+
+    @pytest.mark.parametrize("preference", ["indoor_first", "outdoor_first", "mixed"])
+    def test_environment_check_accepts_every_enum_value(
+        self, db_path: Path, preference: str
+    ) -> None:
+        """Each documented enum value persists."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO agent_settings (athlete_id, environment_preference, updated_at) "
+                "VALUES (1, ?, 'u')",
+                (preference,),
+            )
+            stored = conn.execute(
+                "SELECT environment_preference FROM agent_settings WHERE athlete_id = 1"
+            ).fetchone()[0]
+
+        assert stored == preference
+
+    def test_standing_preferences_over_the_cap_are_rejected(self, db_path: Path) -> None:
+        """A 1001-character standing preference fails the CHECK."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            with pytest.raises(sqlite3.IntegrityError, match="standing_preferences"):
+                conn.execute(
+                    "INSERT INTO agent_settings (athlete_id, standing_preferences, updated_at) "
+                    "VALUES (1, ?, 'u')",
+                    ("x" * 1001,),
+                )
+
+    def test_standing_preferences_at_the_cap_are_accepted(self, db_path: Path) -> None:
+        """Exactly 1000 characters persist (the cap is inclusive)."""
+        command.upgrade(alembic_config(), "head")
+
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO agent_settings (athlete_id, standing_preferences, updated_at) "
+                "VALUES (1, ?, 'u')",
+                ("x" * 1000,),
+            )
+            length = conn.execute(
+                "SELECT length(standing_preferences) FROM agent_settings WHERE athlete_id = 1"
+            ).fetchone()[0]
+
+        assert length == 1000
+
+    def test_round_trip_0008_0009_0008_head_preserves_existing_settings(
+        self, db_path: Path
+    ) -> None:
+        """0008 → 0009 → 0008 → head keeps orientation/verbosity/tone intact."""
+        command.upgrade(alembic_config(), "0008")
+        with _connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO agent_settings "
+                "(athlete_id, orientation, verbosity, tone, updated_at) "
+                "VALUES (1, 'Focus on power-to-weight.', 'concise', 'strict', 'stamp')"
+            )
+            conn.commit()
+
+        command.upgrade(alembic_config(), "head")
+        with _connect(db_path) as conn:
+            conn.execute(
+                "UPDATE agent_settings SET environment_preference = 'indoor_first', "
+                "standing_preferences = 'Trainer on weekdays.' WHERE athlete_id = 1"
+            )
+            conn.commit()
+
+        command.downgrade(alembic_config(), "0008")
+        flags = _agent_settings_column_flags(db_path)
+        assert "environment_preference" not in flags
+        assert "standing_preferences" not in flags
+        with _connect(db_path) as conn:
+            preserved = conn.execute(
+                "SELECT orientation, verbosity, tone, updated_at FROM agent_settings "
+                "WHERE athlete_id = 1"
+            ).fetchone()
+        assert tuple(preserved) == (
+            "Focus on power-to-weight.",
+            "concise",
+            "strict",
+            "stamp",
+        )
+
+        command.upgrade(alembic_config(), "head")
+        with _connect(db_path) as conn:
+            re_upgraded = conn.execute(
+                "SELECT orientation, verbosity, tone, updated_at, environment_preference, "
+                "standing_preferences FROM agent_settings WHERE athlete_id = 1"
+            ).fetchone()
+        assert tuple(re_upgraded) == (
+            "Focus on power-to-weight.",
+            "concise",
+            "strict",
+            "stamp",
+            None,
+            None,
+        )
+
+    def test_downgrade_to_0008_keeps_the_table_without_the_new_columns(self, db_path: Path) -> None:
+        """Downgrade 0009 → 0008 is reversible and non-destructive for 0007 data."""
+        command.upgrade(alembic_config(), "head")
+        command.downgrade(alembic_config(), "0008")
+
+        assert "agent_settings" in _table_names(db_path)
+        flags = _agent_settings_column_flags(db_path)
+        assert tuple(flags) == (
+            "id",
+            "athlete_id",
+            "orientation",
+            "verbosity",
+            "tone",
+            "updated_at",
+        )
 
 
 # ---------------------------------------------------------------------------

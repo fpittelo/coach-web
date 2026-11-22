@@ -38,6 +38,7 @@ from coach_web.agent import (
 )
 from coach_web.agent_settings import (
     AGENT_ORIENTATION_MAX_CHARS,
+    STANDING_PREFERENCES_MAX_CHARS,
     AgentSettings,
     AgentSettingsSaveRequest,
     delete_agent_settings,
@@ -395,40 +396,60 @@ def _athlete_id_for_session(settings: Settings, session_cookie: str | None) -> i
     return athlete_id_from_email(claims.get("email"))
 
 
-def _normalize_orientation_for_save(text: str | None) -> str | None:
-    """Sanitize then validate the owner orientation for persistence (#362).
+def _normalize_untrusted_text_for_save(
+    text: str | None, *, max_chars: int, label: str
+) -> str | None:
+    """Sanitize then validate one free-text settings field for persistence.
 
-    MADR-0026 C2 save call site: the seam sanitizer
+    MADR-0026 C2 / MADR-0032 C8 save call site: the seam sanitizer
     (:func:`coach_web.agent.sanitize_untrusted_text` — one generalised
-    sanitizer, four call sites since MADR-0025 C2) is IMPORTED and reused —
-    its result is what gets stored, never a forked transform. Validation then
-    runs on the SANITIZED result (validate-after-sanitize, #361 review
-    binding): the sanitizer caps BEFORE zero-width defusion, so a payload
-    that fits the cap raw can sanitize PAST it (a defused role token inserts
-    a character) — storing that would trip the ``agent_settings`` CHECK and
-    surface as a 500, so the cap check answers 422 instead (via
-    :class:`SettingsValidationError`, the typed reason the endpoint maps to
-    the owner-safe body). The submission itself is also capped (AC2): an
-    oversize payload is rejected field-only rather than silently clamped,
-    so the echoed text never surprises the owner.
+    sanitizer, no forks) is IMPORTED and reused — its result is what gets
+    stored, never a forked transform. Validation then runs on the SANITIZED
+    result (validate-after-sanitize, #361 review binding): the sanitizer caps
+    BEFORE zero-width defusion, so a payload that fits the cap raw can
+    sanitize PAST it (a defused role token inserts a character) — storing
+    that would trip the ``agent_settings`` CHECK and surface as a 500, so the
+    cap check answers 422 instead (via :class:`SettingsValidationError`, the
+    typed reason the endpoint maps to the owner-safe body). The submission
+    itself is also capped (AC2): an oversize payload is rejected field-only
+    rather than silently clamped, so the echoed text never surprises the
+    owner.
 
     An empty sanitized text (unset preference) normalizes to ``None``,
     matching the seam model's unset shape and the GET defaults body.
     """
-    sanitized = sanitize_untrusted_text(text, max_chars=AGENT_ORIENTATION_MAX_CHARS)
-    if len(sanitized) > AGENT_ORIENTATION_MAX_CHARS:
+    sanitized = sanitize_untrusted_text(text, max_chars=max_chars)
+    if len(sanitized) > max_chars:
         raise SettingsValidationError(
             SettingsReason.INVALID_VALUES,
-            "Sanitized orientation exceeds the agent_settings cap "
-            f"({AGENT_ORIENTATION_MAX_CHARS} characters)",
+            f"Sanitized {label} exceeds the agent_settings cap ({max_chars} characters)",
         )
-    if text is not None and len(text) > AGENT_ORIENTATION_MAX_CHARS:
+    if text is not None and len(text) > max_chars:
         raise SettingsValidationError(
             SettingsReason.INVALID_VALUES,
-            "Orientation exceeds the agent_settings cap "
-            f"({AGENT_ORIENTATION_MAX_CHARS} characters)",
+            f"{label.capitalize()} exceeds the agent_settings cap ({max_chars} characters)",
         )
-    return sanitized or None
+    return sanitized if sanitized.strip() else None
+
+
+def _normalize_orientation_for_save(text: str | None) -> str | None:
+    """Sanitize then validate the owner orientation for persistence (#362)."""
+    return _normalize_untrusted_text_for_save(
+        text, max_chars=AGENT_ORIENTATION_MAX_CHARS, label="orientation"
+    )
+
+
+def _normalize_standing_preferences_for_save(text: str | None) -> str | None:
+    """Sanitize then validate the standing preferences for persistence (#419).
+
+    Same save-time contract as the orientation (C8 second call site): the
+    seam sanitizer with the 1000-character cap, validate-after-sanitize, and
+    blank/whitespace-only normalizes to ``None``. An over-cap submission is
+    rejected field-only — the value is never echoed (MADR-0026 / C8).
+    """
+    return _normalize_untrusted_text_for_save(
+        text, max_chars=STANDING_PREFERENCES_MAX_CHARS, label="standing preferences"
+    )
 
 
 def _journal_agent_settings_change(
@@ -436,23 +457,32 @@ def _journal_agent_settings_change(
     athlete_id: int,
     action: Literal["save", "reset"],
     orientation: str | None,
+    standing_preferences: str | None,
+    environment_preference: str | None,
     updated_at: str,
 ) -> None:
     """Emit the agent-settings audit-journal line — metadata only (MADR-0026 C3).
 
     One line per successful mutation (``save``/``reset``): athlete, action,
-    orientation length, sha256 prefix (≤8 hex) and updated_at. The
-    orientation CONTENT never reaches journald (#354 log-hygiene posture,
-    nLPD): integrity is provable from the length + hash alone.
+    the environment enum, orientation/standing length and sha256 prefix
+    (≤8 hex) and updated_at. Neither free-text CONTENT ever reaches journald
+    (#354 log-hygiene posture, nLPD, MADR-0032 C8): integrity is provable
+    from the length + hash alone.
     """
     stored = orientation or ""
+    standing = standing_preferences or ""
     digest = hashlib.sha256(stored.encode("utf-8")).hexdigest()[:8]
+    standing_digest = hashlib.sha256(standing.encode("utf-8")).hexdigest()[:8]
     logger.info(
-        "Agent settings %s: athlete=%d length=%d sha256=%s updated_at=%s",
+        "Agent settings %s: athlete=%d environment_preference=%s length=%d sha256=%s "
+        "standing_length=%d standing_sha256=%s updated_at=%s",
         action,
         athlete_id,
+        environment_preference or "unset",
         len(stored),
         digest,
+        len(standing),
+        standing_digest,
         updated_at,
     )
 
@@ -1871,6 +1901,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
         try:
             stored_orientation = _normalize_orientation_for_save(payload.orientation)
+            stored_standing = _normalize_standing_preferences_for_save(payload.standing_preferences)
         except SettingsValidationError as exc:
             # The typed reason becomes the owner-safe body (#181) — no
             # exception text, no payload echo in the response (nLPD).
@@ -1885,6 +1916,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     orientation=stored_orientation,
                     verbosity=payload.verbosity,
                     tone=payload.tone,
+                    environment_preference=payload.environment_preference,
+                    standing_preferences=stored_standing,
                 )
         except (OSError, SQLAlchemyError) as exc:
             # Defense-in-depth (MADR-0026): the CHECK constraints must never
@@ -1896,6 +1929,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             athlete_id=athlete_id,
             action="save",
             orientation=stored_orientation,
+            standing_preferences=stored_standing,
+            environment_preference=payload.environment_preference,
             updated_at=row.updated_at,
         )
         _notify_snapshot_dirty(request)
@@ -1903,6 +1938,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             orientation=stored_orientation,
             verbosity=payload.verbosity,
             tone=payload.tone,
+            environment_preference=payload.environment_preference,
+            standing_preferences=stored_standing,
         )
 
     @application.delete(
@@ -1933,6 +1970,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 athlete_id=athlete_id,
                 action="reset",
                 orientation=None,
+                standing_preferences=None,
+                environment_preference=None,
                 updated_at=datetime.now(UTC).isoformat(),
             )
             _notify_snapshot_dirty(request)

@@ -197,7 +197,13 @@ class TestMutationNotifications:
         with TestClient(app) as client:
             response = client.put(
                 "/api/admin/agent-settings",
-                json={"orientation": "direct", "verbosity": "concise", "tone": "supportive"},
+                json={
+                    "orientation": "direct",
+                    "verbosity": "concise",
+                    "tone": "supportive",
+                    "environment_preference": "indoor_first",
+                    "standing_preferences": None,
+                },
             )
 
         assert response.status_code == 200
@@ -242,7 +248,13 @@ class TestMutationNotifications:
             assert (
                 client.put(
                     "/api/admin/agent-settings",
-                    json={"orientation": "direct", "verbosity": "concise", "tone": "supportive"},
+                    json={
+                        "orientation": "direct",
+                        "verbosity": "concise",
+                        "tone": "supportive",
+                        "environment_preference": "indoor_first",
+                        "standing_preferences": None,
+                    },
                 ).status_code
                 == 200
             )

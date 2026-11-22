@@ -1229,7 +1229,7 @@
                 <span x-text="agentSettingsForm.orientation.length + '/1500'"></span>
               </p>
               <p class="settings-note agent-settings-disclosure" id="agent-orientation-disclosure">
-                Orientation text is sent to the model provider on every turn.
+                Orientation, environment preference and standing preferences are sent to OpenRouter on every turn.
               </p>
               <div class="field-row">
                 <fieldset class="agent-settings-segment">
@@ -1275,6 +1275,50 @@
                   </div>
                 </fieldset>
               </div>
+              <!-- Standing athlete preferences (#419, MADR-0032 C8): the
+                   session-environment enum (server-owned fixed directive)
+                   plus bounded free text for logistical/session-format
+                   habits only. Health-adjacent intent stays in the enum —
+                   the helper note and the shared C4 disclosure state the
+                   non-medical scope and the OpenRouter transmission. All
+                   bindings are x-text/x-model (structured text only). -->
+              <fieldset class="agent-settings-segment">
+                <legend class="field-label">Environment preference</legend>
+                <div class="agent-settings-options">
+                  <label class="segment-option">
+                    <input type="radio" name="agent-environment" value="" x-model="agentSettingsForm.environment_preference" />
+                    <span>No preference</span>
+                  </label>
+                  <label class="segment-option">
+                    <input type="radio" name="agent-environment" value="indoor_first" x-model="agentSettingsForm.environment_preference" />
+                    <span>Indoor first (Zwift / smart trainer)</span>
+                  </label>
+                  <label class="segment-option">
+                    <input type="radio" name="agent-environment" value="outdoor_first" x-model="agentSettingsForm.environment_preference" />
+                    <span>Outdoor first</span>
+                  </label>
+                  <label class="segment-option">
+                    <input type="radio" name="agent-environment" value="mixed" x-model="agentSettingsForm.environment_preference" />
+                    <span>Mixed indoor &amp; outdoor</span>
+                  </label>
+                </div>
+              </fieldset>
+              <label class="field">
+                <span class="field-label">Standing preferences</span>
+                <textarea
+                  x-model="agentSettingsForm.standing_preferences"
+                  rows="3"
+                  maxlength="1000"
+                  aria-describedby="agent-standing-counter agent-orientation-disclosure"
+                ></textarea>
+              </label>
+              <p class="settings-note agent-settings-counter" id="agent-standing-counter">
+                <span x-text="agentSettingsForm.standing_preferences.length + ' / 1000'"></span>
+              </p>
+              <p class="settings-note" id="agent-standing-helper">
+                Logistical and session-format habits only: session format, weekday/weekend
+                scheduling and trainer habits. Do not include medical conditions or health data.
+              </p>
               <p class="settings-note" x-show="agentSettingsDirty">Unsaved changes.</p>
               <div class="settings-actions">
                 <button
@@ -1305,7 +1349,7 @@
                 <button
                   class="button"
                   type="button"
-                  :disabled="agentSettingsSaving || agentSettingsOrientationOverflow"
+                  :disabled="agentSettingsSaving || agentSettingsOrientationOverflow || agentSettingsStandingOverflow"
                   @click="saveAgentSettings()"
                 >
                   Save preferences

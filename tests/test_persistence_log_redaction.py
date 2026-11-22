@@ -115,7 +115,13 @@ _SINGLE_FAILURE_SITES = [
     pytest.param(
         "PUT",
         "/api/admin/agent-settings",
-        {"orientation": f"focus {MARKER}", "verbosity": "concise", "tone": "strict"},
+        {
+            "orientation": f"focus {MARKER}",
+            "verbosity": "concise",
+            "tone": "strict",
+            "environment_preference": None,
+            "standing_preferences": None,
+        },
         503,
         id="app.py-1776-agent-settings-save",
     ),

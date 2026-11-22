@@ -16,7 +16,9 @@ from typing import Any
 
 from coach_web.agent import (
     DEFAULT_SYSTEM_PROMPT,
+    ENVIRONMENT_DIRECTIVES,
     REASSERT_CLAUSE,
+    STANDING_PREFERENCES_BLOCK_BEGIN,
     TONE_DIRECTIVES,
     VERBOSITY_DIRECTIVES,
     apply_temporal_anchor,
@@ -31,6 +33,8 @@ def _ui_payload(**overrides: Any) -> dict[str, Any]:
         "orientation": "Anchor recovery weeks after races.",
         "verbosity": "detailed",
         "tone": "supportive",
+        "environment_preference": "indoor_first",
+        "standing_preferences": "Zwift on weekdays; long outdoor ride on Sunday.",
     }
     payload.update(overrides)
     return payload
@@ -49,6 +53,26 @@ class TestSaveThenNextReply:
         assert "| Anchor recovery weeks after races." in reply
         assert VERBOSITY_DIRECTIVES["detailed"] in reply
         assert TONE_DIRECTIVES["supportive"] in reply
+        assert ENVIRONMENT_DIRECTIVES["indoor_first"] in reply
+        assert STANDING_PREFERENCES_BLOCK_BEGIN in reply
+        assert "| Zwift on weekdays; long outdoor ride on Sunday." in reply
+        assert REASSERT_CLAUSE in reply
+
+    def test_unset_standing_preferences_emit_no_block(self, migrated_db: Path) -> None:
+        """The "no preference" selector + empty textarea ride as JSON null."""
+        with _probe_client() as client:
+            put_response = client.put(
+                "/api/admin/agent-settings",
+                json=_ui_payload(environment_preference=None, standing_preferences=None),
+            )
+            reply = _streamed_text(client)
+
+        assert put_response.status_code == 200
+        assert put_response.json()["environment_preference"] is None
+        assert put_response.json()["standing_preferences"] is None
+        assert STANDING_PREFERENCES_BLOCK_BEGIN not in reply
+        for directive in ENVIRONMENT_DIRECTIVES.values():
+            assert directive not in reply
         assert REASSERT_CLAUSE in reply
 
     def test_unset_preferences_emit_no_directives(self, migrated_db: Path) -> None:
@@ -93,8 +117,12 @@ class TestSaveThenNextReply:
 
         assert delete_response.status_code == 200
         assert "| Anchor recovery weeks after races." in with_save
+        assert STANDING_PREFERENCES_BLOCK_BEGIN in with_save
         assert after_reset.startswith(apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today()))
         assert "Anchor recovery weeks after races." not in after_reset
         assert "OWNER ORIENTATION" not in after_reset
+        assert STANDING_PREFERENCES_BLOCK_BEGIN not in after_reset
+        for directive in ENVIRONMENT_DIRECTIVES.values():
+            assert directive not in after_reset
         assert CROSS_THREAD_BRIEF_BEGIN in after_reset
         assert after_reset.endswith(REASSERT_CLAUSE)
