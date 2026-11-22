@@ -41,6 +41,21 @@ Verbosity = Literal["concise", "standard", "detailed"]
 Tone = Literal["strict", "balanced", "supportive"]
 """MADR-0026 ``tone`` CHECK enum."""
 
+EnvironmentPreference = Literal["indoor_first", "outdoor_first", "mixed"]
+"""MADR-0032 C8 ``environment_preference`` CHECK enum (#419).
+
+The health-adjacent session-environment intent is expressed ONLY through this
+structured enum, mapped server-side to a fixed directive at assembly — never
+through free text (MADR-0026 C1–C4 posture).
+"""
+
+STANDING_PREFERENCES_MAX_CHARS = 1000
+"""MADR-0032 §3 cap on the persisted standing preferences (characters).
+
+Hardcoded as a CHECK in migration 0009 — keep the two in sync. The seam
+sanitizer enforces the same cap at both C8 sites (save + read-time assembly).
+"""
+
 
 class AgentSettings(BaseModel):
     """Seam-boundary view of an ``agent_settings`` row (MADR-0026, #361).
@@ -68,22 +83,38 @@ class AgentSettings(BaseModel):
         default=None,
         description="Coaching tone preference (MADR-0026 enum)",
     )
+    environment_preference: EnvironmentPreference | None = Field(
+        default=None,
+        description=(
+            "Session environment preference (MADR-0032 C8 enum; mapped to a "
+            "fixed server-side directive at assembly)"
+        ),
+    )
+    standing_preferences: str | None = Field(
+        default=None,
+        description=(
+            "Standing logistical/session-format habits (C1 plaintext, "
+            "untrusted until sanitized at assembly — never length-checked here)"
+        ),
+    )
 
 
 class AgentSettingsSaveRequest(BaseModel):
     """PUT ``/api/admin/agent-settings`` request body (#362, MADR-0026).
 
-    A FULL representation: all three fields are required (JSON ``null``
-    allowed for "unset") — an omitted field is a malformed payload (422),
-    never an implicit clear. The free text is UNTRUSTED input whose boundary
+    A FULL representation: every field is required (JSON ``null`` allowed for
+    "unset") — an omitted field is a malformed payload (422), never an
+    implicit clear. The free-text fields are UNTRUSTED input whose boundary
     type is deliberately loose (``str | None``): the save-site sanitizer +
-    cap validation live in the API layer (#362), which stores only the
+    cap validation live in the API layer (#362/#419), which stores only the
     sanitized text; the enum fields are CHECK-enum literals.
     """
 
     orientation: str | None
     verbosity: Verbosity | None
     tone: Tone | None
+    environment_preference: EnvironmentPreference | None
+    standing_preferences: str | None
 
 
 class AgentSettingsRow(Base):
@@ -103,6 +134,15 @@ class AgentSettingsRow(Base):
             "tone IN ('strict', 'balanced', 'supportive')",
             name="ck_agent_settings_tone",
         ),
+        CheckConstraint(
+            "environment_preference IS NULL OR environment_preference IN "
+            "('indoor_first', 'outdoor_first', 'mixed')",
+            name="ck_agent_settings_environment_preference",
+        ),
+        CheckConstraint(
+            "standing_preferences IS NULL OR length(standing_preferences) <= 1000",
+            name="ck_agent_settings_standing_preferences_len",
+        ),
         UniqueConstraint("athlete_id", name="uq_agent_settings_athlete_id"),
     )
 
@@ -111,6 +151,8 @@ class AgentSettingsRow(Base):
     orientation: Mapped[str | None] = mapped_column(Text, nullable=True)
     verbosity: Mapped[str | None] = mapped_column(Text, nullable=True)
     tone: Mapped[str | None] = mapped_column(Text, nullable=True)
+    environment_preference: Mapped[str | None] = mapped_column(Text, nullable=True)
+    standing_preferences: Mapped[str | None] = mapped_column(Text, nullable=True)
     updated_at: Mapped[str] = mapped_column(Text, nullable=False)
 
 
@@ -141,6 +183,8 @@ async def get_agent_settings(session: AsyncSession, *, athlete_id: int) -> Agent
             "orientation": row.orientation,
             "verbosity": row.verbosity,
             "tone": row.tone,
+            "environment_preference": row.environment_preference,
+            "standing_preferences": row.standing_preferences,
         }
     )
 
@@ -152,12 +196,14 @@ async def save_agent_settings(
     orientation: str | None,
     verbosity: str | None,
     tone: str | None,
+    environment_preference: str | None,
+    standing_preferences: str | None,
 ) -> AgentSettingsRow:
     """Upsert the athlete's single settings row (last-writer-wins) and commit.
 
-    The caller owns the save-time sanitization/validation contract (API #362:
-    sanitize → validate → 422); the DB CHECK constraints backstop the enum
-    values and the 1500-character cap for every writer (AC1).
+    The caller owns the save-time sanitization/validation contract (API
+    #362/#419: sanitize → validate → 422); the DB CHECK constraints backstop
+    the enum values and the character caps for every writer (AC1).
     """
     result = await session.execute(
         select(AgentSettingsRow).where(AgentSettingsRow.athlete_id == athlete_id)
@@ -170,6 +216,8 @@ async def save_agent_settings(
     row.orientation = orientation
     row.verbosity = verbosity
     row.tone = tone
+    row.environment_preference = environment_preference
+    row.standing_preferences = standing_preferences
     row.updated_at = now
     await session.commit()
     return row

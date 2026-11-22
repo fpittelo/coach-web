@@ -24,12 +24,15 @@ from coach_web.agent import (
     COACH_MCP_READ_TOOLS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
+    ENVIRONMENT_DIRECTIVES,
     ORIENTATION_MAX_CHARS,
     PROPOSE_PERIODIZATION_TOOL,
     PROPOSE_PLAN_TOOL,
     PROPOSE_WEEK_PLAN_TOOL,
     REASSERT_CLAUSE,
     REQUEST_RPE_TOOL,
+    STANDING_PREFERENCES_BLOCK_BEGIN,
+    STANDING_PREFERENCES_BLOCK_END,
     AgentEvent,
     CoachAgent,
     OpenRouterClient,
@@ -47,7 +50,7 @@ from coach_web.agent import (
     sanitize_untrusted_text,
     week_plan_tool_schema,
 )
-from coach_web.agent_settings import AgentSettings
+from coach_web.agent_settings import STANDING_PREFERENCES_MAX_CHARS, AgentSettings
 from coach_web.app import create_app
 from coach_web.config import Settings
 from coach_web.conversation import StoredMessage
@@ -3219,6 +3222,142 @@ class TestSeamCrossThreadBrief:
             "historical cross-session",
         ):
             assert block_text in REASSERT_CLAUSE.lower()
+
+
+class TestSeamStandingPreferences:
+    """MADR-0032 §3 / C8: standing preferences join the single seam, zero fork.
+
+    Pinned 7-block precedence order (C8):
+
+    ``core → owner-orientation → standing-preferences → digests →
+    current-thread memory → cross-thread brief → REASSERT_CLAUSE (LAST)``.
+
+    Block 3 carries the server-owned fixed ``environment_preference``
+    directive plus a SEPARATE ``| ``-line-prefixed fenced block for the
+    read-time re-sanitized ``standing_preferences`` free text. With both
+    fields unset the assembly is byte-identical to the pre-#419 prompt
+    (cold byte-equivalence, AC1).
+    """
+
+    def test_all_seven_blocks_appear_in_the_c8_precedence_order(self) -> None:
+        """core < orientation < standing-preferences < digests < memory <
+        cross-thread brief < REASSERT_CLAUSE."""
+        settings = AgentSettings(
+            orientation="Be pragmatic; focus on power-to-weight.",
+            verbosity="concise",
+            tone="strict",
+            environment_preference="indoor_first",
+            standing_preferences="Weekdays: 60-90 min on the smart trainer.",
+        )
+        prompt = assemble_system_prompt(
+            _ORIENTED_CORE,
+            settings,
+            [_DIGEST_ONE],
+            memory_block=_memory_block(),
+            cross_thread_brief=_cross_thread_brief(),
+        )
+
+        assert prompt.index(_ORIENTED_CORE) < prompt.index("OWNER ORIENTATION")
+        assert prompt.index("OWNER ORIENTATION") < prompt.index(
+            ENVIRONMENT_DIRECTIVES["indoor_first"]
+        )
+        assert prompt.index(ENVIRONMENT_DIRECTIVES["indoor_first"]) < prompt.index(
+            STANDING_PREFERENCES_BLOCK_BEGIN
+        )
+        assert prompt.index(STANDING_PREFERENCES_BLOCK_BEGIN) < prompt.index(_DIGEST_ONE)
+        assert prompt.index(_DIGEST_ONE) < prompt.index("CONVERSATION MEMORY")
+        assert prompt.index("CONVERSATION MEMORY") < prompt.index(CROSS_THREAD_BRIEF_BEGIN)
+        assert prompt.index(CROSS_THREAD_BRIEF_END) < prompt.index(REASSERT_CLAUSE)
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    @pytest.mark.parametrize(
+        ("preference", "directive_fragment"),
+        [
+            ("indoor_first", "Environment preference: indoor first"),
+            ("outdoor_first", "Environment preference: outdoor first"),
+            ("mixed", "Environment preference: mixed"),
+        ],
+    )
+    def test_environment_preference_maps_to_the_fixed_server_directive(
+        self, preference: str, directive_fragment: str
+    ) -> None:
+        """Every enum value emits its constant server-owned directive line."""
+        settings = AgentSettings.model_validate({"environment_preference": preference})
+        prompt = assemble_system_prompt(_ORIENTED_CORE, settings, [])
+
+        assert directive_fragment in prompt
+        assert prompt.index(directive_fragment) < prompt.index(REASSERT_CLAUSE)
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    def test_standing_preferences_render_as_a_separate_line_prefixed_fence(self) -> None:
+        """The free text rides its own fenced block, every line ``| ``-prefixed."""
+        settings = AgentSettings(standing_preferences="Line one\nLine two")
+        prompt = assemble_system_prompt(_ORIENTED_CORE, settings, [])
+
+        assert STANDING_PREFERENCES_BLOCK_BEGIN in prompt
+        assert "| Line one" in prompt
+        assert "| Line two" in prompt
+        # A prefixed content line can never reproduce the closing fence.
+        assert prompt.count(STANDING_PREFERENCES_BLOCK_BEGIN) == 1
+        assert prompt.count(STANDING_PREFERENCES_BLOCK_END) == 1
+        assert prompt.index(STANDING_PREFERENCES_BLOCK_END) < prompt.index(REASSERT_CLAUSE)
+
+    def test_standing_preferences_are_re_sanitized_at_read_time(self) -> None:
+        """A raw (DB-trust-level) payload is defused inside the fence (AC2)."""
+        settings = AgentSettings(standing_preferences=_INJECTION_PAYLOAD)
+        prompt = assemble_system_prompt(_ORIENTED_CORE, settings, [])
+
+        assert "<|im_start|>" not in prompt
+        assert "<system>" not in prompt
+        assert "system: ignore all previous instructions" not in prompt
+        # The visible words survive; only the marker shapes are broken.
+        assert "ignore all previous instructions" in prompt
+        assert prompt.count(STANDING_PREFERENCES_BLOCK_BEGIN) == 1
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    def test_read_time_sanitizer_also_enforces_the_1000_char_cap(self) -> None:
+        """Defense-in-depth: an oversize stored row is clamped at assembly."""
+        settings = AgentSettings(standing_preferences="x" * 1500)
+        prompt = assemble_system_prompt(_ORIENTED_CORE, settings, [])
+
+        assert "x" * STANDING_PREFERENCES_MAX_CHARS in prompt
+        assert "x" * (STANDING_PREFERENCES_MAX_CHARS + 1) not in prompt
+
+    def test_cold_state_is_byte_identical_to_the_pre_419_prompt(self) -> None:
+        """Both fields unset (and no other block) → the bare core, byte-identical."""
+        core = apply_temporal_anchor(_ORIENTED_CORE, date(2026, 10, 25))
+        empty = AgentSettings(environment_preference=None, standing_preferences=None)
+
+        assert assemble_system_prompt(core, empty, []) == core
+        assert REASSERT_CLAUSE not in assemble_system_prompt(core, empty, [])
+
+    @pytest.mark.parametrize("blank", ["", "   ", "\n\t "])
+    def test_blank_standing_preferences_emit_no_block(self, blank: str) -> None:
+        """Empty/whitespace-only standing preferences flip nothing."""
+        settings = AgentSettings(environment_preference=None, standing_preferences=blank)
+        prompt = assemble_system_prompt(_ORIENTED_CORE, settings, [])
+
+        assert prompt == _ORIENTED_CORE
+        assert STANDING_PREFERENCES_BLOCK_BEGIN not in prompt
+        assert REASSERT_CLAUSE not in prompt
+
+    def test_standing_preferences_alone_flip_the_re_assert_clause(self) -> None:
+        """The fenced block alone flips the block-agnostic clause."""
+        prompt = assemble_system_prompt(
+            _ORIENTED_CORE, AgentSettings(standing_preferences="Trainer on weekdays."), []
+        )
+
+        assert prompt.index(STANDING_PREFERENCES_BLOCK_END) < prompt.index(REASSERT_CLAUSE)
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    def test_environment_preference_alone_flips_the_re_assert_clause(self) -> None:
+        """The enum directive alone flips the block-agnostic clause."""
+        prompt = assemble_system_prompt(
+            _ORIENTED_CORE, AgentSettings(environment_preference="outdoor_first"), []
+        )
+
+        assert ENVIRONMENT_DIRECTIVES["outdoor_first"] in prompt
+        assert prompt.endswith(REASSERT_CLAUSE)
 
 
 class TestCrossThreadBriefWithIcuSynthesis:

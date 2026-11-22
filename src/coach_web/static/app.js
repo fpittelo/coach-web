@@ -297,6 +297,11 @@ function settingsReasonMessage(body, fallback) {
 // the boundary — an oversize payload still answers the field-only 422 (#362).
 const AGENT_ORIENTATION_MAX_CHARS = 1500;
 
+// Standing preferences cap (#419, MADR-0032 C8): the client mirror of the
+// server's agent_settings CHECK (STANDING_PREFERENCES_MAX_CHARS). Same
+// posture as the orientation cap — the server remains the boundary.
+const STANDING_PREFERENCES_MAX_CHARS = 1000;
+
 // Debrief error vocabulary (#189): the client mirror of the server's fixed
 // encryption-failure enum (coach_web.errors.EncryptionReason). The debrief
 // 503 body is {code, message}; the server-provided message renders ONLY when
@@ -556,8 +561,20 @@ function coachApp() {
     // last-loaded/saved snapshot the unsaved-changes flag compares against
     // (internal state, never bound in the markup). All bindings are
     // x-text/x-model (structured Pydantic→HTML, no x-html).
-    agentSettingsForm: { orientation: "", verbosity: "", tone: "" },
-    agentSettingsSaved: { orientation: "", verbosity: "", tone: "" },
+    agentSettingsForm: {
+      orientation: "",
+      verbosity: "",
+      tone: "",
+      environment_preference: "",
+      standing_preferences: "",
+    },
+    agentSettingsSaved: {
+      orientation: "",
+      verbosity: "",
+      tone: "",
+      environment_preference: "",
+      standing_preferences: "",
+    },
     agentSettingsSaving: false,
     // Confirm gate (AC3): the reset button arms, only the confirm button
     // DELETEs; disarmed on open/close and after a successful reset.
@@ -1087,7 +1104,11 @@ function coachApp() {
       return (
         this.agentSettingsForm.orientation !== this.agentSettingsSaved.orientation ||
         this.agentSettingsForm.verbosity !== this.agentSettingsSaved.verbosity ||
-        this.agentSettingsForm.tone !== this.agentSettingsSaved.tone
+        this.agentSettingsForm.tone !== this.agentSettingsSaved.tone ||
+        this.agentSettingsForm.environment_preference !==
+          this.agentSettingsSaved.environment_preference ||
+        this.agentSettingsForm.standing_preferences !==
+          this.agentSettingsSaved.standing_preferences
       );
     },
 
@@ -1098,6 +1119,14 @@ function coachApp() {
       return this.agentSettingsForm.orientation.length > AGENT_ORIENTATION_MAX_CHARS;
     },
 
+    get agentSettingsStandingOverflow() {
+      // Client-side cap guard (#419): same posture for the standing
+      // preferences (server remains the 1000-char boundary).
+      return (
+        this.agentSettingsForm.standing_preferences.length > STANDING_PREFERENCES_MAX_CHARS
+      );
+    },
+
     formFromAgentSettings(settings) {
       // API → form: nulls ride as "" so the segmented radios bind (x-model
       // compares against the value attribute); the same shape backs the
@@ -1106,12 +1135,14 @@ function coachApp() {
         orientation: (settings && settings.orientation) || "",
         verbosity: (settings && settings.verbosity) || "",
         tone: (settings && settings.tone) || "",
+        environment_preference: (settings && settings.environment_preference) || "",
+        standing_preferences: (settings && settings.standing_preferences) || "",
       };
     },
 
     payloadFromAgentSettings() {
-      // Form → API: the FULL representation (#362). Empty/whitespace-only
-      // orientation and "" radios serialize as null (the API validates strict
+      // Form → API: the FULL representation (#362/#419). Empty/whitespace-only
+      // free text and "" radios serialize as null (the API validates strict
       // enums — an empty string would be a 422).
       return {
         orientation:
@@ -1120,6 +1151,14 @@ function coachApp() {
             : this.agentSettingsForm.orientation,
         verbosity: this.agentSettingsForm.verbosity === "" ? null : this.agentSettingsForm.verbosity,
         tone: this.agentSettingsForm.tone === "" ? null : this.agentSettingsForm.tone,
+        environment_preference:
+          this.agentSettingsForm.environment_preference === ""
+            ? null
+            : this.agentSettingsForm.environment_preference,
+        standing_preferences:
+          this.agentSettingsForm.standing_preferences.trim() === ""
+            ? null
+            : this.agentSettingsForm.standing_preferences,
       };
     },
 
@@ -1147,7 +1186,7 @@ function coachApp() {
     },
 
     saveAgentSettings() {
-      if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow) {
+      if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow || this.agentSettingsStandingOverflow) {
         return;
       }
       this.agentSettingsSaving = true;

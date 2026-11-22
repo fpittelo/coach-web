@@ -46,6 +46,8 @@ async def _save(
     orientation: str | None = "Focus on power-to-weight.",
     verbosity: str | None = "concise",
     tone: str | None = "strict",
+    environment_preference: str | None = None,
+    standing_preferences: str | None = None,
 ) -> AgentSettingsRow:
     """Persist one settings row through the store under test."""
     return await save_agent_settings(
@@ -54,6 +56,8 @@ async def _save(
         orientation=orientation,
         verbosity=verbosity,
         tone=tone,
+        environment_preference=environment_preference,
+        standing_preferences=standing_preferences,
     )
 
 
@@ -222,7 +226,9 @@ def _tamper_schema_drop_checks(conn: sqlite3.Connection) -> None:
         "orientation TEXT, "
         "verbosity TEXT, "
         "tone TEXT, "
-        "updated_at TEXT NOT NULL)"
+        "updated_at TEXT NOT NULL, "
+        "environment_preference TEXT, "
+        "standing_preferences TEXT)"
     )
 
 

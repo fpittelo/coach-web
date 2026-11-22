@@ -4929,6 +4929,53 @@ class TestAgentSettingsSectionContract:
         )
         assert 'id="agent-orientation-disclosure"' in section
 
+    def test_environment_preference_selector_offers_the_c8_enums(self) -> None:
+        """AC3: a labelled selector carries the three C8 enum values + unset."""
+        section = self._section()
+
+        assert "Environment preference" in section
+        assert 'name="agent-environment"' in section
+        assert section.count('x-model="agentSettingsForm.environment_preference"') == 4
+        for value in ("indoor_first", "outdoor_first", "mixed"):
+            assert f'value="{value}"' in section, value
+        assert ">No preference</span>" in section
+        assert re.search(r'<label[^>]*>\s*<input type="radio"', section)
+
+    def test_standing_preferences_textarea_binds_and_caps_at_1000(self) -> None:
+        """AC3: a textarea binds x-model with maxlength=1000 and a live counter."""
+        section = self._section()
+
+        assert 'x-model="agentSettingsForm.standing_preferences"' in section
+        assert 'maxlength="1000"' in section
+        assert """x-text="agentSettingsForm.standing_preferences.length + ' / 1000'\"""" in section
+        assert 'id="agent-standing-counter"' in section
+        assert 'aria-describedby="agent-standing-counter agent-orientation-disclosure"' in section
+
+    def test_standing_preferences_helper_note_is_non_medical(self) -> None:
+        """AC3: the helper explains logistical habits and excludes medical data."""
+        section = self._section()
+
+        note_at = section.index('id="agent-standing-helper"')
+        note = section[note_at : section.index("</p>", note_at)]
+        assert "session format" in note.lower()
+        assert "schedul" in note.lower()
+        assert "medical" in note.lower()
+
+    def test_standing_overflow_disables_save(self) -> None:
+        """AC3: an over-1000 standing preference disables Save client-side."""
+        section = self._section()
+        script = self._script()
+        save = _rule_block(script, "saveAgentSettings()")
+
+        assert "agentSettingsStandingOverflow" in section
+        assert "get agentSettingsStandingOverflow()" in script
+        assert "const STANDING_PREFERENCES_MAX_CHARS = 1000" in script
+        assert (
+            "this.agentSettingsForm.standing_preferences.length > STANDING_PREFERENCES_MAX_CHARS"
+            in script
+        )
+        assert "this.agentSettingsStandingOverflow" in save
+
     def test_counter_overflow_disables_save(self) -> None:
         """AC4: an overflowing orientation disables Save client-side.
 
@@ -4945,7 +4992,10 @@ class TestAgentSettingsSectionContract:
         assert "const AGENT_ORIENTATION_MAX_CHARS = 1500" in script
         assert "this.agentSettingsForm.orientation.length > AGENT_ORIENTATION_MAX_CHARS" in script
         assert ":disabled" in section
-        assert "if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow)" in save
+        assert (
+            "if (this.agentSettingsSaving || this.agentSettingsOrientationOverflow || "
+            "this.agentSettingsStandingOverflow)" in save
+        )
 
     def test_every_section_button_is_a_plain_button(self) -> None:
         """The section's actions never submit the objectives form."""
@@ -4990,9 +5040,17 @@ class TestAgentSettingsSectionContract:
     # --- disclosure (MADR-0026 C4) -----------------------------------------------
 
     def test_disclosure_line_sits_adjacent_to_the_textarea(self) -> None:
-        """C4: the exact disclosure sentence, between textarea and controls."""
+        """C4: the exact disclosure sentence, between textarea and controls.
+
+        #419 extends the sentence to cover the standing preferences — the
+        save-time disclosure must state that they reach OpenRouter on every
+        turn (MADR-0026 C4 / MADR-0032 C8).
+        """
         section = self._section()
-        marker = "Orientation text is sent to the model provider on every turn."
+        marker = (
+            "Orientation, environment preference and standing preferences are sent to "
+            "OpenRouter on every turn."
+        )
 
         assert marker in section
         textarea_at = section.index('x-model="agentSettingsForm.orientation"')
@@ -5043,12 +5101,14 @@ class TestAgentSettingsSectionContract:
         assert "JSON.stringify(this.payloadFromAgentSettings())" in save
 
     def test_payload_is_a_full_representation_with_null_for_unset(self) -> None:
-        """The payload carries all three fields; "" radios normalize to null."""
+        """The payload carries every field; "" radios normalize to null."""
         payload = _rule_block(self._script(), "payloadFromAgentSettings()")
 
         assert "orientation" in payload
         assert "verbosity" in payload
         assert "tone" in payload
+        assert "environment_preference" in payload
+        assert "standing_preferences" in payload
         assert '=== "" ? null' in payload
 
     def test_save_surfaces_confirmation_and_updates_the_snapshot(self) -> None:

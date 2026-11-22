@@ -1044,6 +1044,8 @@ class TestAgentSettingsPromptAssembly:
                 orientation="Be pragmatic; prioritise recovery on tired weeks.",
                 verbosity="concise",
                 tone="supportive",
+                environment_preference=None,
+                standing_preferences=None,
             )
         agent = _PromptProbeAgent()
         client = self._client_with(settings, agent, db_session_factory)

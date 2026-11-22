@@ -948,6 +948,8 @@ class TestDurabilityRoundTrip:
                     orientation="direct",
                     verbosity="concise",
                     tone="supportive",
+                    environment_preference=None,
+                    standing_preferences=None,
                 )
         finally:
             await engine.dispose()
