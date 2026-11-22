@@ -5,8 +5,12 @@ name: Cloud Run Production Deploy
 #
 # Trigger: workflow_dispatch only (issue #316). main is the only trunk
 # (MADR-0017); the deployed artifact is always an exact GHCR sha256 digest:
-# the `image_tag_or_digest` input (default: `prod` = latest prod digest) is
-# resolved via `docker buildx imagetools inspect` and deployed as `@sha256:…`.
+# the `image_tag_or_digest` input (required on dispatch — no default; #411)
+# is resolved via `docker buildx imagetools inspect` and deployed as
+# `@sha256:…`. Release-class tags (`prod`, `latest`, `v*`) are REFUSED at
+# resolution time — they resolve to the LAST RELEASE build, not the current
+# trunk artifact; that stale-release digest caused three live prod incidents
+# (runs 44897761116, 44898471542, 45003393040 — issue #411).
 #
 # Sequencing (Sprint 32 consensus, grooming amendment 2026-11-15): the FIRST
 # execution (AC1) must not run before @cyber-security records the AC5 review
@@ -45,9 +49,8 @@ on:
   workflow_dispatch:
     inputs:
       image_tag_or_digest:
-        description: "coach-web image tag on ghcr.io/fpittelo/coach-web (default: prod = latest prod digest), or an explicit sha256:… digest"
-        required: false
-        default: "prod"
+        description: "coach-web image ref on ghcr.io/fpittelo/coach-web — pass the CURRENT TRUNK DIGEST (sha256:…, see docs/admin_guide.md deploy-lane runbook), the dev tag, or a trunk-build sha tag. Release-class tags (prod, latest, v*) are refused (#411)."
+        required: true
         type: string
 
 permissions:
@@ -103,6 +106,16 @@ jobs:
         run: |
           set -euo pipefail
           repo="ghcr.io/fpittelo/coach-web"
+          # Stale-release guard (#411, @architect ruling): a release-class tag
+          # (`prod`, `latest`, `v*`) resolves to the LAST RELEASE build in
+          # GHCR, NOT the current trunk artifact — the `prod` default resolved
+          # to the stale v0.20.0 digest and caused three live prod incidents
+          # (runs 44897761116, 44898471542, 45003393040). Fail the run fast,
+          # BEFORE any registry resolution or Cloud Run mutation.
+          if [[ "${IMAGE_INPUT}" == "prod" || "${IMAGE_INPUT}" == "latest" || "${IMAGE_INPUT}" =~ ^v[0-9] ]]; then
+            echo "::error::Release-class tag '${IMAGE_INPUT}' is refused as a deploy input (#411) — it resolves to the LAST RELEASE image, which is stale (prod incidents: runs 44897761116/44898471542/45003393040). Pass the current trunk digest (sha256:…) or the dev tag — see docs/admin_guide.md → deploy-lane runbook."
+            exit 1
+          fi
           if [[ "${IMAGE_INPUT}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             ref="${repo}@${IMAGE_INPUT}"
           elif [[ "${IMAGE_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
