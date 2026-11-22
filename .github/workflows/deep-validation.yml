@@ -97,6 +97,10 @@ jobs:
               "docs/specifications.md",
               "docs/architecture.md",
               "docs/security.md",
+              "docs/architecture/arc42/README.md",
+              "docs/architecture/arc42/01-context-and-building-blocks.md",
+              "docs/architecture/arc42/02-runtime-and-delivery.md",
+              "docs/architecture/arc42/03-cross-cutting-and-security.md",
           )
           FENCE_RE = re.compile(r"^ {0,3}(`{3,})(.*)$")
           LINK_RE = re.compile(r"\[[^\]]*\]\(([^)\s]+)")
