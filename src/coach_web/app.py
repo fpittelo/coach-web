@@ -85,6 +85,7 @@ from coach_web.conversation_api import (
     record_user_turn,
 )
 from coach_web.conversation_context import (
+    build_cross_thread_brief,
     build_turn_memory_block,
     produce_thread_summary,
     refresh_thread_summary_if_due,
@@ -914,6 +915,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             log_persistence_degrade(exc)
         turn_thread: ConversationThreadRow | None = None
         memory_block: str | None = None
+        cross_thread_brief: str | None = None
         if cipher is not None:
             turn_outcome = await open_turn_thread(
                 session_factory,
@@ -935,6 +937,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     thread=turn_thread,
                     cipher=cipher,
                     bound=settings.MEMORY_CONTEXT_MAX_CHARS,
+                )
+                # Cross-thread longitudinal brief (MADR-0032 §2 / C7, #418):
+                # the SEPARATE fenced historical block — prior threads'
+                # summaries, recent debriefs and open actions, active thread
+                # excluded. Same degrade posture: a failure yields no brief
+                # (the reply is the product) and the store failure logs the
+                # exception class name only (zero content, C3).
+                cross_thread_brief = await build_cross_thread_brief(
+                    session_factory,
+                    athlete_id=athlete_id,
+                    thread_id=turn_thread.id,
+                    cipher=cipher,
+                    today=today,
                 )
                 user_write = await record_user_turn(
                     session_factory,
@@ -1059,7 +1074,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             if divergence is not None:
                 digests.append(divergence_digest_text(divergence))
         agent.system_prompt = assemble_system_prompt(
-            core_prompt, agent_settings, digests, memory_block
+            core_prompt,
+            agent_settings,
+            digests,
+            memory_block,
+            cross_thread_brief,
         )
 
         # Morning briefing card (#262, epic #215-A): on the FIRST page load

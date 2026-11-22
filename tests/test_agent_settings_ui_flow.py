@@ -21,6 +21,7 @@ from coach_web.agent import (
     VERBOSITY_DIRECTIVES,
     apply_temporal_anchor,
 )
+from coach_web.conversation_context import CROSS_THREAD_BRIEF_BEGIN
 from tests.test_agent_settings_api import _probe_client, _streamed_text
 
 
@@ -78,7 +79,10 @@ class TestSaveThenNextReply:
         The probe exchange between the two streams persists into a thread
         whose memory block (#350) would enter the second prompt — the
         conversation reset clears it so the second stream exercises the
-        settings-free core assembly.
+        settings-free core assembly. Since #418 (MADR-0032 §2) the reset ALSO
+        archives + summarizes that thread, so the new thread legitimately
+        carries the fenced cross-session brief: the settings content is what
+        the reset removes.
         """
         with _probe_client() as client:
             client.put("/api/admin/agent-settings", json=_ui_payload())
@@ -89,4 +93,8 @@ class TestSaveThenNextReply:
 
         assert delete_response.status_code == 200
         assert "| Anchor recovery weeks after races." in with_save
-        assert after_reset == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
+        assert after_reset.startswith(apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today()))
+        assert "Anchor recovery weeks after races." not in after_reset
+        assert "OWNER ORIENTATION" not in after_reset
+        assert CROSS_THREAD_BRIEF_BEGIN in after_reset
+        assert after_reset.endswith(REASSERT_CLAUSE)

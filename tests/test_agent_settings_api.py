@@ -52,6 +52,7 @@ from coach_web.app import create_app
 from coach_web.auth.middleware import SESSION_COOKIE
 from coach_web.auth.tokens import create_session_token
 from coach_web.config import get_settings
+from coach_web.conversation_context import CROSS_THREAD_BRIEF_BEGIN
 
 GENERIC_REASON_BODY = {"code": "invalid_values", "message": "One or more values are out of range."}
 DEFAULTS_BODY = {"orientation": None, "verbosity": None, "tone": None}
@@ -508,12 +509,15 @@ class TestAgentSettingsPromptRoundTrip:
         assert REASSERT_CLAUSE in streamed
 
     def test_reset_removes_the_orientation_from_the_prompt(self, migrated_db: Path) -> None:
-        """After DELETE the prompt is byte-equivalent to the no-settings prompt.
+        """After DELETE the prompt is back to the settings-free assembly.
 
         The probe exchange between the two streams persists into a thread
         (#349) whose memory block would enter the second prompt (#350) —
         the conversation reset clears it, so the second prompt exercises
-        exactly the settings-free assembly.
+        the settings-free assembly. Since #418 (MADR-0032 §2) the reset ALSO
+        archives + summarizes that thread, so the new thread legitimately
+        carries the fenced cross-session brief: the settings content is what
+        the reset removes.
         """
         with _probe_client() as client:
             client.put(
@@ -527,8 +531,13 @@ class TestAgentSettingsPromptRoundTrip:
 
         assert delete_response.status_code == 200
         assert "| Focus on power-to-weight and recovery." in first
-        assert second == apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today())
+        assert second.startswith(apply_temporal_anchor(DEFAULT_SYSTEM_PROMPT, date.today()))
         assert "power-to-weight" not in second
+        assert "OWNER ORIENTATION" not in second
+        assert "Verbosity:" not in second
+        assert "Tone:" not in second
+        assert CROSS_THREAD_BRIEF_BEGIN in second
+        assert second.endswith(REASSERT_CLAUSE)
 
 
 class TestOpenApiContract:

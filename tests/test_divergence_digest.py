@@ -51,6 +51,10 @@ from coach_web.agent import AgentEvent
 from coach_web.analysis import ICU_TOOL_GET_COSTS
 from coach_web.app import create_app
 from coach_web.config import Settings, get_settings
+from coach_web.conversation_context import (
+    CROSS_THREAD_BRIEF_BEGIN,
+    CROSS_THREAD_BRIEF_END,
+)
 from coach_web.db import Base
 from coach_web.debrief import (
     DEFAULT_ATHLETE_ID,
@@ -99,6 +103,22 @@ def cipher_settings(monkeypatch: pytest.MonkeyPatch) -> Settings:
 def _rpe_token(rpe: int) -> str:
     """Encrypt an RPE exactly the way the save path stores it (#243)."""
     return TEST_CIPHER.encrypt(str(rpe).encode("utf-8")).decode("ascii")
+
+
+def _without_cross_thread_brief(prompt: str) -> str:
+    """The prompt minus the #418 cross-session block (the C-S2-2 prompt scope).
+
+    MADR-0032 §2 gives the cross-thread brief its own fenced block that
+    recalls recent debrief notes by design; the #236 C-S2-2 pin therefore
+    applies to every OTHER prompt surface, which this helper isolates.
+    """
+    start = prompt.find(CROSS_THREAD_BRIEF_BEGIN)
+    if start == -1:
+        return prompt
+    end = prompt.find(CROSS_THREAD_BRIEF_END, start)
+    if end == -1:
+        return prompt[:start]
+    return prompt[:start] + prompt[end + len(CROSS_THREAD_BRIEF_END) :]
 
 
 # ---------------------------------------------------------------------------
@@ -694,8 +714,13 @@ class TestDivergenceDigestEndpoint:
 
         prompt = agent.captured_prompt
         assert prompt is not None
-        # The plaintext note never reaches the prompt or the SSE stream...
-        assert SENTINEL_NOTE not in prompt
+        # The plaintext note never reaches the DIGEST path — the divergence
+        # digest does not carry it, and the SSE stream never echoes it.
+        # (#418 carve-out: the separate cross-thread brief DOES recall recent
+        # debrief notes by design — MADR-0032 §2 — so the assertion is
+        # scoped to every prompt surface EXCEPT that fenced block.)
+        digest_visible_prompt = _without_cross_thread_brief(prompt)
+        assert SENTINEL_NOTE not in digest_visible_prompt
         assert SENTINEL_NOTE not in body
         # ...and the stored ciphertext is never even SELECTED (the stronger
         # half of C-S2-2: the digest path does not touch the column).
@@ -820,9 +845,10 @@ class TestDivergenceDigestEndpoint:
         # write (3), assistant completion write (4), summary-refresh read
         # (#350, 5; below the ~20-turn threshold it writes nothing) — a
         # separate C7 failure posture, deliberately not shared with the
-        # digest reads. One clean turn opens 6 sessions: 1 digest + 5
-        # persistence.
-        assert counting.calls == 6
+        # digest reads. #418 adds the cross-thread brief read (6), the same
+        # per-step posture. One clean turn opens 7 sessions: 1 digest + 6
+        # persistence/brief.
+        assert counting.calls == 7
         prompt = agent.captured_prompt
         assert prompt is not None
         # The shared session served the divergence read too.
