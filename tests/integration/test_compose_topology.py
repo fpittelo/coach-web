@@ -903,15 +903,20 @@ class TestCIContainerScan:
         assert "image-scan" in ci.get("jobs", {})
 
     def test_trivy_action_pinned(self, ci: dict[str, Any]) -> None:
-        """The trivy action is pinned to a specific version tag."""
+        """Every trivy scan step is pinned to the same action version."""
         steps = ci["jobs"]["image-scan"]["steps"]
         trivy = [
             step
             for step in steps
             if str(step.get("uses", "")).startswith("aquasecurity/trivy-action@")
         ]
-        assert len(trivy) == 1
-        assert trivy[0]["uses"] == "aquasecurity/trivy-action@v0.36.0"
+        assert len(trivy) == 2
+        assert all(step["uses"] == "aquasecurity/trivy-action@v0.36.0" for step in trivy)
+        # The second scan is the landing surface (MADR-0031, #427).
+        landing = next(
+            step for step in trivy if step["with"].get("image-ref") == "coach-web-landing:scan"
+        )
+        assert landing["with"].get("severity") == "HIGH,CRITICAL"
 
     def test_trivy_fails_on_high_critical(self, ci: dict[str, Any]) -> None:
         """The scan fails on HIGH/CRITICAL and reports lower severities."""
@@ -926,15 +931,21 @@ class TestCIContainerScan:
         assert str(with_.get("exit-code")) == "1"
 
     def test_image_scan_builds_and_loads_image(self, ci: dict[str, Any]) -> None:
-        """The job builds the image and loads it into the local daemon for scanning."""
+        """Both scan builds (console + landing) load into the local daemon."""
         steps = ci["jobs"]["image-scan"]["steps"]
         builds = [
             step
             for step in steps
             if str(step.get("uses", "")).startswith("docker/build-push-action@")
         ]
-        assert len(builds) == 1
-        assert builds[0]["with"].get("load") is True
+        assert len(builds) == 2
+        for build in builds:
+            assert build["with"].get("load") is True
+        # The second build is the landing surface (MADR-0031, #427).
+        landing = next(
+            build for build in builds if build["with"].get("file") == "Dockerfile.landing"
+        )
+        assert landing["with"].get("tags") == "coach-web-landing:scan"
 
 
 class TestTrivyIgnoreRegister:
@@ -1605,5 +1616,621 @@ with open(os.environ[variable], encoding="utf-8") as handle:
             tmp_path, project_iam=project, bucket_metadata=bucket, bucket_iam=policy
         )
 
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout
+
+
+class TestLandingSurfaceContainerAndGates:
+    """The public static landing surface container and its fail-closed gates (#427).
+
+    MADR-0031 (accepted) binds conditions C1-C7 on the second, public Cloud Run
+    service: a dedicated ZERO-role runtime identity (C1/C2), per-service
+    invoker/IAP posture (C3), resource-scoped deploy grants (C4), a hardened
+    digest-pinned container (C5/C6) and content provenance with the canonical
+    CTA (C7). The container is pinned declaratively; the shipped
+    ``cloud-run-deploy.yaml`` gates are executed for real against replayed
+    ``gcloud``/``curl`` read-backs — positive payloads must pass, every drift
+    class must exit non-zero.
+    """
+
+    LANDING_SERVICE = "coach-web-landing"
+    LANDING_SA_MEMBER = "serviceAccount:coach-web-landing@coach-web-509209.iam.gserviceaccount.com"
+    LANDING_SA_NAME = "coach-web-landing@coach-web-509209.iam.gserviceaccount.com"
+    LANDING_IMAGE = "ghcr.io/fpittelo/coach-web-landing@sha256:" + "c" * 64
+    LANDING_URL = "https://coach-web-landing-853194930683.europe-west6.run.app"
+    CANONICAL_CTA = "https://coach-web-afff35tqxq-oa.a.run.app/auth/login"
+    IAM_GATE_STEP = "Assert landing surface IAM (MADR-0031 C1/C2)"
+    C3_GATE_STEP = "Assert landing surface public posture (MADR-0031 C3)"
+    SPEC_GATE_STEP = "Assert deployed landing spec (MADR-0031 C5/C6)"
+    PROBE_STEP = "Probe the public landing surface (MADR-0031 C7)"
+    IAP_GATE_STEP = (
+        "Assert no project-level run.admin or iap.admin on the deploy SA"
+        " (AC3, Amendments 0002 + 0005)"
+    )
+
+    # ------------------------------------------------------------------
+    # Declarative container pins (C5/C6)
+    # ------------------------------------------------------------------
+
+    @pytest.fixture
+    def landing_dockerfile(self) -> str:
+        """Return the Dockerfile.landing contents."""
+        path = PROJECT_ROOT / "Dockerfile.landing"
+        assert path.is_file(), "Dockerfile.landing must exist"
+        return path.read_text(encoding="utf-8")
+
+    @pytest.fixture
+    def landing_server(self) -> str:
+        """Return the landing Go server source."""
+        path = PROJECT_ROOT / "landing" / "server.go"
+        assert path.is_file(), "landing/server.go must exist"
+        return path.read_text(encoding="utf-8")
+
+    def test_landing_dockerfile_pins_every_base_digest(self, landing_dockerfile: str) -> None:
+        """Every FROM pins an exact sha256 digest (MADR-0031 C6, #423 lesson)."""
+        froms = [line for line in landing_dockerfile.splitlines() if line.startswith("FROM ")]
+        assert len(froms) == 2, "the landing image must have builder + runtime stages"
+        for line in froms:
+            assert "@sha256:" in line, f"unpinned base: {line}"
+
+    def test_landing_dockerfile_runs_nonroot_without_env(self, landing_dockerfile: str) -> None:
+        """The runtime user is nonroot (65532) and no env config is baked in."""
+        assert "USER nonroot:nonroot" in landing_dockerfile
+        assert "gcr.io/distroless/static-debian12:nonroot@sha256:" in landing_dockerfile
+        env_lines = [line for line in landing_dockerfile.splitlines() if line.startswith("ENV ")]
+        assert env_lines == [], "the landing image must bake zero env vars (MADR-0031 C5)"
+        assert "GOOGLE_APPLICATION_CREDENTIALS" not in landing_dockerfile
+
+    def test_landing_dockerfile_asserts_the_canonical_cta_at_build_time(
+        self, landing_dockerfile: str
+    ) -> None:
+        """The build stage rewrites the relative CTA and fails closed on drift."""
+        assert "ARG CONSOLE_ORIGIN=https://coach-web-afff35tqxq-oa.a.run.app" in landing_dockerfile
+        assert 'href="/auth/login"' in landing_dockerfile
+        assert 'grep -F -q "href=\\"${CONSOLE_ORIGIN}/auth/login\\""' in landing_dockerfile
+        assert "grep -F -q 'href=\"/auth/login\"'" in landing_dockerfile
+        assert "sha256sum landing.html" in landing_dockerfile
+
+    def test_landing_server_is_stdlib_only_and_pins_the_cta(self, landing_server: str) -> None:
+        """The Go server pins the canonical CTA, headers and timeouts, and reads nothing."""
+        assert f'const canonicalConsoleLoginURL = "{self.CANONICAL_CTA}"' in landing_server
+        for header in (
+            '"Cache-Control":           "public, max-age=300"',
+            '"X-Content-Type-Options":  "nosniff"',
+            '"Referrer-Policy":         "no-referrer"',
+            "default-src 'none'; style-src 'self'; img-src 'self'; "
+            "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+        ):
+            assert header in landing_server, header
+        assert "//go:embed landing.html static/landing.css" in landing_server
+        for marker in (":8080", "ReadHeaderTimeout", "ReadTimeout", "WriteTimeout", "IdleTimeout"):
+            assert marker in landing_server, marker
+        for forbidden in ("os.Getenv", "os.LookupEnv", "os.Open", "http.Redirect", "SetCookie"):
+            assert forbidden not in landing_server, forbidden
+
+    def test_landing_go_module_is_stdlib_only(self) -> None:
+        """landing/go.mod declares the module with zero external dependencies."""
+        text = (PROJECT_ROOT / "landing" / "go.mod").read_text(encoding="utf-8")
+        assert "module coach_web_landing" in text
+        assert "require" not in text
+
+    # ------------------------------------------------------------------
+    # Executable gates: the shipped workflow steps run against replayed
+    # gcloud/curl read-backs (positive + drift classes).
+    # ------------------------------------------------------------------
+
+    PROJECT_IAM_BASELINE: dict[str, Any] = {
+        "bindings": [
+            {"members": [DEPLOY_SA_MEMBER], "role": PROJECT_IAM_VIEWER_ROLE},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/resourcemanager.viewer"},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/serviceusage.serviceUsageConsumer"},
+            {"members": ["user:frederic.pitteloud@gmail.com"], "role": "roles/owner"},
+        ],
+        "etag": "BwZg3BJ7Uyk=",
+        "version": 3,
+    }
+
+    LANDING_SA_POLICY_BASELINE: dict[str, Any] = {
+        "bindings": [
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/iam.serviceAccountUser"},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/iam.serviceAccountViewer"},
+        ],
+        "etag": "BwZg3BF9cm4=",
+        "version": 1,
+    }
+
+    LANDING_KEYS_BASELINE: list[Any] = []
+
+    LANDING_POLICY_BASELINE: dict[str, Any] = {
+        "bindings": [
+            {"members": ["allUsers"], "role": "roles/run.invoker"},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/run.admin"},
+        ],
+        "etag": "CJiE1oEFEPiY2qPw-1UiGhcuUnRCkKxWzsjZj6hcLY=",
+        "version": 3,
+    }
+
+    LANDING_METADATA_BASELINE: dict[str, Any] = {
+        "metadata": {
+            "annotations": {
+                "run.googleapis.com/description": (
+                    "Coach Web public static landing surface (MADR-0031, #427)"
+                ),
+                "run.googleapis.com/ingress": "all",
+                "run.googleapis.com/ingress-status": "all",
+                "run.googleapis.com/urls": '["https://coach-web-landing-853194930683.europe-west6.run.app"]',
+                "serving.knative.dev/creator": LANDING_SA_NAME,
+                "serving.knative.dev/lastModifier": LANDING_SA_NAME,
+            }
+        }
+    }
+
+    LANDING_TEMPLATE_BASELINE: dict[str, Any] = {
+        "spec": {
+            "template": {
+                "metadata": {
+                    "annotations": {
+                        "autoscaling.knative.dev/maxScale": "2",
+                        "autoscaling.knative.dev/minScale": "0",
+                    }
+                },
+                "spec": {
+                    "serviceAccountName": LANDING_SA_NAME,
+                    "timeoutSeconds": 10,
+                    "containers": [
+                        {
+                            "name": "landing",
+                            "image": LANDING_IMAGE,
+                            "ports": [{"name": "http1", "containerPort": 8080}],
+                            "resources": {"limits": {"cpu": "1000m", "memory": "128Mi"}},
+                        }
+                    ],
+                },
+            }
+        }
+    }
+
+    CTA_HEADERS_BASELINE = (
+        "HTTP/2 200\n"
+        "content-security-policy: default-src 'none'; style-src 'self'; img-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'\n"
+        "cache-control: public, max-age=300\n"
+        "content-type: text/html; charset=utf-8\n"
+        "referrer-policy: no-referrer\n"
+        "x-content-type-options: nosniff\n"
+    )
+
+    CTA_BODY_BASELINE = (
+        "<!doctype html>\n"
+        '<a class="button" href="https://coach-web-afff35tqxq-oa.a.run.app'
+        '/auth/login">Sign in</a>\n'
+        "<footer>Swiss nLPD - europe-west6</footer>\n"
+    )
+
+    GCLOUD_LANDING_SHIM = '''#!/usr/bin/env python3
+"""Test shim for gcloud: replays the #427 landing read-backs."""
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["auth", "print-access-token"]:
+    sys.stdout.write("shim-access-token\\n")
+    sys.exit(0)
+if args[:2] == ["projects", "get-iam-policy"]:
+    variable = "SHIM_PROJECT_IAM"
+elif args[:3] == ["iam", "service-accounts", "get-iam-policy"]:
+    variable = "SHIM_LANDING_SA_POLICY"
+elif args[:4] == ["iam", "service-accounts", "keys", "list"]:
+    variable = "SHIM_LANDING_KEYS"
+elif args[:3] == ["run", "services", "describe"]:
+    if "--format=json(metadata.annotations)" in args:
+        variable = "SHIM_LANDING_METADATA"
+    elif "--format=json(spec.template)" in args:
+        variable = "SHIM_LANDING_TEMPLATE"
+    else:
+        variable = "SHIM_LANDING_URL"
+elif args[:3] == ["run", "services", "get-iam-policy"]:
+    variable = "SHIM_LANDING_POLICY"
+else:
+    sys.stderr.write("unexpected gcloud invocation: " + " ".join(args))
+    sys.exit(2)
+with open(os.environ[variable], encoding="utf-8") as handle:
+    sys.stdout.write(handle.read())
+'''
+
+    CURL_LANDING_SHIM = '''#!/usr/bin/env python3
+"""Test shim for curl: replays the #427 landing HTTP probes / TestIamPermissions."""
+import os
+import sys
+
+args = sys.argv[1:]
+url = args[-1]
+if "testIamPermissions" in url:
+    with open(os.environ["SHIM_TESTIAM"], encoding="utf-8") as handle:
+        sys.stdout.write(handle.read())
+    sys.exit(0)
+root = url.endswith("/") and url.count("/") == 3
+if root:
+    code = os.environ.get("SHIM_CURL_ROOT_CODE", "200")
+    body = os.environ["SHIM_CURL_BODY"]
+    headers = os.environ["SHIM_CURL_HEADERS"]
+else:
+    code = os.environ.get("SHIM_CURL_OTHER_CODE", "404")
+    body = os.devnull
+    headers = None
+out = args[args.index("-o") + 1]
+with open(body, "rb") as src, open(out, "wb") as dst:
+    dst.write(src.read())
+if "-D" in args and headers is not None:
+    hdr_out = args[args.index("-D") + 1]
+    with open(headers, "rb") as src, open(hdr_out, "wb") as dst:
+        dst.write(src.read())
+sys.stdout.write(code + "\\n")
+'''
+
+    @pytest.fixture(scope="class")
+    def workflow(self) -> dict[str, Any]:
+        """The Cloud Run deploy workflow mapping."""
+        return load_yaml(CLOUD_RUN_WORKFLOW)
+
+    @pytest.fixture(scope="class")
+    def steps(self, workflow: dict[str, Any]) -> list[dict[str, Any]]:
+        """The deploy job steps."""
+        return list(workflow["jobs"]["deploy"]["steps"])
+
+    def _step(self, steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
+        """Return the step with the exact name (fails loudly when renamed)."""
+        match = next((step for step in steps if step.get("name") == name), None)
+        assert match is not None, f"missing workflow step: {name}"
+        return match
+
+    def _gate_script(self, name: str) -> str:
+        """The shipped ``run`` script of the named gate step."""
+        workflow = load_yaml(CLOUD_RUN_WORKFLOW)
+        steps = workflow["jobs"]["deploy"]["steps"]
+        return str(self._step(steps, name)["run"])
+
+    def _shim_env(self, tmp_path: Path, payloads: dict[str, Any]) -> dict[str, str]:
+        """Materialize the gcloud/curl shims and payload files; return the env."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        for name, source in (
+            ("gcloud", self.GCLOUD_LANDING_SHIM),
+            ("curl", self.CURL_LANDING_SHIM),
+        ):
+            shim = bin_dir / name
+            shim.write_text(source, encoding="utf-8")
+            shim.chmod(0o755)
+        env = dict(os.environ)
+        for name, value in load_yaml(CLOUD_RUN_WORKFLOW)["env"].items():
+            env.setdefault(name, str(value))
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+        env["GITHUB_ENV"] = str(tmp_path / "github_env")
+        for name, payload in payloads.items():
+            path = tmp_path / f"{name}.payload"
+            if isinstance(payload, str):
+                path.write_text(payload, encoding="utf-8")
+            else:
+                path.write_text(json.dumps(payload), encoding="utf-8")
+            env[name] = str(path)
+        return env
+
+    def _run_step(
+        self,
+        tmp_path: Path,
+        step_name: str,
+        payloads: dict[str, Any],
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the extracted gate step against the replayed read-backs."""
+        env = self._shim_env(tmp_path, payloads)
+        script = tmp_path / "gate.sh"
+        script.write_text(self._gate_script(step_name), encoding="utf-8")
+        return subprocess.run(
+            ["/bin/bash", str(script)],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    @pytest.mark.parametrize(
+        "step_name",
+        [IAM_GATE_STEP, C3_GATE_STEP, SPEC_GATE_STEP, PROBE_STEP, IAP_GATE_STEP],
+    )
+    def test_landing_gate_steps_are_valid_bash(
+        self, steps: list[dict[str, Any]], tmp_path: Path, step_name: str
+    ) -> None:
+        """Every landing gate script parses under ``bash -n``."""
+        script = self._step(steps, step_name)["run"]
+        path = tmp_path / "step.sh"
+        path.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    # -- C1/C2: the landing SA IAM gate ---------------------------------
+
+    def test_landing_iam_baseline_passes(self, tmp_path: Path) -> None:
+        """The live 7078710086 post-state read-backs exit 0."""
+        result = self._run_step(
+            tmp_path,
+            self.IAM_GATE_STEP,
+            {
+                "SHIM_PROJECT_IAM": self.PROJECT_IAM_BASELINE,
+                "SHIM_LANDING_SA_POLICY": self.LANDING_SA_POLICY_BASELINE,
+                "SHIM_LANDING_KEYS": self.LANDING_KEYS_BASELINE,
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "C1 verified" in result.stdout
+        assert "C2 verified" in result.stdout
+
+    LANDING_IAM_DRIFTS = {
+        "landingHoldsProjectRole": lambda payloads: payloads["SHIM_PROJECT_IAM"]["bindings"].append(
+            {
+                "members": [TestLandingSurfaceContainerAndGates.LANDING_SA_MEMBER],
+                "role": "roles/run.invoker",
+            }
+        ),
+        "landingTokenMintingGrant": lambda payloads: payloads["SHIM_LANDING_SA_POLICY"][
+            "bindings"
+        ].append(
+            {
+                "members": [DEPLOY_SA_MEMBER],
+                "role": "roles/iam.serviceAccountTokenCreator",
+            }
+        ),
+        "landingForeignRole": lambda payloads: payloads["SHIM_LANDING_SA_POLICY"][
+            "bindings"
+        ].append({"members": ["user:attacker@example.com"], "role": "roles/editor"}),
+        "landingMissingActAs": lambda payloads: payloads["SHIM_LANDING_SA_POLICY"].update(
+            {
+                "bindings": [
+                    binding
+                    for binding in payloads["SHIM_LANDING_SA_POLICY"]["bindings"]
+                    if binding["role"] != "roles/iam.serviceAccountUser"
+                ]
+            }
+        ),
+        "landingUserManagedKey": lambda payloads: payloads.__setitem__(
+            "SHIM_LANDING_KEYS",
+            [{"name": "bootstrap-key", "keyOrigin": "USER_PROVIDED"}],
+        ),
+    }
+
+    @pytest.mark.parametrize("drift", LANDING_IAM_DRIFTS, ids=list(LANDING_IAM_DRIFTS))
+    def test_landing_iam_drifts_are_rejected(self, tmp_path: Path, drift: str) -> None:
+        """Every landing-SA drift class makes the C1/C2 gate exit non-zero."""
+        payloads = {
+            "SHIM_PROJECT_IAM": copy.deepcopy(self.PROJECT_IAM_BASELINE),
+            "SHIM_LANDING_SA_POLICY": copy.deepcopy(self.LANDING_SA_POLICY_BASELINE),
+            "SHIM_LANDING_KEYS": copy.deepcopy(self.LANDING_KEYS_BASELINE),
+        }
+        self.LANDING_IAM_DRIFTS[drift](payloads)
+        result = self._run_step(tmp_path, self.IAM_GATE_STEP, payloads)
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout
+
+    # -- AC3 (Amendments 0002 + 0005): no project-level run/iap admin ----
+
+    def test_no_project_level_run_or_iap_admin_baseline_passes(self, tmp_path: Path) -> None:
+        """The post-migration steady state (empty TestIamPermissions) exits 0."""
+        result = self._run_step(
+            tmp_path,
+            self.IAP_GATE_STEP,
+            {"SHIM_TESTIAM": "{}"},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "AC3 verified" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("drift", "held"),
+        [
+            (
+                "deployerRegainsProjectIapAdmin",
+                ["iap.web.setIamPolicy", "iap.projects.updateSettings"],
+            ),
+            ("deployerRegainsProjectRunAdmin", ["run.services.delete", "run.services.update"]),
+        ],
+    )
+    def test_project_level_admin_drifts_are_rejected(
+        self, tmp_path: Path, drift: str, held: list[str]
+    ) -> None:
+        """A re-granted project-level run/iap admin surface fails the gate."""
+        result = self._run_step(
+            tmp_path,
+            self.IAP_GATE_STEP,
+            {"SHIM_TESTIAM": json.dumps({"permissions": held})},
+        )
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout
+
+    # -- C3: the landing public posture gate ----------------------------
+
+    def test_landing_posture_baseline_passes(self, tmp_path: Path) -> None:
+        """invoker == exactly allUsers + deployer run.admin, no iap annotation."""
+        result = self._run_step(
+            tmp_path,
+            self.C3_GATE_STEP,
+            {
+                "SHIM_LANDING_METADATA": self.LANDING_METADATA_BASELINE,
+                "SHIM_LANDING_POLICY": self.LANDING_POLICY_BASELINE,
+            },
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "C3 verified" in result.stdout
+
+    LANDING_POSTURE_DRIFTS = {
+        "landingIapEnabled": lambda payloads: payloads["SHIM_LANDING_METADATA"]["metadata"][
+            "annotations"
+        ].update({"run.googleapis.com/iap-enabled": "true"}),
+        "landingExtraInvoker": lambda payloads: payloads["SHIM_LANDING_POLICY"]["bindings"][0][
+            "members"
+        ].append(DEPLOY_SA_MEMBER),
+        "landingAllAuthenticated": lambda payloads: payloads["SHIM_LANDING_POLICY"]["bindings"][
+            0
+        ].update({"members": ["allAuthenticatedUsers"]}),
+        "landingIapRoleBinding": lambda payloads: payloads["SHIM_LANDING_POLICY"][
+            "bindings"
+        ].append(
+            {
+                "members": ["user:frederic.pitteloud@gmail.com"],
+                "role": "roles/iap.httpsResourceAccessor",
+            }
+        ),
+        "landingMissingInvoker": lambda payloads: payloads["SHIM_LANDING_POLICY"].update(
+            {
+                "bindings": [
+                    binding
+                    for binding in payloads["SHIM_LANDING_POLICY"]["bindings"]
+                    if binding["role"] != "roles/run.invoker"
+                ]
+            }
+        ),
+        "landingPublicRoleOnAdmin": lambda payloads: payloads["SHIM_LANDING_POLICY"][
+            "bindings"
+        ].append({"members": ["allUsers"], "role": "roles/run.admin"}),
+    }
+
+    @pytest.mark.parametrize("drift", LANDING_POSTURE_DRIFTS, ids=list(LANDING_POSTURE_DRIFTS))
+    def test_landing_posture_drifts_are_rejected(self, tmp_path: Path, drift: str) -> None:
+        """Every invoker/IAP drift class makes the C3 gate exit non-zero."""
+        payloads = {
+            "SHIM_LANDING_METADATA": copy.deepcopy(self.LANDING_METADATA_BASELINE),
+            "SHIM_LANDING_POLICY": copy.deepcopy(self.LANDING_POLICY_BASELINE),
+        }
+        self.LANDING_POSTURE_DRIFTS[drift](payloads)
+        result = self._run_step(tmp_path, self.C3_GATE_STEP, payloads)
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout
+
+    # -- C5/C6: the deployed landing spec gate ---------------------------
+
+    def test_landing_spec_baseline_passes(self, tmp_path: Path) -> None:
+        """The rendered spec (zero-role SA, digest-pinned image, no env) exits 0."""
+        result = self._run_step(
+            tmp_path,
+            self.SPEC_GATE_STEP,
+            {"SHIM_LANDING_TEMPLATE": self.LANDING_TEMPLATE_BASELINE},
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "C5/C6 verified" in result.stdout
+
+    LANDING_SPEC_DRIFTS = {
+        "landingWrongSA": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"]["template"][
+            "spec"
+        ].update({"serviceAccountName": "853194930683-compute@developer.gserviceaccount.com"}),
+        "landingEnvVar": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"]["template"][
+            "spec"
+        ]["containers"][0].update({"env": [{"name": "SOMETHING", "value": "leak"}]}),
+        "landingTagPinnedImage": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"][
+            "template"
+        ]["spec"]["containers"][0].update({"image": "ghcr.io/fpittelo/coach-web-landing:latest"}),
+        "landingResourceDrift": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"][
+            "template"
+        ]["spec"]["containers"][0].update(
+            {"resources": {"limits": {"cpu": "2000m", "memory": "512Mi"}}}
+        ),
+        "landingTimeoutDrift": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"][
+            "template"
+        ]["spec"].update({"timeoutSeconds": 3600}),
+        "landingScaleDrift": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"]["template"][
+            "metadata"
+        ]["annotations"].update({"autoscaling.knative.dev/maxScale": "5"}),
+        "landingSecretRef": lambda payloads: payloads["SHIM_LANDING_TEMPLATE"]["spec"]["template"][
+            "spec"
+        ]["containers"][0].update(
+            {
+                "env": [
+                    {
+                        "name": "GOOGLE_APPLICATION_CREDENTIALS",
+                        "valueFrom": {"secretKeyRef": {"name": "KEY", "key": "latest"}},
+                    }
+                ]
+            }
+        ),
+    }
+
+    @pytest.mark.parametrize("drift", LANDING_SPEC_DRIFTS, ids=list(LANDING_SPEC_DRIFTS))
+    def test_landing_spec_drifts_are_rejected(self, tmp_path: Path, drift: str) -> None:
+        """Every deployed-spec drift class makes the C5/C6 gate exit non-zero."""
+        payloads = {"SHIM_LANDING_TEMPLATE": copy.deepcopy(self.LANDING_TEMPLATE_BASELINE)}
+        self.LANDING_SPEC_DRIFTS[drift](payloads)
+        result = self._run_step(tmp_path, self.SPEC_GATE_STEP, payloads)
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout
+
+    # -- C7: the unauthenticated content-provenance probe ----------------
+
+    def _probe_payloads(self) -> dict[str, Any]:
+        """The positive probe payloads (200 + pinned headers + canonical CTA)."""
+        return {
+            "SHIM_LANDING_URL": self.LANDING_URL,
+            "SHIM_CURL_HEADERS": self.CTA_HEADERS_BASELINE,
+            "SHIM_CURL_BODY": self.CTA_BODY_BASELINE,
+        }
+
+    def test_landing_probe_baseline_passes(self, tmp_path: Path) -> None:
+        """200 + Cache-Control + canonical CTA + zero console path space exits 0."""
+        result = self._run_step(tmp_path, self.PROBE_STEP, self._probe_payloads())
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "Content provenance verified" in result.stdout
+
+    @pytest.mark.parametrize(
+        ("drift", "mutate"),
+        [
+            (
+                "landingMissingCTA",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_BODY", '<a href="/auth/login">Sign in</a>'
+                ),
+            ),
+            (
+                "landingSetCookie",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_HEADERS",
+                    TestLandingSurfaceContainerAndGates.CTA_HEADERS_BASELINE
+                    + "set-cookie: cw_session=poisoned\n",
+                ),
+            ),
+            (
+                "landingGoogleSurface",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_BODY",
+                    TestLandingSurfaceContainerAndGates.CTA_BODY_BASELINE
+                    + "redirect: https://accounts.google.com/o/oauth2/auth\n",
+                ),
+            ),
+            (
+                "landingNoCacheHeader",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_HEADERS",
+                    TestLandingSurfaceContainerAndGates.CTA_HEADERS_BASELINE.replace(
+                        "cache-control: public, max-age=300\n", ""
+                    ),
+                ),
+            ),
+            (
+                "landingConsolePath200",
+                lambda payloads: payloads.__setitem__("SHIM_CURL_OTHER_CODE", "200"),
+            ),
+            (
+                "landingRoot503",
+                lambda payloads: payloads.__setitem__("SHIM_CURL_ROOT_CODE", "503"),
+            ),
+        ],
+    )
+    def test_landing_probe_drifts_are_rejected(
+        self, tmp_path: Path, drift: str, mutate: Any
+    ) -> None:
+        """Every content-provenance drift class makes the C7 probe exit non-zero."""
+        payloads = self._probe_payloads()
+        mutate(payloads)
+        result = self._run_step(tmp_path, self.PROBE_STEP, payloads)
         assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
         assert "::error::" in result.stdout

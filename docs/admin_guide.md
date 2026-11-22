@@ -951,8 +951,11 @@ The binding chain (provider condition → repo-scoped principalSet → `roles/ia
 
 ```bash
 gh workflow run cloud-run-deploy.yaml --ref main \
-  -f image_tag_or_digest="$(docker buildx imagetools inspect ghcr.io/fpittelo/coach-web:dev | sed -n 's/^Digest:[[:space:]]*//p')"
+  -f image_tag_or_digest="$(docker buildx imagetools inspect ghcr.io/fpittelo/coach-web:dev | sed -n 's/^Digest:[[:space:]]*//p')" \
+  -f landing_image_tag_or_digest="$(docker buildx imagetools inspect ghcr.io/fpittelo/coach-web-landing:dev | sed -n 's/^Digest:[[:space:]]*//p')"
 ```
+
+Both inputs are required, resolved to exact `@sha256:…` digests, and refuse release-class tags (`prod`, `latest`, `v*`) — the landing surface is always deployed by digest too (MADR-0031 C6). Every deploy ships BOTH surfaces: the console 3-container pod and the public landing service, each with its own fail-closed gates.
 
 Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy (Amendment 0001: the whole pipeline — pre-flight included — is that single gated job; no step authenticates to GCP outside it). The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants) **and for the Amendment 0001 deltas above to be applied**.
 
@@ -961,9 +964,14 @@ One-time prerequisites beyond the #315 bootstrap — run before the first dispat
 - **GitHub Environment gate:** the `gcp-cloud-run` environment must exist with `@fpittelo` as a **required reviewer** (repo → Settings → Environments → New environment → add required reviewer) — it is the one-approval-per-deploy gate; create it BEFORE the first dispatch so the very first run is gated.
 
 ```bash
-# IAP enablement + per-service IAP grants are executed BY the workflow
-# (MADR-0027 D2) — the deploy SA needs the IAP admin surface:
-gcloud projects add-iam-policy-binding $PROJECT_ID \
+# IAP management is RESOURCE-SCOPED since 2026-11-22 (MADR-0027 Amendment
+# 0005 / MADR-0031 C4 — the former project-level roles/iap.admin binding was
+# REMOVED; do not re-add it, the TestIamPermissions deploy gate fails closed
+# on any project-level iap.admin-surface permission). IAP enablement
+# (gcloud run services update --iap) and the per-service IAP grants are
+# executed BY the workflow:
+gcloud iap web add-iam-policy-binding \
+  --resource-type=cloud-run --service=coach-web --region=europe-west6 \
   --member="serviceAccount:$SA_EMAIL" --role="roles/iap.admin"
 # the pre-flight secret checks read per-secret METADATA only — the per-secret
 # roles/secretmanager.viewer bindings, the deploy/runtime identity split and
@@ -987,6 +995,7 @@ Smoke checks executed by the workflow (IAP-aware — no PO browser needed; full 
 1. Unauthenticated `GET /` → **IAP 302/403 at the edge** (the app is never reached; an HTTP 200 fails the run).
 2. Authorized smoke with the **deploy-SA ID token** (`iap.httpsResourceAccessor`; audience = the IAP OAuth client ID, extracted from the IAP sign-in redirect) and **no app session cookie**: `/health` + `/healthz` → 200; `/api/*` → 401 (app-layer boundary intact under IAP).
 3. The live `.run.app` URL, the resolved digests and the serving revision are emitted in the job summary.
+4. **Public landing probes (MADR-0031 C3/C7, unauthenticated — zero tokens):** `GET <landing-url>/` → 200 with `Cache-Control: public, max-age=300`, no `Set-Cookie`, no `accounts.google.com`/`x-goog-iap` surface, the exact canonical CTA; `GET /auth/login`, `/api/health`, `/health` → 404 (no console path space). The landing service policy is asserted exactly `roles/run.invoker → allUsers` + resource-scoped `roles/run.admin → deployer`, with no `iap-enabled` annotation.
 
 **Deploy-gate config assertion — `TRUSTED_HOSTS` = the exact two served hostnames (#396 C3, corrected per #406):** Cloud Run serves the service under two URL families — the primary per-service hash form (`coach-web-afff35tqxq-oa.a.run.app`, scraped from `gcloud run services describe … --format='value(status.address.url)'`) AND the deterministic project-number form (`coach-web-853194930683.europe-west6.run.app`, derived from `${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app`) — neither is statically derivable together with the other, so the workflow scrapes the primary URL before rendering the service YAML and pins `TRUSTED_HOSTS='["<primary-host>","<number-host>"]'` in the deployed env. The shared `'["*.run.app"]'` wildcard — which matches every Cloud Run service of every GCP project — remains **only** as the bootstrap fallback for the render that happens before the service exists (first deploy: no URL to scrape yet); the first-deploy sync step (which already replaces the placeholder `CORS_ORIGINS`/`AUTH_REDIRECT_URI`) now also replaces it with the exact two-host list before the smoke checks. The steady-state deploy path therefore always pins the exact two hosts, and a post-deploy read-back gate fails the run if the wildcard ever survives to the deployed service (#406: the original single-host exact match broke the project-number URL form — any request arriving with that Host 400'd "Invalid host header").
 
@@ -997,6 +1006,73 @@ gcloud run services update-traffic coach-web --region=europe-west6 --to-revision
 ```
 
 ---
+
+## 🌐 Public Static Landing Surface (MADR-0031, #427)
+
+The public entry surface is a **separate Cloud Run service** (`coach-web-landing`, `europe-west6`) serving the reused static landing assets and a single CTA to the console. The console service (`coach-web`) keeps its verified IAP zero-trust edge **bit-for-bit unchanged** — that is the entire point of MADR-0031.
+
+**URLs (both live forms are served; the canonical CTA target is pinned to the console primary form):**
+
+| Surface | Primary URL form | Deterministic form |
+|:---|:---|:---|
+| Landing (public) | `https://coach-web-landing-<hash>.a.run.app` (scraped from `status.address.url`) | `https://coach-web-landing-853194930683.europe-west6.run.app` |
+| Console (IAP) | `https://coach-web-afff35tqxq-oa.a.run.app` | `https://coach-web-853194930683.europe-west6.run.app` |
+
+**Canonical CTA (constant, baked at image build):** `https://coach-web-afff35tqxq-oa.a.run.app/auth/login` — the visitor crosses from the landing origin to the console origin, hits the IAP edge, and (as a stranger) is rejected there; the landing copy promises no access.
+
+### One-time bootstrap — MADR-0031 deltas (@devops-executed 2026-11-22, evidence on #427 comment 7078710086)
+
+```bash
+# 1. Dedicated zero-role landing SA (MADR-0031 C1) — DONE 2026-11-22:
+gcloud iam service-accounts create coach-web-landing \
+  --project="$PROJECT_ID" \
+  --display-name="Coach Web Public Landing Runtime (zero roles, MADR-0031 C1)"
+#    (uniqueId 117348723594722420576)
+
+# 2. Deployer bridge, SA-resource-scoped ONLY (C2; exact Am. 0003 G2 mirror) — DONE:
+for role in roles/iam.serviceAccountUser roles/iam.serviceAccountViewer; do
+  gcloud iam service-accounts add-iam-policy-binding \
+    coach-web-landing@$PROJECT_ID.iam.gserviceaccount.com \
+    --project="$PROJECT_ID" \
+    --member="serviceAccount:$SA_EMAIL" --role="${role}" --condition=None
+done
+# End state asserted on every deploy (C1/C2 gate): ZERO project-level roles for
+# coach-web-landing, SA policy == exactly those two bindings, zero user-managed
+# keys. Never grant anything else to this SA — any growth requires a new MADR.
+
+# 3. roles/iap.admin migration (MADR-0027 Amendment 0005) — DONE 2026-11-22:
+#    resource-scoped binding added FIRST, then the project-level binding removed:
+gcloud iap web add-iam-policy-binding \
+  --resource-type=cloud-run --service=coach-web --region=europe-west6 \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/iap.admin"
+gcloud projects remove-iam-policy-binding "$PROJECT_ID" \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/iap.admin" --condition=None
+# (the --condition=None non-interactive form is required — the project policy
+# carries conditional bindings)
+```
+
+**One-time PRIVATE landing-service creation (the deployer holds NO project-level `run.admin` — `run.services.create` is only grantable at project level, MADR-0027 Am. 0002 — so the lane refuses to bootstrap the service and fails closed with these instructions). Execute right after the PR merges and GHCR builds the audited landing image, immediately BEFORE the PO-approved `cloud-run-deploy.yaml` execution — the service is created PRIVATE (`--no-allow-unauthenticated`); the workflow owns the public invoker binding and the C3 gate:**
+
+```bash
+# 4. Create the service PRIVATELY with a digest-pinned audited landing image:
+gcloud run deploy coach-web-landing \
+  --image="ghcr.io/fpittelo/coach-web-landing@sha256:<DIGEST>" \
+  --region=europe-west6 --project="$PROJECT_ID" \
+  --service-account=coach-web-landing@$PROJECT_ID.iam.gserviceaccount.com \
+  --no-allow-unauthenticated
+
+# 5. Resource-scoped deploy grant for the deployer ON the landing service
+#    (MADR-0031 C4 — never project-level; mirrors Am. 0002 D2):
+gcloud run services add-iam-policy-binding coach-web-landing \
+  --region=europe-west6 --project="$PROJECT_ID" \
+  --member="serviceAccount:$SA_EMAIL" --role="roles/run.admin"
+```
+
+After this bootstrap, every `cloud-run-deploy.yaml` run renders + replaces the landing service (digest-pinned image, `minScale=0`/`maxScale=2`, `timeoutSeconds=10`, 128Mi/1000m, zero env, no IAP annotation), sets invoker `allUsers`, and runs the fail-closed C3/C5/C6/C7 gates (per-service policy read-back + unauthenticated content-provenance probes).
+
+**Budget cap:** the landing service is scale-to-zero with `maxScale=2` — a bounded public burst surface. Keep the existing project budget alert on `coach-web-509209` as the cost backstop; a sustained abnormal request rate on a PUBLIC endpoint is a cost-DoS signal (MADR-0031 C5) — check Cloud Run metrics first, then consider `gcloud run services update-traffic`/`delete` as the emergency off-switch (same runbook line as the console).
+
+**MADR trigger (C7):** any growth of the landing surface beyond static files — API, auth, persistence, POST forms, cookies, third-party requests, CDN, custom domain, **any role granted to `coach-web-landing@`**, or a second public surface — requires a new MADR.
 
 ## 📊 Monitoring & Health
 

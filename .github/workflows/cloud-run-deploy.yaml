@@ -22,12 +22,22 @@ name: Cloud Run Production Deploy
 # gate for every deploy run.
 #
 # One-time prerequisites (docs/admin_guide.md → Amendment 0001 deltas +
-# deploy lane):
+# deploy lane + MADR-0031 bootstrap):
 #   - 6 Secret Manager secrets filled (#315 PO secret fill)
 #   - runtime SA coach-web-runtime: ONLY the 6 per-secret
 #     roles/secretmanager.secretAccessor bindings (service identity — no
 #     invoker, no IAP, no IAM-mutation roles; MADR-0027 Amendment 0001)
-#   - deploy SA: roles/iap.admin (enable IAP + manage per-service grants)
+#   - deploy SA: roles/iap.admin RESOURCE-SCOPED on the coach-web IAP
+#     webServices resource (the former project-level binding was removed
+#     2026-11-22 per MADR-0027 Amendment 0005 / MADR-0031 C4; evidence on #427)
+#   - landing SA coach-web-landing: ZERO roles, ZERO keys; the deployer holds
+#     ONLY SA-resource-scoped roles/iam.serviceAccountUser +
+#     roles/iam.serviceAccountViewer on it (MADR-0031 C1/C2, #427)
+#   - landing service coach-web-landing: created ONCE privately by the PO
+#     bootstrap (run.services.create is project-level; the deploy SA holds NO
+#     project-level run.admin) + resource-scoped roles/run.admin for the
+#     deployer ON the landing service (docs/admin_guide.md → MADR-0031
+#     bootstrap)
 #   - deploy SA: roles/secretmanager.viewer on EACH of the 6 secrets
 #     (per-secret metadata viewer — payload values are never accessed)
 #   - deploy SA: roles/iam.serviceAccountUser on the runtime SA (actAs
@@ -61,6 +71,10 @@ on:
         description: "coach-web image ref on ghcr.io/fpittelo/coach-web — pass the CURRENT TRUNK DIGEST (sha256:…, see docs/admin_guide.md deploy-lane runbook), the dev tag, or a trunk-build sha tag. Release-class tags (prod, latest, v*) are refused (#411)."
         required: true
         type: string
+      landing_image_tag_or_digest:
+        description: "coach-web-landing image ref on ghcr.io/fpittelo/coach-web-landing — pass the CURRENT TRUNK DIGEST (sha256:…) or the dev tag. Release-class tags (prod, latest, v*) are refused (#411 + MADR-0031 C6). Every deploy ships both surfaces; the landing gates always assert live."
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -84,6 +98,12 @@ env:
   # the six per-secret secretAccessor bindings — no invoker, no IAP, no
   # IAM-mutation roles (service identity, not an invoker).
   RUNTIME_SA: coach-web-runtime@coach-web-509209.iam.gserviceaccount.com
+  # Public static landing surface (MADR-0031, #427): separate service with a
+  # dedicated ZERO-ROLE service account (C1/C2), invoker exactly allUsers (C3),
+  # no IAP annotation (C3), and a CONSTANT canonical CTA target (C7).
+  LANDING_SERVICE: coach-web-landing
+  LANDING_SA: coach-web-landing@coach-web-509209.iam.gserviceaccount.com
+  LANDING_CONSOLE_CTA: https://coach-web-afff35tqxq-oa.a.run.app/auth/login
   WIF_PROVIDER: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
   IAP_SERVICE_AGENT: serviceAccount:service-853194930683@gcp-sa-iap.iam.gserviceaccount.com
   IAP_PO_USER: user:frederic.pitteloud@gmail.com
@@ -139,6 +159,35 @@ jobs:
           digest="$(docker buildx imagetools inspect "${ref}" | sed -n 's/^Digest:[[:space:]]*//p' || true)"
           if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::Could not resolve ${ref} to a sha256 digest (got: '${digest}'). Check that the tag exists in GHCR and is pullable."
+            exit 1
+          fi
+          echo "Resolved ${ref} -> ${repo}@${digest}"
+          echo "ref=${repo}@${digest}" >> "$GITHUB_OUTPUT"
+
+      # MADR-0031 C6: the landing image resolves to an exact sha256 digest with
+      # the same stale-release refusal as the console image (#411) — the
+      # public surface ships ONLY the release-verified trunk artifact.
+      - name: Resolve landing input to an exact sha256 digest
+        id: resolve-landing
+        env:
+          IMAGE_INPUT: ${{ inputs.landing_image_tag_or_digest }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/fpittelo/coach-web-landing"
+          if [[ "${IMAGE_INPUT}" == "prod" || "${IMAGE_INPUT}" == "latest" || "${IMAGE_INPUT}" =~ ^v[0-9] ]]; then
+            echo "::error::Release-class tag '${IMAGE_INPUT}' is refused as a landing deploy input (#411 + MADR-0031 C6) — it resolves to the LAST RELEASE image, not the current trunk artifact. Pass the current trunk digest (sha256:…) or the dev tag."
+            exit 1
+          fi
+          if [[ "${IMAGE_INPUT}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            ref="${repo}@${IMAGE_INPUT}"
+          elif [[ "${IMAGE_INPUT}" =~ ^[0-9a-f]{64}$ ]]; then
+            ref="${repo}@sha256:${IMAGE_INPUT}"
+          else
+            ref="${repo}:${IMAGE_INPUT}"
+          fi
+          digest="$(docker buildx imagetools inspect "${ref}" | sed -n 's/^Digest:[[:space:]]*//p' || true)"
+          if ! [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not resolve ${ref} to a sha256 digest (got: '${digest}'). Check that the landing tag exists in GHCR and is pullable."
             exit 1
           fi
           echo "Resolved ${ref} -> ${repo}@${digest}"
@@ -381,6 +430,90 @@ jobs:
               sys.exit(1)
           print("C4 verified: snapshot bucket IAM is exactly the two intended custom-role bindings.")
           '
+
+      # MADR-0031 C1/C2 (#427, fail-closed pre-deploy — the #396 C4 pattern):
+      # the landing runtime identity is a dedicated, purpose-created service
+      # account holding ZERO roles. A public container could mint a token for
+      # its own identity from the metadata server, so a broad role on this SA
+      # would hand a compromise of the PUBLIC surface the inherited permissions
+      # (https://docs.cloud.google.com/run/docs/securing/service-identity) —
+      # e.g. run.services.setIamPolicy could void the console IAP edge. Three
+      # exact read-backs:
+      #   1. C1 — coach-web-landing appears in ZERO project-level IAM bindings.
+      #   2. C2 — the landing SA policy is EXACTLY the deployer actAs+viewer
+      #      bridge (roles/iam.serviceAccountUser + roles/iam.serviceAccountViewer,
+      #      the Am. 0003 G2 mirror); any OTHER role fails closed, except a
+      #      platform-Cloud-Run-service-agent-only grant which is recorded and
+      #      tolerated (the runtime-identity mechanism).
+      #   3. C2 — zero user-managed keys on the landing SA (keyless posture).
+      # Requires the deployer grants: SA-resource-scoped
+      # roles/iam.serviceAccountUser + roles/iam.serviceAccountViewer on
+      # coach-web-landing (live evidence on #427, comment 7078710086).
+      - name: Assert landing surface IAM (MADR-0031 C1/C2)
+        run: |
+          set -euo pipefail
+
+          echo "C1 gate: coach-web-landing must hold zero project-level roles."
+          gcloud projects get-iam-policy "${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | LANDING_MEMBER="serviceAccount:${LANDING_SA}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          landing = os.environ["LANDING_MEMBER"]
+          roles = sorted(
+              binding.get("role", "")
+              for binding in bindings
+              if landing in (binding.get("members") or [])
+          )
+          if roles:
+              print("::error::C1 violation: " + landing + " holds " + str(len(roles)) + " project-level role binding(s) " + json.dumps(roles) + " — the landing runtime identity must hold zero project-level roles (MADR-0031 C1/C2); remove the binding(s) per docs/admin_guide.md → MADR-0031 bootstrap.")
+              sys.exit(1)
+          print("C1 verified: coach-web-landing holds zero project-level roles.")
+          '
+
+          echo "C2 gate: the landing SA policy must be exactly the deployer actAs+viewer bridge."
+          gcloud iam service-accounts get-iam-policy "${LANDING_SA}" \
+            --project="${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | DEPLOY_MEMBER="serviceAccount:${DEPLOY_SA}" \
+            PLATFORM_AGENT="serviceAccount:service-853194930683@serverless-robot-prod.iam.gserviceaccount.com" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          deployer = os.environ["DEPLOY_MEMBER"]
+          platform = os.environ["PLATFORM_AGENT"]
+          expected = {
+              "roles/iam.serviceAccountUser": [deployer],
+              "roles/iam.serviceAccountViewer": [deployer],
+          }
+          found = {}
+          violations = []
+          for binding in bindings:
+              role = binding.get("role", "")
+              members = sorted(set(binding.get("members", [])))
+              if role in expected:
+                  found.setdefault(role, []).extend(members)
+              elif members == [platform]:
+                  print("C2 note: platform-only grant tolerated on the landing SA policy: " + role + " (Cloud Run runtime-identity mechanism; flagged for @cyber-security review if unexpected).")
+              else:
+                  violations.append(role + " -> " + ",".join(members))
+          for role, members in expected.items():
+              if sorted(set(found.get(role, []))) != members:
+                  violations.append("missing or drifted: " + role + " found=" + json.dumps(found.get(role, [])) + " expected=" + json.dumps(members))
+          if violations:
+              print("::error::C2 violation: the landing SA policy must be EXACTLY the deployer roles/iam.serviceAccountUser + roles/iam.serviceAccountViewer bindings (Am. 0003 G2 mirror) — any extra non-platform principal or role, incl. any token-minting grant, fails closed (MADR-0031 C2): " + "; ".join(violations))
+              sys.exit(1)
+          print("C2 verified: landing SA policy is exactly the deployer actAs+viewer bridge with zero token-minting grants.")
+          '
+
+          echo "C2 gate: coach-web-landing must hold zero user-managed keys."
+          keys="$(gcloud iam service-accounts keys list --iam-account="${LANDING_SA}" --project="${GCP_PROJECT}" --managed-by=user --format='json' 2>&1 || true)"
+          if [ "${keys}" != "[]" ]; then
+            echo "::error::C2 violation: coach-web-landing holds user-managed key material: ${keys} — the landing identity must stay keyless (delete the keys per docs/admin_guide.md → MADR-0031 bootstrap)."
+            exit 1
+          fi
+          echo "C2 verified: zero user-managed keys on coach-web-landing."
 
       # Grooming amendment #7: capture the revision that was serving before
       # this deploy — the rollback target for the runbook line (NOT a
@@ -880,30 +1013,38 @@ jobs:
           print("C4 verified: no non-platform principal holds token-minting rights on " + os.environ["RUNTIME_SA"] + ".")
           '
 
-      # AC3 (MADR-0027 Amendment 0002 D2, issue #390) — IAM-surface drift
-      # gate (BLOCKING — the live migration to the resource-scoped grant was
-      # executed 2026-11-21): the deploy SA must hold NO project-level
-      # roles/run.admin binding — the grant is resource-scoped on the
-      # coach-web service only. roles/run.admin does NOT include
+      # AC3 (MADR-0027 Amendment 0002 D2, issue #390; extended per Amendment
+      # 0005 / MADR-0031 C4, issue #427) — IAM-surface drift gate (BLOCKING —
+      # the live migrations were executed: resource-scoped run.admin
+      # 2026-11-21, resource-scoped iap.admin 2026-11-22): the deploy SA must
+      # hold NO project-level roles/run.admin AND NO project-level
+      # roles/iap.admin — both grants are resource-scoped on the coach-web
+      # service only (run.admin: the service resource; iap.admin: the
+      # coach-web IAP webServices resource — live evidence on #427, comment
+      # 7078710086). Neither roles/run.admin nor roles/iap.admin includes
       # resourcemanager.projects.getIamPolicy, so the deploy SA cannot read
       # the project IAM policy to inspect its own bindings; the official
       # TestIamPermissions API (cloudresourcemanager v3) requires NO
       # permission to call and answers directly: a project-level run.admin
       # (re-)grant would surface run.services.getIamPolicy / update / delete
-      # (all run.admin signature permissions) on the PROJECT resource, while
-      # the resource-scoped binding grants them only on the service itself.
+      # (all run.admin signature permissions) on the PROJECT resource, and a
+      # project-level iap.admin (re-)grant would surface iap.web.setIamPolicy
+      # and iap.projects.updateSettings (roles/iap.admin signature
+      # permissions, https://docs.cloud.google.com/iam/docs/roles-permissions/iap),
+      # while the resource-scoped bindings grant them only on their service
+      # resources.
       # Steady state: an EMPTY result — Resource Manager v3 serializes it as
       # `{}` (the repeated `permissions` field is omitted when empty), so
       # exactly `{}` is accepted as the healthy steady state (issue #390
       # reopen, cyber verification comment 7060731941). Fail-closed: an API
       # error or any unexpected response also fails the run.
-      - name: Assert no project-level run.admin on the deploy SA (AC3, Amendment 0002)
+      - name: Assert no project-level run.admin or iap.admin on the deploy SA (AC3, Amendments 0002 + 0005)
         run: |
           set -euo pipefail
           curl -sS -X POST \
             -H "Authorization: Bearer $(gcloud auth print-access-token)" \
             -H "Content-Type: application/json" \
-            -d '{"permissions":["run.services.getIamPolicy","run.services.update","run.services.delete"]}' \
+            -d '{"permissions":["run.services.getIamPolicy","run.services.update","run.services.delete","iap.web.setIamPolicy","iap.projects.updateSettings"]}' \
             "https://cloudresourcemanager.googleapis.com/v3/projects/${GCP_PROJECT}:testIamPermissions" \
           | python3 -c '
           import json, sys
@@ -926,9 +1067,9 @@ jobs:
               print("::error::AC3 gate: unexpected TestIamPermissions response shape — failing closed: " + json.dumps(raw)[:300])
               sys.exit(1)
           if held:
-              print("::error::AC3 violation: the deploy SA holds project-level run.* permissions " + json.dumps(held) + " on the project — the run.admin grant must be resource-scoped on the coach-web service ONLY (MADR-0027 Amendment 0002 D2; remove the project-level binding per docs/admin_guide.md → Amendment 0002 deltas).")
+              print("::error::AC3 violation: the deploy SA holds project-level run.* or iap.* admin-surface permissions " + json.dumps(held) + " on the project — the run.admin grant must be resource-scoped on the coach-web service ONLY (MADR-0027 Amendment 0002 D2) and the iap.admin grant resource-scoped on the coach-web IAP webServices resource ONLY (MADR-0027 Amendment 0005 / MADR-0031 C4); remove the project-level binding(s) per docs/admin_guide.md → Amendment 0002 / Amendment 0005 deltas.")
               sys.exit(1)
-          print("AC3 verified: no project-level run.admin-surface permission on the deploy SA (grant is resource-scoped on coach-web).")
+          print("AC3 verified: no project-level run.admin- or iap.admin-surface permission on the deploy SA (both grants resource-scoped on coach-web).")
           '
 
       # AC3 (grooming amendment #1) — IAP-aware smoke, no PO browser needed:
@@ -1043,6 +1184,249 @@ jobs:
             echo "SMOKE_API=${api_code}"
           } >> "$GITHUB_ENV"
 
+      # -------------------------------------------------------------------
+      # Public static landing surface (MADR-0031, #427). The landing service
+      # is PRIVATE at rest (invoker set below) and public only after the C3
+      # gate asserts the exact posture. Zero env entries, zero secrets, no
+      # IAP annotation, no console path space.
+      # -------------------------------------------------------------------
+
+      # Bootstrap boundary (MADR-0027 Am. 0002): run.services.create is only
+      # grantable at project level and the deploy SA holds NO project-level
+      # run.admin — the one-time creation of the (private) landing service is
+      # a documented PO/bootstrap step (docs/admin_guide.md → MADR-0031
+      # bootstrap), followed by the resource-scoped roles/run.admin grant for
+      # the deployer ON the landing service. The lane deploys (replaces) an
+      # existing service and fails closed with the recovery instructions.
+      - name: Refuse to bootstrap the landing service from the lane
+        run: |
+          set -euo pipefail
+          if ! gcloud run services describe "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" >/dev/null 2>&1; then
+            echo "::error::${LANDING_SERVICE} does not exist — run.services.create is project-level and the deploy SA holds NO project-level run.admin (MADR-0027 Am. 0002). Execute the one-time PRIVATE bootstrap in docs/admin_guide.md → MADR-0031 bootstrap (gcloud run deploy coach-web-landing --image=<digest-pinned-landing-image> --no-allow-unauthenticated, then the resource-scoped roles/run.admin grant for the deployer), then re-run this workflow."
+            exit 1
+          fi
+          echo "${LANDING_SERVICE} exists (bootstrap boundary respected)."
+
+      - name: Render the landing service YAML
+        env:
+          LANDING_REF: ${{ steps.resolve-landing.outputs.ref }}
+        run: |
+          set -euo pipefail
+          cat > "${RUNNER_TEMP}/landing-service.yaml" <<YAML
+          apiVersion: serving.knative.dev/v1
+          kind: Service
+          metadata:
+            name: ${LANDING_SERVICE}
+            labels:
+              cloud.googleapis.com/location: ${GCP_REGION}
+            annotations:
+              run.googleapis.com/ingress: all
+              run.googleapis.com/description: Coach Web public static landing surface (MADR-0031, #427)
+          spec:
+            template:
+              metadata:
+                annotations:
+                  autoscaling.knative.dev/minScale: '0'
+                  autoscaling.knative.dev/maxScale: '2'
+              spec:
+                timeoutSeconds: 10
+                serviceAccountName: ${LANDING_SA}
+                containers:
+                - name: landing
+                  image: ${LANDING_REF}
+                  ports:
+                  - name: http1
+                    containerPort: 8080
+                  resources:
+                    limits:
+                      cpu: 1000m
+                      memory: 128Mi
+          YAML
+          echo "Landing service YAML rendered at ${RUNNER_TEMP}/landing-service.yaml"
+
+      # Cost-DoS bound (MADR-0031 C5): scale-to-zero (min=0), maxInstances=2,
+      # a 10 s request timeout and a 128Mi/1000m container. NO env entries,
+      # NO secretKeyRef, NO IAP annotation — the read-only immutable
+      # distroless image needs no writable rootfs, and Cloud Run has no
+      # readOnlyRootFilesystem container field to set.
+      - name: Deploy the landing service (create or replace)
+        run: |
+          gcloud run services replace "${RUNNER_TEMP}/landing-service.yaml" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}"
+
+      # MADR-0031 C3: --allow-unauthenticated semantics = allUsers +
+      # roles/run.invoker (https://docs.cloud.google.com/run/docs/authenticating/public).
+      # Idempotent — the exact member set is asserted fail-closed below.
+      - name: Set the public invoker on the landing service
+        run: |
+          gcloud run services add-iam-policy-binding "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --member="allUsers" \
+            --role=roles/run.invoker
+
+      # MADR-0031 C3: per-service invoker & IAP posture, fail-closed:
+      #   - NO iap-enabled annotation on the landing service (any value).
+      #   - The landing service policy is EXACTLY two bindings:
+      #       roles/run.invoker -> allUsers   (the public surface)
+      #       roles/run.admin   -> deployer   (resource-scoped deploy grant,
+      #                                        MADR-0027 Am. 0002 pattern)
+      #     any other member or role — allAuthenticatedUsers, any iap.* role,
+      #     any stray invoker — fails the run. (The console invoker == {IAP
+      #     service agent} gate above is NOT weakened — it keeps asserting
+      #     coach-web only.)
+      - name: Assert landing surface public posture (MADR-0031 C3)
+        run: |
+          set -euo pipefail
+          gcloud run services describe "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(metadata.annotations)' \
+          | python3 -c '
+          import json, sys
+          raw = json.load(sys.stdin)
+          annotations = (raw.get("metadata", {}).get("annotations", {}) if isinstance(raw, dict) else {})
+          iap_value = annotations.get("run.googleapis.com/iap-enabled")
+          if iap_value is not None:
+              print("::error::C3 violation: coach-web-landing carries run.googleapis.com/iap-enabled=" + json.dumps(iap_value) + " — the public landing surface must carry NO IAP annotation (MADR-0031 C3); the console keeps IAP bit-for-bit unchanged.")
+              sys.exit(1)
+          print("C3 verified: no iap-enabled annotation on coach-web-landing.")
+          '
+          gcloud run services get-iam-policy "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | DEPLOY_MEMBER="serviceAccount:${DEPLOY_SA}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          deployer = os.environ["DEPLOY_MEMBER"]
+          expected = {
+              "roles/run.invoker": ["allUsers"],
+              "roles/run.admin": [deployer],
+          }
+          found = {}
+          violations = []
+          for binding in bindings:
+              role = binding.get("role", "")
+              members = sorted(set(binding.get("members", [])))
+              if role in expected:
+                  found.setdefault(role, []).extend(members)
+              else:
+                  violations.append(role + " -> " + ",".join(members))
+          for public in ("allUsers", "allAuthenticatedUsers"):
+              if any(public in (b.get("members") or []) for b in bindings if b.get("role") != "roles/run.invoker"):
+                  violations.append("public principal outside the invoker set: " + public)
+          normalized = {role: sorted(set(members)) for role, members in found.items()}
+          if normalized != expected or violations:
+              print("::error::C3 violation: the landing service IAM must be EXACTLY " + json.dumps(expected, sort_keys=True) + " — found=" + json.dumps(normalized, sort_keys=True) + "; " + "; ".join(violations) + " (any extra member or role, incl. allAuthenticatedUsers or any iap.* role, fails closed; MADR-0031 C3).")
+              sys.exit(1)
+          print("C3 verified: landing invoker is exactly allUsers and the policy carries only the resource-scoped deployer run.admin.")
+          '
+
+      # MADR-0031 C5/C6: the deployed landing spec must match the rendered
+      # hardening posture exactly — dedicated zero-role SA, digest-pinned
+      # image, zero env / zero secretKeyRef / zero
+      # GOOGLE_APPLICATION_CREDENTIALS, bounded scale, timeout and resources.
+      - name: Assert deployed landing spec (MADR-0031 C5/C6)
+        run: |
+          set -euo pipefail
+          gcloud run services describe "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='json(spec.template)' \
+          | EXPECTED_SA="${LANDING_SA}" \
+            EXPECTED_IMAGE_PREFIX="ghcr.io/fpittelo/coach-web-landing@sha256:" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          template = (raw.get("spec", {}).get("template", {}) if isinstance(raw, dict) else {})
+          spec = template.get("spec", {})
+          annotations = (template.get("metadata", {}) or {}).get("annotations", {})
+          expected_sa = os.environ["EXPECTED_SA"]
+          image_prefix = os.environ["EXPECTED_IMAGE_PREFIX"]
+          failed = False
+          containers = spec.get("containers", [])
+          if len(containers) != 1 or containers[0].get("name") != "landing":
+              print("::error::C5 violation: the landing service must carry exactly one container named landing — found=" + json.dumps([c.get("name") for c in containers]) + ".")
+              failed = True
+          for container in containers:
+              image = container.get("image", "")
+              if not image.startswith(image_prefix):
+                  print("::error::C6 violation: the landing image must be digest-pinned on ghcr.io/fpittelo/coach-web-landing@sha256:… — found=" + json.dumps(image) + " (MADR-0031 C6; the #411 drift guard applies to the public surface too).")
+                  failed = True
+              env_entries = container.get("env") or []
+              if env_entries:
+                  print("::error::C5 violation: the landing container must carry ZERO env entries — found=" + json.dumps([e.get("name") for e in env_entries]) + " (no config, no secrets; MADR-0031 C5).")
+                  failed = True
+              if container.get("resources", {}).get("limits") != {"cpu": "1000m", "memory": "128Mi"}:
+                  print("::error::C5 violation: the landing container limits must be exactly cpu=1000m memory=128Mi — found=" + json.dumps(container.get("resources", {}).get("limits")) + " (cost-DoS bound; MADR-0031 C5).")
+                  failed = True
+          sa = spec.get("serviceAccountName", "")
+          if sa != expected_sa:
+              print("::error::C5 violation: deployed serviceAccountName=" + json.dumps(sa) + " must be the dedicated zero-role landing SA " + json.dumps(expected_sa) + " (MADR-0031 C1/C5; the default compute SA may carry a broad inherited role).")
+              failed = True
+          if spec.get("timeoutSeconds") != 10:
+              print("::error::C5 violation: deployed timeoutSeconds=" + json.dumps(spec.get("timeoutSeconds")) + " must be 10 (cost-DoS bound; MADR-0031 C5).")
+              failed = True
+          if annotations.get("autoscaling.knative.dev/minScale") != "0" or annotations.get("autoscaling.knative.dev/maxScale") != "2":
+              print("::error::C5 violation: deployed scale bounds must be minScale=0 maxScale=2 — found=" + json.dumps(annotations) + " (scale-to-zero with a bounded public burst; MADR-0031 C5).")
+              failed = True
+          blob = json.dumps(raw)
+          if "secretKeyRef" in blob or "GOOGLE_APPLICATION_CREDENTIALS" in blob:
+              print("::error::C5 violation: the landing service spec references secretKeyRef or GOOGLE_APPLICATION_CREDENTIALS — a Cloud Run service must never carry GOOGLE_APPLICATION_CREDENTIALS and the public surface must carry zero secret wiring (https://docs.cloud.google.com/run/docs/configuring/service-accounts; MADR-0031 C5).")
+              failed = True
+          if failed:
+              sys.exit(1)
+          print("C5/C6 verified: dedicated zero-role SA, digest-pinned image, zero env/secret wiring, bounded scale/timeout/resources.")
+          '
+
+      # MADR-0031 C7: content provenance of the PUBLIC surface, probed
+      # unauthenticated (a public endpoint is a phishing magnet if its content
+      # can be swapped): the page must answer 200 with the pinned caching and
+      # security headers, ZERO Set-Cookie / accounts.google.com / x-goog-iap
+      # surface, the EXACT canonical CTA constant, and zero console path
+      # space (404s).
+      - name: Probe the public landing surface (MADR-0031 C7)
+        run: |
+          set -euo pipefail
+          url="$(gcloud run services describe "${LANDING_SERVICE}" \
+            --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
+            --format='value(status.address.url)')"
+          echo "Probing unauthenticated ${url}/ (zero Google interaction)"
+          headers="$(mktemp)"; body="$(mktemp)"
+          code="$(curl -sS -o "${body}" -D "${headers}" -w '%{http_code}' --max-time 30 "${url}/")"
+          if [ "${code}" != "200" ]; then
+            echo "::error::Unauthenticated GET ${url}/ returned HTTP ${code} — expected 200 from the public landing surface (AC1)."
+            exit 1
+          fi
+          if ! grep -qi '^cache-control: public, max-age=300' "${headers}"; then
+            echo "::error::C5 violation: the landing response is missing Cache-Control: public, max-age=300 (see ${headers})."
+            cat "${headers}"
+            exit 1
+          fi
+          if grep -qi '^set-cookie:' "${headers}"; then
+            echo "::error::C5 violation: the landing response carries a Set-Cookie header — the public surface must be cookie-free (MADR-0031 C5/C7)."
+            exit 1
+          fi
+          if grep -qi 'accounts\.google\.com\|x-goog-iap' "${headers}" "${body}"; then
+            echo "::error::C3 violation: the landing response surfaces accounts.google.com or x-goog-iap — the visitor must see ZERO Google interaction (AC1; MADR-0031 C7)."
+            exit 1
+          fi
+          if ! grep -Fq "href=\"${LANDING_CONSOLE_CTA}\"" "${body}"; then
+            echo "::error::C7 violation: the served landing HTML lacks the canonical CTA href=\"${LANDING_CONSOLE_CTA}\" — content drift or a broken rewrite (MADR-0031 C7; compare the served sha256 against the build log)."
+            exit 1
+          fi
+          cta_probe="$(grep -F "href=\"${LANDING_CONSOLE_CTA}\"" "${body}" | head -n1)"
+          echo "CTA verified: ${cta_probe}"
+          echo "LANDING_URL=${url}" >> "$GITHUB_ENV"
+          echo "LANDING_ROOT=${code}" >> "$GITHUB_ENV"
+          for path in /auth/login /api/health /health; do
+            path_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "${url}${path}")"
+            echo "LANDING_${path//[\/]/_}=${path_code}" >> "$GITHUB_ENV"
+            if [ "${path_code}" != "404" ]; then
+              echo "::error::C7 violation: GET ${url}${path} returned HTTP ${path_code} — the landing surface must serve NOTHING outside / and /static/landing.css (no console path space; MADR-0031 C5/C7)."
+              exit 1
+            fi
+          done
+          echo "Content provenance verified: 200 + pinned headers + canonical CTA + zero console path space."
+
       - name: Write job summary
         env:
           PREV_REVISION: ${{ steps.pre.outputs.prev_revision }}
@@ -1060,6 +1444,8 @@ jobs:
             echo "| coach-web image | ${{ steps.resolve.outputs.ref }} |"
             echo "| coach-mcp image | ${{ steps.sidecars.outputs.coach_mcp_ref }} |"
             echo "| github-mcp image | ${{ steps.sidecars.outputs.github_mcp_ref }} |"
+            echo "| Landing URL | ${LANDING_URL} |"
+            echo "| coach-web-landing image | ${{ steps.resolve-landing.outputs.ref }} |"
             echo "| Serving revision | ${revision} |"
             echo "| Region / project | ${GCP_REGION} / ${GCP_PROJECT} |"
             echo ""
@@ -1070,6 +1456,15 @@ jobs:
             echo "| Unauthenticated \`GET /\` | 302/403 (IAP edge) | ${SMOKE_UNAUTH} |"
             echo "| Authorized \`GET /health\` (SA ID token, no app session) | 200 | ${SMOKE_HEALTH} |"
             echo "| Authorized \`GET /api/agent/stream\` (no app session) | 401 | ${SMOKE_API} |"
+            echo ""
+            echo "### Public landing surface probe matrix (MADR-0031 C3/C7, AC1/AC2)"
+            echo ""
+            echo "| Check | Expected | Observed |"
+            echo "|:---|:---|:---|"
+            echo "| Unauthenticated \`GET ${LANDING_URL}/\` | 200 + headers + canonical CTA | ${LANDING_ROOT} |"
+            echo "| Unauthenticated \`GET /auth/login\` | 404 | ${LANDING__auth_login} |"
+            echo "| Unauthenticated \`GET /api/health\` | 404 | ${LANDING__api_health} |"
+            echo "| Unauthenticated \`GET /health\` | 404 | ${LANDING__health} |"
             if [ -n "${PREV_REVISION}" ]; then
               echo ""
               echo "### Rollback (runbook, docs/admin_guide.md)"

@@ -160,3 +160,28 @@ jobs:
           scanners: vuln
           severity: HIGH,CRITICAL
           exit-code: "1"
+
+      # ---------------------------------------------------------------------
+      # Public static landing surface (MADR-0031, #427): the PR gate scans the
+      # landing container too — the same zero-tolerance HIGH/CRITICAL gate.
+      # ---------------------------------------------------------------------
+      - name: Build Landing OCI Docker Image (for scanning)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.landing
+          push: false
+          load: true
+          tags: coach-web-landing:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan landing image for HIGH/CRITICAL vulnerabilities (MADR-0031 C5)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: coach-web-landing:scan
+          format: table
+          vuln-type: os,library
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          exit-code: "1"
