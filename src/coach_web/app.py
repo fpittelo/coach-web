@@ -159,6 +159,7 @@ from coach_web.periodization import (
     validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
+from coach_web.snapshot import SnapshotCoordinator
 from coach_web.suggestions import TurnOutcome
 
 logger = logging.getLogger("coach_web")
@@ -190,6 +191,16 @@ admin agent-settings CRUD (MADR-0026).
 
 GENERIC_PERSISTENCE_DETAIL = "Service temporarily unavailable"
 """Static 503 detail for persistence outages — no internals echoed (nLPD)."""
+
+PURGE_DURABLE_STORAGE_DETAIL = (
+    "Conversation purge could not be committed to durable storage; retry shortly."
+)
+"""Static 503 detail for a purge the durable store did not confirm (C5).
+
+MADR-0032 C5: the owner purge must overwrite the live encrypted snapshot
+before answering 200. The body stays value-free (no bucket, object, status
+or content — nLPD) and deterministic for the UI.
+"""
 
 WEEK_ADJUSTMENT_PAST_DAYS_DETAIL = "Week adjustment rejected: past days are immutable"
 """Static 422 detail for an adjustment touching a past day (#225 C2, AC3).
@@ -272,6 +283,20 @@ def _no_store(response: Response) -> Response:
     """Stamp a session-variant ``/`` render as non-cacheable (#412 AC1)."""
     response.headers["Cache-Control"] = NO_STORE_CACHE_CONTROL
     return response
+
+
+def _notify_snapshot_dirty(request: Request) -> None:
+    """Schedule the debounced durable checkpoint after a committed write (C5).
+
+    One call site per committed mutation family (turns, reset, debriefs,
+    objectives, phases, week drafts, settings). With the snapshot bucket
+    unset the coordinator is disabled and this is a no-op — local lanes are
+    byte-for-byte unchanged (AC4). Never raises: a scheduling failure must
+    not fail the request (the durable store is a checkpoint, MADR-0025 C7).
+    """
+    coordinator = getattr(request.app.state, "snapshot_coordinator", None)
+    if coordinator is not None:
+        coordinator.mark_dirty()
 
 
 def _avatar_html(claims: dict[str, Any]) -> str:
@@ -596,7 +621,16 @@ class ProbeExemptTrustedHostMiddleware(TrustedHostMiddleware):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Manage application startup and shutdown."""
+    """Manage application startup and shutdown.
+
+    The durable snapshot coordinator (MADR-0032, #417) starts before traffic:
+    with ``COACH_SNAPSHOT_BUCKET`` configured and no valid boot state it
+    refuses readiness (the entrypoint's ``boot-restore`` is the primary gate;
+    this is the in-process enforcement). On shutdown the coordinator flushes a
+    final snapshot BEFORE the engine is disposed — Cloud Run delivers SIGTERM
+    here, so the documented loss window stays the ungraceful ``SIGKILL`` case
+    only (MADR-0032 R3).
+    """
     settings: Settings = app.state.settings
     app.state.started_at = time.monotonic()
     logger.info(
@@ -606,10 +640,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.APP_HOST,
         settings.APP_PORT,
     )
-    yield
-    logger.info("Stopping %s", SERVICE_NAME)
-    # Release the persistence engine's connection pool (MADR-008, #166).
-    await app.state.db_engine.dispose()
+    coordinator: SnapshotCoordinator | None = getattr(app.state, "snapshot_coordinator", None)
+    if coordinator is None:
+        coordinator = SnapshotCoordinator(settings)
+        app.state.snapshot_coordinator = coordinator
+    await coordinator.start()
+    try:
+        yield
+    finally:
+        logger.info("Stopping %s", SERVICE_NAME)
+        await coordinator.stop()
+        # Release the persistence engine's connection pool (MADR-008, #166).
+        await app.state.db_engine.dispose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -901,6 +943,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     cipher=cipher,
                     content=payload.message,
                 )
+                if user_write.persisted:
+                    # Committed transcript write => schedule the durable
+                    # checkpoint (MADR-0032 C5; no-op on local lanes).
+                    _notify_snapshot_dirty(request)
             else:
                 user_write = TurnPersistence(persisted=False, degraded=True)
         else:
@@ -1143,6 +1189,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 thread_id=turn_thread.id,
                                 cipher=cipher,
                             )
+                            # The completed turn (and any summary refresh) is
+                            # committed: schedule the durable checkpoint.
+                            _notify_snapshot_dirty(request)
             except Exception as exc:  # noqa: BLE001 - the SSE boundary must never leak
                 logger.warning("Agent stream failed: %s", exc)
                 failure = AgentEvent(type="error", data={"message": str(exc)})
@@ -1254,6 +1303,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     thread_id=archived_id,
                     cipher=reset_cipher,
                 )
+        # Archive + fresh thread (+ any archived-thread summary) committed.
+        _notify_snapshot_dirty(request)
         return ConversationResetResponse(archived_thread_id=archived_id, thread_id=fresh.id)
 
     @application.post(
@@ -1271,6 +1322,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session ``athlete_id`` and reports COUNTS only (C3 — no content
         ever leaves the store). Fails closed with the static 503 on an
         unreadable store.
+
+        **Durable store (MADR-0032 C5, #417):** when the snapshot bucket is
+        active, the delete is followed by a synchronous compaction +
+        encrypted republish BEFORE the 200 — the purge is only reported once
+        the live GCS object no longer holds the purged rows. A failed upload
+        (or a hard-disabled publication state) answers the static, redacted
+        503 so the owner can retry; a 200 from this endpoint always means
+        the durable copy was overwritten.
         """
         settings: Settings = request.app.state.settings
         athlete_id = _athlete_id_for_session(settings, request.cookies.get(SESSION_COOKIE))
@@ -1288,6 +1347,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         ) as exc:
             logger.warning("Conversation purge unavailable (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        coordinator: SnapshotCoordinator | None = getattr(
+            request.app.state, "snapshot_coordinator", None
+        )
+        if coordinator is not None and coordinator.enabled:
+            # publish_now() compacts (VACUUM INTO) and uploads under
+            # ifGenerationMatch; False covers upload failure, a 412 stale
+            # instance, and a hard-disabled boot state — all of which must
+            # NOT report purge success (C5/C6).
+            if not await coordinator.publish_now():
+                logger.warning("Conversation purge could not be committed to durable storage")
+                raise HTTPException(status_code=503, detail=PURGE_DURABLE_STORAGE_DETAIL)
         return ConversationPurgeResponse(
             threads_deleted=threads_deleted,
             messages_deleted=messages_deleted,
@@ -1465,6 +1535,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Week draft persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # The week draft (create/supersede) is committed: schedule the
+        # durable checkpoint (C5). A later approval transition notifies again.
+        _notify_snapshot_dirty(request)
 
         # Terminal-state short-circuit (PR #174 F3): an already-APPROVED
         # matching draft means the week was fully written to the calendar —
@@ -1538,6 +1611,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         session_factory = request.app.state.db_session_factory
         async with session_factory() as session:
             saved = await save_objective_profile(session, payload)
+        _notify_snapshot_dirty(request)
         return ObjectiveProfileResponse(profile=saved)
 
     @application.post(
@@ -1586,6 +1660,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return JSONResponse(status_code=422, content=settings_reason_payload(exc.reason))
             objective_id = objective_row.id
             phases = await replace_phases(session, objective_id, payload.plan)
+        _notify_snapshot_dirty(request)
         return PeriodizationPlanResponse(objective_id=objective_id, phases=phases)
 
     @application.post(
@@ -1635,6 +1710,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Debrief persistence failed (%s)", type(exc).__name__)
             raise HTTPException(status_code=503, detail=GENERIC_PERSISTENCE_DETAIL) from exc
+        # The encrypted debrief row is committed: schedule the durable
+        # checkpoint before the derived/best-effort steps below (C5).
+        _notify_snapshot_dirty(request)
         # Weekly adherence metric (#234 AC2): event-driven recompute + upsert
         # on the debrief-save path — counts/percentages only (C3). Best-effort
         # by contract: the debrief is already durable and the metric is
@@ -1801,6 +1879,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             orientation=stored_orientation,
             updated_at=row.updated_at,
         )
+        _notify_snapshot_dirty(request)
         return AgentSettings(
             orientation=stored_orientation,
             verbosity=payload.verbosity,
@@ -1837,6 +1916,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 orientation=None,
                 updated_at=datetime.now(UTC).isoformat(),
             )
+            _notify_snapshot_dirty(request)
         return AgentSettings()
 
     return application

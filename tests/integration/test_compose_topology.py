@@ -72,6 +72,38 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+def inline_python_blocks(script: str) -> list[str]:
+    """Extract every ``python3 -c '`` body from a workflow shell script.
+
+    The bodies are single-quoted bash strings closed by a line containing only
+    ``'``. An apostrophe inside the Python (typically a comment) terminates the
+    bash string early while leaving both sides balanced, so ``bash -n`` cannot
+    see the bug — extracting to the real closing line and compiling is the
+    only reliable check (the #417 gate simulation caught exactly this).
+    """
+    blocks: list[str] = []
+    lines = script.splitlines()
+    index = 0
+    while index < len(lines):
+        marker = "python3 -c '"
+        if marker in lines[index]:
+            tail = lines[index].split(marker, 1)[1]
+            if tail.strip():
+                # Single-line ``python3 -c '...'`` form — the closing quote is
+                # on the same line and the body cannot hide an apostrophe
+                # comment the way a multi-line body can.
+                index += 1
+                continue
+            body: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].strip() != "'":
+                body.append(lines[index])
+                index += 1
+            blocks.append("\n".join(body))
+        index += 1
+    return blocks
+
+
 def cloud_run_service_yaml() -> dict[str, Any]:
     """Parse the Knative service YAML heredoc from the Cloud Run workflow."""
     workflow = load_yaml(CLOUD_RUN_WORKFLOW)
@@ -1126,3 +1158,219 @@ class TestDockerfilePersistenceEntrypoint:
     def test_data_mountpoint_pre_created_with_runtime_ownership(self, dockerfile: str) -> None:
         """/data exists with coach-web ownership so the named volume inherits it."""
         assert "install -d -o coach-web -g coach-web /data" in dockerfile
+
+
+class TestSnapshotStoreDeployGates:
+    """The durable snapshot store is wired and asserted fail-closed (#417).
+
+    MADR-0032 binding conditions C1/C4/C5/C6 require the production lane to
+    (a) render the snapshot configuration onto the serving container, (b)
+    verify the dedicated bucket's residency/hardening/retention posture, (c)
+    verify the runtime identity holds ZERO project-level roles, and (d) verify
+    the bucket IAM is EXACTLY the two intended custom-role bindings. Every
+    gate reads live GCP state back and aborts the deploy on drift.
+    """
+
+    SNAPSHOT_BUCKET = "coach-web-509209-snapshots"
+    SNAPSHOT_OBJECT = "snapshots/coach.db.fernet"
+    RUNTIME_ROLE = "projects/coach-web-509209/roles/coachWebSnapshotObjectActor"
+    DEPLOYER_ROLE = "projects/coach-web-509209/roles/coachWebSnapshotBucketReader"
+
+    @pytest.fixture(scope="class")
+    def workflow(self) -> dict[str, Any]:
+        """The Cloud Run deploy workflow mapping."""
+        return load_yaml(CLOUD_RUN_WORKFLOW)
+
+    @pytest.fixture(scope="class")
+    def steps(self, workflow: dict[str, Any]) -> list[dict[str, Any]]:
+        """The deploy job steps."""
+        return list(workflow["jobs"]["deploy"]["steps"])
+
+    def _step(self, steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
+        """Return the step with the exact name (fails loudly when renamed)."""
+        match = next((step for step in steps if step.get("name") == name), None)
+        assert match is not None, f"missing workflow step: {name}"
+        return match
+
+    def _assert_bash_syntax(self, script: str, tmp_path: Path) -> None:
+        """Validate an embedded workflow script with ``bash -n``."""
+        path = tmp_path / "step.sh"
+        path.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_workflow_env_declares_the_bucket_and_object(self, workflow: dict[str, Any]) -> None:
+        """SNAPSHOT_BUCKET / SNAPSHOT_OBJECT are workflow-level constants."""
+        env = workflow["env"]
+
+        assert env["SNAPSHOT_BUCKET"] == self.SNAPSHOT_BUCKET
+        assert env["SNAPSHOT_OBJECT"] == self.SNAPSHOT_OBJECT
+
+    def test_service_yaml_renders_the_snapshot_env(self) -> None:
+        """The coach-web container carries bucket, object and 60 s debounce."""
+        containers = cloud_run_service_yaml()["spec"]["template"]["spec"]["containers"]
+        coach_web = next(c for c in containers if c["name"] == "coach-web")
+        env = {entry["name"]: entry.get("value") for entry in coach_web["env"]}
+
+        assert env["COACH_SNAPSHOT_BUCKET"] == "${SNAPSHOT_BUCKET}"
+        assert env["COACH_SNAPSHOT_OBJECT"] == "${SNAPSHOT_OBJECT}"
+        assert env["COACH_SNAPSHOT_DEBOUNCE_SECONDS"] == "60"
+
+    def test_post_deploy_config_assertion_covers_the_snapshot_env(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """The deployed-env read-back gate asserts the three snapshot values."""
+        script = self._step(steps, "Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)")[
+            "run"
+        ]
+
+        assert "COACH_SNAPSHOT_BUCKET" in script
+        assert "COACH_SNAPSHOT_OBJECT" in script
+        assert "COACH_SNAPSHOT_DEBOUNCE_SECONDS" in script
+        assert "SNAPSHOT_BUCKET_EXPECTED" in script or "coach-web-509209-snapshots" in script
+
+    def test_pre_deploy_gate_asserts_runtime_zero_project_roles(
+        self, steps: list[dict[str, Any]], tmp_path: Path
+    ) -> None:
+        """C4: coach-web-runtime must hold no project-level IAM binding."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert "projects get-iam-policy" in script
+        assert "RUNTIME_SA" in script
+        assert "zero project-level" in script
+        self._assert_bash_syntax(script, tmp_path)
+
+    def test_pre_deploy_gate_asserts_bucket_metadata(self, steps: list[dict[str, Any]]) -> None:
+        """C1/C5: residency, UBLA, PAP, versioning, Soft Delete and lifecycle."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        for marker in (
+            "storage buckets describe",
+            "EUROPE-WEST6",
+            "locationType",
+            "uniformBucketLevelAccess",
+            "publicAccessPrevention",
+            "versioning",
+            "softDeletePolicy",
+            "604800",
+            "numNewerVersions",
+            "daysSinceNoncurrentTime",
+        ):
+            assert marker in script, marker
+
+    def test_pre_deploy_gate_asserts_the_exact_bucket_iam_allowlist(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """C4: exactly the two custom-role bindings; no allUsers/extra principals."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert "buckets get-iam-policy" in script
+        assert self.RUNTIME_ROLE in script
+        assert self.DEPLOYER_ROLE in script
+        assert "allUsers" in script
+        assert "allAuthenticatedUsers" in script
+        # Live evidence 7078137681: the bucket policy (etag CAs=) is exactly
+        # those two bindings after the legacyBucket*/legacyObject* scrub.
+        assert "legacyBucket" in script
+        assert '"RUNTIME_MEMBER"' in script or "RUNTIME_MEMBER" in script
+        assert "DEPLOY_MEMBER" in script
+
+    def test_bucket_gate_coerces_the_soft_delete_duration(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """GCP serializes int64 duration fields as str-or-int — int() handles both."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert 'as_int(soft_delete.get("retentionDurationSeconds"))' in script
+        assert "retention != 604800" in script
+
+    def test_workflow_records_the_ratified_project_iam_viewer_role(
+        self, workflow: dict[str, Any]
+    ) -> None:
+        """The nonexistent predefined role is replaced by the custom role (#417)."""
+        text = (PROJECT_ROOT / CLOUD_RUN_WORKFLOW).read_text(encoding="utf-8")
+
+        assert "projects/coach-web-509209/roles/coachWebProjectIamViewer" in text
+        assert "7078148984" in text
+        # The bucket gate reads the project policy (custom role permission).
+        assert "projects get-iam-policy" in text
+
+    def test_render_and_assertion_steps_are_valid_bash(
+        self, steps: list[dict[str, Any]], tmp_path: Path
+    ) -> None:
+        """Both the render and the snapshot gate scripts parse under bash -n."""
+        for name in (
+            "Render the service YAML",
+            "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)",
+            "Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)",
+        ):
+            script = self._step(steps, name)["run"]
+            self._assert_bash_syntax(script, tmp_path)
+
+    def test_dockerfile_runs_boot_restore_before_migrations(self) -> None:
+        """The entrypoint restores the snapshot BEFORE alembic upgrade (C2/C6)."""
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        entrypoint = dockerfile[dockerfile.index("ENTRYPOINT") :]
+
+        assert "python -m coach_web.snapshot boot-restore" in entrypoint
+        assert entrypoint.index("boot-restore") < entrypoint.index("alembic")
+        assert entrypoint.index("alembic") < entrypoint.index("uvicorn")
+
+    def test_embedded_python_blocks_compile(self, workflow: dict[str, Any]) -> None:
+        """Every inline ``python3 -c`` body in the deploy workflow compiles.
+
+        ``bash -n`` cannot see inside single-quoted Python bodies; an
+        apostrophe in a comment silently truncated the #417 snapshot gate
+        while the step still exited 0 (caught by the local gate simulation).
+        """
+        checked = 0
+        for step in workflow["jobs"]["deploy"]["steps"]:
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            for body in inline_python_blocks(script):
+                compile(body, f"<{step.get('name')}>", "exec")
+                checked += 1
+        assert checked >= 4, "the deploy workflow must embed compiled gate scripts"
+
+    def test_docs_record_the_implemented_snapshot_store(self) -> None:
+        """security.md / admin_guide.md describe the shipped store, not a plan."""
+        security = (PROJECT_ROOT / "docs" / "security.md").read_text(encoding="utf-8")
+        admin = (PROJECT_ROOT / "docs" / "admin_guide.md").read_text(encoding="utf-8")
+
+        for doc in (security, admin):
+            assert "MADR-0032" in doc
+            assert "COACH_SNAPSHOT_BUCKET" in doc
+            assert "not yet implemented" not in doc
+            assert "PLANNED" not in doc
+            # The ADR-named predefined role does not exist in GCP: the
+            # @architect-ratified 1-permission custom role is the SSOT.
+            assert "coachWebProjectIamViewer" in doc
+
+    @pytest.mark.parametrize(
+        "adr",
+        [
+            "docs/adr/0032-durable-longitudinal-memory-snapshot-store.md",
+            "docs/adr/0027-cloud-run-production-operating-model.md",
+            "docs/adr/0031-public-landing-surface-with-iap-unchanged.md",
+        ],
+    )
+    def test_adrs_carry_the_ratified_iam_viewer_role(self, adr: str) -> None:
+        """C4's role reference matches live GCP reality (#417 architect ruling)."""
+        text = (PROJECT_ROOT / adr).read_text(encoding="utf-8")
+
+        assert "coachWebProjectIamViewer" in text
+        assert "resourcemanager.projects.getIamPolicy" in text

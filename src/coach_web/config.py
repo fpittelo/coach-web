@@ -160,6 +160,33 @@ class Settings(BaseSettings):
     newest run is kept) and the summary section yields last.
     """
 
+    COACH_SNAPSHOT_BUCKET: str = ""
+    """Dedicated GCS bucket holding the encrypted whole-DB snapshot (#417).
+
+    Empty by default so the local Docker dev/qa/prod lanes (and the
+    maintenance CLI run outside Cloud Run) keep their current behavior with
+    zero regression (MADR-0032 AC4). Cloud Run sets it to the dedicated
+    ``EUROPE-WEST6`` bucket; boot restore and the debounced publisher are
+    active only when it is non-empty.
+    """
+
+    COACH_SNAPSHOT_OBJECT: str = "snapshots/coach.db.fernet"
+    """Canonical live object key of the encrypted snapshot (MADR-0032 C1).
+
+    A single non-sensitive key: the bucket/object name carries no athlete,
+    health or content data. Historical ciphertext lives only in bounded
+    noncurrent generations / Soft Delete (C5).
+    """
+
+    COACH_SNAPSHOT_DEBOUNCE_SECONDS: float = 60.0
+    """Debounce window before a committed write is checkpointed (#417, C5).
+
+    The runtime publisher coalesces writes for this long, then uploads one
+    snapshot with an ``ifGenerationMatch`` precondition. Graceful ``SIGTERM``
+    flushes a final snapshot regardless, so the documented loss window is
+    only the ungraceful ``SIGKILL`` case (MADR-0032 R3).
+    """
+
     @property
     def service_name(self) -> str:
         """Canonical service identifier reported by the healthcheck."""

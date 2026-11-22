@@ -106,4 +106,12 @@ HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=10s \
 # startup on a failed migration rather than half-applying the schema. The
 # alembic.ini is packaged inside coach_web, so migrations always match the
 # installed code version.
-ENTRYPOINT ["sh", "-c", "alembic -c /app/src/coach_web/alembic.ini upgrade head && exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}\""]
+#
+# Durable snapshot restore (MADR-0032 C2/C6, #417): `python -m
+# coach_web.snapshot boot-restore` runs FIRST. With COACH_SNAPSHOT_BUCKET set
+# it either confirms the live object is absent (first boot) or restores +
+# integrity-checks the encrypted snapshot before any migration touches the
+# file; ANY other outcome exits non-zero, so startup fails closed instead of
+# booting an empty database over the durable copy. With the bucket unset
+# (local dev/qa/prod Docker lanes) it is a logged no-op (AC4).
+ENTRYPOINT ["sh", "-c", "python -m coach_web.snapshot boot-restore && alembic -c /app/src/coach_web/alembic.ini upgrade head && exec uvicorn coach_web.app:create_app --factory --host \"${APP_HOST:-0.0.0.0}\" --port \"${APP_PORT:-8000}\" --proxy-headers --forwarded-allow-ips=\"${FORWARDED_ALLOW_IPS:-127.0.0.1,::1}\""]
