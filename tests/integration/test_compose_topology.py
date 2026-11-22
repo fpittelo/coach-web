@@ -6,7 +6,9 @@ requiring a running Docker daemon, so they remain fast and deterministic in
 CI as well as local development.
 """
 
+import copy
 import datetime
+import json
 import os
 import re
 import shutil
@@ -40,6 +42,9 @@ COACH_MCP_PIN = "ghcr.io/fpittelo/coach"
 COACH_MCP_DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
 SERVICES = ("coach-web", "coach-mcp", "github-mcp")
 CLOUD_RUN_WORKFLOW = ".github/workflows/cloud-run-deploy.yaml"
+DEPLOY_SA_MEMBER = "serviceAccount:coach-web-deployer@coach-web-509209.iam.gserviceaccount.com"
+RUNTIME_SA_MEMBER = "serviceAccount:coach-web-runtime@coach-web-509209.iam.gserviceaccount.com"
+PROJECT_IAM_VIEWER_ROLE = "projects/coach-web-509209/roles/coachWebProjectIamViewer"
 # The proven compose invocation (compose.yaml github-mcp command), which under
 # K8s/Knative semantics must reach the container as `args`, never as `command`.
 GITHUB_MCP_CLOUD_RUN_ARGS = ["http", "--port", "8001", "--listen-host", "0.0.0.0"]
@@ -70,6 +75,38 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
         else:
             merged[key] = value
     return merged
+
+
+def inline_python_blocks(script: str) -> list[str]:
+    """Extract every ``python3 -c '`` body from a workflow shell script.
+
+    The bodies are single-quoted bash strings closed by a line containing only
+    ``'``. An apostrophe inside the Python (typically a comment) terminates the
+    bash string early while leaving both sides balanced, so ``bash -n`` cannot
+    see the bug — extracting to the real closing line and compiling is the
+    only reliable check (the #417 gate simulation caught exactly this).
+    """
+    blocks: list[str] = []
+    lines = script.splitlines()
+    index = 0
+    while index < len(lines):
+        marker = "python3 -c '"
+        if marker in lines[index]:
+            tail = lines[index].split(marker, 1)[1]
+            if tail.strip():
+                # Single-line ``python3 -c '...'`` form — the closing quote is
+                # on the same line and the body cannot hide an apostrophe
+                # comment the way a multi-line body can.
+                index += 1
+                continue
+            body: list[str] = []
+            index += 1
+            while index < len(lines) and lines[index].strip() != "'":
+                body.append(lines[index])
+                index += 1
+            blocks.append("\n".join(body))
+        index += 1
+    return blocks
 
 
 def cloud_run_service_yaml() -> dict[str, Any]:
@@ -1126,3 +1163,447 @@ class TestDockerfilePersistenceEntrypoint:
     def test_data_mountpoint_pre_created_with_runtime_ownership(self, dockerfile: str) -> None:
         """/data exists with coach-web ownership so the named volume inherits it."""
         assert "install -d -o coach-web -g coach-web /data" in dockerfile
+
+
+class TestSnapshotStoreDeployGates:
+    """The durable snapshot store is wired and asserted fail-closed (#417).
+
+    MADR-0032 binding conditions C1/C4/C5/C6 require the production lane to
+    (a) render the snapshot configuration onto the serving container, (b)
+    verify the dedicated bucket's residency/hardening/retention posture, (c)
+    verify the runtime identity holds ZERO project-level roles, and (d) verify
+    the bucket IAM is EXACTLY the two intended custom-role bindings. Every
+    gate reads live GCP state back and aborts the deploy on drift.
+    """
+
+    SNAPSHOT_BUCKET = "coach-web-509209-snapshots"
+    SNAPSHOT_OBJECT = "snapshots/coach.db.fernet"
+    RUNTIME_ROLE = "projects/coach-web-509209/roles/coachWebSnapshotObjectActor"
+    DEPLOYER_ROLE = "projects/coach-web-509209/roles/coachWebSnapshotBucketReader"
+
+    @pytest.fixture(scope="class")
+    def workflow(self) -> dict[str, Any]:
+        """The Cloud Run deploy workflow mapping."""
+        return load_yaml(CLOUD_RUN_WORKFLOW)
+
+    @pytest.fixture(scope="class")
+    def steps(self, workflow: dict[str, Any]) -> list[dict[str, Any]]:
+        """The deploy job steps."""
+        return list(workflow["jobs"]["deploy"]["steps"])
+
+    def _step(self, steps: list[dict[str, Any]], name: str) -> dict[str, Any]:
+        """Return the step with the exact name (fails loudly when renamed)."""
+        match = next((step for step in steps if step.get("name") == name), None)
+        assert match is not None, f"missing workflow step: {name}"
+        return match
+
+    def _assert_bash_syntax(self, script: str, tmp_path: Path) -> None:
+        """Validate an embedded workflow script with ``bash -n``."""
+        path = tmp_path / "step.sh"
+        path.write_text(script, encoding="utf-8")
+        result = subprocess.run(
+            ["/bin/bash", "-n", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def test_workflow_env_declares_the_bucket_and_object(self, workflow: dict[str, Any]) -> None:
+        """SNAPSHOT_BUCKET / SNAPSHOT_OBJECT are workflow-level constants."""
+        env = workflow["env"]
+
+        assert env["SNAPSHOT_BUCKET"] == self.SNAPSHOT_BUCKET
+        assert env["SNAPSHOT_OBJECT"] == self.SNAPSHOT_OBJECT
+
+    def test_service_yaml_renders_the_snapshot_env(self) -> None:
+        """The coach-web container carries bucket, object and 60 s debounce."""
+        containers = cloud_run_service_yaml()["spec"]["template"]["spec"]["containers"]
+        coach_web = next(c for c in containers if c["name"] == "coach-web")
+        env = {entry["name"]: entry.get("value") for entry in coach_web["env"]}
+
+        assert env["COACH_SNAPSHOT_BUCKET"] == "${SNAPSHOT_BUCKET}"
+        assert env["COACH_SNAPSHOT_OBJECT"] == "${SNAPSHOT_OBJECT}"
+        assert env["COACH_SNAPSHOT_DEBOUNCE_SECONDS"] == "60"
+
+    def test_post_deploy_config_assertion_covers_the_snapshot_env(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """The deployed-env read-back gate asserts the three snapshot values."""
+        script = self._step(steps, "Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)")[
+            "run"
+        ]
+
+        assert "COACH_SNAPSHOT_BUCKET" in script
+        assert "COACH_SNAPSHOT_OBJECT" in script
+        assert "COACH_SNAPSHOT_DEBOUNCE_SECONDS" in script
+        assert "SNAPSHOT_BUCKET_EXPECTED" in script or "coach-web-509209-snapshots" in script
+
+    def test_pre_deploy_gate_asserts_runtime_zero_project_roles(
+        self, steps: list[dict[str, Any]], tmp_path: Path
+    ) -> None:
+        """C4: coach-web-runtime must hold no project-level IAM binding."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert "projects get-iam-policy" in script
+        assert "RUNTIME_SA" in script
+        assert "zero project-level" in script
+        self._assert_bash_syntax(script, tmp_path)
+
+    def test_pre_deploy_gate_asserts_bucket_metadata(self, steps: list[dict[str, Any]]) -> None:
+        """C1/C5: residency, UBLA, PAP, versioning, Soft Delete and lifecycle."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        for marker in (
+            "storage buckets describe",
+            "EUROPE-WEST6",
+            "locationType",
+            "uniformBucketLevelAccess",
+            "publicAccessPrevention",
+            "versioning",
+            "softDeletePolicy",
+            "604800",
+            "numNewerVersions",
+            "daysSinceNoncurrentTime",
+        ):
+            assert marker in script, marker
+
+    def test_pre_deploy_gate_asserts_the_exact_bucket_iam_allowlist(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """C4: exactly the two custom-role bindings; no allUsers/extra principals."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert "buckets get-iam-policy" in script
+        assert self.RUNTIME_ROLE in script
+        assert self.DEPLOYER_ROLE in script
+        assert "allUsers" in script
+        assert "allAuthenticatedUsers" in script
+        # Live evidence 7078137681: the bucket policy (etag CAs=) is exactly
+        # those two bindings after the legacyBucket*/legacyObject* scrub.
+        assert "legacyBucket" in script
+        assert '"RUNTIME_MEMBER"' in script or "RUNTIME_MEMBER" in script
+        assert "DEPLOY_MEMBER" in script
+
+    def test_bucket_gate_coerces_the_soft_delete_duration(
+        self, steps: list[dict[str, Any]]
+    ) -> None:
+        """GCP serializes int64 duration fields as str-or-int — int() handles both."""
+        script = self._step(steps, "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)")[
+            "run"
+        ]
+
+        assert 'as_int(soft_delete.get("retentionDurationSeconds"))' in script
+        assert "retention != 604800" in script
+
+    def test_workflow_records_the_ratified_project_iam_viewer_role(
+        self, workflow: dict[str, Any]
+    ) -> None:
+        """The nonexistent predefined role is replaced by the custom role (#417)."""
+        text = (PROJECT_ROOT / CLOUD_RUN_WORKFLOW).read_text(encoding="utf-8")
+
+        assert "projects/coach-web-509209/roles/coachWebProjectIamViewer" in text
+        assert "7078148984" in text
+        # The bucket gate reads the project policy (custom role permission).
+        assert "projects get-iam-policy" in text
+
+    def test_render_and_assertion_steps_are_valid_bash(
+        self, steps: list[dict[str, Any]], tmp_path: Path
+    ) -> None:
+        """Both the render and the snapshot gate scripts parse under bash -n."""
+        for name in (
+            "Render the service YAML",
+            "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)",
+            "Assert deployed config (AUTH_REDIRECT_URI, TRUSTED_HOSTS)",
+        ):
+            script = self._step(steps, name)["run"]
+            self._assert_bash_syntax(script, tmp_path)
+
+    def test_dockerfile_runs_boot_restore_before_migrations(self) -> None:
+        """The entrypoint restores the snapshot BEFORE alembic upgrade (C2/C6)."""
+        dockerfile = (PROJECT_ROOT / "Dockerfile").read_text(encoding="utf-8")
+        entrypoint = dockerfile[dockerfile.index("ENTRYPOINT") :]
+
+        assert "python -m coach_web.snapshot boot-restore" in entrypoint
+        assert entrypoint.index("boot-restore") < entrypoint.index("alembic")
+        assert entrypoint.index("alembic") < entrypoint.index("uvicorn")
+
+    def test_embedded_python_blocks_compile(self, workflow: dict[str, Any]) -> None:
+        """Every inline ``python3 -c`` body in the deploy workflow compiles.
+
+        ``bash -n`` cannot see inside single-quoted Python bodies; an
+        apostrophe in a comment silently truncated the #417 snapshot gate
+        while the step still exited 0 (caught by the local gate simulation).
+        """
+        checked = 0
+        for step in workflow["jobs"]["deploy"]["steps"]:
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            for body in inline_python_blocks(script):
+                compile(body, f"<{step.get('name')}>", "exec")
+                checked += 1
+        assert checked >= 4, "the deploy workflow must embed compiled gate scripts"
+
+    def test_docs_record_the_implemented_snapshot_store(self) -> None:
+        """security.md / admin_guide.md describe the shipped store, not a plan."""
+        security = (PROJECT_ROOT / "docs" / "security.md").read_text(encoding="utf-8")
+        admin = (PROJECT_ROOT / "docs" / "admin_guide.md").read_text(encoding="utf-8")
+
+        for doc in (security, admin):
+            assert "MADR-0032" in doc
+            assert "COACH_SNAPSHOT_BUCKET" in doc
+            assert "not yet implemented" not in doc
+            assert "PLANNED" not in doc
+            # The ADR-named predefined role does not exist in GCP: the
+            # @architect-ratified 1-permission custom role is the SSOT.
+            assert "coachWebProjectIamViewer" in doc
+
+    @pytest.mark.parametrize(
+        "adr",
+        [
+            "docs/adr/0032-durable-longitudinal-memory-snapshot-store.md",
+            "docs/adr/0027-cloud-run-production-operating-model.md",
+            "docs/adr/0031-public-landing-surface-with-iap-unchanged.md",
+        ],
+    )
+    def test_adrs_carry_the_ratified_iam_viewer_role(self, adr: str) -> None:
+        """C4's role reference matches live GCP reality (#417 architect ruling)."""
+        text = (PROJECT_ROOT / adr).read_text(encoding="utf-8")
+
+        assert "coachWebProjectIamViewer" in text
+        assert "resourcemanager.projects.getIamPolicy" in text
+
+    # ------------------------------------------------------------------
+    # Executable gates (M3/C9): the workflow gate bodies run for real.
+    #
+    # The JSON below is the exact live read-back @devops recorded in #417
+    # comment 7078137681 (snake_case ``gcloud storage`` shapes, project
+    # policy bindings, bucket policy etag ``CAs=``). A logical inversion of
+    # an allowlist comparison cannot pass any more: each drift class below
+    # must make the shipped gate exit non-zero.
+    # ------------------------------------------------------------------
+
+    GATE_STEP = "Assert snapshot store hardening and snapshot IAM (C1/C4/C5)"
+
+    PROJECT_IAM_BASELINE: dict[str, Any] = {
+        "bindings": [
+            {"members": [DEPLOY_SA_MEMBER], "role": PROJECT_IAM_VIEWER_ROLE},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/iap.admin"},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/resourcemanager.viewer"},
+            {"members": [DEPLOY_SA_MEMBER], "role": "roles/serviceusage.serviceUsageConsumer"},
+            {"members": ["user:frederic.pitteloud@gmail.com"], "role": "roles/owner"},
+        ],
+        "etag": "BwZg21q5aJA=",
+        "version": 3,
+    }
+
+    BUCKET_METADATA_BASELINE: dict[str, Any] = {
+        "location": "EUROPE-WEST6",
+        "location_type": "region",
+        "uniform_bucket_level_access": True,
+        "public_access_prevention": "enforced",
+        "versioning_enabled": True,
+        "soft_delete_policy": {
+            "retentionDurationSeconds": "604800",
+            "effectiveTime": "2026-11-22T10:50:46.535000+00:00",
+        },
+        "lifecycle_config": {
+            "rule": [
+                {
+                    "action": {"type": "Delete"},
+                    "condition": {"isLive": False, "numNewerVersions": 2},
+                },
+                {
+                    "action": {"type": "Delete"},
+                    "condition": {"isLive": False, "daysSinceNoncurrentTime": 7},
+                },
+            ]
+        },
+        "default_storage_class": "STANDARD",
+        "creation_time": "2026-11-22T10:50:46+0000",
+    }
+
+    BUCKET_IAM_BASELINE: dict[str, Any] = {
+        "bindings": [
+            {
+                "members": [DEPLOY_SA_MEMBER],
+                "role": "projects/coach-web-509209/roles/coachWebSnapshotBucketReader",
+            },
+            {
+                "members": [RUNTIME_SA_MEMBER],
+                "role": "projects/coach-web-509209/roles/coachWebSnapshotObjectActor",
+            },
+        ],
+        "etag": "CAs=",
+    }
+
+    GCLOUD_SHIM = '''#!/usr/bin/env python3
+"""Test shim for gcloud: replays the 7078137681 JSON read-backs."""
+import os
+import sys
+
+args = sys.argv[1:]
+if args[:2] == ["projects", "get-iam-policy"]:
+    variable = "SHIM_PROJECT_IAM"
+elif args[:3] == ["storage", "buckets", "describe"]:
+    variable = "SHIM_BUCKET_METADATA"
+elif args[:3] == ["storage", "buckets", "get-iam-policy"]:
+    variable = "SHIM_BUCKET_IAM"
+else:
+    sys.stderr.write("unexpected gcloud invocation: " + " ".join(args))
+    sys.exit(2)
+with open(os.environ[variable], encoding="utf-8") as handle:
+    sys.stdout.write(handle.read())
+'''
+
+    def _gate_script(self) -> str:
+        """The shipped ``run`` script of the snapshot store gate step."""
+        workflow = load_yaml(CLOUD_RUN_WORKFLOW)
+        steps = workflow["jobs"]["deploy"]["steps"]
+        return str(self._step(steps, self.GATE_STEP)["run"])
+
+    def _run_gate(
+        self,
+        tmp_path: Path,
+        *,
+        project_iam: dict[str, Any] | None = None,
+        bucket_metadata: dict[str, Any] | None = None,
+        bucket_iam: dict[str, Any] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        """Execute the extracted gate step against the replayed GCP read-backs."""
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        shim = bin_dir / "gcloud"
+        shim.write_text(self.GCLOUD_SHIM, encoding="utf-8")
+        shim.chmod(0o755)
+        payloads = {
+            "SHIM_PROJECT_IAM": project_iam or self.PROJECT_IAM_BASELINE,
+            "SHIM_BUCKET_METADATA": bucket_metadata or self.BUCKET_METADATA_BASELINE,
+            "SHIM_BUCKET_IAM": bucket_iam or self.BUCKET_IAM_BASELINE,
+        }
+        env = dict(os.environ)
+        for name, value in load_yaml(CLOUD_RUN_WORKFLOW)["env"].items():
+            env.setdefault(name, str(value))
+        env["PATH"] = f"{bin_dir}{os.pathsep}{env['PATH']}"
+        for name, payload in payloads.items():
+            path = tmp_path / f"{name}.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            env[name] = str(path)
+        script = tmp_path / "gate.sh"
+        script.write_text(self._gate_script(), encoding="utf-8")
+        return subprocess.run(
+            ["/bin/bash", str(script)],
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_gate_step_embeds_three_executable_blocks(self) -> None:
+        """The gate step carries the project-IAM, bucket and bucket-IAM bodies."""
+        assert len(inline_python_blocks(self._gate_script())) == 3
+
+    def test_live_bootstrap_evidence_passes_the_gate(self, tmp_path: Path) -> None:
+        """The exact live 7078137681 read-backs exit 0 (positive baseline)."""
+        result = self._run_gate(tmp_path)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "C4 verified" in result.stdout
+
+    DRIFT_CASES = {
+        "allUsers": lambda project, bucket, policy: (
+            policy["bindings"].append(
+                {"members": ["allUsers"], "role": "roles/storage.objectViewer"}
+            )
+        ),
+        "allAuthenticatedUsers": lambda project, bucket, policy: (
+            policy["bindings"].append(
+                {"members": ["allAuthenticatedUsers"], "role": "roles/storage.objectViewer"}
+            )
+        ),
+        "legacyBucketOwner": lambda project, bucket, policy: (
+            policy["bindings"].append(
+                {
+                    "members": ["projectOwner:coach-web-509209"],
+                    "role": "roles/storage.legacyBucketOwner",
+                }
+            )
+        ),
+        "publicAccessPreventionInherited": lambda project, bucket, policy: bucket.update(
+            {"public_access_prevention": "inherited"}
+        ),
+        "softDeleteDisabled": lambda project, bucket, policy: bucket["soft_delete_policy"].update(
+            {"retentionDurationSeconds": "0"}
+        ),
+        "softDeleteOneDay": lambda project, bucket, policy: bucket["soft_delete_policy"].update(
+            {"retentionDurationSeconds": "86400"}
+        ),
+        "missingNumNewerVersionsRule": lambda project, bucket, policy: bucket[
+            "lifecycle_config"
+        ].update(
+            {
+                "rule": [
+                    {
+                        "action": {"type": "Delete"},
+                        "condition": {"isLive": False, "daysSinceNoncurrentTime": 7},
+                    }
+                ]
+            }
+        ),
+        "missingDaysSinceNoncurrentTimeRule": lambda project, bucket, policy: bucket[
+            "lifecycle_config"
+        ].update(
+            {
+                "rule": [
+                    {
+                        "action": {"type": "Delete"},
+                        "condition": {"isLive": False, "numNewerVersions": 2},
+                    }
+                ]
+            }
+        ),
+        "wrongLocation": lambda project, bucket, policy: bucket.update(
+            {"location": "EUROPE-WEST4"}
+        ),
+        "ublaDisabled": lambda project, bucket, policy: bucket.update(
+            {"uniform_bucket_level_access": False}
+        ),
+        "runtimeHoldsProjectRole": lambda project, bucket, policy: project["bindings"].append(
+            {
+                "members": [RUNTIME_SA_MEMBER],
+                "role": "roles/storage.objectViewer",
+            }
+        ),
+        "deployerMissingProjectIamViewer": lambda project, bucket, policy: project.update(
+            {
+                "bindings": [
+                    binding
+                    for binding in project["bindings"]
+                    if binding["role"] != "projects/coach-web-509209/roles/coachWebProjectIamViewer"
+                ]
+            }
+        ),
+    }
+
+    @pytest.mark.parametrize("drift", DRIFT_CASES, ids=list(DRIFT_CASES))
+    def test_drift_classes_are_rejected(self, tmp_path: Path, drift: str) -> None:
+        """Every injected drift class makes the shipped gate exit non-zero (M3)."""
+        project = copy.deepcopy(self.PROJECT_IAM_BASELINE)
+        bucket = copy.deepcopy(self.BUCKET_METADATA_BASELINE)
+        policy = copy.deepcopy(self.BUCKET_IAM_BASELINE)
+        self.DRIFT_CASES[drift](project, bucket, policy)
+
+        result = self._run_gate(
+            tmp_path, project_iam=project, bucket_metadata=bucket, bucket_iam=policy
+        )
+
+        assert result.returncode != 0, f"{drift} was NOT rejected: {result.stdout}"
+        assert "::error::" in result.stdout

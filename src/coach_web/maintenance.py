@@ -37,11 +37,12 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
-from coach_web.config import get_settings
+from coach_web.config import Settings, get_settings
 from coach_web.conversation import PurgeCounts, purge_expired
 from coach_web.db import build_db_engine, build_session_factory
 from coach_web.debrief import resolve_data_encryption_key
 from coach_web.errors import EncryptionUnavailableError
+from coach_web.snapshot import SnapshotError, SnapshotStore, publish_snapshot_once
 
 _BACKUP_SUFFIX = ".backup"
 """Suffix appended to the default backup artifact path."""
@@ -154,7 +155,12 @@ def restore_database(backup_path: str, output_path: str, key: bytes) -> None:
         raise
 
 
-def purge_conversations(db_path: str) -> PurgeCounts:
+def purge_conversations(
+    db_path: str,
+    *,
+    settings: Settings | None = None,
+    store: SnapshotStore | None = None,
+) -> PurgeCounts:
     """Run the MADR-0025 C6 conversation retention sweep (#348).
 
     Deletes raw messages past the message window and inactive threads past
@@ -163,6 +169,13 @@ def purge_conversations(db_path: str) -> PurgeCounts:
     sweep is a pure DELETE, it never reads ``content_encrypted`` or
     ``summary_encrypted``, so no key is needed and no plaintext path
     exists). The sweep is idempotent.
+
+    **Durable store (MADR-0032 C5, #417):** when the snapshot bucket is
+    configured AND the sweep deleted rows, the compacted encrypted snapshot
+    is republished immediately (``VACUUM INTO`` reclaims the free pages the
+    deletes left behind), so purged content cannot survive in the live GCS
+    object. A publication failure propagates — the sweep fails closed rather
+    than reporting a purge that is not durable.
 
     **Live-DB only (C6):** previously-taken encrypted backups retain the
     ciphertext of purged/expired content until they age out of backup
@@ -175,21 +188,27 @@ def purge_conversations(db_path: str) -> PurgeCounts:
     """
     if not Path(db_path).is_file():
         raise FileNotFoundError(f"database not found: {db_path} — nothing to purge")
-    settings = get_settings()
+    resolved = settings or get_settings()
 
     async def _sweep() -> PurgeCounts:
         engine = build_db_engine(db_path)
         try:
             factory = build_session_factory(engine)
             async with factory() as session:
-                return await purge_expired(
+                counts = await purge_expired(
                     session,
                     now=datetime.now(UTC),
-                    message_retention_days=settings.CONVERSATION_MESSAGE_RETENTION_DAYS,
-                    thread_retention_days=settings.CONVERSATION_THREAD_RETENTION_DAYS,
+                    message_retention_days=resolved.CONVERSATION_MESSAGE_RETENTION_DAYS,
+                    thread_retention_days=resolved.CONVERSATION_THREAD_RETENTION_DAYS,
                 )
         finally:
             await engine.dispose()
+        if (counts.messages_deleted or counts.threads_deleted) and resolved.COACH_SNAPSHOT_BUCKET:
+            # C5: opportunistically republish the compacted snapshot right
+            # away — the deletes must not outlive the sweep in the live
+            # durable object.
+            await publish_snapshot_once(resolved, store=store)
+        return counts
 
     return asyncio.run(_sweep())
 
@@ -259,7 +278,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"{counts.threads_deleted} thread(s) — live-DB only; encrypted "
                 "backups retain purged ciphertext until backup rotation (MADR-0025 C6)."
             )
-    except (ValueError, InvalidToken, OSError, sqlite3.Error, EncryptionUnavailableError) as exc:
+    except (
+        ValueError,
+        InvalidToken,
+        OSError,
+        sqlite3.Error,
+        EncryptionUnavailableError,
+        SnapshotError,
+    ) as exc:
         # Clean single-line failure — no traceback, no key material (nLPD;
         # redaction pinned by tests/test_maintenance.py, #301 SEC-296-06).
         print(f"maintenance failed: {exc}", file=sys.stderr)

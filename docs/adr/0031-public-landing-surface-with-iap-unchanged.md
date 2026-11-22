@@ -108,7 +108,7 @@ portfolio does not need with infrastructure it does not want.
     #396 C4 pattern): no project- or SA-level role bindings on the landing SA, **no token-minting
     grants** (`iam.serviceAccount*` family excluded, platform service agents excepted). The deploy
     SA holds only `resourcemanager.viewer` (no `getIamPolicy`); where the assertion needs a policy
-    *read*, the minimal grant to add is `resourcemanager.projectIamViewer`.
+    *read*, the minimal grant to add is the 1-permission custom role `projects/coach-web-509209/roles/coachWebProjectIamViewer` (`resourcemanager.projects.getIamPolicy`; GCP has no predefined `roles/resourcemanager.projectIamViewer` — the custom role is the @architect-ratified exact-minimal replacement, #417 comment `7078148984`).
   - **C3 (per-service invoker gates):** console invoker stays exactly {IAP service agent}; landing
     invoker == exactly {`allUsers`}; the landing service carries **no** `iap-enabled` annotation.
   - **C4 (MADR-0027 Am.0002 D3 revisit trigger FIRES):** the second Cloud Run service now exists →

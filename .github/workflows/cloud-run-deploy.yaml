@@ -42,6 +42,15 @@ name: Cloud Run Production Deploy
 #     project-level Resource Manager lookup previously supplied by the
 #     removed project-level run.admin; the role holds exactly
 #     resourcemanager.projects.get + projects.list and zero write surface)
+#   - deploy SA: projects/coach-web-509209/roles/coachWebProjectIamViewer
+#     PROJECT-LEVEL (MADR-0032 C4 — exactly
+#     resourcemanager.projects.getIamPolicy, zero write; the ADR-named
+#     predefined roles/resourcemanager.projectIamViewer does not exist in
+#     GCP, so the @architect-ratified 1-permission custom role replaces it —
+#     #417 comments 7078137681 / 7078148984)
+#   - snapshot bucket `gs://coach-web-509209-snapshots` bootstrapped with the
+#     two bucket-scoped custom-role bindings ONLY (legacyBucket* scrubbed;
+#     #417 comment 7078137681)
 #   - Actions variable GOOGLE_OIDC_CLIENT_ID (app-level OAuth client ID)
 # ---------------------------------------------------------------------------
 
@@ -78,6 +87,10 @@ env:
   WIF_PROVIDER: projects/853194930683/locations/global/workloadIdentityPools/github-pool/providers/github-oidc-provider
   IAP_SERVICE_AGENT: serviceAccount:service-853194930683@gcp-sa-iap.iam.gserviceaccount.com
   IAP_PO_USER: user:frederic.pitteloud@gmail.com
+  # Durable snapshot store (MADR-0032, #417): the dedicated regional bucket
+  # holding the single whole-file Fernet-encrypted database snapshot.
+  SNAPSHOT_BUCKET: coach-web-509209-snapshots
+  SNAPSHOT_OBJECT: snapshots/coach.db.fernet
 
 jobs:
   # Single approval-gated job (MADR-0027 Amendment 0001 — AC5 fix round):
@@ -201,6 +214,173 @@ jobs:
             echo "::error::Repository variable GOOGLE_OIDC_CLIENT_ID is unset — set it once with 'gh variable set GOOGLE_OIDC_CLIENT_ID --repo fpittelo/coach-web <client-id>' (the OAuth web client ID from the #315 IAP prerequisites; it is public, not a secret)."
             exit 1
           fi
+
+      # MADR-0032 binding conditions C1/C4/C5: the durable snapshot store is
+      # asserted BEFORE any service mutation, fail-closed. Three independent
+      # read-backs:
+      #   1. C4 — coach-web-runtime holds ZERO project-level IAM bindings (its
+      #      only storage grant is the bucket-scoped object actor role) and the
+      #      deployer still holds the 1-permission project IAM viewer role.
+      #   2. C1/C5 — the dedicated bucket is EUROPE-WEST6 REGIONAL, UBLA on,
+      #      PAP enforced, versioning on, 7-day Soft Delete, and carries BOTH
+      #      noncurrent Delete lifecycle rules (numNewerVersions=2 AND
+      #      daysSinceNoncurrentTime=7) bounding history to <= 14 days.
+      #   3. C4 — the bucket IAM is EXACTLY the two intended custom-role
+      #      bindings (runtime -> object actor, deployer -> bucket reader);
+      #      allUsers / allAuthenticatedUsers / any extra role or principal
+      #      fails the run. LIVE EVIDENCE @devops 7078137681 (bucket policy
+      #      etag `CAs=`): all four auto-populated `legacyBucket*` /
+      #      `legacyObject*` bindings were scrubbed — the live policy is
+      #      exactly those two bindings, so any reintroduced legacy binding
+      #      (or a projectOwner-style convenience grant) must fail closed.
+      # Requires the C4 grants: deployer project-level custom role
+      # `projects/coach-web-509209/roles/coachWebProjectIamViewer`
+      # (`resourcemanager.projects.getIamPolicy` only — the ADR-named
+      # predefined `roles/resourcemanager.projectIamViewer` does not exist in
+      # GCP; @architect-ratified replacement, #417 comment 7078148984) plus
+      # `storage.buckets.get` / `storage.buckets.getIamPolicy` on the bucket
+      # (custom bucket reader role).
+      - name: Assert snapshot store hardening and snapshot IAM (C1/C4/C5)
+        run: |
+          set -euo pipefail
+
+          echo "C4 gate: coach-web-runtime must hold zero project-level roles."
+          gcloud projects get-iam-policy "${GCP_PROJECT}" \
+            --format='json(bindings)' \
+          | RUNTIME_MEMBER="serviceAccount:${RUNTIME_SA}" \
+            DEPLOY_MEMBER="serviceAccount:${DEPLOY_SA}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
+          runtime = os.environ["RUNTIME_MEMBER"]
+          deployer = os.environ["DEPLOY_MEMBER"]
+          runtime_roles = sorted(
+              binding.get("role", "")
+              for binding in bindings
+              if runtime in (binding.get("members") or [])
+          )
+          if runtime_roles:
+              print("::error::C4 violation: " + runtime + " holds " + str(len(runtime_roles)) + " project-level role binding(s) " + json.dumps(runtime_roles) + " — the runtime identity must hold zero project-level roles; its only storage grant is the bucket-scoped coachWebSnapshotObjectActor role (MADR-0032 C4).")
+              sys.exit(1)
+          required = "projects/coach-web-509209/roles/coachWebProjectIamViewer"
+          deployer_roles = {
+              binding.get("role", "")
+              for binding in bindings
+              if deployer in (binding.get("members") or [])
+          }
+          if required not in deployer_roles:
+              print("::error::C4 violation: " + deployer + " is missing the project-level " + required + " role — the deploy lane needs resourcemanager.projects.getIamPolicy to keep these gates fail-closed (MADR-0032 C4; recover per docs/admin_guide.md).")
+              sys.exit(1)
+          print("C4 verified: coach-web-runtime holds zero project-level roles and the deployer holds the 1-permission coachWebProjectIamViewer role.")
+          '
+
+          echo "C1/C5 gate: assert the dedicated snapshot bucket posture."
+          gcloud storage buckets describe "gs://${SNAPSHOT_BUCKET}" --format=json \
+          | python3 -c '
+          import json, sys
+          raw = json.load(sys.stdin)
+          failed = False
+
+          def fail(message):
+              global failed
+              print("::error::" + message)
+              failed = True
+
+          def field(name, *aliases):
+              for key in (name, *aliases):
+                  if key in raw:
+                      return raw[key]
+              return None
+
+          def as_int(value):
+              try:
+                  return int(value)
+              except (TypeError, ValueError):
+                  return -1
+
+          # Accept both the camelCase CLI JSON shape and the snake_case API
+          # read-back (the live @devops evidence used the latter) — the gate
+          # must never pass on a shape mismatch, only on the real values.
+          if field("location") != "EUROPE-WEST6":
+              fail("C1 violation: snapshot bucket location=" + json.dumps(field("location")) + " — must be EUROPE-WEST6 (regional Swiss residency; MADR-0032 C1).")
+          location_type = field("locationType", "location_type")
+          if location_type != "region":
+              fail("C1 violation: snapshot bucket locationType=" + json.dumps(location_type) + " — must be \"region\" (never dual/multi-region; MADR-0032 C1).")
+          ubla = field("uniformBucketLevelAccess", "uniform_bucket_level_access")
+          ubla_enabled = ubla.get("enabled") if isinstance(ubla, dict) else ubla
+          if ubla_enabled is not True:
+              fail("C1 violation: uniformBucketLevelAccess.enabled must be true on the snapshot bucket (MADR-0032 C1).")
+          pap = field("publicAccessPrevention", "public_access_prevention")
+          if pap != "enforced":
+              fail("C1 violation: publicAccessPrevention=" + json.dumps(pap) + " — must be \"enforced\" (MADR-0032 C1).")
+          versioning = field("versioning", "versioning_enabled")
+          versioning_enabled = versioning.get("enabled") if isinstance(versioning, dict) else versioning
+          if versioning_enabled is not True:
+              fail("C5 violation: versioning.enabled must be true on the snapshot bucket (MADR-0032 C5).")
+          soft_delete = field("softDeletePolicy", "soft_delete_policy") or {}
+          # GCP serializes int64 duration fields as either "604800" or
+          # 604800 depending on formatter — int() handles both safely.
+          retention = as_int(soft_delete.get("retentionDurationSeconds"))
+          if retention != 604800:
+              fail("C5 violation: softDeletePolicy.retentionDurationSeconds=" + json.dumps(soft_delete.get("retentionDurationSeconds")) + " — must be 604800 (7 days) on the snapshot bucket (MADR-0032 C5).")
+
+          lifecycle = field("lifecycle", "lifecycle_config") or {}
+          rules = lifecycle.get("rule") or []
+
+          def has_delete_rule(num_newer_versions=None, days_since=None):
+              for rule in rules:
+                  if (rule.get("action") or {}).get("type") != "Delete":
+                      continue
+                  condition = rule.get("condition") or {}
+                  if condition.get("isLive") is not False:
+                      continue
+                  if num_newer_versions is not None and as_int(condition.get("numNewerVersions")) != num_newer_versions:
+                      continue
+                  if days_since is not None and as_int(condition.get("daysSinceNoncurrentTime")) != days_since:
+                      continue
+                  return True
+              return False
+
+          if not has_delete_rule(num_newer_versions=2):
+              fail("C5 violation: missing the noncurrent Delete lifecycle rule numNewerVersions=2 (MADR-0032 C5).")
+          if not has_delete_rule(days_since=7):
+              fail("C5 violation: missing the noncurrent Delete lifecycle rule daysSinceNoncurrentTime=7 (MADR-0032 C5).")
+          if failed:
+              sys.exit(1)
+          print("C1/C5 verified: EUROPE-WEST6 regional, UBLA enabled, PAP enforced, versioned, 7-day Soft Delete, both noncurrent Delete rules.")
+          '
+
+          echo "C4 gate: assert the exact snapshot bucket IAM allowlist."
+          gcloud storage buckets get-iam-policy "gs://${SNAPSHOT_BUCKET}" --format=json \
+          | RUNTIME_MEMBER="serviceAccount:${RUNTIME_SA}" \
+            DEPLOY_MEMBER="serviceAccount:${DEPLOY_SA}" python3 -c '
+          import json, os, sys
+          raw = json.load(sys.stdin)
+          bindings = raw.get("bindings", []) if isinstance(raw, dict) else []
+          expected = {
+              "projects/coach-web-509209/roles/coachWebSnapshotObjectActor": [os.environ["RUNTIME_MEMBER"]],
+              "projects/coach-web-509209/roles/coachWebSnapshotBucketReader": [os.environ["DEPLOY_MEMBER"]],
+          }
+          found = {}
+          violations = []
+          for binding in bindings:
+              role = binding.get("role", "")
+              members = sorted(set(binding.get("members", [])))
+              if role in expected:
+                  found.setdefault(role, []).extend(members)
+              else:
+                  violations.append(role + " -> " + ",".join(members))
+          for public in ("allUsers", "allAuthenticatedUsers"):
+              if any(public in (b.get("members") or []) for b in bindings):
+                  violations.append("public principal present: " + public)
+          normalized = {role: sorted(set(members)) for role, members in found.items()}
+          if normalized != expected:
+              violations.append("found=" + json.dumps(normalized, sort_keys=True) + " expected=" + json.dumps(expected, sort_keys=True))
+          if violations:
+              print("::error::C4 violation: snapshot bucket IAM must be EXACTLY the two intended custom-role bindings (runtime -> coachWebSnapshotObjectActor, deployer -> coachWebSnapshotBucketReader); all legacyBucket*/legacyObject* convenience bindings were scrubbed and must stay removed, and any allUsers/allAuthenticatedUsers or extra role/principal fails closed — " + "; ".join(violations) + " (MADR-0032 C4; recover per docs/admin_guide.md).")
+              sys.exit(1)
+          print("C4 verified: snapshot bucket IAM is exactly the two intended custom-role bindings.")
+          '
 
       # Grooming amendment #7: capture the revision that was serving before
       # this deploy — the rollback target for the runbook line (NOT a
@@ -335,6 +515,15 @@ jobs:
                       secretKeyRef:
                         name: DATA_ENCRYPTION_KEY
                         key: latest
+                  # Durable snapshot store (MADR-0032, #417): the entrypoint
+                  # restores before migrations; the debounced publisher
+                  # checkpoints committed writes every 60 s.
+                  - name: COACH_SNAPSHOT_BUCKET
+                    value: ${SNAPSHOT_BUCKET}
+                  - name: COACH_SNAPSHOT_OBJECT
+                    value: ${SNAPSHOT_OBJECT}
+                  - name: COACH_SNAPSHOT_DEBOUNCE_SECONDS
+                    value: '60'
                   resources:
                     limits:
                       cpu: 1000m
@@ -538,7 +727,9 @@ jobs:
             --region="${GCP_REGION}" --project="${GCP_PROJECT}" \
             --format='json(spec.template.spec.containers)' \
           | SERVICE_URL="${url}" \
-            NUMBER_HOST="${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app" python3 -c '
+            NUMBER_HOST="${SERVICE}-${GCP_PROJECT_NUMBER}.${GCP_REGION}.run.app" \
+            SNAPSHOT_BUCKET_EXPECTED="${SNAPSHOT_BUCKET}" \
+            SNAPSHOT_OBJECT_EXPECTED="${SNAPSHOT_OBJECT}" python3 -c '
           import json, os, sys
           from urllib.parse import urlparse
           raw = json.load(sys.stdin)
@@ -568,9 +759,22 @@ jobs:
           if trusted != json.dumps(expected_hosts, separators=(",", ":")):
               print("::error::C3 violation: deployed TRUSTED_HOSTS=" + json.dumps(trusted) + " must be exactly " + json.dumps(expected_hosts) + " — the shared *.run.app wildcard matches every Cloud Run service of every GCP project (#317 C3; permitted only for the bootstrap render before the service exists; both served URL forms enumerated per the #406 ruling).")
               failed = True
+          # Durable snapshot store (MADR-0032, #417): the serving container
+          # must carry the exact bucket/object/debounce wiring the deploy
+          # rendered — a drifted value would silently disable durability or
+          # point at the wrong bucket.
+          expected_snapshot = {
+              "COACH_SNAPSHOT_BUCKET": os.environ["SNAPSHOT_BUCKET_EXPECTED"],
+              "COACH_SNAPSHOT_OBJECT": os.environ["SNAPSHOT_OBJECT_EXPECTED"],
+              "COACH_SNAPSHOT_DEBOUNCE_SECONDS": "60",
+          }
+          deployed_snapshot = {key: env.get(key, "") for key in expected_snapshot}
+          if deployed_snapshot != expected_snapshot:
+              print("::error::MADR-0032 violation: deployed snapshot env drifted — found=" + json.dumps(deployed_snapshot, sort_keys=True) + ", expected=" + json.dumps(expected_snapshot, sort_keys=True) + " (a missing/misdirected bucket silently disables durable persistence; #417 C1/C5).")
+              failed = True
           if failed:
               sys.exit(1)
-          print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact two-host served list (primary hash form + project-number form).")
+          print("C2 verified: AUTH_REDIRECT_URI is https on the service origin. C3 verified: TRUSTED_HOSTS is the exact two-host served list (primary hash form + project-number form). MADR-0032 verified: snapshot bucket/object/debounce env is exactly as rendered.")
           '
 
       # D4 (MADR-0027 Amendment 0002, issue #390) — post-deploy drift guard:
