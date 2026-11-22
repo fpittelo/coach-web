@@ -255,6 +255,24 @@ earn a 401. The attribute is a UI opt-in, never a security boundary — every
 _CONVERSATION_RESTORE_ON = 'data-conversation-restore="true"'
 """Authenticated-session substitution for the root attribute (#351 AC1)."""
 
+NO_STORE_CACHE_CONTROL = "no-store"
+"""``Cache-Control`` value for the identity-sensitive ``/`` renders (#412 AC1).
+
+``/`` branches on the session cookie (landing vs. console), so its body is
+session-variant. Without ``Cache-Control`` the ``ETag``/``Last-Modified`` that
+``FileResponse`` emits make the response heuristically cacheable (RFC 9111
+§4.2): the browser reused the cached unauthenticated landing shell after a
+successful login (forensics comment 7075893715 on #406). ``no-store`` forbids
+storing either render path — the ETag headers stay untouched (no other header
+change). Static assets are cache-safe and keep their current behavior (AC3).
+"""
+
+
+def _no_store(response: Response) -> Response:
+    """Stamp a session-variant ``/`` render as non-cacheable (#412 AC1)."""
+    response.headers["Cache-Control"] = NO_STORE_CACHE_CONTROL
+    return response
+
 
 def _avatar_html(claims: dict[str, Any]) -> str:
     """Build the identity-bar avatar markup from session claims (#319, #323).
@@ -712,26 +730,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         any cookie or validation error resolves to the landing variant — the
         page can never 500. No auto-redirect: the public-landing posture is
         preserved (rejected-by-default option 3, #180).
+
+        Every session-variant render (landing and console) is stamped
+        ``Cache-Control: no-store`` (#412): the body depends on the session
+        cookie, so no cache may store it — a heuristic-freshness hit served
+        the landing shell after a successful login.
         """
         settings: Settings = request.app.state.settings
         if not settings.AUTH_ENABLED:
             return FileResponse(STATIC_DIR / "index.html")
         claims = _verified_session_claims(request, settings)
         if claims is None:
-            return FileResponse(STATIC_DIR / "landing.html")
+            return _no_store(FileResponse(STATIC_DIR / "landing.html"))
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         if _AVATAR_SLOT in html:
             # The authenticated variant owns both substitutions: the #319
             # avatar and the #351 rehydrate opt-in. A static bundle without
             # the avatar anchor keeps the static file — and therefore the
             # no-restore default (fail-safe).
-            return Response(
-                content=html.replace(_AVATAR_SLOT, _avatar_html(claims)).replace(
-                    _CONVERSATION_RESTORE_OFF, _CONVERSATION_RESTORE_ON
-                ),
-                media_type="text/html",
+            return _no_store(
+                Response(
+                    content=html.replace(_AVATAR_SLOT, _avatar_html(claims)).replace(
+                        _CONVERSATION_RESTORE_OFF, _CONVERSATION_RESTORE_ON
+                    ),
+                    media_type="text/html",
+                )
             )
-        return FileResponse(STATIC_DIR / "index.html")
+        return _no_store(FileResponse(STATIC_DIR / "index.html"))
 
     @application.get("/health", response_model=HealthResponse, tags=["ops"])
     @application.get("/healthz", response_model=HealthResponse, include_in_schema=False)
