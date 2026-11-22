@@ -140,7 +140,7 @@ graph TD
 
 ## 4. Deployment Topology (ADR-007 — Local-First)
 
-> **Authoritative deployment models: ADR-007 (§10) for the local lanes; MADR-0027 for the production lane.** The local Docker host on the workstation remains the deployment target for the dev/qa/prod lanes. The GCP Cloud Run topology (Sprint 08, #64–#68; retired and decommissioned via #111) is **reinstated as the production lane** per MADR-0027 (Amendment 0001): a 3-container pod on project `coach-web-509209`, region `europe-west6`, always-on scale-to-zero (`min=0`/`max=1`), IAP edge gate, deployed by the manual WIF-keyless workflow (#316 — deploy/runtime SA split; pod contract and one-time deltas in `docs/admin_guide.md` → GCP Cloud Run Production).
+> **Authoritative deployment models: ADR-007 (§10) for the local lanes; MADR-0027 (Amendments 0001–0004) + MADR-0032 for the production lane.** The local Docker host on the workstation remains the deployment target for the dev/qa/prod lanes. The GCP Cloud Run topology (Sprint 08, #64–#68; retired and decommissioned via #111) is **reinstated as the production lane** per MADR-0027: a 3-container pod on project `coach-web-509209`, region `europe-west6`, always-on scale-to-zero (`min=0`/`max=1`), IAP edge gate, deployed by the manual WIF-keyless workflow (#316 — deploy/runtime SA split; durable `EUROPE-WEST6` encrypted GCS-snapshot store ratified in MADR-0032 / Amendment 0004 for #417 rollout; pod contract and one-time deltas in `docs/admin_guide.md` → GCP Cloud Run Production).
 
 ```mermaid
 graph TD
