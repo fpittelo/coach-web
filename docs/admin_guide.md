@@ -825,7 +825,14 @@ The binding chain (provider condition → repo-scoped principalSet → `roles/ia
 
 ### Production deploy lane (#316 — manual workflow)
 
-`.github/workflows/cloud-run-deploy.yaml` — `workflow_dispatch` with `image_tag_or_digest` (default `prod` = latest prod digest from GHCR; the input is resolved to an exact `@sha256:…` via `docker buildx imagetools inspect` before deploy — the pinned digest, not a mutable tag, is what ships). Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy (Amendment 0001: the whole pipeline — pre-flight included — is that single gated job; no step authenticates to GCP outside it). The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants) **and for the Amendment 0001 deltas above to be applied**.
+`.github/workflows/cloud-run-deploy.yaml` — `workflow_dispatch` with `image_tag_or_digest`, now **required, no default (#411)**: pass the **current trunk digest** (`sha256:…`), the `dev` tag, or a trunk-build sha tag; the input is resolved to an exact `@sha256:…` via `docker buildx imagetools inspect` before deploy — the pinned digest, not a mutable tag, is what ships. A resolution-time guard **refuses release-class tags** (`prod`, `latest`, `v*`) and fails the run before any registry resolution or Cloud Run mutation: they resolve to the **LAST RELEASE build** in GHCR, not the current trunk artifact — the former `prod` default resolved to the stale v0.20.0 digest and caused **three live prod incidents** (deploy runs 44897761116 and 44898471542 — the #406 forensics — and 45003393040, the 2026-11-22 `Invalid OAuth state` recurrence after login; issue #411). Example dispatch:
+
+```bash
+gh workflow run cloud-run-deploy.yaml --ref main \
+  -f image_tag_or_digest="$(docker buildx imagetools inspect ghcr.io/fpittelo/coach-web:dev | sed -n 's/^Digest:[[:space:]]*//p')"
+```
+
+Every run passes the `gcp-cloud-run` GitHub Environment gate → one explicit @fpittelo approval per deploy (Amendment 0001: the whole pipeline — pre-flight included — is that single gated job; no step authenticates to GCP outside it). The **first execution (AC1) waits for the @cyber-security AC5 review** recorded on the #316 PR (secret wiring/masking, `FORWARDED_ALLOW_IPS=*` rationale, IAP enablement + both `iap.httpsResourceAccessor` grants) **and for the Amendment 0001 deltas above to be applied**.
 
 One-time prerequisites beyond the #315 bootstrap — run before the first dispatch:
 
