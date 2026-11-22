@@ -1,0 +1,67 @@
+# ---------------------------------------------------------------------------
+# Dockerfile.landing — public static landing surface (MADR-0031, issue #427).
+#
+# Minimal, hardened container: stdlib-only Go static server embedded with the
+# reused landing assets (src/coach_web/static/landing.html + landing.css — the
+# source files are NOT modified in git; console tests pin their relative
+# /auth/login href), compiled CGO_ENABLED=0 in a digest-pinned golang builder
+# and served from a digest-pinned distroless static runtime.
+#
+# Hardening contract (MADR-0031 C5/C6):
+#   - digest-pinned base images (the #423 supply-chain lesson),
+#   - non-root (distroless static:nonroot — UID 65532, no shell),
+#   - zero runtime env vars, zero secrets, zero credential wiring,
+#   - constant :8080 listener (Cloud Run container contract).
+#
+# Build-time fail-closed assertions (MADR-0031 C6/C7): the relative CTA
+# href="/auth/login" is rewritten to the CONSTANT canonical console URL and
+# the embedded HTML must contain the absolute CTA and zero relative hrefs, or
+# the build fails; the HTML content SHA-256 is recorded for provenance.
+# ---------------------------------------------------------------------------
+
+# Builder stage — digest-pinned (index digest; resolved 2026-11-22 via the
+# registry manifest API — the same digest `docker buildx imagetools inspect`
+# reports for the multi-platform manifest list).
+#
+# Version note (#427 evidence, 2026-11-22): the groom's `golang:1.23` is EOL —
+# its stdlib ships unfixed HIGH CVEs into the statically linked binary
+# (e.g. CVE-2026-78667, fixed in 1.26.9/1.27.2; trivy exit 1 on the
+# HIGH,CRITICAL gate). The current supported toolchain (1.27, the C
+# recommendation at build time) is used instead; the digest pin (MADR-0031 C6)
+# is the binding control, and toolchain bumps are re-pinned + re-scanned.
+FROM golang:1.27-alpine@sha256:70bd7ddea8b6cbe5d6943cde279d6b67feb10cc924fb9100d1d8757c1575b280 AS builder
+
+# Canonical console origin (MADR-0031 C6/C7): the CTA target constant. The
+# default is the live console's canonical primary *.a.run.app URL form — the
+# same origin the deploy lane pins as AUTH_REDIRECT_URI (#406/#410).
+ARG CONSOLE_ORIGIN=https://coach-web-afff35tqxq-oa.a.run.app
+
+WORKDIR /src
+
+COPY landing/go.mod landing/server.go ./
+COPY src/coach_web/static/landing.html ./landing.html
+COPY src/coach_web/static/landing.css ./static/landing.css
+
+# Rewrite the relative console CTA to the canonical absolute URL, then assert
+# fail-closed: the absolute CTA is present, zero relative hrefs remain, and
+# record the HTML content SHA-256 (served-content provenance, C5).
+RUN set -eu; \
+    sed -i "s|href=\"/auth/login\"|href=\"${CONSOLE_ORIGIN}/auth/login\"|g" landing.html; \
+    grep -F -q "href=\"${CONSOLE_ORIGIN}/auth/login\"" landing.html || { echo "FATAL: canonical CTA missing after rewrite"; exit 1; }; \
+    if grep -F -q 'href="/auth/login"' landing.html; then echo "FATAL: relative /auth/login href survived the rewrite"; exit 1; fi; \
+    echo "landing.html content hash:"; sha256sum landing.html
+
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/landing .
+
+# Runtime stage — digest-pinned distroless static:nonroot (UID 65532, no
+# shell, no package manager; index digest, resolved 2026-11-22).
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+
+COPY --from=builder /out/landing /landing
+
+# Explicit non-root user (the nonroot distroless variant: UID/GID 65532).
+USER nonroot:nonroot
+
+EXPOSE 8080
+
+ENTRYPOINT ["/landing"]

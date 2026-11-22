@@ -119,15 +119,51 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ---------------------------------------------------------------------
+      # Public static landing surface (MADR-0031, #427): the same trunk/tag
+      # mapping builds the minimal landing container. The Cloud Run deploy
+      # lane consumes it only by exact sha256 digest (release-class tags are
+      # refused there — #411 + MADR-0031 C6), so these tags exist for
+      # traceability, exactly mirroring the console image tags.
+      # ---------------------------------------------------------------------
+      - name: Generate OCI image metadata (landing surface)
+        id: meta-landing
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}-landing
+          tags: |
+            type=raw,value=${{ steps.env.outputs.tag }}
+            type=sha,prefix=
+            type=raw,value=latest,enable=${{ steps.env.outputs.tag == 'prod' || startsWith(steps.env.outputs.tag, 'v') }}
+            type=raw,value=prod,enable=${{ startsWith(steps.env.outputs.tag, 'v') }}
+
+      - name: Build and Push Landing OCI Image (MADR-0031)
+        id: build-landing
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.landing
+          push: true
+          tags: ${{ steps.meta-landing.outputs.tags }}
+          labels: ${{ steps.meta-landing.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Verify pushed images
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          LANDING_TAGS: ${{ steps.meta-landing.outputs.tags }}
         run: |
           while IFS= read -r image; do
             [ -n "$image" ] || continue
             echo "Verifying registry presence of ${image}"
             docker buildx imagetools inspect "${image}" > /dev/null
           done <<< "${TAGS}"
+          while IFS= read -r image; do
+            [ -n "$image" ] || continue
+            echo "Verifying registry presence of ${image}"
+            docker buildx imagetools inspect "${image}" > /dev/null
+          done <<< "${LANDING_TAGS}"
 
       # ---------------------------------------------------------------------
       # Sidecar lane verification (issue #110): before a lane image is
