@@ -6,10 +6,13 @@ single whole-file encrypted snapshot in a dedicated regional GCS bucket:
 
 - **Boot restore** (``python -m coach_web.snapshot boot-restore``) runs BEFORE
   ``alembic upgrade head`` in the container entrypoint. It implements the
-  fail-closed anti-clobber state machine (C2/C6): only a confirmed ``404``
-  initializes an empty database; when the object exists, the bytes are
-  authenticated/decrypted with the lane Fernet key BEFORE SQLite parses them,
-  integrity-checked, then atomically activated. Any other outcome leaves
+  fail-closed anti-clobber state machine (C2/C6) in the fixed order
+  ``download → Fernet authenticate/decrypt → PRAGMA integrity_check → alembic
+  upgrade head (staged file) → atomic activation``: only a confirmed ``404``
+  initializes an empty database (migrated to ``head`` before publication is
+  enabled); when the object exists, the bytes are authenticated/decrypted with
+  the lane Fernet key BEFORE SQLite parses them, integrity-checked, **migrated
+  while still staged**, then atomically activated. Any other outcome leaves
   publication hard-disabled and exits non-zero, so an empty database can never
   boot and overwrite the durable copy.
 - **Publication** (``SnapshotCoordinator``) builds a WAL-safe snapshot
@@ -31,16 +34,20 @@ import contextlib
 import json
 import logging
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import quote
 
 import httpx
+from alembic import command
+from alembic.config import Config
 from cryptography.fernet import Fernet
 
 from coach_web.config import Settings, get_settings
@@ -52,8 +59,11 @@ logger = logging.getLogger("coach_web")
 GCS_BASE_URL = "https://storage.googleapis.com"
 """GCS JSON API v1 origin — HTTPS only (MADR-0032 C1)."""
 
-METADATA_TOKEN_URL = (  # noqa: S105 - a public metadata endpoint, not a credential
-    "http://metadata.google.internal/computeMetadata/v1/instance/" "service-accounts/default/token"
+METADATA_TOKEN_URL = (
+    # A public metadata endpoint, not a credential — bandit's B105 heuristic
+    # matches the "TOKEN" in the constant name.
+    "http://metadata.google.internal/computeMetadata/v1/instance"  # noqa: S105
+    "/service-accounts/default/token"
 )
 """Cloud Run Metadata Server token endpoint (Google's documented metadata host)."""
 
@@ -319,25 +329,33 @@ def build_snapshot_plaintext(db_path: str) -> bytes:
     consistent image (committed WAL content included) and writes a compacted
     file, which is exactly what the retention purge needs — free pages that
     still hold deleted plaintext/ciphertext are reclaimed (MADR-0032 C2/C5).
-    The ``0600`` scratch file is always removed before returning.
+
+    The plaintext never leaves an owner-only scope (C2): the target lives in a
+    private ``0700`` directory and is an EXISTING empty ``0600`` file (SQLite
+    accepts an empty VACUUM INTO target and keeps the inode it writes), so the
+    database bytes are never group/other-readable for the duration of the
+    vacuum. The whole scratch directory is removed in ``finally``.
     """
     db_file = Path(db_path)
     if not db_file.is_file():
         raise SnapshotError("database not found — refusing to snapshot an empty store")
-    fd, scratch = tempfile.mkstemp(dir=str(db_file.parent), prefix=".snapshot-", suffix=".db")
-    os.close(fd)
+    scratch_dir = tempfile.mkdtemp(dir=str(db_file.parent), prefix=".snapshot-")
     try:
-        # VACUUM INTO requires a target path that does not exist yet.
-        Path(scratch).unlink()
+        os.chmod(scratch_dir, 0o700)
+        scratch = Path(scratch_dir) / "snapshot.db"
+        fd = os.open(scratch, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+        finally:
+            os.close(fd)
         conn = sqlite3.connect(db_path)
         try:
-            conn.execute("VACUUM INTO ?", (scratch,))
+            conn.execute("VACUUM INTO ?", (str(scratch),))
         finally:
             conn.close()
-        os.chmod(scratch, 0o600)
-        return Path(scratch).read_bytes()
+        return scratch.read_bytes()
     finally:
-        Path(scratch).unlink(missing_ok=True)
+        shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 def encrypt_snapshot(db_path: str, key: bytes) -> bytes:
@@ -362,14 +380,45 @@ def _assert_sqlite_integrity(path: str) -> None:
         raise SnapshotError("snapshot integrity check failed")
 
 
-def restore_snapshot(ciphertext: bytes, key: bytes, db_path: str) -> None:
-    """Authenticate, integrity-check and atomically activate a snapshot.
+def _migrate_sqlite_file(db_path: str) -> None:
+    """Bring *db_path* to ``alembic upgrade head``, then restore the environment.
 
-    The Fernet token is verified/decrypted FIRST — ``InvalidToken`` aborts
-    before SQLite ever parses the bytes (MADR-0032 C2/C6). The plaintext is
-    staged in an owner-only temp file, checked with ``PRAGMA integrity_check``,
-    then renamed into place; stale ``-wal``/``-shm`` sidecars are removed so
-    the restored file is the authoritative image.
+    ``coach_web/alembic/env.py`` derives its URL from ``COACH_DB_PATH``, so the
+    variable is pointed at the target for the duration of the upgrade and
+    restored in ``finally`` — the boot restore must migrate the STAGED file
+    (MADR-0032 C2) without disturbing the lane's own setting.
+    """
+    previous = os.environ.get("COACH_DB_PATH")
+    os.environ["COACH_DB_PATH"] = db_path
+    try:
+        command.upgrade(Config(str(Path(__file__).with_name("alembic.ini"))), "head")
+    finally:
+        if previous is None:
+            os.environ.pop("COACH_DB_PATH", None)
+        else:
+            os.environ["COACH_DB_PATH"] = previous
+
+
+def restore_snapshot(
+    ciphertext: bytes,
+    key: bytes,
+    db_path: str,
+    *,
+    migrate_fn: Callable[[str], None] | None = None,
+) -> None:
+    """Authenticate, integrity-check, migrate and atomically activate a snapshot.
+
+    The fixed C2 restore order is enforced here:
+
+    1. ``Fernet.decrypt`` authenticates/decrypts FIRST — ``InvalidToken``
+       aborts before SQLite ever parses the bytes.
+    2. The plaintext is staged in an owner-only ``0600`` temp file.
+    3. ``PRAGMA integrity_check`` validates the staged image.
+    4. The STAGED file is migrated to ``head`` (``migrate_fn``, defaulting to
+       :func:`_migrate_sqlite_file`) — a migration failure aborts with
+       ``db_path`` untouched and no partial swap.
+    5. Only then are stale ``-wal``/``-shm`` sidecars removed and the staged
+       file renamed into place: atomic activation is LAST.
     """
     plaintext = Fernet(key).decrypt(ciphertext)  # InvalidToken => fail closed
     db_file = Path(db_path)
@@ -380,12 +429,15 @@ def restore_snapshot(ciphertext: bytes, key: bytes, db_path: str) -> None:
             os.fchmod(handle.fileno(), 0o600)
             handle.write(plaintext)
         _assert_sqlite_integrity(tmp_name)
+        (migrate_fn or _migrate_sqlite_file)(tmp_name)
         for suffix in ("-wal", "-shm"):
             Path(f"{db_path}{suffix}").unlink(missing_ok=True)
         os.replace(tmp_name, db_file)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
+    finally:
+        # No plaintext residue on any path, including SQLite sidecars a failed
+        # migration may have left next to the staged file.
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            Path(f"{tmp_name}{suffix}").unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -410,10 +462,12 @@ async def boot_restore(
     """Run the fail-closed boot restore. Returns the process exit code.
 
     - Bucket unset → local lane, no-op exit ``0`` (AC4).
-    - Confirmed ``404`` → publish enabled at generation ``0`` (first upload
-      uses ``ifGenerationMatch=0``).
-    - Object present → download/decrypt/integrity-check/activate and track
-      the exact generation.
+    - Confirmed ``404`` → the empty database is migrated to ``head`` and only
+      then is publication enabled at generation ``0`` (first upload uses
+      ``ifGenerationMatch=0``): ``publish_enabled=true`` is never asserted
+      before the schema exists.
+    - Object present → download/decrypt/integrity-check/migrate the staged file
+      and activate it last; track the exact generation.
     - ANY error when the bucket is configured and the object is not a
       confirmed ``404`` → publication hard-disabled, redacted error log and
       exit ``1`` (startup aborts; the durable copy is never clobbered).
@@ -427,6 +481,8 @@ async def boot_restore(
         active_store = store or GcsSnapshotClient(bucket, settings.COACH_SNAPSHOT_OBJECT)
         generation = await active_store.object_generation()
         if generation is None:
+            Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+            _migrate_sqlite_file(db_path)
             write_boot_state(db_path, BootState(generation=0, publish_enabled=True))
             logger.info("event=snapshot_boot_absent bucket=%s generation=0", bucket)
             return 0

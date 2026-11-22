@@ -20,6 +20,7 @@ import respx
 from cryptography.fernet import Fernet, InvalidToken
 from httpx import Response
 
+from coach_web import snapshot as snapshot_module
 from coach_web.agent_settings import get_agent_settings, save_agent_settings
 from coach_web.config import Settings
 from coach_web.conversation import create_thread, set_thread_summary
@@ -117,6 +118,24 @@ def make_settings(db_path: Path, **overrides: Any) -> Settings:
 def object_url() -> str:
     """The GCS JSON API object URL with the object name percent-encoded."""
     return f"{GCS_BASE_URL}/storage/v1/b/{BUCKET}/o/snapshots%2Fcoach.db.fernet"
+
+
+def empty_sqlite_file(tmp_path: Path, name: str = "empty.db") -> Path:
+    """A valid but schema-less SQLite database (0 bytes, ``integrity_check`` ok)."""
+    path = tmp_path / name
+    sqlite3.connect(path).close()
+    return path
+
+
+def schema_version(db_path: Path) -> tuple[str | None, set[str]]:
+    """Return the applied Alembic revision and the table set of *db_path*."""
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute("SELECT version_num FROM alembic_version").fetchone()
+        tables = {entry[0] for entry in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+    return (row[0] if row else None), tables
 
 
 class StaticToken:
@@ -423,6 +442,69 @@ class TestSnapshotEnvelope:
             build_snapshot_plaintext(str(tmp_path / "absent.db"))
 
 
+class TestSnapshotScratchPrivacy:
+    """Plaintext never exists outside a ``0700`` dir / ``0600`` file (M2)."""
+
+    class _Probe:
+        """``sqlite3.Connection`` proxy recording the scratch modes at VACUUM time."""
+
+        def __init__(self, conn: sqlite3.Connection, seen: list[tuple[int, int]]) -> None:
+            self._conn = conn
+            self._seen = seen
+
+        def execute(self, sql: str, *params: tuple[str, ...]) -> sqlite3.Cursor:
+            if sql.startswith("VACUUM INTO"):
+                scratch = Path(params[0][0])
+                self._seen.append(
+                    (
+                        scratch.parent.stat().st_mode & 0o777,
+                        scratch.stat().st_mode & 0o777,
+                    )
+                )
+            return self._conn.execute(sql, *params)
+
+        def close(self) -> None:
+            self._conn.close()
+
+    def test_scratch_is_private_during_the_vacuum(
+        self, migrated_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The scratch dir is 0700 and the target file 0600 WHILE VACUUM runs."""
+        seen: list[tuple[int, int]] = []
+        real_connect = sqlite3.connect
+        monkeypatch.setattr(
+            sqlite3,
+            "connect",
+            lambda *args, **kwargs: self._Probe(real_connect(*args, **kwargs), seen),
+        )
+
+        build_snapshot_plaintext(str(migrated_db))
+
+        assert seen == [(0o700, 0o600)]
+
+    def test_scratch_is_removed_when_the_vacuum_fails(
+        self, migrated_db: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failing VACUUM leaves no plaintext scratch artifact behind."""
+
+        class _FailingConnection:
+            def execute(self, *args: object, **kwargs: object) -> sqlite3.Cursor:
+                raise sqlite3.OperationalError("vacuum failed")
+
+            def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: _FailingConnection())
+
+        with pytest.raises(sqlite3.OperationalError):
+            build_snapshot_plaintext(str(migrated_db))
+
+        leftovers = [
+            path.name for path in migrated_db.parent.iterdir() if path.name.startswith(".snapshot-")
+        ]
+        assert leftovers == []
+
+
 class TestRestoreEnvelope:
     """Restore authenticates BEFORE SQLite parses, then swaps atomically (C2/C6)."""
 
@@ -462,6 +544,68 @@ class TestRestoreEnvelope:
         assert not Path(f"{target}-shm").exists()
         assert (target.stat().st_mode & 0o777) == 0o600
 
+    def test_restore_migrates_the_staged_payload_to_head(self, tmp_path: Path) -> None:
+        """The fixed C2 order migrates the STAGED file before activation (M1).
+
+        A schema-less payload is upgraded to ``head`` while still in the
+        ``0600`` staged temp file, so the authoritative database is never a
+        pre-migration image.
+        """
+        staged_source = empty_sqlite_file(tmp_path)
+        ciphertext = Fernet(KEY).encrypt(staged_source.read_bytes())
+        target = tmp_path / "restored" / "coach.db"
+
+        restore_snapshot(ciphertext, KEY, str(target))
+
+        version, tables = schema_version(target)
+        assert version is not None
+        assert "alembic_version" in tables
+        assert "conversation_threads" in tables
+
+    def test_restore_migrates_before_replacing_the_database(self, tmp_path: Path) -> None:
+        """Migration runs on the staged file, activation remains LAST (M1)."""
+        existing = tmp_path / "coach.db"
+        existing.write_bytes(b"existing-database")
+        ciphertext = Fernet(KEY).encrypt(empty_sqlite_file(tmp_path).read_bytes())
+        observed: list[bytes] = []
+
+        def migrate(staged_path: str) -> None:
+            assert Path(staged_path) != existing
+            assert (Path(staged_path).stat().st_mode & 0o077) == 0
+            # The live database is still the pre-restore image here.
+            observed.append(existing.read_bytes())
+
+        restore_snapshot(ciphertext, KEY, str(existing), migrate_fn=migrate)
+
+        assert observed == [b"existing-database"]
+        assert existing.read_bytes() != b"existing-database"
+
+    def test_integrity_failure_never_runs_the_migration(self, tmp_path: Path) -> None:
+        """``PRAGMA integrity_check`` precedes the migration (fixed C2 order)."""
+        target = tmp_path / "coach.db"
+        ciphertext = Fernet(KEY).encrypt(b"this is not a sqlite database")
+        migrated: list[str] = []
+
+        with pytest.raises(sqlite3.Error):
+            restore_snapshot(ciphertext, KEY, str(target), migrate_fn=migrated.append)
+
+        assert migrated == []
+
+    def test_migration_failure_leaves_the_database_untouched(self, tmp_path: Path) -> None:
+        """A failed migration aborts BEFORE activation — no partial swap (M1)."""
+        existing = tmp_path / "coach.db"
+        existing.write_bytes(b"existing-database")
+        ciphertext = Fernet(KEY).encrypt(empty_sqlite_file(tmp_path).read_bytes())
+
+        def migrate(staged_path: str) -> None:
+            raise RuntimeError("migration failed")
+
+        with pytest.raises(RuntimeError):
+            restore_snapshot(ciphertext, KEY, str(existing), migrate_fn=migrate)
+
+        assert existing.read_bytes() == b"existing-database"
+        assert list(tmp_path.glob("*.snapshot-restore*")) == []
+
 
 # ---------------------------------------------------------------------------
 # Boot restore state machine (C2/C6, AC1/AC4)
@@ -490,6 +634,34 @@ class TestBootRestore:
             generation=0, publish_enabled=True
         )
         assert store.calls == ["object_generation"]
+
+    async def test_confirmed_404_migrates_before_enabling_publication(self, tmp_path: Path) -> None:
+        """The cold boot creates the schema BEFORE asserting publish_enabled (M1)."""
+        store = FakeStore(generation=None)
+        db_path = tmp_path / "lane" / "coach.db"
+        settings = make_settings(db_path)
+
+        assert await boot_restore(settings, store=store) == 0
+
+        version, tables = schema_version(db_path)
+        assert version is not None
+        assert "conversation_threads" in tables
+        assert read_boot_state(db_path) == BootState(generation=0, publish_enabled=True)
+
+    async def test_confirmed_404_migration_failure_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """publication is NEVER enabled when the cold-boot migration fails (M1)."""
+
+        def migrate(staged_path: str) -> None:
+            raise RuntimeError("migration failed")
+
+        monkeypatch.setattr(snapshot_module, "_migrate_sqlite_file", migrate)
+        store = FakeStore(generation=None)
+        db_path = tmp_path / "coach.db"
+
+        assert await boot_restore(make_settings(db_path), store=store) == 1
+        assert read_boot_state(db_path) == BootState(generation=0, publish_enabled=False)
 
     async def test_present_object_restores_and_tracks_the_generation(
         self, migrated_db: Path
@@ -569,6 +741,26 @@ class TestBootRestore:
         assert read_boot_state(tmp_path / "coach.db") == BootState(
             generation=0, publish_enabled=False
         )
+
+    async def test_staged_migration_failure_fails_closed_without_activating(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed staged migration leaves db_path untouched and publishing off (M1)."""
+
+        def migrate(staged_path: str) -> None:
+            raise RuntimeError("migration failed")
+
+        monkeypatch.setattr(snapshot_module, "_migrate_sqlite_file", migrate)
+        db_path = tmp_path / "coach.db"
+        db_path.write_bytes(b"existing-database")
+        store = FakeStore(
+            generation=9,
+            payload=Fernet(KEY).encrypt(empty_sqlite_file(tmp_path).read_bytes()),
+        )
+
+        assert await boot_restore(make_settings(db_path), store=store) == 1
+        assert db_path.read_bytes() == b"existing-database"
+        assert read_boot_state(db_path) == BootState(generation=0, publish_enabled=False)
 
     async def test_failure_never_mentions_payload_or_key(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
