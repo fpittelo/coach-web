@@ -219,7 +219,8 @@ jobs:
       # asserted BEFORE any service mutation, fail-closed. Three independent
       # read-backs:
       #   1. C4 — coach-web-runtime holds ZERO project-level IAM bindings (its
-      #      only storage grant is the bucket-scoped object actor role).
+      #      only storage grant is the bucket-scoped object actor role) and the
+      #      deployer still holds the 1-permission project IAM viewer role.
       #   2. C1/C5 — the dedicated bucket is EUROPE-WEST6 REGIONAL, UBLA on,
       #      PAP enforced, versioning on, 7-day Soft Delete, and carries BOTH
       #      noncurrent Delete lifecycle rules (numNewerVersions=2 AND
@@ -246,16 +247,31 @@ jobs:
           echo "C4 gate: coach-web-runtime must hold zero project-level roles."
           gcloud projects get-iam-policy "${GCP_PROJECT}" \
             --format='json(bindings)' \
-          | RUNTIME_MEMBER="serviceAccount:${RUNTIME_SA}" python3 -c '
+          | RUNTIME_MEMBER="serviceAccount:${RUNTIME_SA}" \
+            DEPLOY_MEMBER="serviceAccount:${DEPLOY_SA}" python3 -c '
           import json, os, sys
           raw = json.load(sys.stdin)
           bindings = (raw.get("bindings", []) if isinstance(raw, dict) else raw)
-          member = os.environ["RUNTIME_MEMBER"]
-          held = sorted(b.get("role", "") for b in bindings if member in b.get("members", []))
-          if held:
-              print("::error::C4 violation: " + member + " holds " + str(len(held)) + " project-level role binding(s) " + json.dumps(held) + " — the runtime identity must hold zero project-level roles; its only storage grant is the bucket-scoped coachWebSnapshotObjectActor role (MADR-0032 C4).")
+          runtime = os.environ["RUNTIME_MEMBER"]
+          deployer = os.environ["DEPLOY_MEMBER"]
+          runtime_roles = sorted(
+              binding.get("role", "")
+              for binding in bindings
+              if runtime in (binding.get("members") or [])
+          )
+          if runtime_roles:
+              print("::error::C4 violation: " + runtime + " holds " + str(len(runtime_roles)) + " project-level role binding(s) " + json.dumps(runtime_roles) + " — the runtime identity must hold zero project-level roles; its only storage grant is the bucket-scoped coachWebSnapshotObjectActor role (MADR-0032 C4).")
               sys.exit(1)
-          print("C4 verified: coach-web-runtime holds zero project-level roles.")
+          required = "projects/coach-web-509209/roles/coachWebProjectIamViewer"
+          deployer_roles = {
+              binding.get("role", "")
+              for binding in bindings
+              if deployer in (binding.get("members") or [])
+          }
+          if required not in deployer_roles:
+              print("::error::C4 violation: " + deployer + " is missing the project-level " + required + " role — the deploy lane needs resourcemanager.projects.getIamPolicy to keep these gates fail-closed (MADR-0032 C4; recover per docs/admin_guide.md).")
+              sys.exit(1)
+          print("C4 verified: coach-web-runtime holds zero project-level roles and the deployer holds the 1-permission coachWebProjectIamViewer role.")
           '
 
           echo "C1/C5 gate: assert the dedicated snapshot bucket posture."
