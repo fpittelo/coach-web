@@ -318,19 +318,52 @@ class SessionMetricsLedger:
         return len(keys)
 
 
-def _sanitized_domain_payload(payload: str) -> str:
+@dataclass(frozen=True)
+class SessionMetricsTurnContext:
+    """One turn's bound view of the active thread's ledger (MADR-0025 Am. 0002).
+
+    Wired by ``POST /api/agent/stream`` onto the turn's ``CoachAgent``: the
+    agent reuses/records baseline reads for exactly one
+    ``(athlete_id, thread_id)`` conversation. When persistence degrades
+    (``turn_thread is None``, MADR-0025 C7) the caller skips the ledger
+    entirely and the agent runs statelessly (AC5b).
+    """
+
+    ledger: SessionMetricsLedger
+    """The app's in-process ledger (``app.state.session_metrics_ledger``)."""
+
+    athlete_id: int
+    """Session-derived athlete id (C4 scoping — never client-supplied)."""
+
+    thread_id: int
+    """The active conversation thread id (C4 scoping)."""
+
+    today: date
+    """Per-request clock boundary (N3) — anchors domain classification."""
+
+    fresh_data_signal: bool = False
+    """Athlete-reported sync cue for this turn (``has_fresh_data_signal``).
+
+    ``True`` disables read reuse: the ledger was evicted before prompt
+    assembly and every baseline read executes live (AC4).
+    """
+
+
+def _sanitized_domain_payload(payload: str, *, domain_max_chars: int) -> str:
     """Sanitize one domain payload and re-measure the exact cap (``C-AM2-01``).
 
     The shared sanitizer caps BEFORE zero-width defusal, so its result can
     exceed the requested cap by a few insertion characters; the contract
-    measures ``SESSION_METRICS_DOMAIN_MAX_CHARS`` on the sanitized +
-    neutralized payload, so the result is sliced to the exact bound.
+    measures the per-domain cap on the sanitized + neutralized payload, so the
+    result is sliced to the exact bound.
     """
-    sanitized = sanitize_untrusted_text(payload, max_chars=SESSION_METRICS_DOMAIN_MAX_CHARS)
-    return sanitized[:SESSION_METRICS_DOMAIN_MAX_CHARS]
+    sanitized = sanitize_untrusted_text(payload, max_chars=domain_max_chars)
+    return sanitized[:domain_max_chars]
 
 
-def _render_lines(entries: Mapping[str, SessionMetricsEntry]) -> list[str]:
+def _render_lines(
+    entries: Mapping[str, SessionMetricsEntry], *, domain_max_chars: int
+) -> list[str]:
     """Render the directive, provenance headers and prefixed payload lines."""
     lines = [SESSION_METRICS_BLOCK_DIRECTIVE]
     for domain in DOMAIN_ORDER:
@@ -343,32 +376,33 @@ def _render_lines(entries: Mapping[str, SessionMetricsEntry]) -> list[str]:
         )
         lines.extend(
             ORIENTATION_LINE_PREFIX + line
-            for line in _sanitized_domain_payload(entry.payload).splitlines()
+            for line in _sanitized_domain_payload(
+                entry.payload, domain_max_chars=domain_max_chars
+            ).splitlines()
         )
     return lines
 
 
 def build_session_metrics_block(
     entries: Mapping[str, SessionMetricsEntry] | None,
+    *,
+    domain_max_chars: int = SESSION_METRICS_DOMAIN_MAX_CHARS,
+    max_chars: int = SESSION_METRICS_MAX_CHARS,
 ) -> str | None:
     """Render the fenced session-metrics DATA block, or ``None`` when empty.
 
     Pure and deterministic: domains render in :data:`DOMAIN_ORDER`, each
-    payload is sanitized + neutralized and capped at
-    :data:`SESSION_METRICS_DOMAIN_MAX_CHARS`, every logical line from
-    ``str.splitlines()`` is ``"| "``-prefixed, and the FINAL block is capped at
-    :data:`SESSION_METRICS_MAX_CHARS` — fence, directive and provenance
-    included — truncating cleanly inside the fence (never dropping the block).
+    payload is sanitized + neutralized and capped at *domain_max_chars*, every
+    logical line from ``str.splitlines()`` is ``"| "``-prefixed, and the FINAL
+    block is capped at *max_chars* — fence, directive and provenance included
+    — truncating cleanly inside the fence (never dropping the block). Both caps
+    default to the named module constants and are call-site injectable so the
+    runtime wiring passes the configured ``Settings`` bounds.
     """
     if not entries:
         return None
-    lines = _render_lines(entries)
-    budget = (
-        SESSION_METRICS_MAX_CHARS
-        - len(SESSION_METRICS_BLOCK_BEGIN)
-        - len(SESSION_METRICS_BLOCK_END)
-        - 1
-    )
+    lines = _render_lines(entries, domain_max_chars=domain_max_chars)
+    budget = max_chars - len(SESSION_METRICS_BLOCK_BEGIN) - len(SESSION_METRICS_BLOCK_END) - 1
     used = 0
     kept: list[str] = []
     for line in lines:

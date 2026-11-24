@@ -161,7 +161,12 @@ from coach_web.periodization import (
     validate_plan_coverage,
 )
 from coach_web.plan_approval import approve_plan
-from coach_web.session_context import SessionMetricsLedger
+from coach_web.session_context import (
+    SessionMetricsLedger,
+    SessionMetricsTurnContext,
+    build_session_metrics_block,
+    has_fresh_data_signal,
+)
 from coach_web.snapshot import SnapshotCoordinator
 from coach_web.suggestions import TurnOutcome
 
@@ -1074,6 +1079,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # fenced blocks sit in the pinned MADR-0026 order and the re-assert
         # clause closes the prompt (structural last word — block-agnostic
         # predicate, MADR-0025 C5).
+        #
+        # Intra-session metrics (MADR-0025 Amendment 0002 §1/§3, #435): the
+        # turn's ephemeral ledger view is bound to the ACTIVE thread only.
+        # A deterministic local sync cue evicts the thread's entries BEFORE
+        # any block is built, so the turn runs cold against live coach-mcp and
+        # a stale block is never re-injected (AC4). No thread (C7 degrade) =>
+        # the ledger is bypassed entirely and the turn runs stateless (AC5b).
+        fresh_signal = has_fresh_data_signal(payload.message)
+        ledger: SessionMetricsLedger | None = getattr(
+            request.app.state, "session_metrics_ledger", None
+        )
+        session_metrics_block: str | None = None
+        if turn_thread is not None and ledger is not None:
+            if fresh_signal:
+                ledger.evict_thread(athlete_id, turn_thread.id)
+                logger.info("session_metrics_invalidated invalidated_by_sync_signal=True")
+            else:
+                session_metrics_block = build_session_metrics_block(
+                    ledger.snapshot(athlete_id, turn_thread.id),
+                    domain_max_chars=settings.SESSION_METRICS_DOMAIN_MAX_CHARS,
+                    max_chars=settings.SESSION_METRICS_MAX_CHARS,
+                )
         digests: list[str] = []
         if profile is not None:
             # The digest's phase resolution takes the same explicit ``today``
@@ -1118,7 +1145,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             digests,
             memory_block,
             cross_thread_brief,
+            session_metrics_block=session_metrics_block,
         )
+        # Bind the turn's ledger view to the agent loop (Agent-Component
+        # operation, Am. 0002 §4): reuse/record happens only through this
+        # context, so a degraded turn carries no ledger access at all (AC5b).
+        if turn_thread is not None and ledger is not None:
+            agent.session_metrics_context = SessionMetricsTurnContext(
+                ledger=ledger,
+                athlete_id=athlete_id,
+                thread_id=turn_thread.id,
+                today=today,
+                fresh_data_signal=fresh_signal,
+            )
 
         # Morning briefing card (#262, epic #215-A): on the FIRST page load
         # of the day (the client-derived date flag — R3, not a security

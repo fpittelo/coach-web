@@ -6,7 +6,7 @@
 
 ## 1. Runtime View
 
-### 1.1 Scenario: Agent Chat Turn & 7-Block Prompt Assembly Seam
+### 1.1 Scenario: Agent Chat Turn & 8-Block Prompt Assembly Seam
 
 - **Trigger:** Authenticated athlete submits a chat message (`POST /api/agent/stream` with `{message, thread_id?}`).
 - **Preconditions:** Request passed Cloud Run IAP + in-app `AuthMiddleware` (`AUTH_WHITELIST_EMAILS`); `/data/coach.db` is migrated to `head`.
@@ -16,6 +16,7 @@ sequenceDiagram
     actor Athlete as @fpittelo (Browser)
     participant App as FastAPI (app.py / auth)
     participant Store as SQLite + Fernet Store
+    participant Ledger as SessionMetricsLedger (in-process RAM)
     participant Seam as assemble_system_prompt (agent.py)
     participant Hub as MCPClientHub (coach-mcp)
     participant LLM as OpenRouter API
@@ -26,13 +27,25 @@ sequenceDiagram
     App->>Store: Load agent_settings + divergence/briefing digests
     App->>Store: Decrypt active thread window + rolling summary
     App->>Store: build_cross_thread_brief (prior summaries + 90d debriefs + open actions)
-    App->>Seam: Assemble 7-block system prompt (sanitize_untrusted_text + | fences + REASSERT_CLAUSE LAST)
+    alt Athlete reports newly synced/recorded data
+        App->>Ledger: Evict (athlete_id, thread_id) before assembly
+    else Ordinary follow-up
+        App->>Ledger: Snapshot baseline domains for (athlete_id, thread_id)
+        Ledger-->>App: Sanitized, bounded session metrics
+    end
+    App->>Seam: Assemble 8-block system prompt (slot 5 = session_metrics_block, REASSERT_CLAUSE LAST)
     Seam-->>App: Deterministic system prompt
     App->>LLM: Stream chat completion + COACH_MCP_READ_TOOLS + proposal schemas
     opt Model invokes read-only Intervals.icu tool
         LLM-->>App: tool_call (e.g. intervals_get_readiness_dashboard)
-        App->>Hub: Dispatch allowlisted read tool
-        Hub-->>App: Intervals.icu JSON telemetry
+        App->>Ledger: classify_session_domain + active entry for today?
+        alt Baseline hit and no sync cue (Turn 2+)
+            Ledger-->>App: Cached payload (reused_session_context = true)
+        else Cache miss or drill-down or post-eviction
+            App->>Hub: Dispatch allowlisted read tool
+            Hub-->>App: Intervals.icu JSON telemetry
+            App->>Ledger: Record baseline domain (RAM only, TTL/LRU bounded)
+        end
         App->>LLM: Append tool result & continue stream
     end
     LLM-->>Athlete: SSE frames (status / token / proposal / done + suggestions)
@@ -41,8 +54,9 @@ sequenceDiagram
 ```
 
 - **Postconditions & Failure Modes:**
-  - Every untrusted block (`orientation`, `standing_preferences`, `memory_block`, `cross_thread_brief`) is sanitized on read and enclosed in `| `-prefixed data fences; `REASSERT_CLAUSE` is structurally **LAST** ([MADR-0026](../../adr/0026-admin-orientation-and-agent-settings-prompt-precedence-and-sanitizer-contract.md), [MADR-0032](../../adr/0032-durable-longitudinal-memory-snapshot-store.md) C7/C8).
-  - Context/brief store failures degrade **fail-open** (returning core prompt without user data and logging the exception class name only — zero content leakage).
+  - Every untrusted block (`orientation`, `standing_preferences`, `session_metrics_block`, `memory_block`, `cross_thread_brief`) is sanitized on read and enclosed in `| `-prefixed data fences; `REASSERT_CLAUSE` is structurally **LAST** and names every such block ([MADR-0026](../../adr/0026-admin-orientation-and-agent-settings-prompt-precedence-and-sanitizer-contract.md), [MADR-0032](../../adr/0032-durable-longitudinal-memory-snapshot-store.md) C7/C8, [MADR-0025](../../adr/0025-conversation-memory-model-retention-and-injection-contract.md) Amendment 0002 §1).
+  - The intra-session `session_metrics_block` (slot 5) carries only baseline telemetry already fetched in the active `(athlete_id, thread_id)` conversation; a Turn 2+ duplicate baseline read is short-circuited **before** `hub.execute_tool` (zero MCP calls, zero `IcuReadBudget` burn) and returns the cached payload stamped `reused_session_context: true`. The ledger is strictly in-process RAM (MADR-0008 C5), evicted on reset, purge and athlete-reported sync cues.
+  - Context/brief store failures degrade **fail-open** (returning core prompt without user data and logging the exception class name only — zero content leakage). With no conversation thread (C7 persistence degrade) the ledger is bypassed entirely and the turn runs statelessly.
   - Unapproved write tools are absent from model tool schemas and refused fail-closed at dispatch; Intervals.icu calendar writes occur exclusively when the athlete clicks **Approve** (`POST /api/plan/approve`).
 
 ---
