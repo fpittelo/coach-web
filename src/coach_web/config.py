@@ -160,6 +160,34 @@ class Settings(BaseSettings):
     newest run is kept) and the summary section yields last.
     """
 
+    SESSION_METRICS_TTL_SECONDS: int = 1800
+    """Ephemeral session-metrics ledger entry TTL (MADR-0025 Am. 0002, #434).
+
+    The in-process ``SessionMetricsLedger`` retains the active thread's
+    baseline ``coach-mcp`` telemetry for this long; past it the entry expires
+    and the next turn re-fetches a cold baseline. Named bound ``C-AM2-02``.
+    """
+
+    SESSION_METRICS_LRU_MAX_THREADS: int = 64
+    """Maximum tracked ``(athlete_id, thread_id)`` ledger keys (``C-AM2-02``).
+
+    LRU eviction bounds the ledger footprint under ``maxInstances=1``; the
+    worst case is ``64 threads × 4 domains × 16 000 chars``.
+    """
+
+    SESSION_METRICS_MAX_ENTRY_CHARS: int = 16_000
+    """Ingestion-time per-domain stored-payload cap (MADR-0008 C5, ``C-AM2-02``).
+
+    Enforced when a tool result enters the ledger so one oversized
+    ``intervals_list_activities`` payload can never exceed the RAM bound.
+    """
+
+    SESSION_METRICS_DOMAIN_MAX_CHARS: int = 3_000
+    """Per-domain cap measured on the sanitized + neutralized payload (``C-AM2-01``)."""
+
+    SESSION_METRICS_MAX_CHARS: int = 12_000
+    """Final rendered session-metrics block cap, fences included (``C-AM2-01``)."""
+
     COACH_SNAPSHOT_BUCKET: str = ""
     """Dedicated GCS bucket holding the encrypted whole-DB snapshot (#417).
 
