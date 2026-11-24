@@ -40,7 +40,7 @@ sequenceDiagram
         LLM-->>App: tool_call (e.g. intervals_get_readiness_dashboard)
         App->>Ledger: classify_session_domain + active entry for today?
         alt Baseline hit and no sync cue (Turn 2+)
-            Ledger-->>App: Cached payload (reused_session_context: true)
+            Ledger-->>App: Cached payload (reused_session_context = true)
         else Cache miss or drill-down or post-eviction
             App->>Hub: Dispatch allowlisted read tool
             Hub-->>App: Intervals.icu JSON telemetry
