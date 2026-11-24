@@ -572,10 +572,16 @@ class SnapshotCoordinator:
         self.enabled = bool(settings.COACH_SNAPSHOT_BUCKET)
         self.publish_enabled = False
         self.generation = 0
-        self._dirty = False
+        self._dirty_seq = 0
+        self._flushed_seq = 0
         self._timer: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
         self._stopping = False
+
+    @property
+    def dirty(self) -> bool:
+        """Whether a committed write still awaits a successful upload (#449)."""
+        return self._dirty_seq > self._flushed_seq
 
     def _active_store(self) -> SnapshotStore:
         if self._store is None:
@@ -600,18 +606,17 @@ class SnapshotCoordinator:
         """Coalesce a committed write into the next debounced publication."""
         if not self.enabled or not self.publish_enabled or self._stopping:
             return
-        self._dirty = True
+        self._dirty_seq += 1
         if self._timer is None or self._timer.done():
             self._timer = asyncio.get_running_loop().create_task(self._debounce_loop())
 
     async def _debounce_loop(self) -> None:
         while True:
             await asyncio.sleep(self._settings.COACH_SNAPSHOT_DEBOUNCE_SECONDS)
-            if not self._dirty:
+            if not self.dirty:
                 return
-            self._dirty = False
             await self.publish_now()
-            if not self._dirty or not self.publish_enabled:
+            if not self.dirty or not self.publish_enabled:
                 return
 
     async def publish_now(self) -> bool:
@@ -621,6 +626,7 @@ class SnapshotCoordinator:
         async with self._lock:
             if not self.enabled or not self.publish_enabled:
                 return False
+            target_seq = self._dirty_seq
             try:
                 key = (
                     self._key
@@ -632,14 +638,14 @@ class SnapshotCoordinator:
             except SnapshotConflict as exc:
                 # Stale instance: never overwrite a newer writer (C6).
                 self.publish_enabled = False
-                self._dirty = False
+                self._flushed_seq = self._dirty_seq
                 log_persistence_degrade(exc)
                 return False
             except Exception as exc:  # noqa: BLE001 - post-boot degrade, never abort chat
                 log_persistence_degrade(exc)
                 return False
             self.generation = generation
-            self._dirty = False
+            self._flushed_seq = max(self._flushed_seq, target_seq)
             try:
                 write_boot_state(self._db_path, BootState(generation, True))
             except OSError:
@@ -647,7 +653,7 @@ class SnapshotCoordinator:
             return True
 
     async def stop(self) -> None:
-        """Cancel the debounce timer and flush a final snapshot (SIGTERM)."""
+        """Cancel the debounce timer and flush pending writes (SIGTERM)."""
         self._stopping = True
         timer = self._timer
         self._timer = None
@@ -655,7 +661,7 @@ class SnapshotCoordinator:
             timer.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await timer
-        if self.enabled and self.publish_enabled:
+        if self.enabled and self.publish_enabled and self.dirty:
             await self.publish_now()
 
 
