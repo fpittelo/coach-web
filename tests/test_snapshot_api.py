@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from coach_web.app import PURGE_DURABLE_STORAGE_DETAIL, create_app
 from coach_web.config import Settings
 from coach_web.conversation import create_thread
 from coach_web.db import build_db_engine, build_session_factory
+from coach_web.microcycle import PlanDraftRow
 from coach_web.snapshot import (
     BootState,
     SnapshotCoordinator,
@@ -29,6 +31,7 @@ from coach_web.snapshot import (
 )
 from tests.conftest import TEST_DATA_ENCRYPTION_KEY
 from tests.test_snapshot import BUCKET, OBJECT, FakeStore
+from tests.test_week_api import WeekHub, _raw_week
 
 KEY = TEST_DATA_ENCRYPTION_KEY
 
@@ -76,6 +79,52 @@ def seed_thread(db_path: Path) -> int:
     return asyncio.run(_seed())
 
 
+APPROVED_WEEK_CONTENT = """# Debrief week
+
+- **Week:** 2026-W47
+- **Total TSS:** 85
+- **Distribution:** 0 hard / 1 easy
+
+## Summary
+
+One rated session.
+
+## Days
+
+| Day | Date | Session | Focus/Zones | TSS | Duration |
+|:---|:---|:---|:---|:---|:---|
+| fri | 2026-11-20 | Threshold 3x12 | Z4 | 85 | 1h15 |
+"""
+
+
+def seed_approved_week(db_path: Path) -> None:
+    """Persist one approved draft whose week contains 2026-11-20 (#234 needed)."""
+
+    async def _seed() -> None:
+        engine = build_db_engine(str(db_path))
+        try:
+            factory = build_session_factory(engine)
+            async with factory() as session:
+                now = datetime.now(UTC).isoformat()
+                session.add(
+                    PlanDraftRow(
+                        week_start_date="2026-11-16",
+                        week_end_date="2026-11-22",
+                        content=APPROVED_WEEK_CONTENT,
+                        status="approved",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                await session.commit()
+        finally:
+            await engine.dispose()
+
+    import asyncio
+
+    asyncio.run(_seed())
+
+
 class TestLifespanCoordinator:
     """Startup is fail-closed; shutdown flushes the final snapshot (C6)."""
 
@@ -86,14 +135,36 @@ class TestLifespanCoordinator:
             with TestClient(app):
                 pass  # pragma: no cover - startup raises before the body
 
-    def test_shutdown_flushes_a_final_snapshot(self, migrated_db: Path) -> None:
-        """A clean lifespan exit publishes once, then disposes the engine."""
+    def test_shutdown_on_a_clean_instance_uploads_nothing(self, migrated_db: Path) -> None:
+        """AC1 (#449): a clean lifespan exit writes nothing, then disposes the engine."""
         write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
         store = FakeStore(generation=0)
         app, _ = build_app_with_store(migrated_db, store)
 
         with TestClient(app) as client:
             assert client.get("/health").status_code == 200
+            assert store.uploads == []
+
+        assert store.calls == []
+
+    def test_shutdown_flushes_a_pending_write(self, migrated_db: Path) -> None:
+        """AC2 (#449): a committed write is flushed once on graceful shutdown."""
+        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
+        store = FakeStore(generation=0)
+        app, _ = build_app_with_store(migrated_db, store, COACH_SNAPSHOT_DEBOUNCE_SECONDS=30.0)
+
+        with TestClient(app) as client:
+            saved = client.put(
+                "/api/admin/agent-settings",
+                json={
+                    "orientation": "direct",
+                    "verbosity": "concise",
+                    "tone": "supportive",
+                    "environment_preference": "indoor_first",
+                    "standing_preferences": None,
+                },
+            )
+            assert saved.status_code == 200
             assert store.uploads == []
 
         assert len(store.uploads) == 1
@@ -124,8 +195,9 @@ class TestSynchronousPurge:
 
         assert response.status_code == 200
         assert response.json() == {"threads_deleted": 1, "messages_deleted": 0}
-        # The purge upload is the first one (generation 4 -> 5); the lifespan
-        # shutdown then flushes a final snapshot unconditionally (C5/C6).
+        # The purge upload is the first one (generation 4 -> 5); the explicit
+        # publish_now() ignores the clean state (AC2) and the lifespan shutdown
+        # then adds no second upload (AC1).
         assert store.uploads
         ciphertext, expected = store.uploads[0]
         assert expected == 4
@@ -237,6 +309,50 @@ class TestMutationNotifications:
 
         assert response.status_code == 201
         assert calls == ["dirty"]
+
+    def test_debrief_save_marks_dirty_again_after_the_adherence_upsert(
+        self, migrated_db: Path
+    ) -> None:
+        """AC3 (#449): the derived adherence commit schedules its own checkpoint.
+
+        The debrief row commit notifies first; the follow-up
+        ``upsert_week_adherence`` commit (metric present) notifies again so the
+        durable copy covers BOTH transactions.
+        """
+        seed_approved_week(migrated_db)
+        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
+        store = FakeStore(generation=0)
+        app, coordinator = build_app_with_store(migrated_db, store)
+        calls: list[str] = []
+
+        def record() -> None:
+            calls.append("dirty")
+
+        coordinator.mark_dirty = record  # type: ignore[method-assign]
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/debrief",
+                json={"plan_session_key": "2026-11-20", "rpe": 6, "notes": "ok"},
+            )
+
+        assert response.status_code == 201
+        assert calls == ["dirty", "dirty"]
+
+    def test_week_approval_marks_dirty_again_for_the_approval_transition(
+        self, dirty_calls: tuple[Any, list[str]]
+    ) -> None:
+        """AC3 (#449): the approved-status transition after the calendar writes notifies.
+
+        The draft upsert notifies first; the follow-up
+        ``transition_draft_status(..., "approved")`` commit notifies again.
+        """
+        app, calls = dirty_calls
+        app.state.hub_factory = lambda _settings: WeekHub()
+        with TestClient(app) as client:
+            response = client.post("/api/week/approve", json={"week": _raw_week()})
+
+        assert response.status_code == 200
+        assert calls == ["dirty", "dirty"]
 
     def test_debounced_publish_runs_after_a_real_write(self, migrated_db: Path) -> None:
         """The recorder being replaced by the real debounce publishes once."""

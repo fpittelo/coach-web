@@ -101,6 +101,30 @@ class FakeStore:
         return self.generation
 
 
+class GenerationGuardedStore(FakeStore):
+    """FakeStore enforcing the GCS ``ifGenerationMatch`` precondition (#449)."""
+
+    async def upload(self, ciphertext: bytes, expected_generation: int) -> int:
+        if expected_generation != self.generation:
+            raise SnapshotConflict("generation conflict")
+        return await super().upload(ciphertext, expected_generation)
+
+
+class BlockingStore(FakeStore):
+    """FakeStore whose FIRST upload blocks until released or cancelled (#449)."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.blocked = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def upload(self, ciphertext: bytes, expected_generation: int) -> int:
+        if not self.blocked.is_set():
+            self.blocked.set()
+            await self.release.wait()
+        return await super().upload(ciphertext, expected_generation)
+
+
 def make_settings(db_path: Path, **overrides: Any) -> Settings:
     """Build Settings for a snapshot-enabled test database."""
     values: dict[str, Any] = {
@@ -877,17 +901,155 @@ class TestSnapshotCoordinator:
 
         assert len(store.uploads) == 1
         await coordinator.stop()
+        # AC1 (#449): the already-checkpointed write adds no second SIGTERM upload.
+        assert len(store.uploads) == 1
 
-    async def test_stop_flushes_a_final_snapshot(self, migrated_db: Path) -> None:
-        """Graceful shutdown (SIGTERM) flushes before the engine is disposed."""
-        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
-        store = FakeStore(generation=0)
+    async def test_stop_on_a_clean_coordinator_uploads_nothing(self, migrated_db: Path) -> None:
+        """AC1 (#449): a clean instance's SIGTERM leaves the GCS generation intact."""
+        write_boot_state(migrated_db, BootState(generation=3, publish_enabled=True))
+        store = FakeStore(generation=3)
         coordinator = SnapshotCoordinator(make_settings(migrated_db), store=store)
         await coordinator.start()
 
         await coordinator.stop()
 
+        assert store.calls == []
+        assert store.uploads == []
+        assert read_boot_state(migrated_db) == BootState(generation=3, publish_enabled=True)
+
+    async def test_stop_flushes_a_pending_write(self, migrated_db: Path) -> None:
+        """AC2 (#449): a write still inside the debounce window is flushed on SIGTERM."""
+        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
+        store = FakeStore(generation=0)
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=30.0), store=store
+        )
+        await coordinator.start()
+
+        coordinator.mark_dirty()
+        await coordinator.stop()
+
         assert len(store.uploads) == 1
+        assert store.uploads[0][1] == 0
+        assert coordinator.generation == 1
+
+    async def test_stop_flushes_after_a_transient_upload_failure(self, migrated_db: Path) -> None:
+        """AC2 (#449): a failed debounce upload keeps the state dirty for SIGTERM."""
+        write_boot_state(migrated_db, BootState(generation=2, publish_enabled=True))
+        store = FakeStore(generation=2)
+        store.failure = SnapshotUnavailable("HTTP 503")
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=0.01), store=store
+        )
+        await coordinator.start()
+        coordinator.mark_dirty()
+        await asyncio.sleep(0.1)
+
+        assert coordinator.dirty is True
+        assert store.uploads == []
+        store.failure = None
+        await coordinator.stop()
+
+        assert len(store.uploads) == 1
+        assert coordinator.generation == 3
+
+    async def test_stop_flushes_a_write_cancelled_mid_upload(self, migrated_db: Path) -> None:
+        """AC2 (#449): cancelling the debounce mid-upload preserves the dirty write."""
+        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
+        store = BlockingStore(generation=0)
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=0.01), store=store
+        )
+        await coordinator.start()
+        coordinator.mark_dirty()
+        await asyncio.wait_for(store.blocked.wait(), timeout=2.0)
+
+        await coordinator.stop()
+
+        assert len(store.uploads) == 1
+        assert coordinator.generation == 1
+
+    async def test_a_write_during_the_upload_keeps_the_state_dirty(self, migrated_db: Path) -> None:
+        """A mutation arriving mid-upload gets its own follow-up pass (dirty sequences)."""
+        write_boot_state(migrated_db, BootState(generation=0, publish_enabled=True))
+        store = BlockingStore(generation=0)
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=0.01), store=store
+        )
+        await coordinator.start()
+        coordinator.mark_dirty()
+        await asyncio.wait_for(store.blocked.wait(), timeout=2.0)
+
+        coordinator.mark_dirty()
+        store.release.set()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 2.0
+        while len(store.uploads) < 2 and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+
+        assert len(store.uploads) == 2
+        assert coordinator.dirty is False
+        await coordinator.stop()
+        assert len(store.uploads) == 2
+
+    async def test_explicit_publish_now_uploads_even_when_clean(self, migrated_db: Path) -> None:
+        """AC2 (#449): the purge path's explicit publish ignores the dirty state."""
+        write_boot_state(migrated_db, BootState(generation=4, publish_enabled=True))
+        store = FakeStore(generation=4)
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=30.0), store=store
+        )
+        await coordinator.start()
+
+        assert coordinator.dirty is False
+        assert await coordinator.publish_now() is True
+        assert len(store.uploads) == 1
+        await coordinator.stop()
+        assert len(store.uploads) == 1
+
+    async def test_conflict_clears_the_pending_dirty_state(self, migrated_db: Path) -> None:
+        """C6 (#449): a 412 disables publication and drops the pending write."""
+        write_boot_state(migrated_db, BootState(generation=5, publish_enabled=True))
+        store = FakeStore(generation=5)
+        store.conflict = True
+        coordinator = SnapshotCoordinator(
+            make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=30.0), store=store
+        )
+        await coordinator.start()
+        coordinator.mark_dirty()
+
+        assert await coordinator.publish_now() is False
+        assert coordinator.publish_enabled is False
+        assert coordinator.dirty is False
+        await coordinator.stop()
+        assert store.uploads == []
+
+    async def test_idle_shutdown_never_poisons_the_active_revision(self, migrated_db: Path) -> None:
+        """AC3 (#449): two revisions booted at G1 — the idle SIGTERM keeps G1 intact.
+
+        Both coordinators boot from the same generation (Cloud Run revision
+        overlap); the idle one stops cleanly, then the active one advances
+        ``G1 -> G2`` without a ``412`` conflict.
+        """
+        write_boot_state(migrated_db, BootState(generation=1, publish_enabled=True))
+        store = GenerationGuardedStore(generation=1)
+        settings = make_settings(migrated_db, COACH_SNAPSHOT_DEBOUNCE_SECONDS=0.01)
+        idle = SnapshotCoordinator(settings, store=store)
+        active = SnapshotCoordinator(settings, store=store)
+        await idle.start()
+        await active.start()
+
+        await idle.stop()
+
+        assert store.uploads == []
+        assert read_boot_state(migrated_db) == BootState(generation=1, publish_enabled=True)
+        active.mark_dirty()
+        await asyncio.sleep(0.1)
+
+        assert active.publish_enabled is True
+        assert [expected for _, expected in store.uploads] == [1]
+        assert store.generation == 2
+        assert read_boot_state(migrated_db) == BootState(generation=2, publish_enabled=True)
 
     async def test_publish_once_requires_a_valid_state(self, migrated_db: Path) -> None:
         """A one-shot publish (retention path) refuses without boot state."""

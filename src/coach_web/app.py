@@ -657,10 +657,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     The durable snapshot coordinator (MADR-0032, #417) starts before traffic:
     with ``COACH_SNAPSHOT_BUCKET`` configured and no valid boot state it
     refuses readiness (the entrypoint's ``boot-restore`` is the primary gate;
-    this is the in-process enforcement). On shutdown the coordinator flushes a
-    final snapshot BEFORE the engine is disposed — Cloud Run delivers SIGTERM
-    here, so the documented loss window stays the ungraceful ``SIGKILL`` case
-    only (MADR-0032 R3).
+    this is the in-process enforcement). On shutdown the coordinator flushes any
+    still-pending write BEFORE the engine is disposed — an idle instance writes
+    nothing, so a deploy-overlap revision can never advance the generation
+    (Cloud Run delivers SIGTERM here; MADR-0032 R3, #449).
     """
     settings: Settings = app.state.settings
     app.state.started_at = time.monotonic()
@@ -1616,13 +1616,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # transition failure after successful writes must not mask the
         # per-day results — it is logged and the response still reports them.
         if all(result.success for result in results):
+            transitioned = False
             try:
                 async with session_factory() as session:
                     stored = await session.get(PlanDraftRow, draft_id)
                     if stored is not None and stored.status == "submitted":
                         await transition_draft_status(session, stored, "approved")
+                        transitioned = True
             except (OSError, SQLAlchemyError) as exc:
                 logger.warning("Week draft approval transition failed (%s)", type(exc).__name__)
+            if transitioned:
+                # The approved-status transition is its own committed write:
+                # schedule a checkpoint covering it (C5, #449).
+                _notify_snapshot_dirty(request)
 
         return WeekApprovalResponse(results=results)
 
@@ -1775,6 +1781,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
         except (OSError, SQLAlchemyError) as exc:
             logger.warning("Week adherence upsert failed (%s)", type(exc).__name__)
+        if week_adherence is not None:
+            # The adherence upsert is its own committed write: schedule a
+            # checkpoint covering it (C5, #449).
+            _notify_snapshot_dirty(request)
         # ICU session-comment mirror (#190 AC3): strictly opt-in and
         # NON-BLOCKING on the save — the debrief row is already durable when
         # the mirror starts, and every mirror failure degrades to the fixed
