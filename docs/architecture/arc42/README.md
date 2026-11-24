@@ -9,7 +9,7 @@ Architecture documentation for **Coach Web** (`fpittelo/coach-web`), following t
 | View | File | Contents | Status |
 | :--- | :--- | :--- | :--- |
 | 1. Context & Building Blocks | [01-context-and-building-blocks.md](01-context-and-building-blocks.md) | §1 Introduction & Goals · §2 Architecture Constraints · §3 System Context & Scope (`C4Context`) · §4 Solution Strategy · §5 Building Block View (`C4Container` + ArchiMate 3.x mapping) | consolidated |
-| 2. Runtime & Delivery | [02-runtime-and-delivery.md](02-runtime-and-delivery.md) | §1 Runtime View (agent chat turn & 7-block prompt seam, Cloud Run encrypted snapshot rehydration/checkpoint, local MADR-0024 auto-update & rollback) · §2 Deployment View (Cloud Run `europe-west6` + local Compose lanes) | consolidated |
+| 2. Runtime & Delivery | [02-runtime-and-delivery.md](02-runtime-and-delivery.md) | §1 Runtime View (agent chat turn & 8-block prompt seam, Cloud Run encrypted snapshot rehydration/checkpoint, local MADR-0024 auto-update & rollback) · §2 Deployment View (Cloud Run `europe-west6` + local Compose lanes) | consolidated |
 | 3. Cross-cutting & Security | [03-cross-cutting-and-security.md](03-cross-cutting-and-security.md) | §1 Cross-cutting Concepts (Swiss nLPD C1/C2 encryption, zero-trust edge, quality gates) · §2 Quality Requirements · §3 Risks & Technical Debt · §4 Glossary · §5 Architecture Decisions (MADR pointer + pre-MADR back-index) | consolidated |
 
 ## Companion Documentation
