@@ -378,14 +378,21 @@ class TestLandingAssets:
         assert "approval" in html.lower()
         assert "debrief" in html.lower()
 
-    def test_landing_footer_states_the_privacy_posture(self) -> None:
-        """nLPD, encryption at rest and the Swiss residency footnote."""
-        footer = self._html()
-        footer = footer[footer.index("<footer") :]
+    def test_landing_footer_links_the_legal_pages(self) -> None:
+        """#457 AC1: the GCP-era footer drops hosting claims, links the legal pages.
+
+        The europe-west6/encryption-at-rest copy and the "no trackers" fine
+        print described the retired local-only hosting; the footer keeps the
+        nLPD anchor and navigates to the two public legal documents.
+        """
+        html = self._html()
+        footer = html[html.index("<footer") :]
 
         assert "nLPD" in footer
-        assert "encrypted at rest" in footer
-        assert "europe-west6" in footer
+        assert '<a href="/disclaimer">Disclaimer</a>' in footer
+        assert '<a href="/privacy">Privacy Policy</a>' in footer
+        for retired in ("encrypted at rest", "europe-west6", "No trackers"):
+            assert retired not in footer, retired
 
     def test_landing_styles_are_system_font_only_and_tokenized(self) -> None:
         """System font stack, CSS custom properties, no webfont fetch."""
@@ -403,6 +410,94 @@ class TestLandingAssets:
 
         assert "@media (min-width:" in css
         assert "@media (max-width:" not in css
+
+
+class TestPublicLegalPages:
+    """Public Disclaimer & Privacy Policy pages (#457 AC3/AC4).
+
+    Both documents are pure static HTML served by the console app (and by the
+    public landing container) with short public caching: value-free content
+    keyed to no session. The source assets stay inside MADR-0031's static
+    boundary — no script, no inline style (CSP ``style-src 'self'``), no
+    external URL, no console path space.
+    """
+
+    PAGES = (("disclaimer", "Disclaimer"), ("privacy", "Privacy Policy"))
+
+    @pytest.mark.parametrize(("slug", "heading"), PAGES)
+    def test_page_is_public_and_cacheable(
+        self, auth_client: TestClient, slug: str, heading: str
+    ) -> None:
+        """Unauthenticated 200 + public max-age=300 + the shipped CSP."""
+        response = auth_client.get(f"/{slug}")
+
+        assert response.status_code == 200
+        assert "text/html" in response.headers["content-type"]
+        assert heading in response.text
+        assert response.headers["cache-control"] == "public, max-age=300"
+        assert response.headers["content-security-policy"] == EXPECTED_CSP_POLICY
+        assert "set-cookie" not in response.headers
+
+    @pytest.mark.parametrize(("slug", "_heading"), PAGES)
+    def test_page_is_semantic_and_self_contained(self, slug: str, _heading: str) -> None:
+        """Semantic HTML5, one h1, same-origin stylesheet, zero script/style/URL."""
+        html = (STATIC_DIR / f"{slug}.html").read_text(encoding="utf-8")
+        lowered = html.lower()
+
+        assert html.startswith("<!doctype html>")
+        assert '<html lang="en">' in html
+        assert '<meta charset="utf-8" />' in html
+        assert '<meta name="viewport" content="width=device-width, initial-scale=1" />' in html
+        assert '<link rel="stylesheet" href="/static/landing.css" />' in html
+        assert '<header class="site-header">' in html
+        assert '<main class="legal">' in html
+        assert '<footer class="site-footer">' in html
+        assert html.count("<h1") == 1
+        assert "<script" not in lowered
+        assert "<style" not in lowered
+        assert "style=" not in lowered
+        assert "http://" not in lowered
+        assert "https://" not in lowered
+        assert 'href="/auth/login"' not in html
+        footer = html[html.index('<footer class="site-footer">') :]
+        for target in ('href="/"', 'href="/disclaimer"', 'href="/privacy"'):
+            assert target in footer, target
+
+    def test_disclaimer_states_the_medical_ai_and_as_is_boundaries(self) -> None:
+        """Medical disclaimer, human oversight gate and the as-is license."""
+        lowered = (STATIC_DIR / "disclaimer.html").read_text(encoding="utf-8").lower()
+
+        for phrase in (
+            "not medical",
+            "physician",
+            "human oversight",
+            "approval",
+            "gpl-3.0-or-later",
+            "as is",
+        ):
+            assert phrase in lowered, phrase
+
+    def test_privacy_policy_covers_gcp_data_and_retention(self) -> None:
+        """nLPD controller, GCP hosting, sub-processors and retention rights."""
+        lowered = (STATIC_DIR / "privacy.html").read_text(encoding="utf-8").lower()
+
+        for phrase in (
+            "nlpd",
+            "fadp",
+            "google cloud platform",
+            "cloud run",
+            "cloud storage",
+            "fernet",
+            "intervals.icu",
+            "openrouter",
+            "90-day",
+            "365-day",
+            "clear memory",
+            "httponly",
+            "samesite=lax",
+            "github.com/fpittelo/coach-web",
+        ):
+            assert phrase in lowered, phrase
 
 
 class TestProfileAvatarContract:

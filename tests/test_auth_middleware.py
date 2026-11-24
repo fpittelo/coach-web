@@ -112,6 +112,11 @@ class TestPublicPaths:
 
         assert response.status_code == 302
 
+    @pytest.mark.parametrize("path", ["/disclaimer", "/privacy"])
+    def test_legal_pages_are_public(self, path: str) -> None:
+        """#457 AC4: the public legal documents need no session."""
+        assert is_public_path(path) is True
+
     def test_docs_are_protected_by_default_deny(self, auth_client: TestClient) -> None:
         """Non-public, non-API paths (e.g. /docs) are protected too."""
         response = auth_client.get("/docs")

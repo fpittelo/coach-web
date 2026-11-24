@@ -122,3 +122,20 @@ class TestCspPostureShipped:
     def test_no_csp_header_claim_is_retired(self) -> None:
         """The retired 'no CSP header today' claim is gone."""
         assert "ships **no CSP header** today" not in self._doc()
+
+
+class TestPublicLandingAssetNote:
+    """#457 AC4: the security doc records the shipped static asset set."""
+
+    def _section(self) -> str:
+        doc = SECURITY_DOC.read_text(encoding="utf-8")
+        start = doc.index("### Public static landing surface")
+        return doc[start : doc.index("### ", start + 1)]
+
+    def test_public_surface_assets_are_recorded(self) -> None:
+        """The landing surface note lists every served static document."""
+        section = self._section()
+
+        for asset in ("landing.html", "disclaimer.html", "privacy.html", "landing.css"):
+            assert asset in section, asset
+        assert "exactly two static assets" not in section

@@ -107,7 +107,7 @@ The production deployment on Cloud Run (project `coach-web-509209`, `europe-west
 
 ### Public static landing surface (MADR-0031 C1–C7; #427)
 
-The public entry surface (`coach-web-landing`, `europe-west6`) serves exactly two static assets — the reused `landing.html`/`landing.css` and the canonical CTA to the console — from a minimal stdlib-only Go container embedded via `//go:embed` (source assets untouched in git; the build stage rewrites the relative CTA to the CONSTANT `https://coach-web-afff35tqxq-oa.a.run.app/auth/login` and fails the build on drift). It holds **no data, no secrets, no API, no cookies and no console path space** (`/auth/*`, `/api/*`, `/health*` → 404), so its blast radius is "public marketing page", not C2 health data. The console service's IAP posture is bit-for-bit unchanged — the entire point of MADR-0031.
+The public entry surface (`coach-web-landing`, `europe-west6`) serves exactly four static assets — the reused `landing.html`, `disclaimer.html` and `privacy.html` documents plus `landing.css`, and the canonical CTA to the console — from a minimal stdlib-only Go container embedded via `//go:embed` (source assets untouched in git; the build stage rewrites the relative CTA to the CONSTANT `https://coach-web-afff35tqxq-oa.a.run.app/auth/login` and fails the build on drift, and the two legal pages are asserted console-link-free and hash-logged). It holds **no data, no secrets, no API, no cookies and no console path space** (`/auth/*`, `/api/*`, `/health*` → 404), so its blast radius is "public marketing and legal pages", not C2 health data. The console service's IAP posture is bit-for-bit unchanged — the entire point of MADR-0031.
 
 | MADR-0031 condition | Implemented control |
 |:---|:---|

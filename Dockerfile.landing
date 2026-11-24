@@ -2,10 +2,11 @@
 # Dockerfile.landing — public static landing surface (MADR-0031, issue #427).
 #
 # Minimal, hardened container: stdlib-only Go static server embedded with the
-# reused landing assets (src/coach_web/static/landing.html + landing.css — the
-# source files are NOT modified in git; console tests pin their relative
-# /auth/login href), compiled CGO_ENABLED=0 in a digest-pinned golang builder
-# and served from a digest-pinned distroless static runtime.
+# reused public assets (src/coach_web/static/landing.html, disclaimer.html,
+# privacy.html + landing.css — the source files are NOT modified in git;
+# console tests pin their relative /auth/login href), compiled CGO_ENABLED=0
+# in a digest-pinned golang builder and served from a digest-pinned distroless
+# static runtime.
 #
 # Hardening contract (MADR-0031 C5/C6):
 #   - digest-pinned base images (the #423 supply-chain lesson),
@@ -40,6 +41,8 @@ WORKDIR /src
 
 COPY landing/go.mod landing/server.go ./
 COPY src/coach_web/static/landing.html ./landing.html
+COPY src/coach_web/static/disclaimer.html ./disclaimer.html
+COPY src/coach_web/static/privacy.html ./privacy.html
 COPY src/coach_web/static/landing.css ./static/landing.css
 
 # Rewrite the relative console CTA to the canonical absolute URL, then assert
@@ -49,7 +52,9 @@ RUN set -eu; \
     sed -i "s|href=\"/auth/login\"|href=\"${CONSOLE_ORIGIN}/auth/login\"|g" landing.html; \
     grep -F -q "href=\"${CONSOLE_ORIGIN}/auth/login\"" landing.html || { echo "FATAL: canonical CTA missing after rewrite"; exit 1; }; \
     if grep -F -q 'href="/auth/login"' landing.html; then echo "FATAL: relative /auth/login href survived the rewrite"; exit 1; fi; \
-    echo "landing.html content hash:"; sha256sum landing.html
+    if grep -F -q 'href="/auth/login"' disclaimer.html privacy.html; then echo "FATAL: the public legal pages must carry zero console auth links"; exit 1; fi; \
+    echo "landing.html content hash:"; sha256sum landing.html; \
+    echo "legal pages content hash:"; sha256sum disclaimer.html privacy.html
 
 RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -o /out/landing .
 

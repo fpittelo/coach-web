@@ -62,6 +62,13 @@ body {
   margin: 0;
   font-weight: 700;
   letter-spacing: -0.01em;
+  color: inherit;
+  text-decoration: none;
+}
+
+.wordmark:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 3px;
 }
 
 .wordmark__mark {
@@ -182,9 +189,45 @@ h1 {
   max-width: 68rem;
 }
 
-.site-footer__fine {
-  margin-top: var(--space-2);
-  font-size: 0.8125rem;
+.site-footer a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.site-footer a:hover {
+  color: var(--accent-hover);
+}
+
+.site-footer a:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 3px;
+}
+
+/* Legal documents (#457): readable prose measure reusing the landing layout.
+   The wordmark is an anchor here (home link) instead of a paragraph. */
+
+.legal {
+  max-width: var(--measure);
+}
+
+.legal__section {
+  margin-top: var(--space-6);
+}
+
+.legal h2 {
+  margin: 0 0 var(--space-2);
+  font-size: 1.25rem;
+  letter-spacing: -0.01em;
+}
+
+.legal p {
+  margin: 0;
+  color: var(--muted);
+}
+
+.legal code {
+  font-size: 0.9375em;
 }
 
 @media (prefers-reduced-motion: reduce) {
