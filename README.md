@@ -4,122 +4,61 @@
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688.svg?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![MCP Client](https://img.shields.io/badge/MCP-Client-brightgreen.svg)](https://modelcontextprotocol.io)
-[![Docker Non-Root](https://img.shields.io/badge/Docker-Non--Root%20(UID%2010001)-success.svg)](https://opencontainers.org)
+[![GCP Cloud Run](https://img.shields.io/badge/GCP-Cloud%20Run-europe--west6-4285F4.svg)](https://cloud.run)
 
 > **Your coach talks. Your watts listen. Your body thanks you.**
 >
-> Coach Web is the Python-native FastAPI frontend for the Coach MCP server — turning your
-> Intervals.icu biometric data into a live cockpit and your weekly training plans into a story
-> you can scroll, not a spreadsheet you dread.
+> Coach Web is a personal AI coaching cockpit: it reads your live Intervals.icu data,
+> coaches you in plain language, plans workouts with explicit wattage, and remembers
+> your season across sessions — private by design, hosted in Switzerland.
 
 ---
 
-## 🎯 What Is This?
+## 🎯 What is Coach Web?
 
-Coach Web is the **interactive frontend** for the [Coach MCP server](https://github.com/fpittelo/coach) — a FastMCP server that exposes the Intervals.icu REST API to LLMs via the Model Context Protocol.
-
-Phase 1 (Local VIDAR Evolution) replaces the legacy Streamlit scaffold with an asynchronous
-FastAPI core that serves a Swiss minimalist single-page interface (Alpine.js + self-hosted
-Inter, zero CDN dependencies) and streams the agent pipeline over native Server-Sent Events.
-
-The Phase 1 core delivers:
-
-- **FastAPI application factory** with clean lifespan startup/shutdown
-- **`GET /health` / `GET /healthz`** healthchecks (status, service, version, uptime)
-- **Static asset serving** for the Swiss minimalist UI at `/static/`
-- **Pydantic v2 settings** with `.env` loading
-- **Dual MCP client hub** and OpenRouter agent loop streaming typed SSE events
-- **Chat console** consuming `POST /api/agent/stream` via `fetch` + ReadableStream (server-owned conversation threads — the client sends the message plus an optional `thread_id`; turns persist server-side, #349)
-- **Conversation memory API** — `GET /api/conversation` rehydrate, `POST /api/conversation/reset` (archive + fresh thread), `POST /api/conversation/purge` (confirm-gated, scoped delete), #349
-- **Plan approval card** posting to `POST /api/plan/approve` (Intervals.icu event + GitHub Markdown commit)
+- **💬 Talk to your coach** — a conversational AI coach grounded in your live readiness: FTP, resting HR, HRV, sleep, and fitness/fatigue/form (CTL · ATL · TSB).
+- **✅ Approve, don't hope** — every proposed cycling or Kettlebell session lands as a plan card with explicit watts; nothing touches your Intervals.icu calendar until you approve it.
+- **🧠 It remembers you** — debriefs, standing preferences, and season objectives persist in encrypted memory that survives restarts and cold starts.
+- **🇨🇭 Private by design** — single-athlete, zero trackers, all data encrypted and resident in the Swiss-adjacent Zürich region (`europe-west6`).
 
 ---
 
-## 🏛️ Architecture in a Nutshell
+## 🏛️ Architecture at a Glance
 
 ```mermaid
-graph TD
-    subgraph "Your Browser"
-        YOU(["🧑‍🚀 @fpittelo<br/>interacts via browser"])
+flowchart LR
+    VISITOR(["🌐 Visitor"]) --> LANDING["coach-web-landing<br/>public page · zero secrets"]
+    LANDING -->|"Sign in"| IAP["Google IAP<br/>owner-only gate"]
+    OWNER(["🧑‍🚀 @fpittelo"]) --> IAP
+    IAP --> CONSOLE["coach-web console<br/>FastAPI · AI coach · SSE"]
+
+    subgraph SIDECARS["Console pod sidecars"]
+        MCP["coach-mcp<br/>(Intervals.icu tools)"]
     end
 
-    subgraph "coach-web Container (OCI Non-Root UID 10001)"
-        APP["FastAPI App<br/>app.py — Python 3.12<br/>⚡ async · static UI · SSE"]
-    end
-
-    subgraph "Coach MCP Server (already deployed)"
-        MCP["FastMCP Server<br/>streamable_http :8000<br/>🔐 holds INTERVALS_API_KEY"]
-    end
-
-    subgraph "External APIs"
-        INTERVALS["Intervals.icu REST API"]
-        GITHUB["GitHub API<br/>training plan issues"]
-    end
-
-    YOU -->|"HTTP :8080"| APP
-    APP -->|"MCP over HTTP"| MCP
-    APP -->|"REST + token"| GITHUB
-    MCP -->|"HTTPS Basic Auth"| INTERVALS
+    CONSOLE --> MCP
+    MCP --> INTERVALS["Intervals.icu"]
+    CONSOLE --> LLM["OpenRouter<br/>(LLM inference)"]
+    CONSOLE --> GITHUB["GitHub<br/>(plan archive)"]
+    CONSOLE --> GCS[("🔐 Encrypted snapshots<br/>GCS europe-west6")]
 ```
 
-**Two containers. One language. Zero proxies.**
+**Two surfaces. One zero-trust boundary. Zero secrets where they don't belong.**
+
+- **`coach-web-landing`** — the public front door: a static, secret-free page anyone can read.
+- **`coach-web`** — the actual cockpit: locked behind Google IAP + owner allowlist; only you get in.
 
 ---
 
-## 🚀 Quick Start
+## ⚙️ How It Runs
 
-### Option 1: Local Dev (KIS)
-
-```bash
-# Clone
-gh repo clone fpittelo/coach-web
-cd coach-web
-
-# Install with uv
-uv sync
-
-# Configure
-cp .env.example .env
-# Edit .env with your COACH_MCP_URL and GITHUB_TOKEN
-
-# Run (FastAPI + uvicorn — binds APP_PORT, default 8000)
-uv run coach-web
-# or with autoreload on an explicit port override
-uv run uvicorn coach_web.app:create_app --factory --reload --port 8080
-```
-
-Then open [http://localhost:8000](http://localhost:8000) (or `:8080` with the override above) — the Swiss minimalist shell is served from `/`.
-
-Healthcheck: [http://localhost:8000/health](http://localhost:8000/health)
-
-### Option 2: Docker (local lanes — ADR-007)
-
-The stack runs on the local workstation in three isolated lanes (dev / qa / prod), all bound to `127.0.0.1` only:
-
-```bash
-# one-time per lane: create the lane env file from its template
-cp .env.dev.example .env.dev   # then edit with your secrets
-
-# dev lane — build from source
-docker compose -p coach-web-dev -f compose.yaml -f compose.dev.yml \
-    --env-file .env.dev up -d --build
-```
-
-Then open [http://localhost:8100](http://localhost:8100) (dev), `:8200` (qa), or `:8000` (prod) and meet your coach.
-
-| Lane | Host port | Compose files | Env file |
-|:---|:---|:---|:---|
-| dev | `127.0.0.1:8100` | `compose.yaml` + `compose.dev.yml` | `.env.dev` |
-| qa | `127.0.0.1:8200` | `compose.yaml` + `compose.qa.yml` | `.env.qa` |
-| prod | `127.0.0.1:8000` | `compose.yaml` + `compose.prod.yml` | `.env.prod` |
-
-Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|prod`) with its own network, and sidecars publish no host ports. See the [Admin Guide](docs/admin_guide.md) for the full lane matrix, the release runbook, and the per-lane pre-flight (`./scripts/e2e-preflight.sh dev|qa|prod`).
+- **Production** — Google Cloud Run in `europe-west6`, always-on scale-to-zero: a public landing service and an IAP-gated console service, deployed together on every release.
+- **Releases** — semantic `vX.Y.Z` tags cut from `main` and deployed as immutable, digest-pinned container images.
+- **Development** — plain `uv` locally, or isolated loopback-only Docker Compose lanes (`dev` / `qa` / `prod`) on your workstation. See the [Admin Guide](docs/admin_guide.md).
 
 ---
 
 ## 📊 What You'll See
-
-### Readiness Cockpit
 
 | Metric | What it tells you |
 |:---|:---|
@@ -131,35 +70,28 @@ Lanes run concurrently — each is its own compose project (`coach-web-dev|qa|pr
 | **ATL (Fatigue)** | Your 7-day acute load — the higher, the more tired you are right now |
 | **TSB (Form)** | CTL minus ATL — negative = building, positive = tapering/peaking |
 
-### Weekly Training Plans
-
-The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `agent::coach`, `type::task`) and rendered as native markdown. Each week shows:
-- Daily sessions with explicit wattage (HOME Rule #6 compliant — no % FTP)
-- Duration, load (TSS), and Intervals.icu event IDs
-- Execution tracking checklists
-
 ---
 
 ## 📖 Documentation
 
 | Document | Audience |
 |:---|:---|
-| [User Guide](docs/user_guide.md) | @fpittelo — how to use the dashboard |
-| [Admin Guide](docs/admin_guide.md) | @devops — deployment, Docker, env vars |
-| [Specifications](docs/specifications.md) | @architect — technical specs, data flow, MCP integration |
-| [Architecture](docs/architecture.md) | @architect — ArchiMate 3.x model, C4 diagrams, ADRs |
-
-> ℹ️ The `docs/` set is refreshed for the local-first deployment model (ADR-007, issue #108); the local-topology STRIDE rewrite lands with #113.
+| [User Guide](docs/user_guide.md) | @fpittelo — how to use the cockpit |
+| [Admin Guide](docs/admin_guide.md) | @devops — deployment, Docker lanes, environment |
+| [Specifications](docs/specifications.md) | @architect — technical specs & data flow |
+| [Architecture (arc42)](docs/architecture/arc42/01-context-and-building-blocks.md) | @architect — context, building blocks, ADRs |
+| [Security](docs/security.md) | @cyber-security — threat model & controls |
+| [Accessibility](docs/accessibility.md) | UI accessibility conformance |
+| [E2E Checklist](docs/e2e-checklist.md) | Release pre-flight verification |
 
 ---
 
 ## 🔒 Security & Privacy
 
-- **Swiss nLPD (FADP) Compliant** — all biometric data (HR, HRV, sleep, training loads) stays in ephemeral browser session. No persistent client-side storage.
-- **Local-First Deployment (ADR-007)** — dev, qa, and prod run on the local workstation in hardened, loopback-only Docker lanes; biometric data never leaves the host. Loopback binding is the primary access control; Google OIDC (prod lane) is defense-in-depth.
-- **No API Key in the Browser** — the Intervals.icu API key lives **only** in the Coach MCP server's environment. The web app never touches it.
-- **OCI Non-Root Container** — runs as unprivileged user `coach-web` (`UID:GID 10001:10001`), same hardening as the Coach MCP server.
-- **Clean stdout** — structured logging with no secrets logged.
+- **Zero-trust edge** — the console is reachable only through Google IAP with an owner-email allowlist, plus in-app OIDC as defense-in-depth.
+- **Encrypted, resident data** — coaching memory is Fernet-encrypted at rest and stored exclusively in the Zürich region (`europe-west6`).
+- **No keys in the browser** — API credentials live only server-side, in sidecar containers; the web app never touches them.
+- **Swiss nLPD / FADP aligned** — single-athlete scope, bounded retention, self-service purge; a public Disclaimer and Privacy Policy ship with the app (`/disclaimer`, `/privacy`).
 
 ---
 
@@ -167,35 +99,19 @@ The last 5 weeks + your current microcycle, pulled from GitHub issues (labels: `
 
 | Layer | Technology |
 |:---|:---|
-| **Language** | Python 3.12 |
-| **Framework** | FastAPI + uvicorn |
-| **Frontend** | Alpine.js + hand-written CSS with v0.7 design tokens (static assets, zero CDN) |
-| **Streaming** | Server-Sent Events (`sse-starlette`) |
-| **MCP Client** | `mcp[cli]` Python SDK (streamable_http transport) |
-| **GitHub API** | `httpx` async client (for training plan issues) |
-| **Validation** | Pydantic v2 + `pydantic-settings` |
-| **Container** | `python:3.12-slim`, multi-stage, non-root UID 10001 |
-| **CI/CD** | GitHub Actions: `ruff` + `mypy --strict` + `pytest` + Docker build |
+| **Backend** | Python 3.12 · FastAPI · Pydantic v2 |
+| **Frontend** | Alpine.js + hand-written CSS — zero build step, zero CDN |
+| **Streaming** | Server-Sent Events |
+| **AI** | OpenRouter tool-calling agent loop · MCP sidecars |
+| **Storage** | SQLite (WAL) with Fernet field encryption · GCS snapshots |
+| **Containers** | Multi-stage OCI images, non-root, digest-pinned deploys |
+| **CI/CD** | GitHub Actions — zero-warning gate, secret & dependency scans |
 
 ---
 
 ## 🌳 Branching & Releases
 
-Coach Web follows the HOME SCRUM trunk+tag lifecycle (MADR-0017): `main` is the single persistent trunk; feature branches squash-merge into `main` only; releases are semantic tags `vX.Y.Z` + GitHub Releases cut from `main` under one explicit PO approval. All merges require 100% clean CI.
-
-```mermaid
-gitGraph
-    commit id: "Init main"
-    branch feature/59-fastapi-scaffold
-    checkout feature/59-fastapi-scaffold
-    commit id: "feat: FastAPI scaffold"
-    checkout main
-    merge feature/59-fastapi-scaffold id: "PR (Clean CI)"
-    commit id: "Release v0.2.0" tag: "v0.2.0"
-```
-
-- `main` — the single persistent trunk: integration + production (`ghcr.io/fpittelo/coach-web:latest`)
-- `dev` / `qa` — retired at the #286 cutover; no promotion branches or promotion PRs
+Coach Web follows the HOME trunk+tag lifecycle: `main` is the single persistent trunk, features land via squash-merged PRs, and every release is a semantic `vX.Y.Z` tag + GitHub Release published under one explicit product-owner approval — with 100% clean CI required for every merge.
 
 ---
 
