@@ -1691,6 +1691,15 @@ class TestLandingSurfaceContainerAndGates:
         assert "grep -F -q 'href=\"/auth/login\"'" in landing_dockerfile
         assert "sha256sum landing.html" in landing_dockerfile
 
+    def test_landing_dockerfile_ships_the_legal_pages(self, landing_dockerfile: str) -> None:
+        """#457: both legal documents are copied and hash-logged for provenance."""
+        assert "COPY src/coach_web/static/disclaimer.html ./disclaimer.html" in landing_dockerfile
+        assert "COPY src/coach_web/static/privacy.html ./privacy.html" in landing_dockerfile
+        assert "sha256sum disclaimer.html privacy.html" in landing_dockerfile
+        assert (
+            "grep -F -q 'href=\"/auth/login\"' disclaimer.html privacy.html" in landing_dockerfile
+        )
+
     def test_landing_server_is_stdlib_only_and_pins_the_cta(self, landing_server: str) -> None:
         """The Go server pins the canonical CTA, headers and timeouts, and reads nothing."""
         assert f'const canonicalConsoleLoginURL = "{self.CANONICAL_CTA}"' in landing_server
@@ -1702,11 +1711,20 @@ class TestLandingSurfaceContainerAndGates:
             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
         ):
             assert header in landing_server, header
-        assert "//go:embed landing.html static/landing.css" in landing_server
+        assert "//go:embed landing.html disclaimer.html privacy.html static/landing.css" in (
+            landing_server
+        )
         for marker in (":8080", "ReadHeaderTimeout", "ReadTimeout", "WriteTimeout", "IdleTimeout"):
             assert marker in landing_server, marker
         for forbidden in ("os.Getenv", "os.LookupEnv", "os.Open", "http.Redirect", "SetCookie"):
             assert forbidden not in landing_server, forbidden
+
+    def test_landing_server_serves_the_legal_pages(self, landing_server: str) -> None:
+        """#457: the embedded legal documents are validated and routed publicly."""
+        for asset in ('"disclaimer.html"', '"privacy.html"'):
+            assert f"assets.ReadFile({asset})" in landing_server, asset
+        for route in ('case "/disclaimer":', 'case "/privacy":'):
+            assert route in landing_server, route
 
     def test_landing_go_module_is_stdlib_only(self) -> None:
         """landing/go.mod declares the module with zero external dependencies."""
@@ -1807,6 +1825,24 @@ class TestLandingSurfaceContainerAndGates:
         "<footer>Swiss nLPD - europe-west6</footer>\n"
     )
 
+    LEGAL_HEADERS_BASELINE = (
+        "HTTP/2 200\n"
+        "content-security-policy: default-src 'none'; style-src 'self'; img-src 'self'; "
+        "base-uri 'none'; form-action 'none'; frame-ancestors 'none'\n"
+        "cache-control: public, max-age=300\n"
+        "content-type: text/html; charset=utf-8\n"
+        "referrer-policy: no-referrer\n"
+        "x-content-type-options: nosniff\n"
+    )
+
+    LEGAL_BODY_BASELINE = (
+        "<!doctype html>\n"
+        "<h1>Disclaimer</h1>\n"
+        '<footer class="site-footer"><a href="/">Home</a> · '
+        '<a href="/disclaimer">Disclaimer</a> · '
+        '<a href="/privacy">Privacy Policy</a></footer>\n'
+    )
+
     GCLOUD_LANDING_SHIM = '''#!/usr/bin/env python3
 """Test shim for gcloud: replays the #427 landing read-backs."""
 import os
@@ -1839,9 +1875,10 @@ with open(os.environ[variable], encoding="utf-8") as handle:
 '''
 
     CURL_LANDING_SHIM = '''#!/usr/bin/env python3
-"""Test shim for curl: replays the #427 landing HTTP probes / TestIamPermissions."""
+"""Test shim for curl: replays the #427/#457 landing HTTP probes / TestIamPermissions."""
 import os
 import sys
+from urllib.parse import urlsplit
 
 args = sys.argv[1:]
 url = args[-1]
@@ -1849,8 +1886,12 @@ if "testIamPermissions" in url:
     with open(os.environ["SHIM_TESTIAM"], encoding="utf-8") as handle:
         sys.stdout.write(handle.read())
     sys.exit(0)
-root = url.endswith("/") and url.count("/") == 3
-if root:
+path = urlsplit(url).path
+if path in ("/disclaimer", "/privacy"):
+    code = os.environ.get("SHIM_CURL_LEGAL_CODE", "200")
+    body = os.environ["SHIM_CURL_LEGAL_BODY"]
+    headers = os.environ["SHIM_CURL_LEGAL_HEADERS"]
+elif path == "/":
     code = os.environ.get("SHIM_CURL_ROOT_CODE", "200")
     body = os.environ["SHIM_CURL_BODY"]
     headers = os.environ["SHIM_CURL_HEADERS"]
@@ -2173,13 +2214,16 @@ sys.stdout.write(code + "\\n")
             "SHIM_LANDING_URL": self.LANDING_URL,
             "SHIM_CURL_HEADERS": self.CTA_HEADERS_BASELINE,
             "SHIM_CURL_BODY": self.CTA_BODY_BASELINE,
+            "SHIM_CURL_LEGAL_HEADERS": self.LEGAL_HEADERS_BASELINE,
+            "SHIM_CURL_LEGAL_BODY": self.LEGAL_BODY_BASELINE,
         }
 
     def test_landing_probe_baseline_passes(self, tmp_path: Path) -> None:
-        """200 + Cache-Control + canonical CTA + zero console path space exits 0."""
+        """200 + Cache-Control + canonical CTA + legal pages + zero console space exits 0."""
         result = self._run_step(tmp_path, self.PROBE_STEP, self._probe_payloads())
         assert result.returncode == 0, result.stdout + result.stderr
         assert "Content provenance verified" in result.stdout
+        assert "Legal pages verified" in result.stdout
 
     @pytest.mark.parametrize(
         ("drift", "mutate"),
@@ -2222,6 +2266,35 @@ sys.stdout.write(code + "\\n")
             (
                 "landingRoot503",
                 lambda payloads: payloads.__setitem__("SHIM_CURL_ROOT_CODE", "503"),
+            ),
+            (
+                "landingLegalStatus500",
+                lambda payloads: payloads.__setitem__("SHIM_CURL_LEGAL_CODE", "500"),
+            ),
+            (
+                "landingLegalSetCookie",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_LEGAL_HEADERS",
+                    TestLandingSurfaceContainerAndGates.LEGAL_HEADERS_BASELINE
+                    + "set-cookie: cw_session=poisoned\n",
+                ),
+            ),
+            (
+                "landingLegalNoCacheHeader",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_LEGAL_HEADERS",
+                    TestLandingSurfaceContainerAndGates.LEGAL_HEADERS_BASELINE.replace(
+                        "cache-control: public, max-age=300\n", ""
+                    ),
+                ),
+            ),
+            (
+                "landingLegalGoogleSurface",
+                lambda payloads: payloads.__setitem__(
+                    "SHIM_CURL_LEGAL_BODY",
+                    TestLandingSurfaceContainerAndGates.LEGAL_BODY_BASELINE
+                    + "accounts.google.com\n",
+                ),
             ),
         ],
     )

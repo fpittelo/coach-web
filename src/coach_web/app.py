@@ -293,6 +293,22 @@ def _no_store(response: Response) -> Response:
     return response
 
 
+LEGAL_CACHE_CONTROL = "public, max-age=300"
+"""Short public caching for the value-free legal pages (#457 AC4).
+
+The bodies are static and identical for every visitor, exactly like the
+public landing container's headers (MADR-0031 C5): no cookie, no session
+variant, no data.
+"""
+
+
+def _legal_page(filename: str) -> Response:
+    """Serve one static legal document with the pinned public cache header."""
+    response = FileResponse(STATIC_DIR / filename)
+    response.headers["Cache-Control"] = LEGAL_CACHE_CONTROL
+    return response
+
+
 def _notify_snapshot_dirty(request: Request) -> None:
     """Schedule the debounced durable checkpoint after a committed write (C5).
 
@@ -844,6 +860,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             )
         return _no_store(FileResponse(STATIC_DIR / "index.html"))
+
+    @application.get("/disclaimer", include_in_schema=False)
+    async def disclaimer() -> Response:
+        """Serve the public Disclaimer page (#457 AC3/AC4).
+
+        A pure static document, identical for every visitor: public by design
+        (``PUBLIC_PATHS``) and short publicly cacheable — ``Cache-Control:
+        public, max-age=300`` matches the landing container's pinned header.
+        """
+        return _legal_page("disclaimer.html")
+
+    @application.get("/privacy", include_in_schema=False)
+    async def privacy() -> Response:
+        """Serve the public Privacy Policy page (#457 AC3/AC4)."""
+        return _legal_page("privacy.html")
 
     @application.get("/health", response_model=HealthResponse, tags=["ops"])
     @application.get("/healthz", response_model=HealthResponse, include_in_schema=False)

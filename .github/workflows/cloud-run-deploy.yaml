@@ -1382,7 +1382,8 @@ jobs:
       # can be swapped): the page must answer 200 with the pinned caching and
       # security headers, ZERO Set-Cookie / accounts.google.com / x-goog-iap
       # surface, the EXACT canonical CTA constant, and zero console path
-      # space (404s).
+      # space (404s). The two legal documents (#457) are probed with the same
+      # pinned-header contract.
       - name: Probe the public landing surface (MADR-0031 C7)
         run: |
           set -euo pipefail
@@ -1417,15 +1418,44 @@ jobs:
           echo "CTA verified: ${cta_probe}"
           echo "LANDING_URL=${url}" >> "$GITHUB_ENV"
           echo "LANDING_ROOT=${code}" >> "$GITHUB_ENV"
+          # Public legal documents (#457): same pinned value-free contract.
+          for page in disclaimer privacy; do
+            page_headers="$(mktemp)"; page_body="$(mktemp)"
+            page_code="$(curl -sS -o "${page_body}" -D "${page_headers}" -w '%{http_code}' --max-time 30 "${url}/${page}")"
+            if [ "${page_code}" != "200" ]; then
+              echo "::error::Unauthenticated GET ${url}/${page} returned HTTP ${page_code} — expected 200 from the public ${page} page (AC3/AC4)."
+              exit 1
+            fi
+            if ! grep -qi '^content-type: text/html; charset=utf-8' "${page_headers}"; then
+              echo "::error::C7 violation: the /${page} response is not text/html; charset=utf-8 (see ${page_headers})."
+              cat "${page_headers}"
+              exit 1
+            fi
+            if ! grep -qi '^cache-control: public, max-age=300' "${page_headers}"; then
+              echo "::error::C5 violation: the /${page} response is missing Cache-Control: public, max-age=300 (see ${page_headers})."
+              cat "${page_headers}"
+              exit 1
+            fi
+            if grep -qi '^set-cookie:' "${page_headers}"; then
+              echo "::error::C5 violation: the /${page} response carries a Set-Cookie header — the public legal pages must be cookie-free (MADR-0031 C5/C7)."
+              exit 1
+            fi
+            if grep -qi 'accounts\.google\.com\|x-goog-iap' "${page_headers}" "${page_body}"; then
+              echo "::error::C3 violation: the /${page} response surfaces accounts.google.com or x-goog-iap — the visitor must see ZERO Google interaction (AC3/AC4; MADR-0031 C7)."
+              exit 1
+            fi
+            echo "LANDING_${page^^}=${page_code}" >> "$GITHUB_ENV"
+          done
           for path in /auth/login /api/health /health; do
             path_code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "${url}${path}")"
             echo "LANDING_${path//[\/]/_}=${path_code}" >> "$GITHUB_ENV"
             if [ "${path_code}" != "404" ]; then
-              echo "::error::C7 violation: GET ${url}${path} returned HTTP ${path_code} — the landing surface must serve NOTHING outside / and /static/landing.css (no console path space; MADR-0031 C5/C7)."
+              echo "::error::C7 violation: GET ${url}${path} returned HTTP ${path_code} — the landing surface must serve NOTHING outside /, /disclaimer, /privacy and /static/landing.css (no console path space; MADR-0031 C5/C7)."
               exit 1
             fi
           done
-          echo "Content provenance verified: 200 + pinned headers + canonical CTA + zero console path space."
+          echo "Legal pages verified: 200 + pinned headers + zero cookie/Google surface."
+          echo "Content provenance verified: 200 + pinned headers + canonical CTA + legal pages + zero console path space."
 
       - name: Write job summary
         env:
@@ -1462,6 +1492,8 @@ jobs:
             echo "| Check | Expected | Observed |"
             echo "|:---|:---|:---|"
             echo "| Unauthenticated \`GET ${LANDING_URL}/\` | 200 + headers + canonical CTA | ${LANDING_ROOT} |"
+            echo "| Unauthenticated \`GET /disclaimer\` | 200 + pinned headers, zero cookie | ${LANDING_DISCLAIMER} |"
+            echo "| Unauthenticated \`GET /privacy\` | 200 + pinned headers, zero cookie | ${LANDING_PRIVACY} |"
             echo "| Unauthenticated \`GET /auth/login\` | 404 | ${LANDING__auth_login} |"
             echo "| Unauthenticated \`GET /api/health\` | 404 | ${LANDING__api_health} |"
             echo "| Unauthenticated \`GET /health\` | 404 | ${LANDING__health} |"

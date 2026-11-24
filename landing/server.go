@@ -1,9 +1,10 @@
-// Public static landing surface (MADR-0031, issue #427).
+// Public static landing surface (MADR-0031, issue #427; legal pages #457).
 //
-// A minimal stdlib-only static server: it serves EXACTLY two assets — the
-// landing page HTML and its stylesheet — with pinned security headers, and
-// refuses everything else. Zero env reads, zero config, zero cookies, zero
-// redirects, no console path space (/auth/*, /api/*, /health* → 404).
+// A minimal stdlib-only static server: it serves EXACTLY four assets — the
+// landing page HTML, the Disclaimer and Privacy Policy HTML documents, and the
+// shared stylesheet — with pinned security headers, and refuses everything
+// else. Zero env reads, zero config, zero cookies, zero redirects, no console
+// path space (/auth/*, /api/*, /health* → 404).
 // Any growth beyond static files requires a new MADR (MADR-0031 C7).
 package main
 
@@ -17,7 +18,7 @@ import (
 	"time"
 )
 
-//go:embed landing.html static/landing.css
+//go:embed landing.html disclaimer.html privacy.html static/landing.css
 var assets embed.FS
 
 // canonicalConsoleLoginURL is the one and only CTA target (MADR-0031 C6/C7):
@@ -65,7 +66,7 @@ func applyLandingHeaders(w http.ResponseWriter) {
 	}
 }
 
-func landingHandler(html, css []byte) http.Handler {
+func landingHandler(html, disclaimer, privacy, css []byte) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			methodNotAllowed(w)
@@ -73,9 +74,11 @@ func landingHandler(html, css []byte) http.Handler {
 		}
 		switch r.URL.Path {
 		case "/":
-			applyLandingHeaders(w)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write(html)
+			writeHTML(w, html)
+		case "/disclaimer":
+			writeHTML(w, disclaimer)
+		case "/privacy":
+			writeHTML(w, privacy)
 		case "/static/landing.css":
 			applyLandingHeaders(w)
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
@@ -86,10 +89,31 @@ func landingHandler(html, css []byte) http.Handler {
 	})
 }
 
+// writeHTML serves one embedded static document with the pinned headers.
+func writeHTML(w http.ResponseWriter, document []byte) {
+	applyLandingHeaders(w)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write(document)
+}
+
+// logContentHash records the served-content SHA-256 for provenance (C5/C6).
+func logContentHash(name string, document []byte) {
+	sum := sha256.Sum256(document)
+	log.Printf("landing: serving %s (%d bytes), content sha256: %s", name, len(document), hex.EncodeToString(sum[:]))
+}
+
 func main() {
 	html, err := assets.ReadFile("landing.html")
 	if err != nil {
 		log.Fatalf("landing: embedded landing.html missing: %v", err)
+	}
+	disclaimer, err := assets.ReadFile("disclaimer.html")
+	if err != nil {
+		log.Fatalf("landing: embedded disclaimer.html missing: %v", err)
+	}
+	privacy, err := assets.ReadFile("privacy.html")
+	if err != nil {
+		log.Fatalf("landing: embedded privacy.html missing: %v", err)
 	}
 	css, err := assets.ReadFile("static/landing.css")
 	if err != nil {
@@ -103,14 +127,25 @@ func main() {
 	if bytes.Contains(html, []byte(`href="/auth/login"`)) {
 		log.Fatalf("landing: embedded HTML still carries the relative href=%q — refusing to serve", `href="/auth/login"`)
 	}
-	// Content provenance (C5/C6): log the served content hash so operators can
-	// compare the running instance against the release-verified build log.
-	sum := sha256.Sum256(html)
-	log.Printf("landing: serving %d bytes, content sha256: %s", len(html), hex.EncodeToString(sum[:]))
+	// The legal pages are console-path-free by contract (#457): a public
+	// document must never link the console auth route.
+	for name, page := range map[string][]byte{
+		"disclaimer.html": disclaimer,
+		"privacy.html":    privacy,
+	} {
+		if bytes.Contains(page, []byte(`href="/auth/login"`)) {
+			log.Fatalf("landing: embedded %s carries the console auth href — refusing to serve", name)
+		}
+	}
+	// Content provenance (C5/C6): log the served content hashes so operators
+	// can compare the running instance against the release-verified build log.
+	logContentHash("landing.html", html)
+	logContentHash("disclaimer.html", disclaimer)
+	logContentHash("privacy.html", privacy)
 
 	server := &http.Server{
 		Addr:              ":8080",
-		Handler:           landingHandler(html, css),
+		Handler:           landingHandler(html, disclaimer, privacy, css),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,

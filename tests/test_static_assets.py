@@ -5215,3 +5215,79 @@ class TestAgentSettingsSectionContract:
         assert "var(--muted)" in disclosure
         assert counter, "the counter must be styled"
         assert "var(--muted)" in counter
+
+
+# ---------------------------------------------------------------------------
+# Public legal pages & GCP-era footers (#457)
+# ---------------------------------------------------------------------------
+
+
+class TestPublicLegalAssetContract:
+    """GCP-era footer copy and the static Disclaimer / Privacy Policy pages.
+
+    Issue #457 removes the local-only hosting claims from both footers and
+    adds two public legal documents. MADR-0031 C7 is preserved: the documents
+    are pure static HTML reusing ``landing.css`` — zero script, zero inline
+    style (``style-src 'self'``), zero external URL, zero console path space.
+    """
+
+    LEGAL_PAGES = ("disclaimer", "privacy")
+
+    def _index(self) -> str:
+        return (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _css(self) -> str:
+        return (STATIC_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _landing_css(self) -> str:
+        return (STATIC_DIR / "landing.css").read_text(encoding="utf-8")
+
+    def test_console_footer_drops_local_only_claims(self) -> None:
+        """AC2: no `· self-hosted`, no `Data stays local`; Alpine.js stays."""
+        html = self._index()
+        footer = html[html.index('<footer class="footer">') : html.index("</footer>")]
+
+        assert "<span>Alpine.js</span>" in footer
+        assert "self-hosted" not in footer
+        assert "Data stays local" not in footer
+
+    def test_console_footer_links_the_legal_pages(self) -> None:
+        """AC2: new-tab links preserve the active chat state."""
+        html = self._index()
+        footer = html[html.index('<footer class="footer">') : html.index("</footer>")]
+
+        for path, label in (("/disclaimer", "Disclaimer"), ("/privacy", "Privacy Policy")):
+            link = f'<a href="{path}" target="_blank" rel="noopener noreferrer">{label}</a>'
+            assert link in footer, link
+
+    def test_console_footer_links_are_tokenized_with_a_focus_ring(self) -> None:
+        """AC2: the footer links reuse the v0.7 tokens and a visible focus ring."""
+        css = self._css()
+        link = _rule_block(css, ".footer a")
+        focus = _rule_block(css, ".footer a:focus-visible")
+
+        assert link, "the footer link rule must exist"
+        assert "var(--accent)" in link
+        assert "text-decoration" in link
+        assert focus, "the footer link focus-visible rule must exist"
+        assert "outline" in focus
+        assert "var(--accent)" in focus
+
+    def test_legal_pages_reuse_the_landing_stylesheet(self) -> None:
+        """AC3: both documents link the same public stylesheet, no fork."""
+        for slug in self.LEGAL_PAGES:
+            html = (STATIC_DIR / f"{slug}.html").read_text(encoding="utf-8")
+            assert 'href="/static/landing.css"' in html, slug
+
+    def test_landing_styles_carry_the_legal_layout(self) -> None:
+        """AC3: .legal/.site-footer link rules are tokenized system-font CSS."""
+        css = self._landing_css()
+        legal = _rule_block(css, ".legal")
+        footer_link = _rule_block(css, ".site-footer a")
+
+        assert legal, "the legal prose measure must be styled"
+        assert "max-width" in legal
+        assert footer_link, "the footer links must be styled"
+        assert "var(--accent)" in footer_link
+        assert "@font-face" not in css
+        assert "url(" not in css

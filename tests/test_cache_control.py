@@ -71,3 +71,15 @@ class TestStaticAssetsKeepTheirCacheBehavior:
 
         assert response.status_code == 200
         assert response.headers.get("cache-control") != NO_STORE
+
+
+class TestPublicLegalPagesAreCacheable:
+    """#457 AC4: the value-free legal pages opt into short public caching."""
+
+    @pytest.mark.parametrize("path", ["/disclaimer", "/privacy"])
+    def test_legal_page_is_public_and_cacheable(self, auth_client: TestClient, path: str) -> None:
+        """The static legal pages answer the pinned public cache header."""
+        response = auth_client.get(path)
+
+        assert response.status_code == 200
+        assert response.headers.get("cache-control") == "public, max-age=300"

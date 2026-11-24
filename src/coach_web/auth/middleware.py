@@ -24,7 +24,7 @@ from coach_web.config import Settings
 
 SESSION_COOKIE = "cw_session"
 
-PUBLIC_PATHS = frozenset({"/", "/health", "/healthz"})
+PUBLIC_PATHS = frozenset({"/", "/health", "/healthz", "/disclaimer", "/privacy"})
 PUBLIC_PREFIXES = ("/static/", "/auth/")
 
 PROBE_EXEMPT_PATHS = frozenset({"/health", "/healthz"})
