@@ -81,6 +81,11 @@ from coach_web.periodization import (
     PeriodizationPlan,
     replace_phases,
 )
+from coach_web.session_context import (
+    SESSION_METRICS_BLOCK_BEGIN,
+    SessionMetricsLedger,
+    SessionMetricsTurnContext,
+)
 from coach_web.suggestions import DEBRIEF_SUGGESTIONS, DEFAULT_SUGGESTIONS
 
 # ---------------------------------------------------------------------------
@@ -3408,3 +3413,424 @@ class TestCrossThreadBriefWithIcuSynthesis:
         # …and the turn synthesised cleanly.
         assert events[-1].data["message"].startswith("Your 15 Nov race was cut short")
         assert not any(event.type == "error" for event in events)
+
+
+# ---------------------------------------------------------------------------
+# assemble_system_prompt — intra-session metrics slot (#435, Am. 0002 §1)
+# ---------------------------------------------------------------------------
+
+_SESSION_METRICS_STUB_BLOCK = (
+    f"{SESSION_METRICS_BLOCK_BEGIN}\n"
+    "| domain: readiness_wellness | tool_name: icu_get_wellness | fetched_at_utc: t\n"
+    '| {"resting_hr": 44, "hrv_rmssd": 68}\n'
+    "=== SESSION METRICS (END) ==="
+)
+
+
+class TestSeamSessionMetricsBlock:
+    """AC1 / C-AM2-04: slot 5 precedence, predicate and cold byte-equivalence.
+
+    Pinned 8-block order (MADR-0025 Amendment 0002): ``core → owner-orientation
+    → standing-preferences → digests → session-metrics → memory →
+    cross-thread brief → REASSERT_CLAUSE (LAST)``.
+    """
+
+    def test_metrics_block_slots_between_digests_and_memory(self) -> None:
+        """All blocks present: the metrics block is slot 5, above memory."""
+        prompt = assemble_system_prompt(
+            _ORIENTED_CORE,
+            _FULL_SETTINGS,
+            [_DIGEST_ONE],
+            _memory_block(),
+            _cross_thread_brief(),
+            session_metrics_block=_SESSION_METRICS_STUB_BLOCK,
+        )
+
+        assert prompt.index(_DIGEST_ONE) < prompt.index(SESSION_METRICS_BLOCK_BEGIN)
+        assert prompt.index(SESSION_METRICS_BLOCK_BEGIN) < prompt.index("CONVERSATION MEMORY")
+        assert prompt.index(CROSS_THREAD_BRIEF_END) < prompt.index(REASSERT_CLAUSE)
+        assert prompt.endswith(REASSERT_CLAUSE)
+
+    def test_metrics_block_alone_flips_the_block_agnostic_re_assert(self) -> None:
+        """Metrics content alone flips the clause and stays above it."""
+        prompt = assemble_system_prompt(
+            _ORIENTED_CORE, None, [], session_metrics_block=_SESSION_METRICS_STUB_BLOCK
+        )
+
+        assert prompt == (f"{_ORIENTED_CORE}\n\n{_SESSION_METRICS_STUB_BLOCK}\n\n{REASSERT_CLAUSE}")
+
+    def test_cold_none_is_byte_identical_to_the_pre_change_prompt(self) -> None:
+        """``session_metrics_block=None`` leaves the prompt byte-identical."""
+        pre_change = assemble_system_prompt(_ORIENTED_CORE, _FULL_SETTINGS, [_DIGEST_ONE])
+        assert (
+            assemble_system_prompt(
+                _ORIENTED_CORE, _FULL_SETTINGS, [_DIGEST_ONE], session_metrics_block=None
+            )
+            == pre_change
+        )
+        assert assemble_system_prompt(_ORIENTED_CORE, None, [], session_metrics_block=None) == (
+            _ORIENTED_CORE
+        )
+
+    def test_empty_metrics_string_emits_no_block_and_flips_nothing(self) -> None:
+        """An empty block string is treated as no metrics context."""
+        prompt = assemble_system_prompt(_ORIENTED_CORE, None, [], session_metrics_block="")
+
+        assert prompt == _ORIENTED_CORE
+        assert REASSERT_CLAUSE not in prompt
+
+    def test_re_assert_clause_enumerates_the_session_metrics_block(self) -> None:
+        """C-AM2-04: the clause names the metrics block among the data blocks."""
+        clause = REASSERT_CLAUSE.lower()
+
+        for block_text in (
+            "owner orientation",
+            "preference",
+            "session metrics",
+            "stored conversation",
+            "historical cross-session",
+        ):
+            assert block_text in clause, block_text
+
+    def test_re_assert_clause_recognizes_established_session_metrics(self) -> None:
+        """C-AM2-04: established intra-session metrics ground advice too."""
+        clause = REASSERT_CLAUSE.lower()
+
+        assert "established" in clause
+        assert "live tool call" in clause
+
+
+class TestDefaultPromptSessionContinuity:
+    """AC2: established session metrics satisfy the tool-grounding mandate."""
+
+    def test_prompt_treats_session_metrics_as_established_real_tool_data(self) -> None:
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+
+        assert "session metrics block" in prompt
+        assert "established real tool data" in prompt
+
+    def test_prompt_forbids_re_fetching_and_re_introducing_session_metrics(self) -> None:
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+
+        assert "without re-fetching" in prompt
+        assert "newly discovered" in prompt
+
+    def test_prompt_restricts_mid_session_baseline_lookups(self) -> None:
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+
+        assert "not yet been retrieved in this session" in prompt
+        assert "newly synced or recorded data" in prompt
+
+
+class TestCoachAgentSessionMetricsDedup:
+    """AC3/AC4/AC5: baseline read dedup in the agent loop (Am. 0002 §4)."""
+
+    _WELLNESS = "coach-mcp__icu_get_wellness"
+    _TRENDS = "coach-mcp__icu_get_trends"
+    _COMPLIANCE = "coach-mcp__icu_get_workout_compliance"
+    _INTERVALS = "coach-mcp__intervals_get_activity_intervals"
+    _WELLNESS_PAYLOAD = json.dumps({"resting_hr": 44, "hrv_rmssd": 68})
+    _TODAY = date(2026, 11, 22)
+
+    def _hub(self, results: dict[str, str]) -> FakeHub:
+        return FakeHub(
+            tools=[
+                {"type": "function", "function": {"name": name}}
+                for name in (self._WELLNESS, self._TRENDS, self._COMPLIANCE, self._INTERVALS)
+            ],
+            results=results,
+        )
+
+    def _context(
+        self,
+        ledger: SessionMetricsLedger | None = None,
+        *,
+        fresh_data_signal: bool = False,
+    ) -> SessionMetricsTurnContext:
+        return SessionMetricsTurnContext(
+            ledger=ledger if ledger is not None else SessionMetricsLedger(),
+            athlete_id=1,
+            thread_id=7,
+            today=self._TODAY,
+            fresh_data_signal=fresh_data_signal,
+        )
+
+    async def test_duplicate_baseline_call_is_served_from_the_session_ledger(self) -> None:
+        """Turn 2 reuses Turn 1's baseline: zero hub calls, identical numbers.
+
+        The duplicate call carries the ``oldest``-window jitter of the
+        2026-11-22 incident; the ``today``-anchored domain key absorbs it.
+        """
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Resting HR 44, HRV 68.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(
+                                0,
+                                call_id="w2",
+                                name=self._WELLNESS,
+                                arguments=json.dumps(
+                                    {"oldest": "2026-11-15", "newest": "2026-11-22"}
+                                ),
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Keep the 90-minute endurance ride.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._WELLNESS: self._WELLNESS_PAYLOAD})
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context()
+
+        first = await _collect(agent, "How am I today?")
+        second = await _collect(agent, "Should we adjust today's session then?")
+
+        # The duplicate baseline read never reached coach-mcp (0 MCP calls).
+        assert hub.calls == [(self._WELLNESS, {})]
+        turn_one_result = json.loads(
+            [event.data["result"] for event in first if event.type == "tool_result"][0]
+        )
+        turn_two_result = json.loads(
+            [event.data["result"] for event in second if event.type == "tool_result"][0]
+        )
+        assert "reused_session_context" not in turn_one_result
+        assert turn_two_result["reused_session_context"] is True
+        # Identical baseline numbers are preserved across turns.
+        assert turn_two_result["resting_hr"] == turn_one_result["resting_hr"] == 44
+        assert turn_two_result["hrv_rmssd"] == turn_one_result["hrv_rmssd"] == 68
+
+    async def test_reused_calls_do_not_consume_the_icu_read_budget(self) -> None:
+        """Three cached 2-GET calls overrun a 4-GET budget if charged first."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="c1", name=self._COMPLIANCE, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Two of three sessions completed.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(
+                                index,
+                                call_id=f"c{index + 10}",
+                                name=self._COMPLIANCE,
+                                arguments="{}",
+                            )
+                            for index in range(3)
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Same compliance report.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._COMPLIANCE: json.dumps({"completed": 2, "missed": 1})})
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context()
+
+        await _collect(agent, "How did my week go?")
+        second = await _collect(agent, "And the compliance?")
+
+        assert hub.calls == [(self._COMPLIANCE, {})]
+        results = [
+            json.loads(event.data["result"]) for event in second if event.type == "tool_result"
+        ]
+        assert len(results) == 3
+        assert all(result["reused_session_context"] is True for result in results)
+
+    async def test_fresh_data_signal_bypasses_the_cache_and_updates_the_ledger(self) -> None:
+        """AC4: a sync cue executes the live read and refreshes the baseline."""
+        ledger = SessionMetricsLedger()
+        results = {self._WELLNESS: self._WELLNESS_PAYLOAD}
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Resting HR 44.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w2", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Your new HRV is 61.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub(results)
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context(ledger)
+
+        await _collect(agent, "How am I today?")
+        results[self._WELLNESS] = json.dumps({"resting_hr": 41, "hrv_rmssd": 61})
+        agent.session_metrics_context = self._context(ledger, fresh_data_signal=True)
+        second = await _collect(agent, "I just logged my morning HRV.")
+
+        assert hub.calls == [(self._WELLNESS, {}), (self._WELLNESS, {})]
+        result = json.loads(
+            [event.data["result"] for event in second if event.type == "tool_result"][0]
+        )
+        assert "reused_session_context" not in result
+        assert result["hrv_rmssd"] == 61
+        snapshot = ledger.snapshot(1, 7)
+        assert snapshot is not None
+        assert json.loads(snapshot["readiness_wellness"].payload)["hrv_rmssd"] == 61
+
+    async def test_drill_down_tools_always_execute_live_on_later_turns(self) -> None:
+        """AC5a: non-baseline drill-downs are never cached or suppressed."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Resting HR 44.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(
+                                0,
+                                call_id="i2",
+                                name=self._INTERVALS,
+                                arguments=json.dumps({"activity_id": "a-42"}),
+                            )
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="The intervals were 3x12 min.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._WELLNESS: self._WELLNESS_PAYLOAD, self._INTERVALS: "{}"})
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context()
+
+        await _collect(agent, "How am I today?")
+        await _collect(agent, "Break down yesterday's intervals.")
+
+        assert [name for name, _arguments in hub.calls] == [self._WELLNESS, self._INTERVALS]
+
+    async def test_no_context_keeps_the_agent_stateless(self) -> None:
+        """AC5b: without a session context the loop behaves exactly as before."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Resting HR 44.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._WELLNESS: self._WELLNESS_PAYLOAD})
+        agent = CoachAgent(streamer, hub)
+
+        assert agent.session_metrics_context is None
+        events = await _collect(agent, "How am I today?")
+
+        assert hub.calls == [(self._WELLNESS, {})]
+        result = json.loads(
+            [event.data["result"] for event in events if event.type == "tool_result"][0]
+        )
+        assert "reused_session_context" not in result
+
+    async def test_error_payloads_are_never_cached_as_baseline_data(self) -> None:
+        """A hub/refusal ``{"error": ...}`` result is not a successful read."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="The source is unavailable.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w2", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Still unavailable.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._WELLNESS: json.dumps({"error": "Tool failed"})})
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context()
+
+        await _collect(agent, "How am I today?")
+        await _collect(agent, "Try again?")
+
+        assert hub.calls == [(self._WELLNESS, {}), (self._WELLNESS, {})]
+
+    async def test_non_json_baseline_payload_is_wrapped_and_stamped(self) -> None:
+        """A non-object cached payload is wrapped cleanly in valid JSON."""
+        streamer = FakeStreamer(
+            [
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w1", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Resting HR 44.", finish_reason="stop")],
+                [
+                    _chunk(
+                        tool_calls=[
+                            _tool_call_delta(0, call_id="w2", name=self._WELLNESS, arguments="{}")
+                        ],
+                        finish_reason="tool_calls",
+                    )
+                ],
+                [_chunk(content="Same reading.", finish_reason="stop")],
+            ]
+        )
+        hub = self._hub({self._WELLNESS: "resting hr 44"})
+        agent = CoachAgent(streamer, hub)
+        agent.session_metrics_context = self._context()
+
+        await _collect(agent, "How am I today?")
+        second = await _collect(agent, "And now?")
+
+        assert hub.calls == [(self._WELLNESS, {})]
+        result = json.loads(
+            [event.data["result"] for event in second if event.type == "tool_result"][0]
+        )
+        assert result == {"data": "resting hr 44", "reused_session_context": True}
