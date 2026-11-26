@@ -376,7 +376,7 @@ sidecar audit records redacted full arguments including training prose (risk **R
 browser no longer replays history; `AgentStreamRequest.history` was deleted and is never read
 (`src/coach_web/models.py`), and `ChatMessage` is an internal seam type, not a wire type. Threads,
 messages and rolling summaries are stored in SQLite with C2 columns sealed by
-`Fernet(DATA_ENCRYPTION_KEY)` ([MADR-0025](../../docs/adr/0025-conversation-memory-model-retention-and-injection-contract.md)).
+`Fernet(DATA_ENCRYPTION_KEY)` ([MADR-0025](adr/0025-conversation-memory-model-retention-and-injection-contract.md)).
 The old "client-owned history / no server-side store / no conversation audit" claims are **false and
 retired** — they predate MADR-0025.
 
@@ -392,7 +392,7 @@ retired** — they predate MADR-0025.
 **Human approval remains the security boundary for everything else:** the 7 other `coach-mcp`
 writes, batch/activity/wellness writes, and `POST /api/plan/approve` (which re-validates the exact
 `PlanProposal` JSON). The direct-write exception is limited to the three single-event calendar
-mutations recorded in [MADR-0034](../../docs/adr/0034-direct-conversational-calendar-writes.md);
+mutations recorded in [MADR-0034](adr/0034-direct-conversational-calendar-writes.md);
 every residual risk **R1–R8** is PO-accepted under the 2026-11-26 `n=1` decision.
 
 **#87 conditions C6/C7 — IMPLEMENTED and verified in code (#148):** **C6** — `ChatMessage.role`
