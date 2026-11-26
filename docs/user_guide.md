@@ -95,6 +95,24 @@ The **Chat** tab lets you talk to the Coach MCP server directly through a Stream
 
 ---
 
+## 🗓️ Managing Your Calendar in Chat
+
+A single-workout calendar change needs no form: ask the coach in plain language
+to add, move, retitle, retarget or delete a calendar entry, and it calls the
+matching Intervals.icu tool directly. For an update or delete it first looks up
+the exact event and reads it, so it acts on the event you meant — check the tool
+activity if you want to see which one it picked.
+
+The coach reports what the tool actually returned. If a change fails, it says
+so; it never claims a success it cannot confirm.
+
+> **Careful:** a confirmed change is immediate and there is no in-app undo.
+> Correct a mistake by asking for the opposite change, or edit the event directly
+> in Intervals.icu. Full weekly and season plans still use the review card and
+> require your explicit approval before anything is written.
+
+---
+
 ## 🔄 Refreshing Data
 
 All data is cached for 60 seconds (TTL). To force a refresh:

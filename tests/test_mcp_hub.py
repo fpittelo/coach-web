@@ -27,6 +27,94 @@ def _tool(name: str, description: str = "A tool") -> Tool:
     )
 
 
+def _read_tool(name: str, description: str = "A read tool") -> Tool:
+    """Build a params-model read Tool declaring ``response_format``."""
+    return Tool(
+        name=name,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "params": {
+                    "type": "object",
+                    "properties": {
+                        "athlete_id": {"type": "string"},
+                        "event_id": {"type": "string"},
+                        "oldest": {"type": "string"},
+                        "newest": {"type": "string"},
+                        "response_format": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                }
+            },
+            "required": ["params"],
+        },
+    )
+
+
+def _flat_read_tool(name: str, description: str = "A flat read tool") -> Tool:
+    """Build a flat (non-wrapped) read Tool that declares ``response_format``."""
+    return Tool(
+        name=name,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "athlete_id": {"type": "string"},
+                "response_format": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _flat_mutation_tool(name: str, description: str = "A flat mutation tool") -> Tool:
+    """Build a flat (non-wrapped) mutation Tool without ``response_format``."""
+    return Tool(
+        name=name,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string"},
+                "name": {"type": "string"},
+                "start_date_local": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _mutation_tool(name: str, fields: dict[str, Any] | None = None) -> Tool:
+    """Build a strict params-model mutation Tool without ``response_format``."""
+    properties: dict[str, Any] = {
+        "event_id": {"type": "string"},
+        "name": {"type": "string"},
+        "start_date_local": {"type": "string"},
+        "description": {"type": "string"},
+        "workout_doc": {"type": "string"},
+        "moving_time_seconds": {"type": "integer"},
+        "athlete_id": {"type": "string"},
+    }
+    properties.update(fields or {})
+    return Tool(
+        name=name,
+        description="A mutation tool",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "params": {
+                    "type": "object",
+                    "properties": properties,
+                    "additionalProperties": False,
+                }
+            },
+            "required": ["params"],
+        },
+    )
+
+
 def _text_result(text: str, *, is_error: bool = False) -> CallToolResult:
     """Build a CallToolResult carrying a single text content block."""
     return CallToolResult(
@@ -216,8 +304,8 @@ class TestExecuteTool:
     """Tool routing, argument injection and error handling."""
 
     async def test_execute_tool_routes_to_coach_and_injects_response_format(self) -> None:
-        """coach-mcp tools receive response_format=json by default."""
-        coach = _mock_client([_tool("intervals_get_readiness_dashboard")])
+        """coach-mcp read tools receive response_format=json when the schema allows it."""
+        coach = _mock_client([_read_tool("intervals_get_readiness_dashboard")])
         github = _mock_client([_tool("list_issues")])
         hub = _build_hub(coach, github)
         await hub.connect()
@@ -230,13 +318,13 @@ class TestExecuteTool:
 
         coach.call_tool.assert_awaited_once_with(
             "intervals_get_readiness_dashboard",
-            {"athlete_id": "0", "response_format": "json"},
+            {"params": {"athlete_id": "0", "response_format": "json"}},
         )
         assert json.loads(result) == {"ftp": 250}
 
     async def test_execute_tool_preserves_explicit_response_format(self) -> None:
         """An explicit response_format is never overwritten."""
-        coach = _mock_client([_tool("intervals_get_readiness_dashboard")])
+        coach = _mock_client([_read_tool("intervals_get_readiness_dashboard")])
         hub = _build_hub(coach, _mock_client())
         await hub.connect()
 
@@ -247,7 +335,7 @@ class TestExecuteTool:
 
         coach.call_tool.assert_awaited_once_with(
             "intervals_get_readiness_dashboard",
-            {"response_format": "markdown"},
+            {"params": {"response_format": "markdown"}},
         )
 
     async def test_execute_tool_does_not_inject_for_github(self) -> None:
@@ -420,12 +508,12 @@ class TestParamsWrapping:
             {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
         )
 
-    async def test_params_wrapped_arguments_pass_through_unchanged(self) -> None:
-        """The model's wrapped shape is never double-wrapped.
+    async def test_params_wrapped_arguments_receive_defaults_inside_params(self) -> None:
+        """The model's wrapped shape gets schema-supported defaults inside params.
 
-        The pre-existing top-level ``response_format`` default injection is
-        untouched (the sidecar tolerates the extra key; changing its
-        position would alter agent-path response formats — out of scope).
+        The default lands in the argument container the tool actually
+        declares (the nested ``params`` model), never as an undeclared
+        top-level keyword.
         """
         coach = _mock_client([self._params_tool("icu_batch_create_events")])
         hub = _build_hub(coach, _mock_client())
@@ -439,7 +527,7 @@ class TestParamsWrapping:
 
         coach.call_tool.assert_awaited_once_with(
             "icu_batch_create_events",
-            {"params": {"events": [{"external_id": "e1"}]}, "response_format": "json"},
+            {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
         )
 
     async def test_injected_response_format_lands_inside_params(self) -> None:
@@ -465,8 +553,8 @@ class TestParamsWrapping:
             },
         )
 
-    async def test_tools_without_a_params_property_are_untouched(self) -> None:
-        """Flat-schema tools are called with flat (unwrapped) args."""
+    async def test_tools_without_a_response_format_property_are_untouched(self) -> None:
+        """A tool schema that does not declare response_format gets no default."""
         coach = _mock_client([_tool("flat_tool")])
         hub = _build_hub(coach, _mock_client())
         await hub.connect()
@@ -474,7 +562,7 @@ class TestParamsWrapping:
 
         await hub.execute_tool(f"{COACH_SERVER}__flat_tool", {"x": "1"})
 
-        coach.call_tool.assert_awaited_once_with("flat_tool", {"x": "1", "response_format": "json"})
+        coach.call_tool.assert_awaited_once_with("flat_tool", {"x": "1"})
 
     async def test_wrapping_applies_to_unique_raw_name_resolution(self) -> None:
         """A unique un-namespaced raw name resolves and wraps identically."""
@@ -502,6 +590,211 @@ class TestParamsWrapping:
         coach.call_tool.assert_awaited_once_with(
             "intervals_get_readiness_dashboard",
             {"params": {"response_format": "json"}},
+        )
+
+
+class TestSchemaGatedDefaultArguments:
+    """Response-format defaults only where the resolved schema declares them (#463).
+
+    The coach-mcp mutations (create/update/delete) use strict ``extra="forbid"``
+    input models without ``response_format``; injecting it breaks the real hub.
+    Read tools that do declare it keep their JSON default.
+    """
+
+    async def test_single_event_create_is_not_injected(self) -> None:
+        """intervals_create_event is called with exactly the caller's fields."""
+        coach = _mock_client([_mutation_tool("intervals_create_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_create_event",
+            {
+                "name": "Threshold",
+                "start_date_local": "2026-09-23T08:00:00",
+                "description": "3x12",
+            },
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_create_event",
+            {
+                "params": {
+                    "name": "Threshold",
+                    "start_date_local": "2026-09-23T08:00:00",
+                    "description": "3x12",
+                }
+            },
+        )
+
+    async def test_update_is_not_injected_in_flat_or_wrapped_shape(self) -> None:
+        """intervals_update_event never receives an undeclared response_format."""
+        coach = _mock_client([_mutation_tool("intervals_update_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_update_event",
+            {"event_id": "icu_42", "name": "New title"},
+        )
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_update_event",
+            {"params": {"event_id": "icu_42", "name": "New title"}},
+        )
+
+        assert coach.call_tool.await_count == 2
+        expected = (
+            "intervals_update_event",
+            {"params": {"event_id": "icu_42", "name": "New title"}},
+        )
+        for awaited in coach.call_tool.await_args_list:
+            assert awaited.args == expected
+            assert awaited.kwargs == {}
+
+    async def test_delete_is_not_injected(self) -> None:
+        """intervals_delete_event carries only the approved target id."""
+        coach = _mock_client([_mutation_tool("intervals_delete_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_delete_event",
+            {"event_id": "icu_42"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_delete_event", {"params": {"event_id": "icu_42"}}
+        )
+
+    async def test_read_default_lands_inside_a_declared_nested_params_schema(self) -> None:
+        """A nested params model that declares response_format receives the default."""
+        coach = _mock_client([_read_tool("intervals_list_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("[]"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_list_events",
+            {"oldest": "2026-09-21", "newest": "2026-09-27"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_list_events",
+            {
+                "params": {
+                    "oldest": "2026-09-21",
+                    "newest": "2026-09-27",
+                    "response_format": "json",
+                }
+            },
+        )
+
+    async def test_wrapped_read_default_is_not_duplicated_at_top_level(self) -> None:
+        """The model's wrapped read shape gains the default inside params only."""
+        coach = _mock_client([_read_tool("intervals_list_events")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("[]"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_list_events",
+            {"params": {"oldest": "2026-09-21", "newest": "2026-09-27"}},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_list_events",
+            {
+                "params": {
+                    "oldest": "2026-09-21",
+                    "newest": "2026-09-27",
+                    "response_format": "json",
+                }
+            },
+        )
+
+    async def test_explicit_unsupported_key_is_not_silently_stripped(self) -> None:
+        """Only the default injection is gated; caller arguments pass through."""
+        coach = _mock_client([_mutation_tool("intervals_delete_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_delete_event",
+            {"event_id": "icu_42", "response_format": "json"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_delete_event",
+            {"params": {"event_id": "icu_42", "response_format": "json"}},
+        )
+
+    async def test_flat_read_schema_declaring_the_field_is_injected_flat(self) -> None:
+        """A non-wrapped read schema keeps its JSON default at the top level."""
+        coach = _mock_client([_flat_read_tool("intervals_get_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_get_event",
+            {"event_id": "icu_42"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_get_event",
+            {"event_id": "icu_42", "response_format": "json"},
+        )
+
+    async def test_flat_mutation_schema_without_the_field_is_not_injected(self) -> None:
+        """A non-wrapped mutation schema is called with exactly its fields."""
+        coach = _mock_client([_flat_mutation_tool("intervals_update_event")])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_update_event",
+            {"event_id": "icu_42", "name": "New title"},
+        )
+
+        coach.call_tool.assert_awaited_once_with(
+            "intervals_update_event",
+            {"event_id": "icu_42", "name": "New title"},
+        )
+
+    async def test_overlapping_read_and_write_schemas_diverge_on_the_field(self) -> None:
+        """Two params models share event fields; only the read gets the default."""
+        coach = _mock_client(
+            [
+                _read_tool("intervals_get_event"),
+                _mutation_tool("intervals_update_event"),
+            ]
+        )
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+        coach.call_tool = AsyncMock(return_value=_text_result("{}"))
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_get_event",
+            {"event_id": "icu_42"},
+        )
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_update_event",
+            {"event_id": "icu_42", "name": "New title"},
+        )
+
+        calls = coach.call_tool.await_args_list
+        assert calls[0].args == (
+            "intervals_get_event",
+            {"params": {"event_id": "icu_42", "response_format": "json"}},
+        )
+        assert calls[1].args == (
+            "intervals_update_event",
+            {"params": {"event_id": "icu_42", "name": "New title"}},
         )
 
 

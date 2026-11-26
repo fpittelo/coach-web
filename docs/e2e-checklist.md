@@ -162,6 +162,27 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/
 - [ ] The workouts appear on the Intervals.icu calendar.
 - [ ] The approval is attributable to the owner (single whitelisted identity).
 
+### Step 5b — Direct single-event calendar writes (#463)
+
+The PO authorized direct create/update/delete of single calendar events: a clear
+chat request is the authorization, with no approval card. This is a **manual**
+check — normal test/CI runs make no live Intervals.icu mutations.
+
+1. Ask the coach to add a specific workout on a named date; confirm it calls
+   `intervals_create_event` and that the event appears on the calendar.
+2. Ask it to move or retitle that event; confirm it first reads the event
+   (`intervals_list_events` / `intervals_get_event`) and then calls
+   `intervals_update_event` with the same event id.
+3. Ask it to delete the event; confirm it calls `intervals_delete_event` for the
+   resolved id.
+
+- [ ] Only the 3 event mutations are callable; a batch/activity/wellness write
+      request is refused (the model reports the tool is unavailable).
+- [ ] The coach's reply matches the real tool outcome — no invented success or
+      failure.
+- [ ] Delete the test event at the end; the app has no rollback.
+
+
 ## Step 6 — Teardown
 
 ```bash

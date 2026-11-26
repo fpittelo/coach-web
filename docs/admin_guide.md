@@ -382,6 +382,24 @@ docker buildx imagetools inspect ghcr.io/fpittelo/coach:dev
 
 `github-mcp` follows the same pattern (tag-pinned on dev/qa, digest-pinned on prod, AC7 / #113).
 
+### Direct calendar writes and sidecar schema pinning (#463)
+
+The model may call exactly three coach-mcp single-event mutations directly —
+`intervals_create_event`, `intervals_update_event`, `intervals_delete_event` —
+on a clear athlete request; every other coach-mcp write stays denied at the
+catalogue and dispatch boundaries ([MADR-0033](adr/0033-direct-conversational-calendar-writes.md)).
+Their input models are strict (`extra="forbid"`) and do **not** declare
+`response_format`, so `MCPClientHub` injects that default only when the pinned
+sidecar's advertised schema declares the property (flat or nested under
+`params`). If a sidecar upgrade changes those schemas, the drift check and the
+hub transport tests are the guard rails — do not re-add an unconditional
+`response_format` injection.
+
+A confirmed direct write is immediate and has **no rollback** and **no
+idempotency key**; correct a mistake by asking for the opposite change or by
+editing the event in Intervals.icu. Direct writes do not update the GitHub plan
+Markdown, so the two can diverge.
+
 ---
 
 ## 🚀 Release Runbook (approve + tag)

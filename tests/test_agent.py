@@ -21,6 +21,8 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
+    COACH_MCP_ALLOWED_TOOLS,
+    COACH_MCP_EVENT_WRITE_TOOLS,
     COACH_MCP_READ_TOOLS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
@@ -873,6 +875,21 @@ FROZEN_COACH_MCP_WRITE_TOOLS: frozenset[str] = frozenset(
     }
 )
 
+# PO-authorized direct single-event calendar mutations (#463, revised decision
+# replacing the approval-card scope): the only write tools exposed to the model
+# and permitted at dispatch. Every other coach-mcp write stays denied.
+FROZEN_COACH_MCP_EVENT_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "intervals_create_event",
+        "intervals_update_event",
+        "intervals_delete_event",
+    }
+)
+
+FROZEN_COACH_MCP_DENIED_WRITE_TOOLS: frozenset[str] = (
+    FROZEN_COACH_MCP_WRITE_TOOLS - FROZEN_COACH_MCP_EVENT_WRITE_TOOLS
+)
+
 FROZEN_COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
     {
         "icu_get_completed_sessions",
@@ -905,7 +922,7 @@ def _hub_schema(raw_name: str) -> dict[str, Any]:
 
 
 class TestModelToolsetFilter:
-    """The model toolset carries coach-mcp READ tools only (#248 AC1)."""
+    """The model toolset carries coach-mcp reads + the 3 event writes (#463)."""
 
     def test_frozen_classification_covers_the_whole_registry(self) -> None:
         """The frozen read/write sets partition the 29-tool live registry."""
@@ -915,21 +932,40 @@ class TestModelToolsetFilter:
         )
         assert len(FROZEN_COACH_MCP_READ_TOOLS) == 19
         assert len(FROZEN_COACH_MCP_WRITE_TOOLS) == 10
+        assert FROZEN_COACH_MCP_EVENT_WRITE_TOOLS <= FROZEN_COACH_MCP_WRITE_TOOLS
+        assert len(FROZEN_COACH_MCP_EVENT_WRITE_TOOLS) == 3
+        assert len(FROZEN_COACH_MCP_DENIED_WRITE_TOOLS) == 7
 
     def test_production_allow_list_matches_the_frozen_read_registry(self) -> None:
-        """The shipped allow-list equals the frozen read classification."""
+        """The shipped read allow-list equals the frozen read classification."""
         assert COACH_MCP_READ_TOOLS == FROZEN_COACH_MCP_READ_TOOLS
 
-    def test_filter_drops_every_coach_mcp_write_tool(self) -> None:
-        """No write tool survives the filter (the #248 incident tool first)."""
-        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
+    def test_production_event_write_allow_list_matches_the_frozen_set(self) -> None:
+        """Only the 3 PO-authorized event mutations are direct-write enabled."""
+        assert COACH_MCP_EVENT_WRITE_TOOLS == FROZEN_COACH_MCP_EVENT_WRITE_TOOLS
+        assert COACH_MCP_ALLOWED_TOOLS == (
+            FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_EVENT_WRITE_TOOLS
+        )
+
+    def test_filter_drops_every_denied_coach_mcp_write_tool(self) -> None:
+        """Non-event writes stay invisible: the #248 incident tool first."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_DENIED_WRITE_TOOLS]
         catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
 
         filtered = filter_model_tools(catalogue)
 
         names = {schema["function"]["name"] for schema in filtered}
-        for write_tool in FROZEN_COACH_MCP_WRITE_TOOLS:
+        for write_tool in FROZEN_COACH_MCP_DENIED_WRITE_TOOLS:
             assert f"coach-mcp__{write_tool}" not in names
+
+    def test_filter_keeps_the_event_write_tools(self) -> None:
+        """The 3 PO-authorized event mutations survive the filter (#463)."""
+        catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_EVENT_WRITE_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        names = {schema["function"]["name"] for schema in filtered}
+        assert names == {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_EVENT_WRITE_TOOLS}
 
     def test_filter_keeps_every_coach_mcp_read_tool(self) -> None:
         """Every read tool survives the filter."""
@@ -962,8 +998,8 @@ class TestModelToolsetFilter:
 
         assert filtered == []
 
-    async def test_agent_toolset_exposes_reads_and_proposal_tools_only(self) -> None:
-        """The assembled toolset: 19 reads + 4 proposal tools, zero writes."""
+    async def test_agent_toolset_exposes_reads_event_writes_and_proposals(self) -> None:
+        """The assembled toolset: 19 reads + 3 event writes + 4 proposal tools."""
         catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
         catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
         streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
@@ -973,7 +1009,10 @@ class TestModelToolsetFilter:
 
         names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
         assert set(names) == (
-            {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+            {
+                f"coach-mcp__{name}"
+                for name in FROZEN_COACH_MCP_READ_TOOLS | FROZEN_COACH_MCP_EVENT_WRITE_TOOLS
+            }
             | {
                 PROPOSE_PLAN_TOOL,
                 PROPOSE_WEEK_PLAN_TOOL,
@@ -981,6 +1020,9 @@ class TestModelToolsetFilter:
                 REQUEST_RPE_TOOL,
             }
         )
+        # The 7 non-event writes never reach the model.
+        for denied in FROZEN_COACH_MCP_DENIED_WRITE_TOOLS:
+            assert f"coach-mcp__{denied}" not in names
 
 
 # ---------------------------------------------------------------------------
@@ -2005,17 +2047,19 @@ def _tool_streamer(
 
 
 class TestDispatchAllowListEnforcement:
-    """The dispatch boundary re-checks the coach-mcp read allow-list (#252).
+    """The dispatch boundary re-checks the coach-mcp allow-list (#252, #463).
 
-    The #248 filter hides coach-mcp writes from the advertised toolset, but
-    the dispatch path resolves whatever name the model emits. These contract
-    tests pin the refusal: a write call (namespaced or raw) is refused with a
-    structured error before the hub is ever called, while reads, github-mcp
-    tools and the synthetic proposal tools pass through untouched.
+    The #248 filter hides non-event coach-mcp writes from the advertised
+    toolset, and the dispatch path resolves whatever name the model emits.
+    These contract tests pin the revised boundary: the 3 PO-authorized
+    single-event mutations (raw or namespaced) execute through the hub, every
+    other coach-mcp write is refused with a structured error before the hub is
+    ever called, and reads, github-mcp tools and the synthetic proposal tools
+    pass through untouched.
     """
 
     async def test_namespaced_write_is_refused_before_the_hub(self) -> None:
-        """A model-emitted coach-mcp write call is refused, never executed."""
+        """A model-emitted non-event coach-mcp write is refused, never executed."""
         tool_name = "coach-mcp__icu_batch_create_events"
         streamer = _tool_streamer([(tool_name, {"events": []})])
         hub = FakeHub(
@@ -2037,9 +2081,9 @@ class TestDispatchAllowListEnforcement:
         assert follow_up[-1]["role"] == "tool"
         assert "not available" in follow_up[-1]["content"]
 
-    async def test_every_frozen_write_tool_is_refused_by_namespaced_name(self) -> None:
-        """All ten frozen write tools are refused at dispatch (allow-list reuse)."""
-        for raw in sorted(FROZEN_COACH_MCP_WRITE_TOOLS):
+    async def test_every_denied_write_tool_is_refused_by_namespaced_name(self) -> None:
+        """All seven non-event frozen write tools are refused at dispatch."""
+        for raw in sorted(FROZEN_COACH_MCP_DENIED_WRITE_TOOLS):
             tool_name = f"coach-mcp__{raw}"
             streamer = _tool_streamer([(tool_name, {})])
             hub = FakeHub(
@@ -2051,6 +2095,61 @@ class TestDispatchAllowListEnforcement:
             await _collect(agent, "go")
 
             assert hub.calls == [], tool_name
+
+    async def test_every_event_write_tool_executes_by_namespaced_name(self) -> None:
+        """The 3 authorized event mutations reach the hub when namespaced."""
+        for raw in sorted(FROZEN_COACH_MCP_EVENT_WRITE_TOOLS):
+            tool_name = f"coach-mcp__{raw}"
+            streamer = _tool_streamer([(tool_name, {"event_id": "icu_42"})])
+            hub = FakeHub(
+                tools=[{"type": "function", "function": {"name": tool_name}}],
+                results={tool_name: '{"id": "icu_42"}'},
+            )
+            agent = CoachAgent(streamer, hub)
+
+            events = await _collect(agent, "Update my calendar")
+
+            assert hub.calls == [(tool_name, {"event_id": "icu_42"})], tool_name
+            result = next(e for e in events if e.type == "tool_result")
+            assert result.data["result"] == '{"id": "icu_42"}'
+
+    async def test_every_event_write_tool_executes_by_unique_raw_name(self) -> None:
+        """The 3 authorized event mutations resolve and execute when raw."""
+        for raw in sorted(FROZEN_COACH_MCP_EVENT_WRITE_TOOLS):
+            tool_name = f"coach-mcp__{raw}"
+            streamer = _tool_streamer([(raw, {"event_id": "icu_42"})])
+            hub = FakeHub(
+                tools=[{"type": "function", "function": {"name": tool_name}}],
+                results={raw: '{"id": "icu_42"}'},
+            )
+            agent = CoachAgent(streamer, hub)
+
+            events = await _collect(agent, "Update my calendar")
+
+            assert hub.calls == [(raw, {"event_id": "icu_42"})], tool_name
+            result = next(e for e in events if e.type == "tool_result")
+            assert result.data["result"] == '{"id": "icu_42"}'
+
+    async def test_event_create_executes_with_its_own_arguments(self) -> None:
+        """A direct create passes the model's event arguments through unchanged."""
+        tool_name = "coach-mcp__intervals_create_event"
+        arguments = {
+            "name": "Threshold Builder",
+            "start_date_local": "2026-09-23T08:00:00",
+            "description": "3x12 at threshold",
+        }
+        streamer = _tool_streamer([(tool_name, arguments)])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+            results={tool_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Add a threshold workout on Wednesday")
+
+        assert hub.calls == [(tool_name, arguments)]
+        result = next(e for e in events if e.type == "tool_result")
+        assert result.data["result"] == '{"id": "e1"}'
 
     async def test_raw_write_name_is_refused_before_the_hub(self) -> None:
         """A raw write name resolvable through the hub catalogue is refused."""
@@ -2375,6 +2474,62 @@ class TestDefaultPromptAdjustmentGuidance:
         assert "past days" in DEFAULT_SYSTEM_PROMPT
         assert "future days" in DEFAULT_SYSTEM_PROMPT
         assert "rationale" in DEFAULT_SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Direct conversational calendar writes (#463, revised PO decision)
+# ---------------------------------------------------------------------------
+
+
+class TestDirectCalendarWritePrompt:
+    """DEFAULT_SYSTEM_PROMPT authorizes direct, target-checked calendar calls."""
+
+    def test_prompt_names_the_three_event_write_tools(self) -> None:
+        """The model is told the exact event tools it may call directly."""
+        for tool in FROZEN_COACH_MCP_EVENT_WRITE_TOOLS:
+            assert tool in DEFAULT_SYSTEM_PROMPT
+
+    def test_prompt_treats_a_clear_request_as_authorization(self) -> None:
+        """An unambiguous chat request authorizes the direct call."""
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+        assert "directly" in prompt
+        assert "authoriz" in prompt
+        # No stale "approval card" framing survives on the calendar path.
+        assert "approval card" not in prompt
+
+    def test_prompt_requires_reading_the_exact_target_first(self) -> None:
+        """An update/delete must discover and read the exact target event."""
+        prompt = DEFAULT_SYSTEM_PROMPT
+        assert "intervals_list_events" in prompt
+        assert "intervals_get_event" in prompt
+        assert "event_id" in prompt
+        assert "before" in prompt.lower()
+
+    def test_prompt_demands_truthful_outcome_reporting(self) -> None:
+        """The model reports the tool's real result and never invents failure."""
+        prompt = DEFAULT_SYSTEM_PROMPT.lower()
+        assert "tool response" in prompt or "tool result" in prompt
+        assert "never" in prompt
+
+    async def test_direct_create_turn_reaches_the_hub_without_a_card(self) -> None:
+        """A clear create request dispatches directly — no plan card emitted."""
+        tool_name = "coach-mcp__intervals_create_event"
+        arguments = {
+            "name": "Threshold Builder",
+            "start_date_local": "2026-09-23T08:00:00",
+            "description": "3x12 at threshold",
+        }
+        streamer = _tool_streamer([(tool_name, arguments)])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": tool_name}}],
+            results={tool_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Schedule my threshold workout on Wednesday")
+
+        assert hub.calls == [(tool_name, arguments)]
+        assert all(e.type not in {"plan", "plan_proposal"} for e in events)
 
 
 # ---------------------------------------------------------------------------

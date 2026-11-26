@@ -35,9 +35,9 @@ sequenceDiagram
     end
     App->>Seam: Assemble 8-block system prompt (slot 5 = session_metrics_block, REASSERT_CLAUSE LAST)
     Seam-->>App: Deterministic system prompt
-    App->>LLM: Stream chat completion + COACH_MCP_READ_TOOLS + proposal schemas
-    opt Model invokes read-only Intervals.icu tool
-        LLM-->>App: tool_call (e.g. intervals_get_readiness_dashboard)
+    App->>LLM: Stream chat completion + COACH_MCP_ALLOWED_TOOLS + proposal schemas
+    opt Model invokes an allowlisted Intervals.icu tool
+        LLM-->>App: tool_call (read, or a PO-authorized single-event write)
         App->>Ledger: classify_session_domain + active entry for today?
         alt Baseline hit and no sync cue (Turn 2+)
             Ledger-->>App: Cached payload (reused_session_context = true)
@@ -57,7 +57,7 @@ sequenceDiagram
   - Every untrusted block (`orientation`, `standing_preferences`, `session_metrics_block`, `memory_block`, `cross_thread_brief`) is sanitized on read and enclosed in `| `-prefixed data fences; `REASSERT_CLAUSE` is structurally **LAST** and names every such block ([MADR-0026](../../adr/0026-admin-orientation-and-agent-settings-prompt-precedence-and-sanitizer-contract.md), [MADR-0032](../../adr/0032-durable-longitudinal-memory-snapshot-store.md) C7/C8, [MADR-0025](../../adr/0025-conversation-memory-model-retention-and-injection-contract.md) Amendment 0002 §1).
   - The intra-session `session_metrics_block` (slot 5) carries only baseline telemetry already fetched in the active `(athlete_id, thread_id)` conversation; a Turn 2+ duplicate baseline read is short-circuited **before** `hub.execute_tool` (zero MCP calls, zero `IcuReadBudget` burn) and returns the cached payload stamped `reused_session_context: true`. The ledger is strictly in-process RAM (MADR-0008 C5), evicted on reset, purge and athlete-reported sync cues.
   - Context/brief store failures degrade **fail-open** (returning core prompt without user data and logging the exception class name only — zero content leakage). With no conversation thread (C7 persistence degrade) the ledger is bypassed entirely and the turn runs statelessly.
-  - Unapproved write tools are absent from model tool schemas and refused fail-closed at dispatch; Intervals.icu calendar writes occur exclusively when the athlete clicks **Approve** (`POST /api/plan/approve`).
+  - Unapproved coach-mcp write tools are absent from the model catalogue and refused fail-closed at dispatch. The only exception is the 3 PO-authorized single-event mutations (`intervals_create_event` / `intervals_update_event` / `intervals_delete_event`), invoked directly when the athlete's chat request is unambiguous — for an update/delete the model first resolves and reads the exact target with `intervals_list_events`/`intervals_get_event` ([MADR-0033](../../adr/0033-direct-conversational-calendar-writes.md)). Multi-day plan scheduling still executes exclusively when the athlete clicks **Approve** (`POST /api/plan/approve`).
 
 ---
 

@@ -17,7 +17,7 @@
 ## 🎯 What is Coach Web?
 
 - **💬 Talk to your coach** — a conversational AI coach grounded in your live readiness: FTP, resting HR, HRV, sleep, and fitness/fatigue/form (CTL · ATL · TSB).
-- **✅ Approve, don't hope** — every proposed cycling or Kettlebell session lands as a plan card with explicit watts; nothing touches your Intervals.icu calendar until you approve it.
+- **✅ Direct single-event edits, planned blocks approved** — ask in chat to add, move, retitle or delete one calendar event and the coach does it directly; full weekly and season plans still land as a plan card with explicit watts and wait for your approval.
 - **🧠 It remembers you** — debriefs, standing preferences, and season objectives persist in encrypted memory that survives restarts and cold starts.
 - **🇨🇭 Private by design** — single-athlete, zero trackers, all data encrypted and resident in the Swiss-adjacent Zürich region (`europe-west6`).
 

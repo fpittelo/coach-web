@@ -140,6 +140,16 @@ DEFAULT_SYSTEM_PROMPT = (
     "your reasoning concisely and use explicit wattage and durations. When you are "
     f"ready to prescribe a workout block, call the `{PROPOSE_PLAN_TOOL}` tool so the "
     "athlete can review and approve the structured plan, then summarise it in your answer. "
+    "The athlete's clear chat request is the authorization to manage their calendar "
+    "directly: when they ask to add, schedule, move, retitle, retarget or delete a "
+    "single calendar entry, call the matching tool directly — "
+    "`intervals_create_event`, `intervals_update_event` or `intervals_delete_event` — "
+    "with the exact fields they described. Before an update or delete, first find the "
+    "target with `intervals_list_events`, then read it with `intervals_get_event`, and "
+    "pass the exact `event_id`; never guess the id. Report the outcome truthfully: say "
+    "the change happened only when the tool response confirms it, and never invent a "
+    "success or a failure. Full weekly and season plans still go through the proposal "
+    "tools above. "
     "When the athlete asks for a full training week — or a weekly microcycle is the "
     f"right deliverable — call the `{PROPOSE_WEEK_PLAN_TOOL}` tool with the complete "
     "7-day plan grounded in the athlete's objectives, current phase and weekly "
@@ -755,23 +765,45 @@ COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
         "intervals_list_workouts",
     }
 )
-"""Allow-list of coach-mcp tools the model may see (#248 B1, ADR-0010 / #87-C7).
+"""Allow-list of coach-mcp READ tools (#248 B1, ADR-0010 / #87-C7).
 
-Calendar writes go through the human approval endpoint ONLY: the model
-toolset therefore carries the sidecar's READ family exclusively. The list is
-explicit (allow-list, not deny-list) so a new upstream write tool stays
-invisible by default. github-mcp tools are unaffected — its writes serve the
-designed plan-persistence flow.
+The model toolset carries the sidecar's READ family plus only the three
+PO-authorized single-event mutations below (#463). The list is explicit
+(allow-list, not deny-list) so a new upstream write tool stays invisible by
+default. github-mcp tools are unaffected — its writes serve the designed
+plan-persistence flow.
 """
+
+
+COACH_MCP_EVENT_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "intervals_create_event",
+        "intervals_update_event",
+        "intervals_delete_event",
+    }
+)
+"""Single-event calendar mutations the model may call directly (#463).
+
+The PO's revised decision (2026-11-26) replaced the approval-card expansion
+with direct conversational writes: an unambiguous athlete chat request is the
+authorization to invoke these three tools. Every OTHER coach-mcp write tool
+remains denied by default at both the catalogue filter and the dispatch
+boundary.
+"""
+
+
+COACH_MCP_ALLOWED_TOOLS: frozenset[str] = COACH_MCP_READ_TOOLS | COACH_MCP_EVENT_WRITE_TOOLS
+"""Full coach-mcp allow-list: reads plus the 3 authorized event mutations."""
 
 
 def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter the hub catalogue down to the model-allowed toolset (#248 B1).
 
-    coach-mcp contributes its READ allow-list only; every other coach-mcp
-    tool (writes included) is dropped. github-mcp tools pass through
-    untouched, as do the synthetic proposal tools appended after this filter.
-    Schemas without a usable function name are dropped defensively.
+    coach-mcp contributes its READ allow-list plus the 3 PO-authorized event
+    mutations (#463); every other coach-mcp tool (writes included) is dropped.
+    github-mcp tools pass through untouched, as do the synthetic proposal
+    tools appended after this filter. Schemas without a usable function name
+    are dropped defensively.
     """
     allowed: list[dict[str, Any]] = []
     for schema in hub_tools:
@@ -780,7 +812,7 @@ def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(name, str) or not name:
             continue
         server, _, raw_name = name.partition(NAMESPACE_SEPARATOR)
-        if server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS:
+        if server == COACH_SERVER and raw_name not in COACH_MCP_ALLOWED_TOOLS:
             continue
         allowed.append(schema)
     return allowed
@@ -792,17 +824,18 @@ def _dispatch_allow_list_refusal(
 ) -> str | None:
     """Return the dispatch refusal for *tool_name*, or ``None`` to proceed (#252).
 
-    The #248 toolset filter hides coach-mcp writes from the advertised
-    tools, but the dispatch path resolves whatever name the model emits —
-    a prompt-injected write call by raw or namespaced name would still
-    reach the sidecar. This guard re-checks the SAME allow-list
-    (``COACH_MCP_READ_TOOLS``) at the dispatch boundary: a coach-mcp tool
-    that is not a read is refused before ``execute_tool`` is ever called.
-    github-mcp tools and the synthetic proposal tools are unaffected.
+    The #248 toolset filter hides disallowed coach-mcp tools from the
+    advertised set, but the dispatch path resolves whatever name the model
+    emits — a prompt-injected non-event write call by raw or namespaced name
+    would still reach the sidecar. This guard re-checks the SAME allow-list
+    (``COACH_MCP_ALLOWED_TOOLS``) at the dispatch boundary: a coach-mcp tool
+    that is neither a read nor one of the 3 authorized event mutations is
+    refused before ``execute_tool`` is ever called. github-mcp tools and the
+    synthetic proposal tools are unaffected.
     """
     server, separator, raw_name = tool_name.partition(NAMESPACE_SEPARATOR)
     if separator:
-        refused = server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS
+        refused = server == COACH_SERVER and raw_name not in COACH_MCP_ALLOWED_TOOLS
     else:
         # Raw form: mirror the hub's unique-raw-name resolution over the hub
         # catalogue — refuse only when the name resolves to coach-mcp alone.
@@ -815,7 +848,7 @@ def _dispatch_allow_list_refusal(
             candidate_server, sep, candidate_raw = name.partition(NAMESPACE_SEPARATOR)
             if sep and candidate_raw == tool_name:
                 servers.add(candidate_server)
-        refused = servers == {COACH_SERVER} and tool_name not in COACH_MCP_READ_TOOLS
+        refused = servers == {COACH_SERVER} and tool_name not in COACH_MCP_ALLOWED_TOOLS
     if not refused:
         return None
     return json.dumps({"error": f"Tool '{tool_name}' is not available"})
@@ -1061,7 +1094,7 @@ class CoachAgent:
                         # static refusal and the call is never executed; the
                         # tool name is the only detail logged (nLPD).
                         logger.warning(
-                            "Refused coach-mcp tool outside the read allow-list: %s",
+                            "Refused coach-mcp tool outside the allow-list: %s",
                             call["name"],
                         )
                         result = refusal

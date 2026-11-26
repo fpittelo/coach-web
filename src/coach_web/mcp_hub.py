@@ -8,6 +8,7 @@ every runtime error is surfaced to the agent loop as a structured JSON string.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from types import TracebackType
@@ -185,10 +186,9 @@ class MCPClientHub:
             return self._error(f"MCP server '{server}' is not connected")
 
         raw_name = namespaced.split(NAMESPACE_SEPARATOR, 1)[1]
-        args: dict[str, Any] = dict(arguments) if arguments else {}
+        args: dict[str, Any] = copy.deepcopy(arguments) if arguments else {}
         if server == COACH_SERVER:
-            for key, value in COACH_DEFAULT_ARGUMENTS.items():
-                args.setdefault(key, value)
+            self._apply_default_arguments(namespaced, args)
         args = self._wrap_flat_params(namespaced, args)
 
         try:
@@ -204,6 +204,47 @@ class MCPClientHub:
             return self._error(f"Tool '{name}' failed: {exc}")
 
         return self._serialize(result)
+
+    def _apply_default_arguments(self, namespaced: str, args: dict[str, Any]) -> None:
+        """Inject coach defaults only where the resolved input schema declares them.
+
+        The coach-mcp mutations (``intervals_create_event`` / update / delete)
+        use strict ``extra="forbid"`` input models without ``response_format``;
+        injecting it breaks the real hub (#463). Read tools that declare the
+        field keep their JSON default. The default lands in the argument
+        container the schema actually declares — the nested ``params`` model
+        when the tool is params-wrapped, otherwise the top-level object.
+        """
+        supported = self._supported_argument_names(namespaced)
+        container = args
+        if isinstance(args.get("params"), dict):
+            container = args["params"]
+        for key, value in COACH_DEFAULT_ARGUMENTS.items():
+            if supported is not None and key not in supported:
+                continue
+            container.setdefault(key, value)
+
+    def _supported_argument_names(self, namespaced: str) -> set[str] | None:
+        """Return the argument names the tool schema declares, or ``None`` if permissive.
+
+        ``None`` means the schema explicitly or implicitly accepts arbitrary
+        keys (a permissive ``params`` object), so legacy default injection is
+        safe. A concrete set is the closed argument vocabulary of a strict
+        input model.
+        """
+        schema = self._tools[namespaced].input_schema or {}
+        properties = schema.get("properties") or {}
+        params_schema = properties.get("params")
+        if isinstance(params_schema, dict):
+            nested = params_schema.get("properties")
+            if isinstance(nested, dict):
+                return set(nested)
+            if params_schema.get("additionalProperties") is False:
+                return set()
+            return None
+        if properties:
+            return set(properties)
+        return set()
 
     def _wrap_flat_params(self, namespaced: str, args: dict[str, Any]) -> dict[str, Any]:
         """Wrap flat arguments for tools whose schema requires a ``params`` object.

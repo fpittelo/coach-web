@@ -329,6 +329,8 @@ graph TD
 
 Because a single whitelisted identity is admitted, any approval is attributable to the owner by construction. **Residual:** an unattended unlocked browser could approve on the owner's behalf — accepted for a single-tenant personal app; session TTL bounded (`AUTH_SESSION_TTL_SECONDS=3600`).
 
+**Direct single-event calendar writes (#463, [MADR-0033](adr/0033-direct-conversational-calendar-writes.md)):** create/update/delete event requests are executed by the model directly on an unambiguous athlete chat request, with no approval card. Attribution rests on the single whitelisted identity and the Intervals.icu event history rather than a GitHub commit — an accepted residual for the n=1 owner. The multi-day plan-Markdown approval path above is unchanged.
+
 ### Boundary B7 — Plaintext env secrets on disk
 
 | STRIDE | Threat | Mitigation |
@@ -367,12 +369,12 @@ The conversation is client-owned: the browser replays the last ≤ 10 turns in t
 |:---|:---|:---|
 | **Spoofing** | Client forges assistant turns to impersonate the coach | Inherent to client-owned history; no server session store (nLPD ephemeral). **Accepted residual.** |
 | **Tampering** | Forged history injects instructions (jailbreak / system-prompt override) | `ChatMessage.role` is `Literal["user", "assistant"]` — a forged `system`/`tool` role is rejected at the Pydantic boundary; the system prompt is always first in `_build_messages`; entry/length caps bound the payload. |
-| **Elevation of Privilege** | Forged history induces tool invocation with attacker-chosen arguments | Tools are read-only (Intervals.icu, GitHub issues) except the synthetic `propose_plan`, which only emits a validated `PlanProposal`; the sole state-changing path `POST /api/plan/approve` requires an explicit human click and re-validates the exact `PlanProposal` JSON. **Human approval is the security boundary.** |
+| **Elevation of Privilege** | Forged history induces tool invocation with attacker-chosen arguments | The model catalogue carries coach-mcp reads plus only the 3 PO-authorized single-event mutations (`intervals_create_event`/`intervals_update_event`/`intervals_delete_event`); every other coach-mcp write (batch, activity, wellness) is absent and refused at dispatch. github-mcp plan tools and the synthetic `propose_plan`/week/periodization tools are unaffected; the legacy `POST /api/plan/approve` path still requires an explicit human click and re-validates the exact `PlanProposal` JSON. For multi-day plan scheduling, **human approval is the security boundary**; direct single-event calendar writes rest on the accepted n=1 owner trust decision ([MADR-0033](adr/0033-direct-conversational-calendar-writes.md)). |
 | **Repudiation** | Forged transcript misrepresents what the coach said | The transcript is client-owned and ephemeral; there is no server-side conversation audit. The approval audit trail (GitHub commits + Intervals.icu records) is independent of the transcript. |
 | **Denial of Service** | Oversized or looping history | `max_length=10` entries × 8,000 chars; agent tool-iteration cap (`AGENT_MAX_TOOL_ITERATIONS`). |
 | **Information Disclosure** | Forged history exfiltrates biometric data to a third party | Single-tenant; the only recipient is the owner's own browser; no attacker-controlled outbound channel. OpenRouter processing is already assessed (B8). |
 
-**Residual-risk acceptance:** prompt injection via forged assistant turns cannot be eliminated without server-side session state, which contradicts the nLPD ephemeral posture. Accepted for a single-tenant personal app where the only user is the owner and every state-changing action is gated by explicit human approval.
+**Residual-risk acceptance:** prompt injection via forged assistant turns cannot be eliminated without server-side session state, which contradicts the nLPD ephemeral posture. Accepted for a single-tenant personal app where the only user is the owner. Direct single-event calendar writes (MADR-0033) are authorized by the owner's own chat request under an accepted n=1 trust boundary — their prompt-error/no-rollback/idempotency risks are recorded in that MADR. Multi-day plan scheduling still requires an explicit human approval click.
 
 **#87 conditions C6/C7 — IMPLEMENTED and verified in code (#148):**
 

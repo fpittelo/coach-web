@@ -46,7 +46,7 @@ Per `home-governance` §2, all source code, tests, ADRs, `arc42` views, runbooks
 
 - Feature/chore/fix branches follow `<type>/<issue-#>-<slug>` off `main` and squash-merge into `main` (MADR-0017).
 - Database schema changes ship strictly as reversible batch-mode Alembic revisions under `src/coach_web/alembic/versions/NNNN_<slug>.py` tested for upgrade and downgrade data preservation.
-- MCP tool names exposed to the agent are namespaced `<server>__<tool>` and filtered through `COACH_MCP_READ_TOOLS`.
+- MCP tool names exposed to the agent are namespaced `<server>__<tool>` and filtered through `COACH_MCP_ALLOWED_TOOLS` (the read family plus the 3 PO-authorized single-event mutations `intervals_create_event`/`intervals_update_event`/`intervals_delete_event`, [MADR-0033](../../adr/0033-direct-conversational-calendar-writes.md)); every other coach-mcp write stays denied at both the catalogue and dispatch boundaries.
 
 ---
 
