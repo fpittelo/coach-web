@@ -8,9 +8,11 @@ Every step is surfaced to the browser as a typed :class:`AgentEvent` which the
 SSE endpoint serialises verbatim.
 """
 
+import copy
 import json
 import logging
 import re
+import time
 import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
@@ -23,9 +25,11 @@ from pydantic import BaseModel, Field, ValidationError
 from coach_web.agent_settings import STANDING_PREFERENCES_MAX_CHARS, AgentSettings
 from coach_web.analysis import (
     BUDGET_EXHAUSTED_MESSAGE,
+    EVENT_MUTATION_BUDGET_EXHAUSTED_MESSAGE,
     NAMESPACE_SEPARATOR,
     CompletedSessionsPageMirror,
     ComplianceReportMirror,
+    IcuEventMutationBudget,
     IcuReadBudget,
     build_debrief_summary_card,
     icu_tool_get_cost,
@@ -137,9 +141,26 @@ DEFAULT_SYSTEM_PROMPT = (
     "only when a required baseline domain has not yet been retrieved in this "
     "session, when drilling into a specific workout, calendar entry or archive "
     "detail, or when the athlete reports newly synced or recorded data. Explain "
-    "your reasoning concisely and use explicit wattage and durations. When you are "
-    f"ready to prescribe a workout block, call the `{PROPOSE_PLAN_TOOL}` tool so the "
-    "athlete can review and approve the structured plan, then summarise it in your answer. "
+    "your reasoning concisely and use explicit wattage and durations. Calendar "
+    "edits are direct: when the athlete unambiguously asks to create, change or "
+    "delete one or more specific Intervals.icu calendar events, call "
+    "`intervals_create_event`, `intervals_update_event` or "
+    "`intervals_delete_event` directly — there is no approval card for these "
+    "single-event writes. Before any update or delete, call "
+    "`intervals_list_events` to locate the target and then `intervals_get_event` "
+    "to verify that exact event in this run; multi-event week edits may issue the "
+    "verification reads in parallel in one turn, followed by the matching writes "
+    "in parallel in the next turn, staying within the per-run mutation budget. "
+    'If the athlete\'s turn is hypothetical ("what if..."), clarify intent and '
+    "wait for confirmation before mutating. For structured workouts (category "
+    "WORKOUT) populate `workout_doc` with valid Intervals.icu workout DSL using "
+    "explicit watts (for example `- Warmup 10m 100-160w` and "
+    "`- 12m 200w 85rpm`) — never leave `workout_doc` empty or paste a prose step "
+    "table. Keep prose in `description` and the DSL in `workout_doc`: when "
+    'updating an event always resend both fields, and pass `workout_doc=""` '
+    "for a prose-only calendar note. After the tools return, report the actual "
+    "upstream outcome truthfully — never claim a mutation succeeded unless the "
+    "tool result confirms it. "
     "When the athlete asks for a full training week — or a weekly microcycle is the "
     f"right deliverable — call the `{PROPOSE_WEEK_PLAN_TOOL}` tool with the complete "
     "7-day plan grounded in the athlete's objectives, current phase and weekly "
@@ -755,23 +776,58 @@ COACH_MCP_READ_TOOLS: frozenset[str] = frozenset(
         "intervals_list_workouts",
     }
 )
-"""Allow-list of coach-mcp tools the model may see (#248 B1, ADR-0010 / #87-C7).
+"""Allow-list of coach-mcp READ tools the model may see (#248 B1, ADR-0010 / #87-C7).
 
-Calendar writes go through the human approval endpoint ONLY: the model
-toolset therefore carries the sidecar's READ family exclusively. The list is
-explicit (allow-list, not deny-list) so a new upstream write tool stays
-invisible by default. github-mcp tools are unaffected — its writes serve the
-designed plan-persistence flow.
+The list is explicit (allow-list, not deny-list) so a new upstream write tool
+stays invisible by default. github-mcp tools are unaffected — its writes serve
+the designed plan-persistence flow.
 """
+
+COACH_MCP_EVENT_WRITE_TOOLS: frozenset[str] = frozenset(
+    {
+        "intervals_create_event",
+        "intervals_update_event",
+        "intervals_delete_event",
+    }
+)
+"""The #466 PO-authorized direct single-event calendar mutations.
+
+These three are the ONLY coach-mcp writes exposed to the model; every other
+upstream write stays hidden and refused pre-hub. Each one is additionally
+constrained by the pre-hub mutation budget (C1), read-before-write gate (C2),
+self athlete-id pin (C3), preservation guard (C4) and metadata-only logs (C6).
+"""
+
+COACH_MCP_ALLOWED_TOOLS: frozenset[str] = COACH_MCP_READ_TOOLS | COACH_MCP_EVENT_WRITE_TOOLS
+"""The complete coach-mcp model toolset: 19 reads + 3 single-event writes."""
+
+EVENT_UNVERIFIED_REFUSAL = (
+    "Refused {tool}: the target event_id was not verified by a successful "
+    "intervals_get_event call in this run. Call intervals_get_event for the "
+    "exact event first, then retry."
+)
+"""Static self-correcting C2 refusal (tool name only — no athlete data)."""
+
+EVENT_DESCRIPTION_GUARD_REFUSAL = (
+    "Refused intervals_update_event: `description` was provided without "
+    "`workout_doc`, which would erase the existing structured workout. Re-read "
+    "the event, then resend BOTH `description` (prose) and `workout_doc` "
+    '(Intervals.icu workout DSL with explicit Watts) — or pass `workout_doc=""` '
+    "for a prose-only calendar note."
+)
+"""Static self-correcting C4 refusal (no event data echoed)."""
+
+_EVENT_ID_LOG_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+"""Structural event-id shape safe to log (matches the sidecar's id pattern)."""
 
 
 def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Filter the hub catalogue down to the model-allowed toolset (#248 B1).
 
-    coach-mcp contributes its READ allow-list only; every other coach-mcp
-    tool (writes included) is dropped. github-mcp tools pass through
-    untouched, as do the synthetic proposal tools appended after this filter.
-    Schemas without a usable function name are dropped defensively.
+    coach-mcp contributes its READ allow-list plus the three #466 event
+    writes; every other coach-mcp tool is dropped. github-mcp tools pass
+    through untouched, as do the synthetic proposal tools appended after this
+    filter. Schemas without a usable function name are dropped defensively.
     """
     allowed: list[dict[str, Any]] = []
     for schema in hub_tools:
@@ -780,7 +836,7 @@ def filter_model_tools(hub_tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not isinstance(name, str) or not name:
             continue
         server, _, raw_name = name.partition(NAMESPACE_SEPARATOR)
-        if server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS:
+        if server == COACH_SERVER and raw_name not in COACH_MCP_ALLOWED_TOOLS:
             continue
         allowed.append(schema)
     return allowed
@@ -792,17 +848,17 @@ def _dispatch_allow_list_refusal(
 ) -> str | None:
     """Return the dispatch refusal for *tool_name*, or ``None`` to proceed (#252).
 
-    The #248 toolset filter hides coach-mcp writes from the advertised
-    tools, but the dispatch path resolves whatever name the model emits —
-    a prompt-injected write call by raw or namespaced name would still
+    The #248 toolset filter hides non-allowed coach-mcp tools from the
+    advertised tools, but the dispatch path resolves whatever name the model
+    emits — a prompt-injected write call by raw or namespaced name would still
     reach the sidecar. This guard re-checks the SAME allow-list
-    (``COACH_MCP_READ_TOOLS``) at the dispatch boundary: a coach-mcp tool
-    that is not a read is refused before ``execute_tool`` is ever called.
+    (``COACH_MCP_ALLOWED_TOOLS``) at the dispatch boundary: a coach-mcp tool
+    that is not allowed is refused before ``execute_tool`` is ever called.
     github-mcp tools and the synthetic proposal tools are unaffected.
     """
     server, separator, raw_name = tool_name.partition(NAMESPACE_SEPARATOR)
     if separator:
-        refused = server == COACH_SERVER and raw_name not in COACH_MCP_READ_TOOLS
+        refused = server == COACH_SERVER and raw_name not in COACH_MCP_ALLOWED_TOOLS
     else:
         # Raw form: mirror the hub's unique-raw-name resolution over the hub
         # catalogue — refuse only when the name resolves to coach-mcp alone.
@@ -815,10 +871,162 @@ def _dispatch_allow_list_refusal(
             candidate_server, sep, candidate_raw = name.partition(NAMESPACE_SEPARATOR)
             if sep and candidate_raw == tool_name:
                 servers.add(candidate_server)
-        refused = servers == {COACH_SERVER} and tool_name not in COACH_MCP_READ_TOOLS
+        refused = servers == {COACH_SERVER} and tool_name not in COACH_MCP_ALLOWED_TOOLS
     if not refused:
         return None
     return json.dumps({"error": f"Tool '{tool_name}' is not available"})
+
+
+def _split_tool_name(tool_name: str) -> tuple[str | None, str]:
+    """Split ``<server>__<tool>``; a raw name yields ``(None, name)``."""
+    server, separator, raw_name = tool_name.partition(NAMESPACE_SEPARATOR)
+    if separator:
+        return server, raw_name
+    return None, tool_name
+
+
+def _arguments_container(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Return the active argument container (wrapped ``params`` or flat args)."""
+    params = arguments.get("params")
+    return params if isinstance(params, dict) else arguments
+
+
+def _target_event_id(arguments: dict[str, Any]) -> str | None:
+    """Return the non-empty string ``event_id`` from the active container."""
+    value = _arguments_container(arguments).get("event_id")
+    if isinstance(value, str) and value.strip():
+        return value
+    return None
+
+
+def _safe_event_id_for_log(event_id: str | None) -> str | None:
+    """Return *event_id* only when it matches the structural safe shape."""
+    if event_id is None or _EVENT_ID_LOG_PATTERN.fullmatch(event_id) is None:
+        return None
+    return event_id
+
+
+def _pin_self_athlete_id(arguments: dict[str, Any]) -> dict[str, Any]:
+    """Deep-copy arguments and pin ``athlete_id`` to the self value ``"0"`` (C3).
+
+    In the wrapped shape the pin lands in ``params`` and any stray top-level
+    ``athlete_id`` is stripped; flat arguments are pinned directly. The
+    caller's dict is never mutated.
+    """
+    pinned = copy.deepcopy(arguments)
+    params = pinned.get("params")
+    if isinstance(params, dict):
+        params["athlete_id"] = "0"
+        pinned.pop("athlete_id", None)
+    else:
+        pinned["athlete_id"] = "0"
+    return pinned
+
+
+def _event_write_refusal(
+    raw_name: str,
+    arguments: dict[str, Any],
+    verified_event_ids: set[str],
+    mutation_budget: IcuEventMutationBudget,
+) -> str | None:
+    """Apply the pre-hub event-write guards, returning a refusal payload or None.
+
+    Order: C1 mutation budget → C2 verified-``event_id`` gate → C4
+    description/workout preservation guard. Every log line carries the tool
+    name and, only when structurally safe, the ``event_id`` — never prose
+    (C6). The caller pins ``athlete_id`` and charges the budget on success.
+    """
+    event_id = _target_event_id(arguments)
+    safe_id = _safe_event_id_for_log(event_id)
+    if mutation_budget.would_exceed(1):
+        logger.warning(
+            "Refused event mutation budget: tool=%s used=%s budget=%s",
+            raw_name,
+            mutation_budget.used,
+            mutation_budget.budget,
+        )
+        return json.dumps(
+            {
+                "error": EVENT_MUTATION_BUDGET_EXHAUSTED_MESSAGE.format(
+                    used=mutation_budget.used,
+                    budget=mutation_budget.budget,
+                    tool=raw_name,
+                )
+            }
+        )
+    if raw_name != "intervals_create_event" and event_id not in verified_event_ids:
+        logger.warning(
+            "Refused unverified event mutation: tool=%s event_id=%s",
+            raw_name,
+            safe_id or "-",
+        )
+        return json.dumps({"error": EVENT_UNVERIFIED_REFUSAL.format(tool=raw_name)})
+    container = _arguments_container(arguments)
+    if (
+        raw_name == "intervals_update_event"
+        and container.get("description") is not None
+        and container.get("workout_doc") is None
+    ):
+        logger.warning(
+            "Refused description-only event update: tool=%s event_id=%s",
+            raw_name,
+            safe_id or "-",
+        )
+        return json.dumps({"error": EVENT_DESCRIPTION_GUARD_REFUSAL})
+    return None
+
+
+def _is_coach_tool(tool_name: str, hub_tools: list[dict[str, Any]]) -> bool:
+    """Return True when *tool_name* resolves to a coach-mcp catalogue entry."""
+    server, raw_name = _split_tool_name(tool_name)
+    if server is not None:
+        return server == COACH_SERVER
+    for schema in hub_tools:
+        function = schema.get("function") if isinstance(schema, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(name, str):
+            continue
+        candidate_server, sep, candidate_raw = name.partition(NAMESPACE_SEPARATOR)
+        if sep and candidate_raw == raw_name and candidate_server == COACH_SERVER:
+            return True
+    return False
+
+
+def _is_coach_get_event(tool_name: str, hub_tools: list[dict[str, Any]]) -> bool:
+    """Return True when *tool_name* is the coach-mcp event verification read."""
+    _, raw_name = _split_tool_name(tool_name)
+    return raw_name == "intervals_get_event" and _is_coach_tool(tool_name, hub_tools)
+
+
+def _record_verified_event_id(
+    verified_event_ids: set[str],
+    arguments: dict[str, Any],
+    result: str,
+) -> None:
+    """Record the requested ``event_id`` only after a successful lookup (C2).
+
+    Success is strict: the returned payload must parse as a JSON object
+    without an ``"error"`` key. A failed ``"Error fetching event..."`` text
+    payload, a hub error object or any non-object payload never qualifies.
+    """
+    event_id = _target_event_id(arguments)
+    if event_id is None:
+        return
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if isinstance(parsed, dict) and "error" not in parsed:
+        verified_event_ids.add(event_id)
+
+
+def _result_is_error(result: str) -> bool:
+    """Return True when a tool result is a hub/upstream error JSON object."""
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, dict) and "error" in parsed
 
 
 def _classify_baseline_domain(
@@ -987,6 +1195,8 @@ class CoachAgent:
         # analysis collector that turns the fetched compliance data into the
         # debrief summary card — both live and die with this single run.
         budget = IcuReadBudget()
+        mutation_budget = IcuEventMutationBudget()
+        verified_event_ids: set[str] = set()
         collector = _WeekAnalysisCollector()
         metrics_context = self.session_metrics_context
 
@@ -1061,46 +1271,83 @@ class CoachAgent:
                         # static refusal and the call is never executed; the
                         # tool name is the only detail logged (nLPD).
                         logger.warning(
-                            "Refused coach-mcp tool outside the read allow-list: %s",
+                            "Refused coach-mcp tool outside the allow-list: %s",
                             call["name"],
                         )
                         result = refusal
                     else:
-                        # Session-metrics dedup (MADR-0025 Am. 0002 §4, #435):
-                        # an already-populated baseline domain is served from
-                        # the thread ledger BEFORE the budget/network path —
-                        # zero MCP calls, zero IcuReadBudget burn (AC3).
-                        reused = _reused_session_result(metrics_context, call["name"], arguments)
-                        if reused is not None:
-                            result = reused
-                            for event in collector.card_events(call["name"], result):
-                                yield event
-                        else:
-                            cost = icu_tool_get_cost(call["name"])
-                            if cost is not None and budget.would_exceed(cost):
-                                # Budget refusal (PO decision 5a): the call is NOT
-                                # executed — the model is told to summarise from the
-                                # data already fetched. The message carries counts
-                                # and the tool name only (nLPD).
-                                result = json.dumps(
-                                    {
-                                        "error": BUDGET_EXHAUSTED_MESSAGE.format(
-                                            used=budget.used,
-                                            budget=budget.budget,
-                                            tool=call["name"],
-                                            cost=cost,
-                                        )
-                                    }
-                                )
+                        _, raw_name = _split_tool_name(call["name"])
+                        is_event_write = raw_name in COACH_MCP_EVENT_WRITE_TOOLS and _is_coach_tool(
+                            call["name"], hub_tools
+                        )
+                        if is_event_write:
+                            # Pre-hub deterministic event-write guards (#466):
+                            # C1 mutation budget, C2 verified-event gate, C4
+                            # description/workout preservation. Refusals are
+                            # never executed, never charged.
+                            write_refusal = _event_write_refusal(
+                                raw_name,
+                                arguments,
+                                verified_event_ids,
+                                mutation_budget,
+                            )
+                            if write_refusal is not None:
+                                result = write_refusal
                             else:
-                                if cost is not None:
-                                    budget.consume(cost)
+                                arguments = _pin_self_athlete_id(arguments)
+                                mutation_budget.consume(1)
+                                started = time.monotonic()
                                 result = await self.hub.execute_tool(call["name"], arguments)
-                                _record_session_result(
-                                    metrics_context, call["name"], arguments, result
+                                # C6: tool name, structurally-safe event id,
+                                # outcome and duration only — zero prose.
+                                logger.info(
+                                    "Coach-mcp event mutation: tool=%s event_id=%s "
+                                    "status=%s duration_ms=%.1f",
+                                    raw_name,
+                                    _safe_event_id_for_log(_target_event_id(arguments)) or "-",
+                                    "error" if _result_is_error(result) else "ok",
+                                    (time.monotonic() - started) * 1000,
                                 )
+                        else:
+                            # Session-metrics dedup (MADR-0025 Am. 0002 §4, #435):
+                            # an already-populated baseline domain is served from
+                            # the thread ledger BEFORE the budget/network path —
+                            # zero MCP calls, zero IcuReadBudget burn (AC3).
+                            reused = _reused_session_result(
+                                metrics_context, call["name"], arguments
+                            )
+                            if reused is not None:
+                                result = reused
                                 for event in collector.card_events(call["name"], result):
                                     yield event
+                            else:
+                                cost = icu_tool_get_cost(call["name"])
+                                if cost is not None and budget.would_exceed(cost):
+                                    # Budget refusal (PO decision 5a): the call is NOT
+                                    # executed — the model is told to summarise from the
+                                    # data already fetched. The message carries counts
+                                    # and the tool name only (nLPD).
+                                    result = json.dumps(
+                                        {
+                                            "error": BUDGET_EXHAUSTED_MESSAGE.format(
+                                                used=budget.used,
+                                                budget=budget.budget,
+                                                tool=call["name"],
+                                                cost=cost,
+                                            )
+                                        }
+                                    )
+                                else:
+                                    if cost is not None:
+                                        budget.consume(cost)
+                                    result = await self.hub.execute_tool(call["name"], arguments)
+                                    _record_session_result(
+                                        metrics_context, call["name"], arguments, result
+                                    )
+                                    for event in collector.card_events(call["name"], result):
+                                        yield event
+                        if _is_coach_get_event(call["name"], hub_tools):
+                            _record_verified_event_id(verified_event_ids, arguments, result)
                 yield AgentEvent(
                     type="tool_result",
                     data={"id": call["id"], "name": call["name"], "result": result},

@@ -187,6 +187,42 @@ class IcuReadBudget:
         self.used += cost
 
 
+ICU_EVENT_MUTATION_BUDGET = 7
+"""Per-user-action calendar-mutation cap (#466 C1).
+
+Seven covers the primary ERG-population workflow — one week of daily
+workouts — while bounding write fan-out inside a single turn.
+"""
+
+EVENT_MUTATION_BUDGET_EXHAUSTED_MESSAGE = (
+    "Calendar mutation budget exhausted for this action: {used} of {budget} "
+    "event mutations already executed and {tool} would exceed the cap. Do not "
+    "retry; report the mutations already applied truthfully."
+)
+"""Model-facing mutation-budget refusal (tool name + counts only — nLPD)."""
+
+
+class IcuEventMutationBudget:
+    """Per-user-action calendar-mutation budget (#466 C1).
+
+    Mirrors :class:`IcuReadBudget`: one instance per agent run, and a call
+    refused by :meth:`would_exceed` is never executed and never charged.
+    """
+
+    def __init__(self, budget: int = ICU_EVENT_MUTATION_BUDGET) -> None:
+        """Start an empty budget with the documented cap."""
+        self.budget = budget
+        self.used = 0
+
+    def would_exceed(self, cost: int) -> bool:
+        """Return True when spending *cost* would push the total past the cap."""
+        return self.used + cost > self.budget
+
+    def consume(self, cost: int) -> None:
+        """Charge *cost* executed mutations to this action's budget."""
+        self.used += cost
+
+
 class SessionDebriefRow(BaseModel):
     """One planned session's planned-vs-executed outcome row (#165 contract).
 

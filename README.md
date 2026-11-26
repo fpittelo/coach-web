@@ -17,7 +17,7 @@
 ## 🎯 What is Coach Web?
 
 - **💬 Talk to your coach** — a conversational AI coach grounded in your live readiness: FTP, resting HR, HRV, sleep, and fitness/fatigue/form (CTL · ATL · TSB).
-- **✅ Approve, don't hope** — every proposed cycling or Kettlebell session lands as a plan card with explicit watts; nothing touches your Intervals.icu calendar until you approve it.
+- **✅ Approve, don't hope** — season and weekly plans still land as review cards with explicit watts. Single calendar events are different: tell the coach to create, move, rewrite or delete one — including explicit-Watt ERG `workout_doc` steps — and it edits your Intervals.icu calendar directly, behind server-side mutation, verification and erasure guards ([MADR-0034](docs/adr/0034-direct-conversational-calendar-writes.md)).
 - **🧠 It remembers you** — debriefs, standing preferences, and season objectives persist in encrypted memory that survives restarts and cold starts.
 - **🇨🇭 Private by design** — single-athlete, zero trackers, all data encrypted and resident in the Swiss-adjacent Zürich region (`europe-west6`).
 

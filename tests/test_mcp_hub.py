@@ -2,11 +2,13 @@
 
 import asyncio
 import json
+import logging
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from mcp.types import CallToolResult, TextContent, Tool
+from pydantic import BaseModel, ConfigDict, create_model
 
 from coach_web.config import Settings
 from coach_web.mcp_client import MCPConnectionError
@@ -24,6 +26,52 @@ def _tool(name: str, description: str = "A tool") -> Tool:
         name=name,
         description=description,
         input_schema={"type": "object", "properties": {"x": {"type": "string"}}},
+    )
+
+
+def _permissive_tool(name: str, description: str = "A tool") -> Tool:
+    """Build a Tool whose flat schema explicitly permits extra properties."""
+    return Tool(
+        name=name,
+        description=description,
+        input_schema={"type": "object"},
+    )
+
+
+class _MutationParams(BaseModel):
+    """FastMCP-equivalent event write input model (no ``response_format``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: str
+    name: str = "Workout"
+    description: str | None = None
+    workout_doc: str | None = None
+    athlete_id: str = "0"
+
+
+class _ReadParams(BaseModel):
+    """FastMCP-equivalent read input model (declares ``response_format``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    athlete_id: str = "0"
+    response_format: str = "markdown"
+
+
+def _wrapped_tool(name: str, params_model: type[BaseModel]) -> Tool:
+    """Build a real mcp 2.x-style tool schema wrapping *params_model*.
+
+    The sidecar advertises every tool as a single ``params`` Pydantic-model
+    argument (``{"properties": {"params": {"$ref": "#/$defs/..."}}, "$defs":
+    {...}}``), so this mirrors the real FastMCP/Pydantic v2 output rather
+    than hand-rolling an already-inlined schema.
+    """
+    arguments_model = create_model(f"{name}Arguments", params=(params_model, ...))
+    return Tool(
+        name=name,
+        description="Wrapped tool",
+        input_schema=arguments_model.model_json_schema(),
     )
 
 
@@ -217,7 +265,7 @@ class TestExecuteTool:
 
     async def test_execute_tool_routes_to_coach_and_injects_response_format(self) -> None:
         """coach-mcp tools receive response_format=json by default."""
-        coach = _mock_client([_tool("intervals_get_readiness_dashboard")])
+        coach = _mock_client([_permissive_tool("intervals_get_readiness_dashboard")])
         github = _mock_client([_tool("list_issues")])
         hub = _build_hub(coach, github)
         await hub.connect()
@@ -420,12 +468,12 @@ class TestParamsWrapping:
             {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
         )
 
-    async def test_params_wrapped_arguments_pass_through_unchanged(self) -> None:
+    async def test_params_wrapped_arguments_receive_defaults_inside_params(self) -> None:
         """The model's wrapped shape is never double-wrapped.
 
-        The pre-existing top-level ``response_format`` default injection is
-        untouched (the sidecar tolerates the extra key; changing its
-        position would alter agent-path response formats — out of scope).
+        The injected default lands in the DECLARED container (``params``),
+        never as a stray top-level key the sidecar's ``extra="forbid"`` model
+        would reject (C5).
         """
         coach = _mock_client([self._params_tool("icu_batch_create_events")])
         hub = _build_hub(coach, _mock_client())
@@ -439,7 +487,7 @@ class TestParamsWrapping:
 
         coach.call_tool.assert_awaited_once_with(
             "icu_batch_create_events",
-            {"params": {"events": [{"external_id": "e1"}]}, "response_format": "json"},
+            {"params": {"events": [{"external_id": "e1"}], "response_format": "json"}},
         )
 
     async def test_injected_response_format_lands_inside_params(self) -> None:
@@ -466,8 +514,8 @@ class TestParamsWrapping:
         )
 
     async def test_tools_without_a_params_property_are_untouched(self) -> None:
-        """Flat-schema tools are called with flat (unwrapped) args."""
-        coach = _mock_client([_tool("flat_tool")])
+        """A permissive flat schema keeps flat (unwrapped) args plus defaults."""
+        coach = _mock_client([_permissive_tool("flat_tool")])
         hub = _build_hub(coach, _mock_client())
         await hub.connect()
         coach.call_tool = AsyncMock(return_value=_text_result("{}"))
@@ -578,3 +626,230 @@ class TestResultSerialization:
         result = await hub.execute_tool(f"{COACH_SERVER}__t")
 
         assert json.loads(result) == {"ok": True}
+
+
+class TestLocalSchemaGate:
+    """Bounded local-only ``$defs``/``$ref`` gate before default injection (C5).
+
+    The real coach-mcp sidecar advertises FastMCP/Pydantic v2 schemas where
+    the arguments live under ``params`` behind a local ``#/$defs/<Model>``
+    reference. Event-write models forbid extra keys and do not declare
+    ``response_format``; injecting a default there makes the sidecar reject
+    the call. Reads do declare ``response_format`` and must keep receiving the
+    JSON default inside ``params``.
+    """
+
+    async def test_wrapped_mutation_schema_gets_no_response_format(self) -> None:
+        """A real wrapped event-write schema is sent without response_format."""
+        tool = _wrapped_tool("intervals_create_event", _MutationParams)
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_create_event",
+            {"event_id": "e1", "name": "Threshold", "description": "Prose"},
+        )
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"event_id": "e1", "name": "Threshold", "description": "Prose"}}
+        assert "response_format" not in json.dumps(sent)
+
+    async def test_wrapped_mutation_payload_already_in_params_is_untouched(self) -> None:
+        """The model's wrapped payload is not mutated with a forbidden default."""
+        tool = _wrapped_tool("intervals_update_event", _MutationParams)
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(
+            f"{COACH_SERVER}__intervals_update_event",
+            {"params": {"event_id": "e1", "workout_doc": "- 10m 200w"}},
+        )
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"event_id": "e1", "workout_doc": "- 10m 200w"}}
+        assert "response_format" not in json.dumps(sent)
+
+    async def test_wrapped_read_schema_receives_json_inside_params(self) -> None:
+        """A read model declaring response_format keeps the JSON default inside params."""
+        tool = _wrapped_tool("intervals_get_event", _ReadParams)
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(f"{COACH_SERVER}__intervals_get_event", {"athlete_id": "0"})
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"athlete_id": "0", "response_format": "json"}}
+
+    async def test_root_ref_is_resolved_locally(self) -> None:
+        """A root-level local ``$ref`` is dereferenced before the params lookup."""
+        tool = Tool(
+            name="root_ref_read",
+            description="Root $ref",
+            input_schema={
+                "type": "object",
+                "$ref": "#/$defs/ReadArguments",
+                "$defs": {
+                    "ReadArguments": {
+                        "type": "object",
+                        "properties": {"params": {"$ref": "#/$defs/ReadParams"}},
+                        "required": ["params"],
+                    },
+                    "ReadParams": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"response_format": {"type": "string"}},
+                    },
+                },
+            },
+        )
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(f"{COACH_SERVER}__root_ref_read", {"params": {}})
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"response_format": "json"}}
+
+    async def test_external_ref_is_never_followed_and_blocks_injection(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An ``http(s)`` ``$ref`` fails closed: no fetch, no default, tool-only log."""
+        tool = Tool(
+            name="external_ref_write",
+            description="External $ref",
+            input_schema={
+                "type": "object",
+                "properties": {"params": {"$ref": "https://evil.example/x.json"}},
+                "required": ["params"],
+            },
+        )
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.mcp_hub"):
+            await hub.execute_tool(
+                f"{COACH_SERVER}__external_ref_write",
+                {"params": {"event_id": "e1"}},
+            )
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"event_id": "e1"}}
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("external_ref_write" in r.getMessage() for r in warnings)
+        assert all("evil.example" not in r.getMessage() for r in warnings)
+        assert len(warnings) == 1
+
+    async def test_cyclic_ref_terminates_and_blocks_injection(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A self-referential ``$ref`` is bounded, non-permissive and logged once."""
+        tool = Tool(
+            name="cyclic_ref_write",
+            description="Cyclic $ref",
+            input_schema={
+                "type": "object",
+                "properties": {"params": {"$ref": "#/$defs/A"}},
+                "$defs": {"A": {"$ref": "#/$defs/A"}},
+            },
+        )
+        coach = _mock_client([tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.mcp_hub"):
+            await hub.execute_tool(
+                f"{COACH_SERVER}__cyclic_ref_write",
+                {"params": {"event_id": "e1"}},
+            )
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"event_id": "e1"}}
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("cyclic_ref_write" in r.getMessage() for r in warnings)
+        assert len(warnings) == 1
+
+    @staticmethod
+    def _chain_tool(name: str, ref_hops: int) -> Tool:
+        """Build a tool whose ``params`` ref chain is *ref_hops* long."""
+        defs: dict[str, Any] = {f"K{i}": {"$ref": f"#/$defs/K{i + 1}"} for i in range(ref_hops - 1)}
+        defs[f"K{ref_hops - 1}"] = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"response_format": {"type": "string"}},
+        }
+        return Tool(
+            name=name,
+            description="Ref chain",
+            input_schema={
+                "type": "object",
+                "properties": {"params": {"$ref": "#/$defs/K0"}},
+                "$defs": defs,
+            },
+        )
+
+    async def test_eight_ref_hops_still_resolve_and_inject(self) -> None:
+        """The documented hop cap allows a chain of exactly eight refs."""
+        coach = _mock_client([self._chain_tool("deep_ok_read", 8)])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(f"{COACH_SERVER}__deep_ok_read", {"params": {}})
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {"response_format": "json"}}
+
+    async def test_more_than_eight_ref_hops_fail_closed(self) -> None:
+        """A nine-ref chain is unresolvable: no injection, even though it declares it."""
+        coach = _mock_client([self._chain_tool("deep_blocked_read", 9)])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(f"{COACH_SERVER}__deep_blocked_read", {"params": {}})
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"params": {}}
+
+    async def test_non_permissive_flat_schema_gets_no_injection(self) -> None:
+        """A flat schema with ``additionalProperties: false`` never gains a key."""
+        coach = _mock_client(
+            [
+                Tool(
+                    name="flat_forbid_write",
+                    description="Flat forbid",
+                    input_schema={
+                        "type": "object",
+                        "properties": {"event_id": {"type": "string"}},
+                        "additionalProperties": False,
+                    },
+                )
+            ]
+        )
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        await hub.execute_tool(f"{COACH_SERVER}__flat_forbid_write", {"event_id": "e1"})
+
+        sent = coach.call_tool.await_args.args[1]
+        assert sent == {"event_id": "e1"}
+
+    async def test_caller_arguments_and_nested_dicts_are_not_mutated(self) -> None:
+        """C5d: deepcopy protects every caller-owned dict from in-place mutation."""
+        read_tool = _wrapped_tool("intervals_get_event", _ReadParams)
+        coach = _mock_client([read_tool])
+        hub = _build_hub(coach, _mock_client())
+        await hub.connect()
+
+        wrapped: dict[str, Any] = {"params": {"athlete_id": "0"}}
+        await hub.execute_tool(f"{COACH_SERVER}__intervals_get_event", wrapped)
+        assert wrapped == {"params": {"athlete_id": "0"}}
+
+        flat: dict[str, Any] = {"athlete_id": "0"}
+        await hub.execute_tool(f"{COACH_SERVER}__intervals_get_event", flat)
+        assert flat == {"athlete_id": "0"}

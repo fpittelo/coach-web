@@ -1028,6 +1028,14 @@ class TestApprovedWeekDigest:
         assert "Current phase:" not in digest
         assert "Peak/target date:" not in digest
 
+    def test_digest_states_live_calendar_precedence(self) -> None:
+        """#466: direct Intervals.icu edits take precedence over the snapshot."""
+        digest = approved_week_digest(self._approved_row())
+
+        assert "Live calendar precedence" in digest
+        assert "intervals_list_events" in digest
+        assert len(digest) <= APPROVED_WEEK_DIGEST_MAX_CHARS
+
     def test_a_line_broken_phase_name_collapses_to_one_safe_line(self) -> None:
         """A phase name carrying control characters collapses to one safe line (C5).
 

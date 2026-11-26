@@ -21,6 +21,8 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
+    COACH_MCP_ALLOWED_TOOLS,
+    COACH_MCP_EVENT_WRITE_TOOLS,
     COACH_MCP_READ_TOOLS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
@@ -38,6 +40,7 @@ from coach_web.agent import (
     OpenRouterClient,
     OpenRouterError,
     _accumulate_tool_call,
+    _dispatch_allow_list_refusal,
     _first_choice,
     _parse_arguments,
     apply_temporal_anchor,
@@ -51,6 +54,7 @@ from coach_web.agent import (
     week_plan_tool_schema,
 )
 from coach_web.agent_settings import STANDING_PREFERENCES_MAX_CHARS, AgentSettings
+from coach_web.analysis import ICU_EVENT_MUTATION_BUDGET, IcuEventMutationBudget
 from coach_web.app import create_app
 from coach_web.config import Settings
 from coach_web.conversation import StoredMessage
@@ -917,19 +921,39 @@ class TestModelToolsetFilter:
         assert len(FROZEN_COACH_MCP_WRITE_TOOLS) == 10
 
     def test_production_allow_list_matches_the_frozen_read_registry(self) -> None:
-        """The shipped allow-list equals the frozen read classification."""
+        """The shipped allow-list equals the frozen read classification + 3 writes."""
         assert COACH_MCP_READ_TOOLS == FROZEN_COACH_MCP_READ_TOOLS
+        assert COACH_MCP_EVENT_WRITE_TOOLS == frozenset(
+            {
+                "intervals_create_event",
+                "intervals_update_event",
+                "intervals_delete_event",
+            }
+        )
+        assert COACH_MCP_ALLOWED_TOOLS == (
+            FROZEN_COACH_MCP_READ_TOOLS | COACH_MCP_EVENT_WRITE_TOOLS
+        )
 
-    def test_filter_drops_every_coach_mcp_write_tool(self) -> None:
-        """No write tool survives the filter (the #248 incident tool first)."""
+    def test_filter_drops_the_seven_non_event_coach_mcp_write_tools(self) -> None:
+        """Every non-event write stays invisible (default-deny allow-list)."""
         catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
         catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
 
         filtered = filter_model_tools(catalogue)
 
         names = {schema["function"]["name"] for schema in filtered}
-        for write_tool in FROZEN_COACH_MCP_WRITE_TOOLS:
+        for write_tool in FROZEN_COACH_MCP_WRITE_TOOLS - COACH_MCP_EVENT_WRITE_TOOLS:
             assert f"coach-mcp__{write_tool}" not in names
+
+    def test_filter_keeps_the_three_event_write_tools(self) -> None:
+        """The #466 PO exception exposes exactly the three event mutations."""
+        catalogue = [_hub_schema(name) for name in COACH_MCP_EVENT_WRITE_TOOLS]
+
+        filtered = filter_model_tools(catalogue)
+
+        assert {schema["function"]["name"] for schema in filtered} == {
+            f"coach-mcp__{name}" for name in COACH_MCP_EVENT_WRITE_TOOLS
+        }
 
     def test_filter_keeps_every_coach_mcp_read_tool(self) -> None:
         """Every read tool survives the filter."""
@@ -962,8 +986,8 @@ class TestModelToolsetFilter:
 
         assert filtered == []
 
-    async def test_agent_toolset_exposes_reads_and_proposal_tools_only(self) -> None:
-        """The assembled toolset: 19 reads + 4 proposal tools, zero writes."""
+    async def test_agent_toolset_exposes_reads_event_writes_and_proposal_tools(self) -> None:
+        """The assembled toolset: 19 reads + 3 event writes + 4 proposal tools."""
         catalogue = [_hub_schema(name) for name in FROZEN_COACH_MCP_WRITE_TOOLS]
         catalogue += [_hub_schema(name) for name in FROZEN_COACH_MCP_READ_TOOLS]
         streamer = FakeStreamer([[_chunk(content="ok"), _chunk(finish_reason="stop")]])
@@ -974,6 +998,7 @@ class TestModelToolsetFilter:
         names = [tool["function"]["name"] for tool in streamer.requests[0]["tools"]]
         assert set(names) == (
             {f"coach-mcp__{name}" for name in FROZEN_COACH_MCP_READ_TOOLS}
+            | {f"coach-mcp__{name}" for name in COACH_MCP_EVENT_WRITE_TOOLS}
             | {
                 PROPOSE_PLAN_TOOL,
                 PROPOSE_WEEK_PLAN_TOOL,
@@ -2037,9 +2062,9 @@ class TestDispatchAllowListEnforcement:
         assert follow_up[-1]["role"] == "tool"
         assert "not available" in follow_up[-1]["content"]
 
-    async def test_every_frozen_write_tool_is_refused_by_namespaced_name(self) -> None:
-        """All ten frozen write tools are refused at dispatch (allow-list reuse)."""
-        for raw in sorted(FROZEN_COACH_MCP_WRITE_TOOLS):
+    async def test_every_non_event_write_tool_is_refused_by_namespaced_name(self) -> None:
+        """The seven non-event write tools are refused at dispatch."""
+        for raw in sorted(FROZEN_COACH_MCP_WRITE_TOOLS - COACH_MCP_EVENT_WRITE_TOOLS):
             tool_name = f"coach-mcp__{raw}"
             streamer = _tool_streamer([(tool_name, {})])
             hub = FakeHub(
@@ -2051,6 +2076,28 @@ class TestDispatchAllowListEnforcement:
             await _collect(agent, "go")
 
             assert hub.calls == [], tool_name
+
+    async def test_every_non_event_write_tool_is_refused_by_raw_name(self) -> None:
+        """The same seven tools are refused when the model emits the raw name."""
+        for raw in sorted(FROZEN_COACH_MCP_WRITE_TOOLS - COACH_MCP_EVENT_WRITE_TOOLS):
+            namespaced = f"coach-mcp__{raw}"
+            streamer = _tool_streamer([(raw, {})])
+            hub = FakeHub(
+                tools=[{"type": "function", "function": {"name": namespaced}}],
+                results={namespaced: '{"created": true}'},
+            )
+            agent = CoachAgent(streamer, hub)
+
+            await _collect(agent, "go")
+
+            assert hub.calls == [], raw
+
+    def test_event_write_tools_are_on_the_allow_list(self) -> None:
+        """The three event writes pass the allow-list guard (guards run later)."""
+        catalogue = [_hub_schema(name) for name in COACH_MCP_EVENT_WRITE_TOOLS]
+        for raw in sorted(COACH_MCP_EVENT_WRITE_TOOLS):
+            assert _dispatch_allow_list_refusal(f"coach-mcp__{raw}", catalogue) is None, raw
+            assert _dispatch_allow_list_refusal(raw, catalogue) is None, raw
 
     async def test_raw_write_name_is_refused_before_the_hub(self) -> None:
         """A raw write name resolvable through the hub catalogue is refused."""
@@ -2173,6 +2220,508 @@ class TestDispatchAllowListEnforcement:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("icu_batch_create_events" in r.getMessage() for r in warnings)
         assert all("secret" not in r.getMessage() for r in warnings)
+
+
+def _parallel_tool_streamer(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    closing: str = "Done.",
+) -> FakeStreamer:
+    """Build a streamer emitting every *calls* entry in ONE assistant turn."""
+    deltas = [
+        _tool_call_delta(
+            index,
+            call_id=f"call_{index}",
+            name=name,
+            arguments=json.dumps(arguments),
+        )
+        for index, (name, arguments) in enumerate(calls)
+    ]
+    return FakeStreamer(
+        [
+            [_chunk(tool_calls=deltas, finish_reason="tool_calls")],
+            [_chunk(content=closing), _chunk(finish_reason="stop")],
+        ]
+    )
+
+
+WRITE_CATALOGUE = [_hub_schema(name) for name in COACH_MCP_EVENT_WRITE_TOOLS]
+
+
+class TestEventMutationBudget:
+    """Per-run event-mutation budget mirrors ``IcuReadBudget`` (C1)."""
+
+    def test_budget_mirrors_the_read_budget_lifecycle(self) -> None:
+        """The class caps executions and never charges a refused call."""
+        budget = IcuEventMutationBudget()
+
+        assert ICU_EVENT_MUTATION_BUDGET == 7
+        assert budget.budget == 7
+        for _ in range(7):
+            assert budget.would_exceed(1) is False
+            budget.consume(1)
+        assert budget.would_exceed(1) is True
+        assert budget.used == 7
+
+    async def test_eighth_mutation_is_refused_before_the_hub(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A turn emitting 8 event creates executes exactly 7 and refuses the 8th."""
+        calls = [
+            (
+                "coach-mcp__intervals_create_event",
+                {
+                    "event_id": f"evt_{index}",
+                    "name": "Sweet Spot 3x12",
+                    "description": "Secret training prose",
+                    "workout_doc": "- 12m 200w",
+                },
+            )
+            for index in range(8)
+        ]
+        streamer = _parallel_tool_streamer(calls)
+        hub = FakeHub(
+            tools=WRITE_CATALOGUE,
+            results={"coach-mcp__intervals_create_event": '{"id": "created"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        with caplog.at_level(logging.INFO, logger="coach_web.agent"):
+            events = await _collect(agent, "Fill my week")
+
+        assert len(hub.calls) == 7
+        results = [e for e in events if e.type == "tool_result"]
+        assert len(results) == 8
+        refused = json.loads(results[-1].data["result"])
+        assert "budget" in refused["error"]
+        assert "evt_7" not in caplog.text
+        assert "Sweet Spot" not in caplog.text
+        assert "Secret training prose" not in caplog.text
+        assert "200w" not in caplog.text
+
+
+class TestReadBeforeWriteGate:
+    """Update/delete require a same-run successful ``intervals_get_event`` (C2)."""
+
+    async def test_update_of_unverified_event_is_refused_before_the_hub(self) -> None:
+        """A guessed event_id never reaches the sidecar."""
+        tool_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer([(tool_name, {"event_id": "e9", "workout_doc": "- 10m 200w"})])
+        hub = FakeHub(tools=WRITE_CATALOGUE, results={tool_name: '{"id": "e9"}'})
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Update it")
+
+        assert hub.calls == []
+        result = next(e for e in events if e.type == "tool_result")
+        assert "verified" in json.loads(result.data["result"])["error"]
+
+    async def test_delete_of_unverified_event_is_refused_before_the_hub(self) -> None:
+        """A delete needs the same verified event_id as an update."""
+        tool_name = "coach-mcp__intervals_delete_event"
+        streamer = _tool_streamer([(tool_name, {"event_id": "e9"})])
+        hub = FakeHub(tools=WRITE_CATALOGUE, results={tool_name: '{"deleted": true}'})
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Delete it")
+
+        assert hub.calls == []
+
+    async def test_update_after_a_successful_get_event_executes(self) -> None:
+        """The exact verified event_id unlocks the update."""
+        get_name = "coach-mcp__intervals_get_event"
+        update_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (update_name, {"event_id": "e1", "workout_doc": "- 10m 200w"}),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1", "name": "Threshold"}', update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        assert [name for name, _ in hub.calls] == [get_name, update_name]
+        assert hub.calls[1][1] == {
+            "event_id": "e1",
+            "workout_doc": "- 10m 200w",
+            "athlete_id": "0",
+        }
+
+    async def test_a_failed_lookup_never_verifies_the_event(self) -> None:
+        """An ``Error fetching event...`` text result leaves the id unverified."""
+        get_name = "coach-mcp__intervals_get_event"
+        update_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (update_name, {"event_id": "e1", "workout_doc": "- 10m 200w"}),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: "Error fetching event e1: 404", update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        assert [name for name, _ in hub.calls] == [get_name]
+
+    async def test_a_hub_error_payload_never_verifies_the_event(self) -> None:
+        """A JSON ``{"error": ...}`` lookup payload leaves the id unverified."""
+        get_name = "coach-mcp__intervals_get_event"
+        delete_name = "coach-mcp__intervals_delete_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (delete_name, {"event_id": "e1"}),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"error": "upstream down"}', delete_name: '{"deleted": true}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Delete e1")
+
+        assert [name for name, _ in hub.calls] == [get_name]
+
+    async def test_wrapped_event_id_is_verified_and_unlocks_the_update(self) -> None:
+        """A ``params``-wrapped update resolves the same target event_id."""
+        get_name = "coach-mcp__intervals_get_event"
+        update_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (
+                    update_name,
+                    {"params": {"event_id": "e1", "workout_doc": "- 10m 200w"}},
+                ),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1"}', update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        assert hub.calls[1][1] == {
+            "params": {
+                "event_id": "e1",
+                "workout_doc": "- 10m 200w",
+                "athlete_id": "0",
+            }
+        }
+
+    async def test_raw_update_name_is_gated_too(self) -> None:
+        """A raw write name resolvable through the catalogue is still gated."""
+        namespaced = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer([("intervals_update_event", {"event_id": "e1"})])
+        hub = FakeHub(
+            tools=[{"type": "function", "function": {"name": namespaced}}],
+            results={namespaced: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        assert hub.calls == []
+
+
+class TestAthleteIdPinning:
+    """Every event write pins ``athlete_id`` to the server-owned self (C3)."""
+
+    async def test_create_overwrites_a_foreign_athlete_id(self) -> None:
+        """A model-emitted ``iXXXXX`` never reaches the sidecar."""
+        tool_name = "coach-mcp__intervals_create_event"
+        streamer = _tool_streamer(
+            [(tool_name, {"event_id": "e1", "name": "x", "athlete_id": "i12345"})]
+        )
+        hub = FakeHub(tools=WRITE_CATALOGUE, results={tool_name: '{"id": "e1"}'})
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Create it")
+
+        sent = hub.calls[0][1]
+        assert sent is not None
+        assert sent["athlete_id"] == "0"
+
+    async def test_delete_pins_the_verified_event(self) -> None:
+        """A verified delete also pins the self athlete id."""
+        get_name = "coach-mcp__intervals_get_event"
+        delete_name = "coach-mcp__intervals_delete_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (delete_name, {"event_id": "e1", "athlete_id": "i12345"}),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1"}', delete_name: '{"deleted": true}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Delete e1")
+
+        sent = hub.calls[1][1]
+        assert sent is not None
+        assert sent["athlete_id"] == "0"
+
+    async def test_wrapped_update_strips_the_stray_top_level_id(self) -> None:
+        """The wrapped container is pinned and a top-level stray key is stripped."""
+        get_name = "coach-mcp__intervals_get_event"
+        update_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (
+                    update_name,
+                    {
+                        "params": {"event_id": "e1", "workout_doc": "- 10m 200w"},
+                        "athlete_id": "i12345",
+                    },
+                ),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1"}', update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        sent = hub.calls[1][1]
+        assert sent == {
+            "params": {
+                "event_id": "e1",
+                "workout_doc": "- 10m 200w",
+                "athlete_id": "0",
+            }
+        }
+        assert "athlete_id" not in sent
+
+
+class TestDescriptionPreservationGuard:
+    """A prose-only update must not erase the compiled workout (C4)."""
+
+    async def _run_two_calls(
+        self,
+        update_arguments: dict[str, Any],
+        *,
+        update_name: str = "coach-mcp__intervals_update_event",
+    ) -> tuple[FakeHub, list[AgentEvent]]:
+        """Verify ``e1`` then run the supplied update call."""
+        get_name = "coach-mcp__intervals_get_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (update_name, update_arguments),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1"}', update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+        events = await _collect(agent, "Update e1")
+        return hub, events
+
+    async def test_description_only_update_is_refused_before_the_hub(self) -> None:
+        """The silent ERG-erasure path is unreachable."""
+        hub, events = await self._run_two_calls({"event_id": "e1", "description": "New prose"})
+
+        assert [name for name, _ in hub.calls] == ["coach-mcp__intervals_get_event"]
+        result = [e for e in events if e.type == "tool_result"][-1]
+        error = json.loads(result.data["result"])["error"]
+        assert "description" in error
+        assert "workout_doc" in error
+
+    async def test_description_with_workout_doc_executes(self) -> None:
+        """Resending both fields keeps the structured workout intact."""
+        hub, _ = await self._run_two_calls(
+            {
+                "event_id": "e1",
+                "description": "New prose",
+                "workout_doc": "- 10m 200w",
+            }
+        )
+
+        assert [name for name, _ in hub.calls] == [
+            "coach-mcp__intervals_get_event",
+            "coach-mcp__intervals_update_event",
+        ]
+
+    async def test_empty_workout_doc_is_the_prose_only_escape_hatch(self) -> None:
+        """``workout_doc=""`` explicitly allows a prose-only calendar note."""
+        hub, _ = await self._run_two_calls(
+            {"event_id": "e1", "description": "New prose", "workout_doc": ""}
+        )
+
+        assert len(hub.calls) == 2
+
+    async def test_wrapped_description_only_update_is_refused(self) -> None:
+        """The guard reads the wrapped container identically."""
+        hub, _ = await self._run_two_calls(
+            {"params": {"event_id": "e1", "description": "New prose"}}
+        )
+
+        assert [name for name, _ in hub.calls] == ["coach-mcp__intervals_get_event"]
+
+    async def test_raw_update_name_hits_the_same_guard(self) -> None:
+        """A raw update name is refused before the hub too."""
+        namespaced = "coach-mcp__intervals_get_event"
+        raw_update = "intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (namespaced, {"event_id": "e1"}),
+                (raw_update, {"event_id": "e1", "description": "New prose"}),
+            ]
+        )
+        hub = FakeHub(
+            tools=[
+                _hub_schema("intervals_get_event"),
+                {"type": "function", "function": {"name": "coach-mcp__intervals_update_event"}},
+            ],
+            results={"coach-mcp__intervals_get_event": '{"id": "e1"}', raw_update: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        await _collect(agent, "Update e1")
+
+        assert [name for name, _ in hub.calls] == ["coach-mcp__intervals_get_event"]
+
+
+class TestMetadataOnlyWriteLogging:
+    """coach-web logs tool name, event_id, status and duration only (C6)."""
+
+    async def test_executed_write_log_carries_no_prose(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A successful write logs metadata but never the workout body."""
+        tool_name = "coach-mcp__intervals_create_event"
+        streamer = _tool_streamer(
+            [
+                (
+                    tool_name,
+                    {
+                        "event_id": "e1",
+                        "name": "Sweet Spot 3x12",
+                        "description": "Secret training prose",
+                        "workout_doc": "- 12m 200w",
+                    },
+                )
+            ]
+        )
+        hub = FakeHub(tools=WRITE_CATALOGUE, results={tool_name: '{"id": "e1"}'})
+        agent = CoachAgent(streamer, hub)
+
+        with caplog.at_level(logging.INFO, logger="coach_web.agent"):
+            await _collect(agent, "Create e1")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("intervals_create_event" in message for message in messages)
+        assert any("e1" in message for message in messages)
+        assert any("ok" in message for message in messages)
+        assert "Sweet Spot" not in caplog.text
+        assert "Secret training prose" not in caplog.text
+        assert "200w" not in caplog.text
+
+    async def test_guard_refusal_log_carries_no_prose(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A C4 refusal logs the tool and safe id only — no description text."""
+        get_name = "coach-mcp__intervals_get_event"
+        update_name = "coach-mcp__intervals_update_event"
+        streamer = _tool_streamer(
+            [
+                (get_name, {"event_id": "e1"}),
+                (
+                    update_name,
+                    {"event_id": "e1", "description": "Secret training prose"},
+                ),
+            ]
+        )
+        hub = FakeHub(
+            tools=[*WRITE_CATALOGUE, _hub_schema("intervals_get_event")],
+            results={get_name: '{"id": "e1"}', update_name: '{"id": "e1"}'},
+        )
+        agent = CoachAgent(streamer, hub)
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            await _collect(agent, "Update e1")
+
+        assert any("intervals_update_event" in m for m in caplog.messages)
+        assert "Secret training prose" not in caplog.text
+
+    async def test_allow_list_refusal_message_is_reworded(
+        self,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The refusal no longer claims a read-only allow-list (C6a)."""
+        tool_name = "coach-mcp__icu_batch_create_events"
+        streamer = _tool_streamer([(tool_name, {"events": []})])
+        hub = FakeHub(tools=[{"type": "function", "function": {"name": tool_name}}])
+        agent = CoachAgent(streamer, hub)
+
+        with caplog.at_level(logging.WARNING, logger="coach_web.agent"):
+            await _collect(agent, "go")
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("outside the allow-list" in message for message in warnings)
+        assert all("read allow-list" not in message for message in warnings)
+
+
+class TestDirectCalendarPromptContract:
+    """DEFAULT_SYSTEM_PROMPT routes calendar writes to the 3 event tools (AC3)."""
+
+    def test_propose_plan_is_removed_from_the_prompt(self) -> None:
+        """The conflicting single-workout prescription sentence is gone."""
+        assert PROPOSE_PLAN_TOOL not in DEFAULT_SYSTEM_PROMPT
+
+    def test_the_three_event_tools_are_named(self) -> None:
+        """Direct calendar create/update/delete is prescribed."""
+        for tool in COACH_MCP_EVENT_WRITE_TOOLS:
+            assert tool in DEFAULT_SYSTEM_PROMPT
+
+    def test_explicit_watt_workout_doc_dsl_is_mandated(self) -> None:
+        """Structured workouts carry explicit-Watt DSL in workout_doc."""
+        prompt = DEFAULT_SYSTEM_PROMPT
+        assert "workout_doc" in prompt
+        assert "explicit watts" in prompt.lower()
+
+    def test_list_then_get_verification_and_parallel_batching(self) -> None:
+        """The prompt directs list → get verification and parallel calls."""
+        prompt = DEFAULT_SYSTEM_PROMPT
+        assert "intervals_list_events" in prompt
+        assert "intervals_get_event" in prompt
+        assert "parallel" in prompt.lower()
+
+    def test_description_and_workout_doc_separation_is_explained(self) -> None:
+        """Prose and DSL are separate fields; workout_doc="" is the escape hatch."""
+        prompt = DEFAULT_SYSTEM_PROMPT
+        assert "description" in prompt
+        assert 'workout_doc=""' in prompt
+
+    def test_hypothetical_turns_are_clarified_before_mutating(self) -> None:
+        """A "what if" turn never mutates without confirmation."""
+        assert "hypothetical" in DEFAULT_SYSTEM_PROMPT.lower()
+
+    def test_truthful_outcome_reporting_is_required(self) -> None:
+        """The model must report the actual upstream outcome, not optimism."""
+        assert "truthfully" in DEFAULT_SYSTEM_PROMPT.lower()
 
 
 class TestCoachAgentWeekAnalysis:
