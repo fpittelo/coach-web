@@ -17,7 +17,7 @@ import unicodedata
 from collections.abc import AsyncIterator, Sequence
 from datetime import date
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OPENROUTER_MODEL = "anthropic/claude-sonnet-4.5"
 """Model routed through OpenRouter when no override is configured."""
+
+DEFAULT_MAX_TOOL_ITERATIONS: Final[int] = 20
+"""Default tool-calling rounds per turn (#472).
+
+Covers cold grounding reads (3–4 rounds) plus a full seven-workout week of
+sequential read-before-write pairs (``7 × intervals_get_event`` +
+``7 × intervals_update_event``) and a self-correction/summary round.
+Normal turns still stop on the first non-tool reply.
+"""
 
 OPENROUTER_CHAT_COMPLETIONS_PATH = "/chat/completions"
 """Relative path of the OpenRouter chat-completions endpoint."""
@@ -1121,6 +1130,16 @@ def _record_session_result(
     )
 
 
+_MAX_ITERATIONS_SYNTHESIS_PROMPT: Final[str] = (
+    "The per-turn tool-call limit has been reached. Do not call any further "
+    "tools. Concisely summarise only the actions confirmed by the tool results "
+    "above — never claim a mutation succeeded unless its tool result confirms "
+    "it — and briefly note any remaining items the athlete can ask you to "
+    "continue on in the next turn."
+)
+"""Ephemeral wrap-up directive appended only to the synthesis pass (#472)."""
+
+
 class CoachAgent:
     """Autonomous agent loop bridging OpenRouter and the dual MCP hub."""
 
@@ -1130,7 +1149,7 @@ class CoachAgent:
         hub: ToolExecutor,
         *,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
-        max_tool_iterations: int = 8,
+        max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
     ) -> None:
         """Store the streaming backend, the tool hub and the loop limits."""
         self.client = client
@@ -1206,24 +1225,10 @@ class CoachAgent:
             content_parts: list[str] = []
             tool_calls: dict[int, dict[str, str]] = {}
             try:
-                async for chunk in self.client.stream_chat_completion(messages, tools=tools):
-                    choice = _first_choice(chunk)
-                    delta = choice.get("delta")
-                    if not isinstance(delta, dict):
-                        continue
-
-                    reasoning = delta.get("reasoning")
-                    if isinstance(reasoning, str) and reasoning:
-                        yield AgentEvent(type="thought", data={"text": reasoning})
-
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
-                        content_parts.append(content)
-                        yield AgentEvent(type="token", data={"text": content})
-
-                    for delta_call in delta.get("tool_calls") or []:
-                        if isinstance(delta_call, dict):
-                            _accumulate_tool_call(tool_calls, delta_call)
+                async for event in self._stream_model_output(
+                    messages, tools, content_parts, tool_calls
+                ):
+                    yield event
             except OpenRouterError as exc:
                 yield AgentEvent(type="error", data={"message": str(exc)})
                 yield AgentEvent(
@@ -1354,14 +1359,87 @@ class CoachAgent:
                 )
                 messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
 
+        # Cap exhaustion (#472): every tool-enabled round requested tools, so
+        # the turn has no plain-text reply yet. Spend at most ONE additional
+        # completion with ``tools=None`` — zero further tool executions — on a
+        # shallow copy plus an ephemeral wrap-up directive. The caller's
+        # history is never mutated and the directive is never persisted.
+        synthesis_messages = [
+            *messages,
+            {"role": "system", "content": _MAX_ITERATIONS_SYNTHESIS_PROMPT},
+        ]
+        synth_content_parts: list[str] = []
+        synth_tool_calls: dict[int, dict[str, str]] = {}
         yield AgentEvent(
-            type="error",
-            data={"message": f"Exceeded maximum of {self.max_tool_iterations} tool iterations"},
+            type="status",
+            data={"phase": "thinking", "iteration": self.max_tool_iterations},
         )
+        try:
+            async for event in self._stream_model_output(
+                synthesis_messages, None, synth_content_parts, synth_tool_calls
+            ):
+                yield event
+        except OpenRouterError as exc:
+            yield AgentEvent(type="error", data={"message": str(exc)})
+            yield AgentEvent(
+                type="done",
+                data={
+                    "message": "".join(synth_content_parts),
+                    "iterations": self.max_tool_iterations,
+                },
+            )
+            return
+
+        synth_text = "".join(synth_content_parts)
+        if synth_tool_calls or not synth_text.strip():
+            # Fail closed: a runaway model ignored ``tools=None``, or the
+            # synthesis produced nothing. The typed error preserves MADR-0011
+            # suggestion suppression and MADR-0025 (#349) non-persistence.
+            yield AgentEvent(
+                type="error",
+                data={"message": f"Exceeded maximum of {self.max_tool_iterations} tool iterations"},
+            )
+            yield AgentEvent(
+                type="done",
+                data={"message": "", "iterations": self.max_tool_iterations},
+            )
+            return
+
         yield AgentEvent(
             type="done",
-            data={"message": "", "iterations": self.max_tool_iterations},
+            data={"message": synth_text, "iterations": self.max_tool_iterations},
         )
+
+    async def _stream_model_output(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        content_parts: list[str],
+        tool_calls: dict[int, dict[str, str]],
+    ) -> AsyncIterator[AgentEvent]:
+        """Stream one completion: yield thought/token events, fill accumulators.
+
+        ``OpenRouterError`` propagates to the caller, whose recovery differs
+        between the tool-enabled loop and the ``tools=None`` synthesis pass.
+        """
+        async for chunk in self.client.stream_chat_completion(messages, tools=tools):
+            choice = _first_choice(chunk)
+            delta = choice.get("delta")
+            if not isinstance(delta, dict):
+                continue
+
+            reasoning = delta.get("reasoning")
+            if isinstance(reasoning, str) and reasoning:
+                yield AgentEvent(type="thought", data={"text": reasoning})
+
+            content = delta.get("content")
+            if isinstance(content, str) and content:
+                content_parts.append(content)
+                yield AgentEvent(type="token", data={"text": content})
+
+            for delta_call in delta.get("tool_calls") or []:
+                if isinstance(delta_call, dict):
+                    _accumulate_tool_call(tool_calls, delta_call)
 
     def _build_messages(
         self,

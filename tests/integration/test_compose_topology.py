@@ -206,6 +206,14 @@ class TestBaseComposeTopology:
         assert env.get("COACH_MCP_URL") == "http://coach-mcp:8000/sse"
         assert env.get("GITHUB_MCP_URL") == "http://github-mcp:8001/"
 
+    def test_coach_web_agent_iteration_headroom_default(self, base_compose: dict[str, Any]) -> None:
+        """AC1 (#472): compose injects a default of 20 agent tool iterations."""
+        env = base_compose["services"]["coach-web"].get("environment", {})
+        assert env.get("AGENT_MAX_TOOL_ITERATIONS") == "${AGENT_MAX_TOOL_ITERATIONS:-20}"
+        for service in ("coach-mcp", "github-mcp"):
+            foreign = base_compose["services"][service].get("environment", {})
+            assert "AGENT_MAX_TOOL_ITERATIONS" not in foreign
+
     def test_coach_mcp_uses_sse_transport(self, base_compose: dict[str, Any]) -> None:
         """coach-mcp is configured for SSE transport on the internal network."""
         env = base_compose["services"]["coach-mcp"].get("environment", {})
@@ -593,6 +601,11 @@ class TestLaneEnvTemplates:
         ]
         assert active.count("CACHE_TTL_SECONDS") == 1
         assert "COACH_MCP_CACHE_TTL_SECONDS=300" in text
+
+    def test_env_example_documents_agent_iteration_headroom(self) -> None:
+        """AC1 (#472): the template documents the 20-iteration headroom."""
+        text = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+        assert "AGENT_MAX_TOOL_ITERATIONS=20" in text
 
     def test_gitignore_covers_real_env_files(self) -> None:
         """.gitignore ignores real lane env files but keeps the templates (AC4)."""
