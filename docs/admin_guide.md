@@ -35,6 +35,8 @@
 | **OpenRouter** | `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `OPENROUTER_TIMEOUT_SECONDS` | coach agent LLM |
 | **coach-mcp** | `INTERVALS_API_KEY`, `INTERVALS_ATHLETE_ID`, `INTERVALS_BASE_URL`, `MCP_TRANSPORT`, `MCP_HOST`, `MCP_PORT` | sidecar-local |
 
+> **Direct calendar edits (#466, [MADR-0034](adr/0034-direct-conversational-calendar-writes.md)):** the agent may call exactly three single-event sidecar writes — `intervals_create_event`, `intervals_update_event`, `intervals_delete_event`. This changed **no** environment variable and **no** secret: the `coach-mcp` container env, the D4 `secretKeyRef` set (**exactly 6 secrets**) and `INTERVALS_API_KEY` isolation are unchanged. At runtime, `coach-web` enforces a 7-mutation budget per turn, a same-turn `intervals_get_event` verification for update/delete, a self `athlete_id="0"` pin and a `description`/`workout_doc` preservation guard, and writes metadata-only logs (tool name, structurally-safe event id, status, duration — never workout prose). The sidecar's own stderr audit still records redacted full arguments (R8, tracked in `fpittelo/coach#127`); the unauthenticated intra-pod MCP endpoint is tracked as F1 in #467.
+
 ### Per-Lane Env Files (ADR-007, #109)
 
 - `.env.dev`, `.env.qa`, `.env.prod` — one per lane, created from the matching `*.example` template, **never a shared `.env`**; each is `chmod 600` and gitignored.

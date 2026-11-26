@@ -162,6 +162,19 @@ curl -sS -o /dev/null -w '%{http_code}\n' -X POST -H 'Content-Type: application/
 - [ ] The workouts appear on the Intervals.icu calendar.
 - [ ] The approval is attributable to the owner (single whitelisted identity).
 
+## Step 5b — Direct calendar write (ERG `workout_doc.steps`)
+
+Single-event calendar edits are direct — no approval card (MADR-0034).
+
+1. In Chat, ask: *"Create a 60-minute sweet-spot workout tomorrow with explicit watts."*
+2. Verify the created event in Intervals.icu.
+3. Then ask: *"Add 10 minutes to the warm-up of that workout."*
+
+- [ ] The agent calls `intervals_create_event` / `intervals_update_event` directly (no approval card).
+- [ ] The created event's `workout_doc.steps` is **non-empty** — the ERG steps are present with explicit Watts (not a prose-only description).
+- [ ] The follow-up update verifies the target via `intervals_get_event` first and keeps the structured `workout_doc.steps` non-empty.
+- [ ] `docker compose -p coach-web-prod logs --tail 200 coach-web` shows metadata-only mutation lines (tool, event id, status, duration) with no workout prose.
+
 ## Step 6 — Teardown
 
 ```bash

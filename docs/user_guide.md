@@ -93,6 +93,24 @@ The **Chat** tab lets you talk to the Coach MCP server directly through a Stream
 - The app calls the Coach MCP server over the MCP protocol
 - The response is rendered in the chat window
 
+### Direct calendar edits
+
+You can also edit your Intervals.icu calendar in the same conversation — no approval card for
+single-event changes:
+
+- **Create** — "Add a 90-minute sweet-spot workout on Thursday."
+- **Update** — "Move Thursday's threshold session to Friday and keep the watts."
+- **Delete** — "Delete the duplicate event on Saturday."
+
+The coach verifies the target event first, then calls exactly one of the three authorized event
+tools. Structured workouts are written as Intervals.icu workout DSL with **explicit Watts**
+(for example `- 12m 200w 85rpm`) in `workout_doc`; prose stays in `description`. If you ask a
+hypothetical question ("what if I moved…"), the coach clarifies before changing anything. Weekly and
+season plans still use the review/approve cards. Guardrails: at most seven calendar mutations per
+turn, update/delete only after a same-turn event lookup, and a prose-only update must resend the
+workout DSL (or pass an empty `workout_doc`) so the compiled ERG steps are never erased
+([MADR-0034](adr/0034-direct-conversational-calendar-writes.md)).
+
 ---
 
 ## 🔄 Refreshing Data
