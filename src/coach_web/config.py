@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     OPENROUTER_REFERER: str = "https://github.com/fpittelo/coach-web"
     """HTTP-Referer attribution header sent to OpenRouter."""
 
-    AGENT_MAX_TOOL_ITERATIONS: int = 8
+    AGENT_MAX_TOOL_ITERATIONS: int = 20
     """Hard cap on agent tool-calling iterations per user turn."""
 
     CACHE_TTL_SECONDS: int = 60

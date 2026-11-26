@@ -33,6 +33,10 @@ class TestSettings:
 
         assert get_settings().service_name == "coach-web"
 
+    def test_agent_iteration_headroom_default_is_twenty(self) -> None:
+        """AC1 (#472): the tool-iteration cap defaults to 20, not 8."""
+        assert Settings().AGENT_MAX_TOOL_ITERATIONS == 20
+
     def test_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Environment variables override defaults."""
         monkeypatch.setenv("COACH_MCP_URL", "http://override.local/mcp")

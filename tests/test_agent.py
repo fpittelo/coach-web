@@ -21,9 +21,11 @@ from pydantic import ValidationError
 from sqlalchemy.exc import SQLAlchemyError
 
 from coach_web.agent import (
+    _MAX_ITERATIONS_SYNTHESIS_PROMPT,
     COACH_MCP_ALLOWED_TOOLS,
     COACH_MCP_EVENT_WRITE_TOOLS,
     COACH_MCP_READ_TOOLS,
+    DEFAULT_MAX_TOOL_ITERATIONS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_SYSTEM_PROMPT,
     ENVIRONMENT_DIRECTIVES,
@@ -1141,6 +1143,211 @@ class TestCreateAgent:
         app = create_app(settings)
 
         assert app.state.agent_factory is create_agent
+
+
+# ---------------------------------------------------------------------------
+# Tool-iteration headroom & bounded tools=None synthesis (#472)
+# ---------------------------------------------------------------------------
+
+
+def _coach_call(raw_name: str) -> str:
+    """Return a coach-mcp tool name in the hub's namespaced form."""
+    return f"coach-mcp__{raw_name}"
+
+
+class _SynthesisRaisingStreamer(FakeStreamer):
+    """Raise ``OpenRouterError`` on the ``tools=None`` synthesis completion."""
+
+    def stream_chat_completion(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Fail only when the agent disables tools for the wrap-up pass."""
+        if tools is not None:
+            return super().stream_chat_completion(messages, tools=tools)
+        self.requests.append({"messages": deepcopy(messages), "tools": None})
+
+        async def _generate() -> AsyncIterator[dict[str, Any]]:
+            raise OpenRouterError("synthesis exploded")
+            yield {}  # pragma: no cover - makes this an async generator
+
+        return _generate()
+
+
+class TestToolIterationHeadroom:
+    """Raise the loop cap to 20 and synthesize gracefully at exhaustion (#472)."""
+
+    def test_agent_default_iteration_headroom_is_twenty(self) -> None:
+        """AC1 (#472): the constant and the CoachAgent default agree on 20."""
+        agent = CoachAgent(FakeStreamer([]), FakeHub())
+
+        assert DEFAULT_MAX_TOOL_ITERATIONS == 20
+        assert agent.max_tool_iterations == 20
+
+    async def test_twelve_round_coaching_and_calendar_turn_completes_cleanly(self) -> None:
+        """AC2 (#472): a full multi-workout week fits under the default cap."""
+        profile = _coach_call("intervals_get_athlete_profile")
+        readiness = _coach_call("intervals_get_readiness_dashboard")
+        listing = _coach_call("intervals_list_events")
+        get_event = _coach_call("intervals_get_event")
+        update_event = _coach_call("intervals_update_event")
+        event_ids = ("e1", "e2", "e3", "e4")
+        calls: list[tuple[str, dict[str, Any]]] = [
+            (profile, {}),
+            (readiness, {}),
+            (listing, {"oldest": "2026-11-23", "newest": "2026-11-29"}),
+        ]
+        for event_id in event_ids:
+            calls.append((get_event, {"event_id": event_id}))
+            calls.append((update_event, {"event_id": event_id, "workout_doc": "- 10m 200w"}))
+        summary = "Updated all four workouts for the week at 200 W."
+        streamer = _tool_streamer(calls, closing=summary)
+        hub = FakeHub(
+            tools=[
+                _hub_schema("intervals_get_athlete_profile"),
+                _hub_schema("intervals_get_readiness_dashboard"),
+                _hub_schema("intervals_list_events"),
+                _hub_schema("intervals_get_event"),
+                _hub_schema("intervals_update_event"),
+            ],
+            results={
+                profile: '{"id": "i0", "name": "Athlete"}',
+                readiness: '{"readiness": 82}',
+                listing: '{"events": []}',
+                get_event: '{"id": "e1", "name": "Threshold"}',
+                update_event: '{"id": "e1"}',
+            },
+        )
+        agent = CoachAgent(streamer, hub)
+
+        events = await _collect(agent, "Build my week")
+
+        assert len(streamer.requests) == 12
+        assert all(event.type != "error" for event in events)
+        executed = [
+            arguments["event_id"]
+            for name, arguments in hub.calls
+            if name == update_event and arguments is not None
+        ]
+        assert executed == list(event_ids)
+        done = events[-1]
+        assert done.type == "done"
+        assert done.data["message"] == summary
+        assert done.data["iterations"] == 12
+
+    async def test_cap_exhaustion_synthesizes_once_with_tools_disabled(self) -> None:
+        """AC3 (#472): one tools=None wrap-up pass replaces the hard error."""
+        looping = [
+            _chunk(
+                tool_calls=[_tool_call_delta(0, call_id="x", name="t", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        summary = "Two mutations landed; the remaining workouts can continue next turn."
+        streamer = FakeStreamer(
+            [
+                deepcopy(looping),
+                deepcopy(looping),
+                [_chunk(content=summary), _chunk(finish_reason="stop")],
+            ]
+        )
+        hub = FakeHub()
+        agent = CoachAgent(streamer, hub, max_tool_iterations=2)
+        history = [ChatMessage(role="user", content="before")]
+
+        events = await _collect(agent, "loop", history=history)
+
+        assert len(streamer.requests) == 3
+        assert streamer.requests[-1]["tools"] is None
+        assert streamer.requests[-1]["messages"][-1] == {
+            "role": "system",
+            "content": _MAX_ITERATIONS_SYNTHESIS_PROMPT,
+        }
+        assert all(
+            message["content"] != _MAX_ITERATIONS_SYNTHESIS_PROMPT
+            for message in streamer.requests[0]["messages"]
+        )
+        assert history == [ChatMessage(role="user", content="before")]
+        assert len(hub.calls) == 2
+        assert all(event.type != "error" for event in events)
+        assert [event.data["text"] for event in events if event.type == "token"] == [summary]
+        done = events[-1]
+        assert done.type == "done"
+        assert done.data["message"] == summary
+        assert done.data["iterations"] == 2
+
+    async def test_synthesis_openrouter_error_fails_closed(self) -> None:
+        """AC4 (#472): a failing wrap-up surfaces the error and an empty done."""
+        looping = [
+            _chunk(
+                tool_calls=[_tool_call_delta(0, call_id="x", name="t", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        streamer = _SynthesisRaisingStreamer([deepcopy(looping), deepcopy(looping)])
+        hub = FakeHub()
+        agent = CoachAgent(streamer, hub, max_tool_iterations=2)
+
+        events = await _collect(agent, "loop")
+
+        error = next(event for event in events if event.type == "error")
+        assert error.data["message"] == "synthesis exploded"
+        assert len(hub.calls) == 2
+        assert events[-1].data == {"message": "", "iterations": 2}
+        assert "suggestions" not in events[-1].data
+
+    async def test_runaway_synthesis_tool_calls_fail_closed_without_executing(self) -> None:
+        """AC4 (#472): a tools=None completion that calls a tool is never executed."""
+        looping = [
+            _chunk(
+                tool_calls=[_tool_call_delta(0, call_id="x", name="t", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        runaway = [
+            _chunk(
+                tool_calls=[_tool_call_delta(0, call_id="y", name="t", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        streamer = FakeStreamer([deepcopy(looping), deepcopy(looping), runaway])
+        hub = FakeHub()
+        agent = CoachAgent(streamer, hub, max_tool_iterations=2)
+
+        events = await _collect(agent, "loop")
+
+        error = next(event for event in events if event.type == "error")
+        assert error.data["message"] == "Exceeded maximum of 2 tool iterations"
+        assert len(hub.calls) == 2
+        assert events[-1].data == {"message": "", "iterations": 2}
+        assert "suggestions" not in events[-1].data
+
+    async def test_empty_synthesis_text_fails_closed(self) -> None:
+        """AC4 (#472): whitespace-only wrap-up text is a failed synthesis."""
+        looping = [
+            _chunk(
+                tool_calls=[_tool_call_delta(0, call_id="x", name="t", arguments="{}")],
+                finish_reason="tool_calls",
+            )
+        ]
+        streamer = FakeStreamer(
+            [
+                deepcopy(looping),
+                deepcopy(looping),
+                [_chunk(content="   "), _chunk(finish_reason="stop")],
+            ]
+        )
+        hub = FakeHub()
+        agent = CoachAgent(streamer, hub, max_tool_iterations=2)
+
+        events = await _collect(agent, "loop")
+
+        error = next(event for event in events if event.type == "error")
+        assert error.data["message"] == "Exceeded maximum of 2 tool iterations"
+        assert len(hub.calls) == 2
+        assert events[-1].data == {"message": "", "iterations": 2}
+        assert "suggestions" not in events[-1].data
 
 
 # ---------------------------------------------------------------------------
