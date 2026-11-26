@@ -47,13 +47,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 # Security (#351): the image-scan gate stays strict on OS findings that already
 # have a published fix — only *unfixed* CVEs belong in the .trivyignore
-# accepted-risk register. The mutable python:3.12-slim tag still ships zlib1g
+# accepted-risk register. The mutable python:3.12-slim tag ships zlib1g
 # 1.3.dfsg+really1.3.1-1+b1, whose HIGH fixes (CVE-2026-76844, CVE-2026-85091)
-# are in trixie-security as 1.3.dfsg+really1.3.1-1+deb13u1, so upgrade that one
-# package in place instead of accepting a fixable finding. This is a no-op once
-# the base tag carries the fix; the apt lists are removed in the same layer.
+# are in trixie-security as 1.3.dfsg+really1.3.1-1+deb13u1, and libzstd1, whose
+# fix for CVE-2026-124851 is published in the same suite, so upgrade both
+# packages in place instead of accepting fixable findings. This is a no-op once
+# the base tag carries the fixes; the apt lists are removed in the same layer.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends --only-upgrade zlib1g && \
+    apt-get install -y --no-install-recommends --only-upgrade zlib1g libzstd1 && \
     rm -rf /var/lib/apt/lists/*
 
 # Create non-root user and group (UID/GID 10001) and pre-create the

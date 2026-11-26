@@ -8,6 +8,7 @@ every runtime error is surfaced to the agent loop as a structured JSON string.
 """
 
 import asyncio
+import copy
 import json
 import logging
 from types import TracebackType
@@ -31,6 +32,17 @@ NAMESPACE_SEPARATOR = "__"
 
 COACH_DEFAULT_ARGUMENTS: dict[str, Any] = {"response_format": "json"}
 """Arguments injected into coach-mcp tool calls when not explicitly provided."""
+
+_LOCAL_REF_PREFIX = "#/$defs/"
+"""The only ``$ref`` form the hub resolves — local, same-document pointers (C5a)."""
+
+_MAX_REF_HOPS = 8
+"""Hard cap on ``$ref`` traversals before the schema is treated as unresolvable (C5b)."""
+
+_SCHEMA_GATE_WARNING = (
+    "Coach schema gate: cannot resolve $ref for tool %s; skipping default arguments"
+)
+"""Fail-closed warning (tool name only — never the ref, a URL or schema content)."""
 
 
 class MCPHubError(Exception):
@@ -185,11 +197,11 @@ class MCPClientHub:
             return self._error(f"MCP server '{server}' is not connected")
 
         raw_name = namespaced.split(NAMESPACE_SEPARATOR, 1)[1]
-        args: dict[str, Any] = dict(arguments) if arguments else {}
+        # C5d: caller-owned dicts are never mutated in place — the raw
+        # arguments (and every nested dict) are copied before normalization.
+        args: dict[str, Any] = copy.deepcopy(arguments) if arguments else {}
         if server == COACH_SERVER:
-            for key, value in COACH_DEFAULT_ARGUMENTS.items():
-                args.setdefault(key, value)
-        args = self._wrap_flat_params(namespaced, args)
+            args = self._apply_default_arguments(namespaced, args)
 
         try:
             result = await asyncio.wait_for(
@@ -205,23 +217,95 @@ class MCPClientHub:
 
         return self._serialize(result)
 
-    def _wrap_flat_params(self, namespaced: str, args: dict[str, Any]) -> dict[str, Any]:
-        """Wrap flat arguments for tools whose schema requires a ``params`` object.
+    def _apply_default_arguments(self, namespaced: str, args: dict[str, Any]) -> dict[str, Any]:
+        """Normalize the argument shape and inject defaults behind the schema gate.
 
         The coach-mcp sidecar (mcp 2.x ``MCPServer``) exposes every tool as a
-        single ``params`` Pydantic-model argument, so its advertised schema is
-        ``required: ["params"]``. Server-side call sites speak the flat legacy
-        shape while the model speaks the wrapped shape it reads from the
-        schema; normalizing here — at the single transport boundary — makes
+        single ``params`` Pydantic-model argument whose schema is a local
+        ``#/$defs/<Model>`` reference. Server-side call sites speak the flat
+        legacy shape while the model speaks the wrapped shape it reads from
+        the schema; normalizing here — at the single transport boundary — makes
         both shapes work and keeps the sidecar contract out of every call
-        site (#248 B2b). A payload already carrying ``params`` (the model's
-        shape) is never double-wrapped.
+        site (#248 B2b).
+
+        C5: the default ``response_format`` is injected into the DECLARED
+        container (``params`` when the schema is params-wrapped, top level when
+        flat) only when the locally dereferenced target schema explicitly
+        declares ``response_format`` or is permissive (no properties and
+        ``additionalProperties`` not ``False``). Event-write models forbid
+        extra keys and do not declare it, so they are never injected; an
+        unresolvable or cyclic reference fails closed with a tool-name-only
+        warning.
         """
         schema = self._tools[namespaced].input_schema or {}
-        properties = schema.get("properties") or {}
-        if "params" in properties and "params" not in args:
-            return {"params": args}
+        defs = schema.get("$defs")
+        root = self._dereference(namespaced, schema, defs)
+        if root is None:
+            return args
+        properties = root.get("properties")
+        if not isinstance(properties, dict):
+            properties = {}
+        if "params" in properties:
+            container = self._dereference(namespaced, properties["params"], defs)
+            if container is None:
+                return args
+            if "params" not in args:
+                args = {"params": args}
+            params = args.get("params")
+            if isinstance(params, dict) and self._permits_default(container):
+                for key, value in COACH_DEFAULT_ARGUMENTS.items():
+                    params.setdefault(key, value)
+            return args
+        if self._permits_default(root):
+            for key, value in COACH_DEFAULT_ARGUMENTS.items():
+                args.setdefault(key, value)
         return args
+
+    @classmethod
+    def _dereference(
+        cls,
+        tool_name: str,
+        schema: Any,
+        defs: Any,
+    ) -> dict[str, Any] | None:
+        """Resolve a local ``#/$defs/<Key>`` chain, failing closed.
+
+        Only same-document local pointers are followed (C5a) — an external
+        URL, a filesystem path or any non-local ``$ref`` is treated as
+        unresolvable with zero network/filesystem access. A visited-key set
+        plus the hard :data:`_MAX_REF_HOPS` cap bounds cycles and deep DAGs
+        (C5b). Any failure logs one tool-name-only warning and returns
+        ``None`` so the caller skips injection (C5c).
+        """
+        current = schema
+        visited: set[str] = set()
+        hops = 0
+        while isinstance(current, dict):
+            ref = current.get("$ref")
+            if ref is None:
+                return current
+            if not isinstance(ref, str) or not ref.startswith(_LOCAL_REF_PREFIX):
+                break
+            key = ref[len(_LOCAL_REF_PREFIX) :]
+            if not key or "/" in key or key in visited or hops >= _MAX_REF_HOPS:
+                break
+            target = defs.get(key) if isinstance(defs, dict) else None
+            if not isinstance(target, dict):
+                break
+            visited.add(key)
+            hops += 1
+            current = target
+        logger.warning(_SCHEMA_GATE_WARNING, tool_name)
+        return None
+
+    @staticmethod
+    def _permits_default(schema: dict[str, Any]) -> bool:
+        """Return True when a dereferenced target schema can accept the default."""
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and "response_format" in properties:
+            return True
+        has_properties = isinstance(properties, dict) and bool(properties)
+        return not has_properties and schema.get("additionalProperties") is not False
 
     def _resolve_tool(self, name: str) -> str | None:
         """Resolve a namespaced or unique raw tool name to its registry key."""

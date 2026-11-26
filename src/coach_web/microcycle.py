@@ -110,6 +110,11 @@ _APPROVED_WEEK_DIGEST_HEADER = (
     "Approved current week (past days are locked — adjust future days only):"
 )
 
+_APPROVED_WEEK_LIVE_CALENDAR_NOTE = (
+    "Live calendar precedence: direct Intervals.icu edits override this snapshot — "
+    "re-verify with intervals_list_events."
+)
+
 
 class DaySlot(BaseModel):
     """One day of a proposed weekly microcycle (#165 sketch)."""
@@ -571,6 +576,7 @@ def approved_week_digest(
         )
     if target_date is not None:
         lines.append(f"Peak/target date: {target_date}")
+    lines.append(_APPROVED_WEEK_LIVE_CALENDAR_NOTE)
     for day_date, session_title, load in days:
         collapsed_title = _digest_single_line(session_title)
         if load == _REST_DAY_LOAD:
